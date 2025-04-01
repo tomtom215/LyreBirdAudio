@@ -1,22 +1,95 @@
 #!/bin/bash
-
+#
 # MediaMTX Installer and RTSP Microphone Setup Script
+#
 # This script automates the installation of MediaMTX and sets up RTSP streams
 # for attached USB sound cards with microphone inputs.
 # It handles existing installations safely with backups and version checks.
+#
+# Usage: ./install_mediamtx.sh [options]
+#
+# Options:
+#   --help, -h             Show this help message and exit
+#   --version VERSION      Specify MediaMTX version to install (default: v1.11.3)
+#   --no-upgrade           Skip system updates (useful for limited bandwidth)
+#   --install-dir DIR      Custom installation directory (default: $HOME/mediamtx)
+#   --skip-autostart       Don't set up crontab autostart entry
+#
+# Example:
+#   ./install_mediamtx.sh --version v1.12.0 --install-dir /opt/mediamtx
+#
+# GitHub: [Your GitHub Repository URL]
+# License: Apache 2.0
 
 set -e                  # Exit on error
 set -o pipefail         # Exit if any command in a pipe fails
 
-# Log file
+# Default configuration
 LOG_FILE="/tmp/mediamtx_install.log"
 INSTALL_DIR="$HOME/mediamtx"
 MEDIAMTX_VERSION="v1.11.3"  # Update this version as needed
-STARTMIC_SCRIPT="$INSTALL_DIR/startmic.sh"
-BACKUP_DIR="$INSTALL_DIR/backups/$(date +%Y%m%d%H%M%S)"
+DO_SYSTEM_UPGRADE=true
+SETUP_AUTOSTART=true
 OVERWRITE_EXISTING=false
 UPGRADE_AVAILABLE=false
 EXISTING_VERSION=""
+
+# Process command line arguments
+process_arguments() {
+    while [[ $# -gt 0 ]]; do
+        key="$1"
+        case $key in
+            --help|-h)
+                show_help
+                exit 0
+                ;;
+            --version)
+                MEDIAMTX_VERSION="$2"
+                shift 2
+                ;;
+            --no-upgrade)
+                DO_SYSTEM_UPGRADE=false
+                shift
+                ;;
+            --install-dir)
+                INSTALL_DIR="$2"
+                shift 2
+                ;;
+            --skip-autostart)
+                SETUP_AUTOSTART=false
+                shift
+                ;;
+            *)
+                log "Unknown option: $1"
+                show_help
+                exit 1
+                ;;
+        esac
+    done
+
+    # Set dependent variables after processing arguments
+    STARTMIC_SCRIPT="$INSTALL_DIR/startmic.sh"
+    BACKUP_DIR="$INSTALL_DIR/backups/$(date +%Y%m%d%H%M%S)"
+}
+
+# Show help message
+show_help() {
+    cat << EOF
+MediaMTX Installer and RTSP Microphone Setup Script
+
+Usage: $0 [options]
+
+Options:
+  --help, -h             Show this help message and exit
+  --version VERSION      Specify MediaMTX version to install (default: $MEDIAMTX_VERSION)
+  --no-upgrade           Skip system updates (useful for limited bandwidth)
+  --install-dir DIR      Custom installation directory (default: $INSTALL_DIR)
+  --skip-autostart       Don't set up crontab autostart entry
+
+Example:
+  $0 --version v1.12.0 --install-dir /opt/mediamtx
+EOF
+}
 
 # Function to log messages
 log() {
@@ -150,11 +223,61 @@ setup_directories() {
 
 # Function to update system and install dependencies
 update_system() {
-    log "Updating system and installing dependencies..."
-    sudo apt update || error_exit "Failed to update package lists"
-    sudo apt upgrade -y || error_exit "Failed to upgrade packages"
-    sudo apt install -y ffmpeg alsa-utils || error_exit "Failed to install required packages"
-    log "System updated and dependencies installed successfully"
+    log "Installing required dependencies..."
+    
+    # Detect package manager
+    if command -v apt &> /dev/null; then
+        PKG_MANAGER="apt"
+    elif command -v yum &> /dev/null; then
+        PKG_MANAGER="yum"
+    elif command -v dnf &> /dev/null; then
+        PKG_MANAGER="dnf"
+    elif command -v pacman &> /dev/null; then
+        PKG_MANAGER="pacman"
+    else
+        log "Warning: Unable to detect package manager. You may need to install dependencies manually."
+        log "Required packages: ffmpeg, alsa-utils"
+        if confirm "Continue without automatic dependency installation?" "Y"; then
+            return 0
+        else
+            error_exit "Cannot proceed without installing dependencies"
+        fi
+    fi
+    
+    # Update and install packages based on detected manager
+    case $PKG_MANAGER in
+        apt)
+            if [ "$DO_SYSTEM_UPGRADE" = true ]; then
+                log "Updating system packages with apt..."
+                sudo apt update || error_exit "Failed to update package lists"
+                sudo apt upgrade -y || error_exit "Failed to upgrade packages"
+            fi
+            sudo apt install -y ffmpeg alsa-utils || error_exit "Failed to install required packages"
+            ;;
+        yum)
+            if [ "$DO_SYSTEM_UPGRADE" = true ]; then
+                log "Updating system packages with yum..."
+                sudo yum update -y || error_exit "Failed to update packages"
+            fi
+            sudo yum install -y ffmpeg alsa-utils || error_exit "Failed to install required packages"
+            ;;
+        dnf)
+            if [ "$DO_SYSTEM_UPGRADE" = true ]; then
+                log "Updating system packages with dnf..."
+                sudo dnf update -y || error_exit "Failed to update packages"
+            fi
+            sudo dnf install -y ffmpeg alsa-utils || error_exit "Failed to install required packages"
+            ;;
+        pacman)
+            if [ "$DO_SYSTEM_UPGRADE" = true ]; then
+                log "Updating system packages with pacman..."
+                sudo pacman -Syu --noconfirm || error_exit "Failed to update packages"
+            fi
+            sudo pacman -S --needed --noconfirm ffmpeg alsa-utils || error_exit "Failed to install required packages"
+            ;;
+    esac
+    
+    log "Dependencies installed successfully"
 }
 
 # Function to download and extract MediaMTX
@@ -330,6 +453,50 @@ EOF
 
 # Function to set up autostart
 setup_autostart() {
+    if [ "$SETUP_AUTOSTART" = false ]; then
+        log "Skipping autostart setup as requested"
+        return 0
+    fi
+    
+    log "Setting up autostart..."
+    
+    # Detect init system
+    if command -v systemctl &> /dev/null; then
+        # Setup using systemd
+        log "Setting up autostart using systemd..."
+        
+        # Create systemd service file
+        SYSTEMD_SERVICE_PATH="/etc/systemd/system/mediamtx.service"
+        
+        # Ask user for confirmation before creating systemd service
+        if confirm "Create systemd service for autostart?" "Y"; then
+            cat << EOF | sudo tee "$SYSTEMD_SERVICE_PATH" > /dev/null
+[Unit]
+Description=MediaMTX RTSP Server
+After=network.target
+
+[Service]
+Type=simple
+User=$(whoami)
+ExecStart=$STARTMIC_SCRIPT
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+EOF
+            
+            # Enable and start the service
+            sudo systemctl daemon-reload
+            sudo systemctl enable mediamtx.service || log "Warning: Failed to enable systemd service"
+            
+            log "Systemd service created at $SYSTEMD_SERVICE_PATH"
+            log "Service will start on next boot. To start now, run: sudo systemctl start mediamtx"
+            return 0
+        fi
+    fi
+    
+    # Fall back to crontab if systemd not available or user declined
     log "Setting up autostart using crontab..."
     
     # Check if entry already exists
@@ -395,31 +562,128 @@ display_stream_info() {
     log "=============================================="
 }
 
+# Check for root/sudo without being root
+check_permissions() {
+    # Check if script is being run as root (not recommended)
+    if [ "$(id -u)" -eq 0 ]; then
+        log "Warning: This script is running as root, which is not recommended."
+        log "It's better to run as a regular user with sudo privileges."
+        if ! confirm "Continue running as root?" "N"; then
+            error_exit "Please run this script as a non-root user with sudo access"
+        fi
+    else
+        # Check if user has sudo privileges
+        if ! sudo -v &> /dev/null; then
+            error_exit "This script requires sudo privileges. Please run with a user that has sudo access."
+        fi
+    fi
+}
+
+# Create an uninstall script
+create_uninstall_script() {
+    local UNINSTALL_SCRIPT="$INSTALL_DIR/uninstall_mediamtx.sh"
+    
+    log "Creating uninstall script at $UNINSTALL_SCRIPT..."
+    
+    cat > "$UNINSTALL_SCRIPT" << EOF
+#!/bin/bash
+#
+# MediaMTX Uninstaller Script
+# Created by MediaMTX Installer on $(date)
+#
+
+echo "MediaMTX Uninstaller"
+echo "===================="
+
+# Variables
+INSTALL_DIR="$INSTALL_DIR"
+SYSTEMD_SERVICE="mediamtx.service"
+
+# Check if running with sudo/root
+if [ "\$(id -u)" -ne 0 ]; then
+    echo "This uninstaller should be run with sudo."
+    echo "Please run: sudo $UNINSTALL_SCRIPT"
+    exit 1
+fi
+
+# Confirm uninstallation
+read -p "Are you sure you want to uninstall MediaMTX? [y/N]: " confirm
+if [[ ! \$confirm =~ ^[Yy] ]]; then
+    echo "Uninstallation cancelled."
+    exit 0
+fi
+
+# Stop any running processes
+echo "Stopping MediaMTX services..."
+pkill -f mediamtx || true
+pkill -f ffmpeg || true
+
+# Remove systemd service if exists
+if [ -f "/etc/systemd/system/\$SYSTEMD_SERVICE" ]; then
+    echo "Removing systemd service..."
+    systemctl stop \$SYSTEMD_SERVICE
+    systemctl disable \$SYSTEMD_SERVICE
+    rm -f "/etc/systemd/system/\$SYSTEMD_SERVICE"
+    systemctl daemon-reload
+fi
+
+# Remove crontab entry
+echo "Removing crontab entry..."
+(crontab -l 2>/dev/null | grep -v "$STARTMIC_SCRIPT") | crontab -
+
+# Ask if user wants to keep configuration files
+read -p "Do you want to keep configuration files? [Y/n]: " keep_config
+if [[ \$keep_config =~ ^[Nn] ]]; then
+    echo "Removing all MediaMTX files..."
+    rm -rf "\$INSTALL_DIR"
+else
+    echo "Keeping configuration files but removing binaries..."
+    rm -f "\$INSTALL_DIR/mediamtx"
+fi
+
+echo "MediaMTX has been uninstalled."
+exit 0
+EOF
+
+    # Make the script executable
+    chmod +x "$UNINSTALL_SCRIPT"
+    log "Uninstall script created successfully"
+}
+
 # Main script execution
 main() {
     log "Starting MediaMTX installation and RTSP microphone setup..."
     
+    # Process command line arguments
+    process_arguments "$@"
+    
+    # Check for root/sudo
+    check_permissions
+    
     # Step 1: Check for existing installation and setup directories
     setup_directories
     
-    # Step 3: Update system and install dependencies
+    # Step 2: Update system and install dependencies
     update_system
     
-    # Step 4: Detect architecture and set download URL
+    # Step 3: Detect architecture and set download URL
     detect_architecture
     
-    # Step 5: Download and extract MediaMTX
+    # Step 4: Download and extract MediaMTX
     download_mediamtx
     
-    # Step 6: Detect sound cards
+    # Step 5: Detect sound cards
     detect_sound_cards
     has_cards=$?
     
-    # Step 7: Create startmic.sh script
+    # Step 6: Create startmic.sh script
     create_startmic_script
     
-    # Step 8: Set up autostart
+    # Step 7: Set up autostart
     setup_autostart
+    
+    # Step 8: Create uninstall script
+    create_uninstall_script
     
     # Step 9: Display information
     display_stream_info
@@ -428,4 +692,6 @@ main() {
 }
 
 # Execute main function
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    main "$@"
+fi
