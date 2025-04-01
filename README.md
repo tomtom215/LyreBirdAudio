@@ -29,7 +29,7 @@ The script handles:
 
 1. Download the installer script:
    ```bash
-   wget https://raw.githubusercontent.com/yourusername/mediamtx-mic-installer/main/install_mediamtx.sh
+   wget https://raw.githubusercontent.com/yourtomtom215/mediamtx-mic-installer/main/install_mediamtx.sh
    ```
 
 2. Make it executable:
