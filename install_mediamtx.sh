@@ -1,8 +1,6 @@
 #!/bin/bash
-
 # Exit on error
 set -e
-
 echo "Installing FFmpeg..."
 sudo apt update && sudo apt install ffmpeg -y
 
@@ -42,14 +40,43 @@ esac
 DOWNLOAD_URL="https://github.com/bluenviron/mediamtx/releases/download/${VERSION}/mediamtx_${VERSION}_linux_${MTX_ARCH}.tar.gz"
 echo "Download URL: $DOWNLOAD_URL"
 
-# Download and extract
+# Create a temporary directory for extraction
+TEMP_DIR=$(mktemp -d)
+echo "Using temporary directory: $TEMP_DIR"
+
+# Download and extract to temporary directory first
 echo "Downloading and extracting MediaMTX..."
-wget -c "$DOWNLOAD_URL" -O - | sudo tar -xz -C /usr/local
+wget -c "$DOWNLOAD_URL" -O - | tar -xz -C "$TEMP_DIR"
+
+# List extracted contents to debug
+echo "Extracted files:"
+ls -la "$TEMP_DIR"
+
+# Create destination directory if it doesn't exist
+sudo mkdir -p /usr/local/mediamtx
+
+# Copy all files to final location
+sudo cp -R "$TEMP_DIR"/* /usr/local/mediamtx/
+
+# Remove temporary directory
+rm -rf "$TEMP_DIR"
+
+# Verify binary exists and set proper permissions
+if [ -f "/usr/local/mediamtx/mediamtx" ]; then
+  BINARY_PATH="/usr/local/mediamtx/mediamtx"
+  echo "MediaMTX binary found at: $BINARY_PATH"
+  sudo chmod +x "$BINARY_PATH"
+else
+  echo "ERROR: MediaMTX binary not found after extraction!"
+  echo "Contents of /usr/local/mediamtx:"
+  ls -la /usr/local/mediamtx/
+  exit 1
+fi
 
 echo "MediaMTX has been installed to /usr/local/mediamtx"
-echo "To start MediaMTX, run: /usr/local/mediamtx/mediamtx"
+echo "To start MediaMTX, run: $BINARY_PATH"
 
-# Create a systemd service file for MediaMTX (optional)
+# Create a systemd service file for MediaMTX
 echo "Creating MediaMTX systemd service..."
 cat << EOF | sudo tee /etc/systemd/system/mediamtx.service
 [Unit]
@@ -57,7 +84,7 @@ Description=MediaMTX RTSP server
 After=network.target
 
 [Service]
-ExecStart=/usr/local/mediamtx/mediamtx
+ExecStart=$BINARY_PATH
 WorkingDirectory=/usr/local/mediamtx
 Restart=always
 RestartSec=10
@@ -66,6 +93,10 @@ User=root
 [Install]
 WantedBy=multi-user.target
 EOF
+
+# Reload systemd to recognize the new service
+echo "Reloading systemd daemon..."
+sudo systemctl daemon-reload
 
 # Enable and start the service
 echo "Enabling and starting MediaMTX service..."
