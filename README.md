@@ -2,6 +2,8 @@
 
 A production-ready system for automatically creating RTSP audio streams from USB sound cards on Linux. The system detects all available audio capture devices and creates robust, auto-restarting RTSP streams that are accessible over the network.
 
+Ideally this should be used after successfully using my other project to create persistent mappings for your attached USB sound card microphones - https://github.com/tomtom215/udev-audio-mapper
+
 ## Features
 
 - **Automatic Installation**: Simple scripts to install and configure everything
