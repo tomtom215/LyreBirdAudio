@@ -32,7 +32,7 @@ The script supports the following CPU architectures:
 
 1. Download the script
 ```bash
-wget https://example.com/path/to/install_mediamtx.sh
+wget https://github.com/tomtom215/mediamtx-rtsp-setup/blob/main/install_mediamtx.sh
 ```
 
 2. Make the script executable
