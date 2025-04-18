@@ -344,7 +344,7 @@ Adjust `-b:a 320k` for higher bitrate, or change `-acodec` for different encodin
 
 ## License
 
-This installer script and associated software are provided under the MIT License.
+This installer script and associated software are provided under the Apache 2.0 License.
 
 ## Disclaimer
 
