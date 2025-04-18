@@ -1,181 +1,125 @@
-# MediaMTX RTSP Microphone Installer
+# MediaMTX Installer Script
 
-A bash script that automates the installation and configuration of [MediaMTX](https://github.com/bluenviron/mediamtx) for streaming audio from USB microphones over RTSP.
+This script automates the process of installing the latest MediaMTX release on Linux systems. It detects your system's CPU architecture and downloads the appropriate version for your machine.
 
-## Overview
+## Features
 
-This project provides an installer script that simplifies the setup of MediaMTX for streaming audio from connected USB microphones or sound cards. It's particularly useful for:
+- Automatically installs FFmpeg dependency
+- Detects system architecture (x86_64, arm64, armv6)
+- Downloads the latest MediaMTX release from GitHub
+- Extracts MediaMTX to `/usr/local/mediamtx`
+- Creates and configures a systemd service for automatic startup
 
-- Home automation systems that need to integrate microphone audio
-- DIY security or monitoring systems
-- Networked audio distribution
-- Remote audio monitoring solutions
+## Supported Architectures
 
-The script handles:
-- Installing MediaMTX with proper architecture detection
-- Detecting connected USB sound cards with microphone inputs
-- Creating RTSP streams for each detected microphone
-- Setting up automatic startup on system boot
-- Providing proper backup and version management for updates
+The script supports the following CPU architectures:
+- x86_64 (64-bit Intel/AMD processors) → downloads the `amd64` version
+- aarch64/arm64 (64-bit ARM processors) → downloads the `arm64v8` version
+- armv6 (32-bit ARM processors) → downloads the `armv6` version
 
-## Requirements
+## Prerequisites
 
-- A Linux system (Debian/Ubuntu, RedHat/CentOS, Fedora, or Arch-based)
-- Sudo privileges
-- Internet connection for downloading MediaMTX
-- One or more USB sound cards/microphones (optional at install time)
+- A Linux system with systemd
+- sudo access
+- The following tools installed:
+  - curl
+  - wget
+  - tar
+  - grep
+  - sed
 
-## Quick Start
+## Installation
 
-1. Download the installer script:
-   ```bash
-   wget https://raw.githubusercontent.com/yourtomtom215/mediamtx-mic-installer/main/install_mediamtx.sh
-   ```
-
-2. Make it executable:
-   ```bash
-   chmod +x install_mediamtx.sh
-   ```
-
-3. Run the installer:
-   ```bash
-   ./install_mediamtx.sh
-   ```
-
-4. After installation, your microphones will be available as RTSP streams:
-   ```
-   rtsp://your-ip-address:8554/mic1
-   rtsp://your-ip-address:8554/mic2
-   ...
-   ```
-
-## Usage Options
-
-The installer has several command-line options for customization:
-
-```
-Usage: ./install_mediamtx.sh [options]
-
-Options:
-  --help, -h             Show this help message and exit
-  --version VERSION      Specify MediaMTX version to install (default: v1.11.3)
-  --no-upgrade           Skip system updates (useful for limited bandwidth)
-  --install-dir DIR      Custom installation directory (default: $HOME/mediamtx)
-  --skip-autostart       Don't set up crontab autostart entry
-```
-
-### Examples
-
-Install a specific version:
+1. Download the script
 ```bash
-./install_mediamtx.sh --version v1.12.0
+wget https://example.com/path/to/install_mediamtx.sh
 ```
 
-Install to a custom location without system upgrades:
+2. Make the script executable
 ```bash
-./install_mediamtx.sh --install-dir /opt/mediamtx --no-upgrade
+chmod +x install_mediamtx.sh
 ```
 
-## How It Works
-
-1. **Detection Phase**: The script checks your system architecture and detects connected USB sound cards.
-
-2. **Installation Phase**: 
-   - Downloads the appropriate MediaMTX binary for your system
-   - Installs required dependencies (ffmpeg and alsa-utils)
-   - Creates a backup if updating an existing installation
-
-3. **Configuration Phase**:
-   - Creates a startup script that automatically configures streams for each detected microphone
-   - Sets up systemd service or crontab entry for automatic startup
-   - Creates an uninstall script for easy removal
-
-4. **Service Phase**:
-   - When the system boots, MediaMTX starts and creates RTSP streams
-   - Each microphone is available on a separate RTSP URL
-
-## Accessing Streams
-
-After installation, your microphone streams are available at:
-```
-rtsp://YOUR_IP_ADDRESS:8554/mic1  (first microphone)
-rtsp://YOUR_IP_ADDRESS:8554/mic2  (second microphone)
-...
+3. Run the script with sudo
+```bash
+sudo ./install_mediamtx.sh
 ```
 
-These streams can be accessed by any RTSP-compatible player or software:
-- VLC media player
-- FFmpeg
-- GStreamer
-- Home Assistant
-- Most IP camera viewing software
+## What the Script Does
+
+1. Updates package lists and installs FFmpeg
+2. Determines your CPU architecture
+3. Fetches the latest MediaMTX release version from GitHub
+4. Downloads and extracts the appropriate MediaMTX package to `/usr/local/mediamtx`
+5. Creates a systemd service for MediaMTX
+6. Enables and starts the MediaMTX service
+
+## After Installation
+
+After installation, MediaMTX will be:
+- Installed in `/usr/local/mediamtx/`
+- Running as a systemd service named `mediamtx`
+- Configured to start automatically on system boot
+
+## Managing the MediaMTX Service
+
+To check the status of the MediaMTX service:
+```bash
+sudo systemctl status mediamtx
+```
+
+To stop the service:
+```bash
+sudo systemctl stop mediamtx
+```
+
+To start the service:
+```bash
+sudo systemctl start mediamtx
+```
+
+To disable automatic startup:
+```bash
+sudo systemctl disable mediamtx
+```
+
+## Configuration
+
+MediaMTX configuration is located at `/usr/local/mediamtx/mediamtx.yml`. Edit this file to modify MediaMTX settings.
+
+After changing the configuration, restart the service:
+```bash
+sudo systemctl restart mediamtx
+```
 
 ## Troubleshooting
 
-### No Sound Cards Detected
+If you encounter issues:
 
-If the script doesn't detect your USB microphone:
-
-1. Connect your microphone and verify it appears in the system:
-   ```bash
-   arecord -l
-   ```
-
-2. If it shows up, edit the `startmic.sh` script in your MediaMTX installation directory to add the device manually:
-   ```bash
-   nano ~/mediamtx/startmic.sh
-   ```
-
-3. Add a line like the following (adjust the card number based on `arecord -l` output):
-   ```bash
-   ffmpeg -nostdin -f alsa -ac 1 -i plughw:1,0 -acodec libmp3lame -b:a 160k -ac 2 -content_type 'audio/mpeg' -f rtsp rtsp://localhost:8554/mic1 -rtsp_transport tcp &
-   ```
-
-### Service Doesn't Start
-
-If MediaMTX doesn't start automatically on boot:
-
-1. Check the status of the systemd service:
-   ```bash
-   sudo systemctl status mediamtx
-   ```
-
-2. Check the service logs:
-   ```bash
-   journalctl -u mediamtx
-   ```
-
-3. Try starting it manually:
-   ```bash
-   ~/mediamtx/startmic.sh
-   ```
-
-### Reinstalling or Upgrading
-
-To reinstall or upgrade MediaMTX, simply run the installer script again:
+1. Check the service status:
 ```bash
-./install_mediamtx.sh
+sudo systemctl status mediamtx
 ```
 
-The script will detect your existing installation and offer to update it.
-
-### Uninstalling
-
-An uninstall script is created during installation:
+2. Check the logs:
 ```bash
-sudo ~/mediamtx/uninstall_mediamtx.sh
+sudo journalctl -u mediamtx
 ```
 
-This will remove MediaMTX, its services, and optionally its configuration files.
+3. Verify the architecture detection:
+```bash
+uname -m
+```
 
-## Contributing
-
-Contributions are welcome! Please feel free to submit a Pull Request.
+4. Ensure the MediaMTX binary exists:
+```bash
+ls -l /usr/local/mediamtx/mediamtx
+```
 
 ## License
 
-This project is licensed under the Apache License 2.0 - see the LICENSE file for details.
+This installer script is provided under the Apache 2.0 License.
 
-## Acknowledgments
+## Disclaimer
 
-- [MediaMTX](https://github.com/bluenviron/mediamtx) - The excellent RTSP server this installer is built for.
+This script is not officially affiliated with the MediaMTX project. Always review scripts before running them with sudo privileges.
