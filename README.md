@@ -19,11 +19,10 @@ This solution provides:
 - Basic audio devices connected via USB
 - Internet connection (for initial download)
 - Git or WGET
-- If you are on a newly imaged Raspberry Pi, it is suggested to use sudo raspi-config and go to advanced options to expand your filesystem before continuing
+- If you are using a newly imaged Raspberry Pi, it is suggested to use sudo raspi-config and go to advanced options to expand your filesystem before continuing
 - Run sudo apt update && sudo apt upgrade -y before starting
 
-- It is highly recommended to use my other project before this project to map your USB microphones/sound cards to be persistently named
-- For details check it out here before continuing https://github.com/tomtom215/usb-audio-mapper
+- It is highly recommended to use my other project before this project to map your USB microphones/sound cards to be persistently named. For details check it out here before continuing https://github.com/tomtom215/usb-audio-mapper
 
 ## Quick Start
 
