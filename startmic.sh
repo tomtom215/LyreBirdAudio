@@ -78,8 +78,9 @@ echo "$SOUND_CARDS" | while read -r line; do
             echo "$CARD_NUM|$CARD_ID|$USB_INFO|$RTSP_URL" >> /tmp/stream_details.$
             
             # Start ffmpeg with the appropriate sound card
+            # This assumes mono input, if stereo, change the references to -ac 2
             ffmpeg -nostdin -f alsa -ac 1 -i "plughw:CARD=$CARD_ID,DEV=0" \
-                  -acodec libmp3lame -b:a 160k -ac 2 -content_type 'audio/mpeg' \
+                  -acodec libmp3lame -b:a 192k -ac 1 -content_type 'audio/mpeg' \
                   -f rtsp "$RTSP_URL" -rtsp_transport tcp &
             
             # Small delay to stagger the ffmpeg starts
