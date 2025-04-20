@@ -18,6 +18,10 @@ This solution provides:
 - Root/sudo access
 - Basic audio devices connected via USB
 - Internet connection (for initial download)
+- Git or WGET
+
+- It is highly recommended to use my other project before this project to map your USB microphones/sound cards to be persistently named
+- For details check it out here before continuing https://github.com/tomtom215/usb-audio-mapper
 
 ## Quick Start
 
@@ -27,14 +31,24 @@ This solution provides:
    cd mediamtx-rtsp-setup
    ```
    or use WGET if git is not installed
+   ```bash
+   mkdir mediamtx-rtsp-setup && cd mediamtx-rtsp-setup &&
+   wget https://raw.githubusercontent.com/tomtom215/mediamtx-rtsp-setup/blob/main/install_mediamtx.sh &&
+   wget https://raw.githubusercontent.com/tomtom215/mediamtx-rtsp-setup/blob/main/setup_audio_rtsp.sh &&
+   wget https://raw.githubusercontent.com/tomtom215/mediamtx-rtsp-setup/blob/main/startmic.sh
+   ```
+   Make the scripts executable
+   ```bash
+   chmod +x install_mediamtx.sh setup_audio_rtsp.sh startmic.sh
+   ```
 
-2. Run the scripts in order:
+3. Run the scripts in order:
    ```bash
    sudo bash install_mediamtx.sh
    sudo bash setup_audio_rtsp.sh
    ```
 
-3. Check the status of your streams:
+4. Check the status of your streams:
    ```bash
    sudo check-audio-rtsp.sh
    ```
