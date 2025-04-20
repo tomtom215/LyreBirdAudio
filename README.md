@@ -220,7 +220,8 @@ Contributions are welcome! Please feel free to submit a Pull Request.
 ## Acknowledgments
 
 - [MediaMTX](https://github.com/bluenviron/mediamtx) for the excellent RTSP server
-- All contributors and testers of this project
+- All contributors and testers of this project that join this project
+- [Cbeger908](https://github.com/cberge908) for his [original gist that got me started](https://gist.github.com/cberge908/ab7ddc1ac46fd63bb6935cd1f4341112)
 
 ## License
 
