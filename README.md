@@ -55,6 +55,11 @@ This solution provides:
    sudo check-audio-rtsp.sh
    ```
 
+5. If you add any new microphones, or adjust the streeam settings in startmic.sh, re-run the setup script again:
+   ```bash
+   sudo bash setup_audio_rtsp.sh
+   ```
+
 ## Installation Process
 
 ### Step 1: Install MediaMTX
