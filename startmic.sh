@@ -69,7 +69,7 @@ echo "$SOUND_CARDS" | while read -r line; do
         if has_capture_device "$CARD_NUM"; then
             # Generate stream name based on card ID
             STREAM_NAME=$(get_stream_name "$CARD_ID")
-            RTSP_URL="rtsp://localhost:8554/$STREAM_NAME"
+            RTSP_URL="rtsp://localhost:18554/$STREAM_NAME"
             
             echo "Starting RTSP stream for card $CARD_NUM [$CARD_ID]: $RTSP_URL"
             
