@@ -177,6 +177,9 @@ sudo check-audio-rtsp.sh
    - Check errors: `journalctl -u audio-rtsp -n 50`
    - Verify MediaMTX is running: `systemctl status mediamtx`
 
+4. **Stream is silent**
+   - Check alsamixer `alsamixer` to check your soun card's capture levels. Some default to 0. Do not set it to 100.
+  
 ### Logs
 
 Log files are stored in `/var/log/audio-rtsp/`:
