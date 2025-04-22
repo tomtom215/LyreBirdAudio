@@ -178,7 +178,7 @@ sudo check-audio-rtsp.sh
    - Verify MediaMTX is running: `systemctl status mediamtx`
 
 4. **Stream is silent**
-   - Check alsamixer `alsamixer` to check your soun card's capture levels. Some default to 0. Do not set it to 100.
+   - Check alsamixer `alsamixer` to check your sound card's capture levels. Some default to 0. Do not set it to 100.
   
 ### Logs
 
