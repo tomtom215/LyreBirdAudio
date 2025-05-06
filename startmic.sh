@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # startmic.sh: Universal audio capture to RTSP streaming script
-# Version: 1.1.0
+# Version: 1.2.0
 # Date: 2025-05-06
 
 # Exit on error
@@ -18,6 +18,8 @@ RUNTIME_DIR="/run/audio-rtsp"
 TEMP_FILE="${RUNTIME_DIR}/stream_details.$$"
 LOCK_FILE="${RUNTIME_DIR}/startmic.lock"
 PID_FILE="${RUNTIME_DIR}/startmic.pid"
+CONFIG_DIR="/etc/audio-rtsp"
+DEVICE_MAP_FILE="${CONFIG_DIR}/device_map.conf"
 
 # Create runtime directory if it doesn't exist
 mkdir -p "$RUNTIME_DIR" 2>/dev/null || {
@@ -27,6 +29,13 @@ mkdir -p "$RUNTIME_DIR" 2>/dev/null || {
     TEMP_FILE="${RUNTIME_DIR}/stream_details.$$"
     LOCK_FILE="${RUNTIME_DIR}/startmic.lock"
     PID_FILE="${RUNTIME_DIR}/startmic.pid"
+}
+
+# Create config directory if it doesn't exist
+mkdir -p "$CONFIG_DIR" 2>/dev/null || {
+    echo "WARNING: Could not create config directory $CONFIG_DIR. Using $RUNTIME_DIR instead."
+    CONFIG_DIR="$RUNTIME_DIR"
+    DEVICE_MAP_FILE="${CONFIG_DIR}/device_map.conf"
 }
 
 # Store our PID
@@ -171,17 +180,49 @@ has_capture_device() {
     fi
 }
 
-# Function to get a sanitized name for the RTSP stream
+# Function to create a consistent unique identifier for a device
+get_device_uuid() {
+    local card_id="$1"
+    local usb_info="$2"
+    
+    # For USB devices, use device-specific info to create a stable identifier
+    if [[ -n "$usb_info" ]]; then
+        # Extract vendor/product information if possible
+        local vendor_product
+        if [[ "$usb_info" =~ ([A-Za-z0-9]+:[A-Za-z0-9]+) ]]; then
+            vendor_product="${BASH_REMATCH[1]}"
+            echo "${card_id}_${vendor_product}" | tr -d ' '
+        else
+            # Fall back to a hash of the full USB info for uniqueness
+            local hash
+            hash=$(echo "$usb_info" | md5sum | cut -c1-8)
+            echo "${card_id}_${hash}" | tr -d ' '
+        fi
+    else
+        # For non-USB devices, just use the card ID
+        echo "$card_id" | tr -d ' '
+    fi
+}
+
+# Function to get a user-friendly stream name
 get_stream_name() {
-    local card_name="$1"
-    local card_num="$2"
+    local card_id="$1"
+    local device_uuid="$2"
     
-    # Remove spaces, special characters and convert to lowercase
+    # First check if we have a mapped name for this device
+    if [[ -f "$DEVICE_MAP_FILE" ]]; then
+        local mapped_name
+        mapped_name=$(grep "^$device_uuid=" "$DEVICE_MAP_FILE" 2>/dev/null | cut -d= -f2)
+        if [[ -n "$mapped_name" ]]; then
+            echo "$mapped_name"
+            return
+        fi
+    fi
+    
+    # No mapping found, use sanitized card_id
     local sanitized
-    sanitized=$(echo "$card_name" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]//g')
-    
-    # Append card number to make it unique
-    echo "${sanitized}_${card_num}"
+    sanitized=$(echo "$card_id" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]//g')
+    echo "$sanitized"
 }
 
 # Kill any existing ffmpeg streams
@@ -202,6 +243,9 @@ EXCLUDED_DEVICES=("bcm2835_headpho" "vc4-hdmi" "HDMI")
 
 # Create an array to store stream details that will be preserved when we exit the loop
 declare -a STREAM_DETAILS_ARRAY
+
+# Store device UUIDs for the device map
+declare -a DEVICE_UUIDS
 
 # Parse sound cards and start ffmpeg for each one with capture capability
 while read -r line; do
@@ -242,14 +286,18 @@ while read -r line; do
                 echo "WARNING: Cannot test capture from card $CARD_NUM [$CARD_ID] - trying anyway"
             fi
             
-            # Generate stream name based on card ID
-            STREAM_NAME=$(get_stream_name "$CARD_ID" "$CARD_NUM")
+            # Generate a stable, unique identifier for this device
+            DEVICE_UUID=$(get_device_uuid "$CARD_ID" "$USB_INFO")
+            DEVICE_UUIDS+=("$DEVICE_UUID")
+            
+            # Get a stable, human-readable stream name
+            STREAM_NAME=$(get_stream_name "$CARD_ID" "$DEVICE_UUID")
             RTSP_URL="rtsp://localhost:$RTSP_PORT/$STREAM_NAME"
             
             echo "Starting RTSP stream for card $CARD_NUM [$CARD_ID]: $RTSP_URL"
             
             # Store the stream details for display later (outside the loop)
-            STREAM_DETAILS_ARRAY+=("$CARD_NUM|$CARD_ID|$USB_INFO|$RTSP_URL")
+            STREAM_DETAILS_ARRAY+=("$CARD_NUM|$CARD_ID|$USB_INFO|$RTSP_URL|$DEVICE_UUID")
             
             # Start ffmpeg with the appropriate sound card
             # Redirect output to /dev/null to avoid cluttering the console
@@ -274,6 +322,43 @@ if [[ -f "${TEMP_FILE}.pids" ]]; then
     STREAMS_CREATED=$(wc -l < "${TEMP_FILE}.pids")
 fi
 
+# Create or update the device map file with detected devices
+if [[ "$STREAMS_CREATED" -gt 0 ]]; then
+    # Create the device map file if it doesn't exist
+    if [[ ! -f "$DEVICE_MAP_FILE" ]]; then
+        echo "# Audio Device Map - Edit this file to give devices persistent, friendly names" > "$DEVICE_MAP_FILE"
+        echo "# Format: DEVICE_UUID=friendly_name" >> "$DEVICE_MAP_FILE"
+        echo "# Do not change the DEVICE_UUID values as they are used for consistent identification" >> "$DEVICE_MAP_FILE"
+        echo "" >> "$DEVICE_MAP_FILE"
+        
+        # Add initial entries for detected devices
+        for detail in "${STREAM_DETAILS_ARRAY[@]}"; do
+            IFS='|' read -r card_num card_id usb_info rtsp_url device_uuid <<< "$detail"
+            # Check if this UUID is already in the file
+            if ! grep -q "^$device_uuid=" "$DEVICE_MAP_FILE" 2>/dev/null; then
+                # Add a sanitized default name
+                sanitized=$(echo "$card_id" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]//g')
+                echo "$device_uuid=$sanitized" >> "$DEVICE_MAP_FILE"
+            fi
+        done
+        
+        echo "Created device map file: $DEVICE_MAP_FILE"
+        echo "You can edit this file to give your audio devices persistent, friendly names."
+    else
+        # Update existing map file with any new devices
+        for detail in "${STREAM_DETAILS_ARRAY[@]}"; do
+            IFS='|' read -r card_num card_id usb_info rtsp_url device_uuid <<< "$detail"
+            # Check if this UUID is already in the file
+            if ! grep -q "^$device_uuid=" "$DEVICE_MAP_FILE" 2>/dev/null; then
+                # Add a sanitized default name
+                sanitized=$(echo "$card_id" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]//g')
+                echo "$device_uuid=$sanitized" >> "$DEVICE_MAP_FILE"
+                echo "Added new device to map file: $device_uuid=$sanitized"
+            fi
+        done
+    fi
+fi
+
 # Write stream details to the temp file for display
 for detail in "${STREAM_DETAILS_ARRAY[@]}"; do
     echo "$detail" >> "$TEMP_FILE"
@@ -285,12 +370,12 @@ if [[ -f "$TEMP_FILE" && "$STREAMS_CREATED" -gt 0 ]]; then
     echo "================================================================="
     echo "                  ACTIVE AUDIO RTSP STREAMS                      "
     echo "================================================================="
-    printf "%-4s | %-15s | %-30s | %s\n" "Card" "Card ID" "USB Device" "RTSP URL"
+    printf "%-4s | %-15s | %-30s | %s | %s\n" "Card" "Card ID" "USB Device" "RTSP URL" "Device UUID"
     echo "-----------------------------------------------------------------"
     
     # Print a formatted table of the streams
-    while IFS="|" read -r card_num card_id usb_info rtsp_url; do
-        printf "%-4s | %-15s | %-30s | %s\n" "$card_num" "$card_id" "$usb_info" "$rtsp_url"
+    while IFS="|" read -r card_num card_id usb_info rtsp_url device_uuid; do
+        printf "%-4s | %-15s | %-30s | %s | %s\n" "$card_num" "$card_id" "$usb_info" "$rtsp_url" "$device_uuid"
     done < "$TEMP_FILE"
     
     echo "================================================================="
@@ -303,6 +388,10 @@ if [[ -f "$TEMP_FILE" && "$STREAMS_CREATED" -gt 0 ]]; then
         echo "'localhost' with '$IP_ADDR' in the RTSP URLs"
         echo ""
     fi
+    
+    echo "To customize stream names, edit: $DEVICE_MAP_FILE"
+    echo "Changes will take effect the next time the service starts"
+    echo ""
 else
     echo "No audio streams were created. Check if you have audio capture devices connected."
     # Important: Don't exit with failure when running as a service if no audio devices are found
