@@ -13,7 +13,7 @@ LOG_DIR="/var/log/mediamtx"
 SERVICE_USER="mediamtx"
 
 # Latest version
-VERSION="v1.12.0"
+VERSION="v1.12.2"
 TEMP_DIR="/tmp/mediamtx-install-$(date +%s)"  # Unique temp dir
 
 # Custom ports (to avoid conflicts)
