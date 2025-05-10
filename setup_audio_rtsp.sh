@@ -1,178 +1,226 @@
 #!/bin/bash
-# Enhanced Audio RTSP Streaming Service Setup Script - Production Ready
+# Streamlined Audio RTSP Streaming Service Setup Script
+# Version: 2.0.0
+# Date: 2025-05-10
 
-# Exit on error, enable error tracing
-set -e
-trap 'echo "Error occurred at line $LINENO. Command: $BASH_COMMAND"' ERR
-
-# Define color codes for better visibility
+# Color codes for better readability
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
 BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
-# Version information
-SCRIPT_VERSION="1.0.0"
-REQUIRED_FFMPEG_VERSION="4.0.0"
+# Script version
+VERSION="2.0.0"
+
+# Default paths
 CONFIG_DIR="/etc/audio-rtsp"
 CONFIG_FILE="${CONFIG_DIR}/config"
+LOG_DIR="/var/log/audio-rtsp"
+RTSP_PORT="18554"
+RESTART_DELAY=10
+MAX_RESTART_ATTEMPTS=5
+LOG_LEVEL="info"
 
-# Show script information
-echo -e "${BLUE}Audio RTSP Streaming Service Setup v${SCRIPT_VERSION}${NC}"
-echo -e "${GREEN}Setting up Audio RTSP Streaming Service...${NC}"
+# Create a timestamp for backups
+TIMESTAMP=$(date +"%Y%m%d%H%M%S")
+
+# Log function to print with timestamps
+log() {
+    local level=$1
+    shift
+    local message="$*"
+    
+    case "$level" in
+        INFO)  echo -e "${GREEN}[INFO]${NC} $message" ;;
+        WARN)  echo -e "${YELLOW}[WARNING]${NC} $message" ;;
+        ERROR) echo -e "${RED}[ERROR]${NC} $message" ;;
+        *)     echo -e "[$level] $message" ;;
+    esac
+}
 
 # Function to check if a command exists
 command_exists() {
-  command -v "$1" >/dev/null 2>&1
+    command -v "$1" >/dev/null 2>&1
 }
 
 # Function to compare versions
 version_greater_equal() {
-  printf '%s\n%s\n' "$2" "$1" | sort -V -C
+    printf '%s\n%s\n' "$2" "$1" | sort -V -C
+}
+
+# Function to backup a file before modification
+backup_file() {
+    local file=$1
+    if [ -f "$file" ]; then
+        local backup="${file}.backup-${TIMESTAMP}"
+        log INFO "Backing up ${file} to ${backup}"
+        cp "$file" "$backup"
+        return $?
+    fi
+    return 0
+}
+
+# Function to create a directory if it doesn't exist
+create_directory() {
+    local dir=$1
+    if [ ! -d "$dir" ]; then
+        log INFO "Creating directory: $dir"
+        mkdir -p "$dir" || {
+            log ERROR "Failed to create directory: $dir"
+            return 1
+        }
+    fi
+    return 0
 }
 
 # Check if running as root
-if [ "$EUID" -ne 0 ]; then
-  echo -e "${RED}Error: Please run as root${NC}"
-  exit 1
-fi
-
-# Check for required dependencies
-echo -e "${YELLOW}Checking dependencies...${NC}"
-
-# Check for ffmpeg
-if ! command_exists ffmpeg; then
-  echo -e "${RED}Error: ffmpeg is not installed${NC}"
-  read -p "Would you like to install ffmpeg now? (y/n) " -n 1 -r
-  echo
-  if [[ $REPLY =~ ^[Yy]$ ]]; then
-    echo -e "${YELLOW}Installing ffmpeg...${NC}"
-    if command_exists apt-get; then
-      apt-get update && apt-get install -y ffmpeg
-    elif command_exists yum; then
-      yum install -y ffmpeg
-    elif command_exists dnf; then
-      dnf install -y ffmpeg
-    else
-      echo -e "${RED}Error: Unable to install ffmpeg. Please install it manually.${NC}"
-      exit 1
+check_root() {
+    if [ "$EUID" -ne 0 ]; then
+        log ERROR "Please run as root"
+        exit 1
     fi
-  else
-    echo -e "${RED}ffmpeg is required. Exiting installation.${NC}"
-    exit 1
-  fi
-fi
+}
 
-# Check ffmpeg version
-FFMPEG_VERSION=$(ffmpeg -version | head -n1 | awk '{print $3}')
-if ! version_greater_equal "$FFMPEG_VERSION" "$REQUIRED_FFMPEG_VERSION"; then
-  echo -e "${YELLOW}Warning: ffmpeg version $FFMPEG_VERSION may be too old. Recommended: $REQUIRED_FFMPEG_VERSION or newer.${NC}"
-  read -p "Continue anyway? (y/n) " -n 1 -r
-  echo
-  if [[ ! $REPLY =~ ^[Yy]$ ]]; then
-    echo -e "${RED}Installation aborted.${NC}"
-    exit 1
-  fi
-fi
+# Check required dependencies
+check_dependencies() {
+    log INFO "Checking dependencies..."
+    
+    # Check for ffmpeg
+    if ! command_exists ffmpeg; then
+        log ERROR "ffmpeg is not installed"
+        read -p "Would you like to install ffmpeg now? (y/n) " -n 1 -r
+        echo
+        if [[ $REPLY =~ ^[Yy]$ ]]; then
+            log INFO "Installing ffmpeg..."
+            if command_exists apt-get; then
+                apt-get update && apt-get install -y ffmpeg
+            elif command_exists yum; then
+                yum install -y ffmpeg
+            elif command_exists dnf; then
+                dnf install -y ffmpeg
+            else
+                log ERROR "Unable to install ffmpeg. Please install it manually."
+                exit 1
+            fi
+        else
+            log ERROR "ffmpeg is required. Exiting installation."
+            exit 1
+        fi
+    fi
+    
+    # Check ffmpeg version
+    FFMPEG_VERSION=$(ffmpeg -version | head -n1 | awk '{print $3}')
+    REQUIRED_FFMPEG_VERSION="4.0.0"
+    if ! version_greater_equal "$FFMPEG_VERSION" "$REQUIRED_FFMPEG_VERSION"; then
+        log WARN "ffmpeg version $FFMPEG_VERSION may be too old. Recommended: $REQUIRED_FFMPEG_VERSION or newer."
+        read -p "Continue anyway? (y/n) " -n 1 -r
+        echo
+        if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+            log ERROR "Installation aborted."
+            exit 1
+        fi
+    fi
+}
 
-# Validate original script exists
-if [ ! -f "startmic.sh" ]; then
-  echo -e "${RED}Error: startmic.sh not found in current directory${NC}"
-  exit 1
-fi
+# Check if startmic.sh exists in current directory
+check_startmic() {
+    if [ ! -f "startmic.sh" ]; then
+        log ERROR "startmic.sh not found in current directory"
+        exit 1
+    fi
+    
+    # Create backup of original script
+    backup_file "startmic.sh"
+    log INFO "Original script backed up"
+}
 
-# Create backup of original script with timestamp
-TIMESTAMP=$(date +"%Y%m%d%H%M%S")
-echo -e "${YELLOW}Creating backup of original script...${NC}"
-cp startmic.sh "startmic.sh.backup-${TIMESTAMP}"
-echo -e "${GREEN}Backup created as startmic.sh.backup-${TIMESTAMP}${NC}"
+# Set up directories
+setup_directories() {
+    log INFO "Creating necessary directories..."
+    create_directory "/usr/local/bin" || exit 1
+    create_directory "$LOG_DIR" || exit 1
+    create_directory "$CONFIG_DIR" || exit 1
+}
 
-# Set up directories with proper permissions
-echo -e "${YELLOW}Creating necessary directories...${NC}"
-mkdir -p /usr/local/bin
-mkdir -p /var/log/audio-rtsp
-mkdir -p $CONFIG_DIR
-chmod 755 /var/log/audio-rtsp
-chmod 755 $CONFIG_DIR
-
-# Create default configuration if it doesn't exist
-if [ ! -f "$CONFIG_FILE" ]; then
-  echo -e "${YELLOW}Creating default configuration...${NC}"
-  cat > "$CONFIG_FILE" << EOF
+# Create configuration file
+create_config_file() {
+    log INFO "Creating configuration file..."
+    
+    # If config exists, try to extract the RTSP port
+    if [ -f "$CONFIG_FILE" ]; then
+        local EXISTING_PORT=$(grep -o "RTSP_PORT=[0-9]\+" "$CONFIG_FILE" 2>/dev/null | cut -d= -f2)
+        if [ -n "$EXISTING_PORT" ]; then
+            RTSP_PORT=$EXISTING_PORT
+            log INFO "Using existing RTSP port: $RTSP_PORT"
+        fi
+        backup_file "$CONFIG_FILE"
+    fi
+    
+    # Create config content
+    cat > "$CONFIG_FILE" << EOF
 # Audio RTSP Streaming Service Configuration
-# Modify these settings to customize the service
+# Modified by setup_audio_rtsp.sh v${VERSION}
+# Date: $(date)
 
-# RTSP server port (default: 8554, your setting: 18554)
-RTSP_PORT=18554
+# RTSP server port
+RTSP_PORT=$RTSP_PORT
 
 # Number of seconds to wait before restart attempts
-RESTART_DELAY=10
+RESTART_DELAY=$RESTART_DELAY
 
 # Maximum number of restart attempts before giving up
-MAX_RESTART_ATTEMPTS=5
+MAX_RESTART_ATTEMPTS=$MAX_RESTART_ATTEMPTS
 
 # Logging level (debug, info, warning, error)
-LOG_LEVEL=info
+LOG_LEVEL=$LOG_LEVEL
 
 # Path to the log directory
-LOG_DIR=/var/log/audio-rtsp
+LOG_DIR=$LOG_DIR
 
 # Log rotation settings
 LOG_ROTATE_DAYS=7
+
+# Audio settings
+AUDIO_BITRATE=192k
+AUDIO_CODEC=libmp3lame
+AUDIO_CHANNELS=1
+AUDIO_SAMPLE_RATE=44100
 EOF
-  chmod 644 "$CONFIG_FILE"
-fi
 
-# Source the configuration file
-echo -e "${YELLOW}Loading configuration...${NC}"
-source "$CONFIG_FILE"
+    chmod 644 "$CONFIG_FILE"
+    log INFO "Configuration file created successfully"
+}
 
-# Validate mediamtx.service exists if we're going to depend on it
-if ! systemctl list-unit-files | grep -q mediamtx.service; then
-  echo -e "${YELLOW}Warning: mediamtx.service not found. This service will be set as 'Wants' rather than 'Requires'.${NC}"
-  MEDIA_DEPENDENCY="Wants=mediamtx.service"
-else
-  MEDIA_DEPENDENCY="Wants=mediamtx.service"
-  
-  # Check mediamtx version if possible
-  if command_exists mediamtx; then
-    MEDIAMTX_VERSION=$(mediamtx --version 2>&1 | grep -oP 'v\K[0-9]+\.[0-9]+\.[0-9]+' || echo "unknown")
-    echo -e "${GREEN}Found mediamtx version ${MEDIAMTX_VERSION}, setting as a soft dependency.${NC}"
-  else
-    echo -e "${GREEN}Found mediamtx.service, setting as a soft dependency.${NC}"
-  fi
-fi
-
-# Copy startmic.sh to /usr/local/bin with safeguards
-echo -e "${YELLOW}Installing startmic.sh script...${NC}"
-STARTMIC_ORIG="/usr/local/bin/startmic.sh.original"
-if [ -f "$STARTMIC_ORIG" ]; then
-  echo -e "${YELLOW}Found existing startmic.sh.original, creating backup...${NC}"
-  cp "$STARTMIC_ORIG" "${STARTMIC_ORIG}.backup-${TIMESTAMP}"
-fi
-cp startmic.sh "$STARTMIC_ORIG"
-chmod +x "$STARTMIC_ORIG"
-
-# Create a proper modified version of startmic.sh instead of using sed directly
-echo -e "${YELLOW}Creating service-compatible version of startmic.sh...${NC}"
-STARTMIC_SERVICE="/usr/local/bin/startmic.sh"
-if [ -f "$STARTMIC_SERVICE" ]; then
-  echo -e "${YELLOW}Found existing startmic.sh, creating backup...${NC}"
-  cp "$STARTMIC_SERVICE" "${STARTMIC_SERVICE}.backup-${TIMESTAMP}"
-fi
-
-# Check for RTSP port in original script and use it if found
-ORIGINAL_PORT=$(grep -o "rtsp://[^:]*:[0-9]\+" "$STARTMIC_ORIG" | grep -o ":[0-9]\+" | grep -o "[0-9]\+" | head -1)
-if [ -n "$ORIGINAL_PORT" ]; then
-  echo -e "${GREEN}Found RTSP port $ORIGINAL_PORT in original script${NC}"
-else
-  # Default to 18554 if not found
-  ORIGINAL_PORT=18554
-  echo -e "${YELLOW}No RTSP port found in original script, defaulting to $ORIGINAL_PORT${NC}"
-fi
-
-cat > "$STARTMIC_SERVICE" << 'EOF'
+# Install the startmic.sh script
+install_startmic_script() {
+    log INFO "Installing startmic.sh script..."
+    
+    # First copy the original script
+    local STARTMIC_ORIG="/usr/local/bin/startmic.sh.original"
+    if [ -f "$STARTMIC_ORIG" ]; then
+        backup_file "$STARTMIC_ORIG"
+    fi
+    cp "startmic.sh" "$STARTMIC_ORIG"
+    chmod +x "$STARTMIC_ORIG"
+    
+    # Create the service version of the script
+    local STARTMIC_SERVICE="/usr/local/bin/startmic.sh"
+    if [ -f "$STARTMIC_SERVICE" ]; then
+        backup_file "$STARTMIC_SERVICE"
+    fi
+    
+    # Check for RTSP port in original script
+    local ORIGINAL_PORT=$(grep -o "rtsp://[^:]*:[0-9]\+" "startmic.sh" | grep -o ":[0-9]\+" | grep -o "[0-9]\+" | head -1)
+    if [ -n "$ORIGINAL_PORT" ]; then
+        log INFO "Found RTSP port $ORIGINAL_PORT in original script"
+        RTSP_PORT=$ORIGINAL_PORT
+    else
+        log INFO "No RTSP port found in original script, using default: $RTSP_PORT"
+    fi
+    
+    # Create the script header
+    cat > "$STARTMIC_SERVICE" << 'EOF'
 #!/bin/bash
 # Modified for use with systemd service
 
@@ -187,6 +235,10 @@ else
     MAX_RESTART_ATTEMPTS=5
     LOG_LEVEL=info
     LOG_DIR=/var/log/audio-rtsp
+    AUDIO_BITRATE=192k
+    AUDIO_CODEC=libmp3lame
+    AUDIO_CHANNELS=1
+    AUDIO_SAMPLE_RATE=44100
 fi
 
 # Setup logging based on level
@@ -225,22 +277,23 @@ if systemctl is-active --quiet audio-rtsp.service; then
     log debug "System CPU load: $(uptime | awk -F'load average: ' '{print $2}')"
     log debug "Disk space: $(df -h /var/log | tail -1 | awk '{print $5}') used on log partition"
 fi
-
 EOF
-
-# Append the original script content but modify any RTSP URLs to use the configured port
-cat "$STARTMIC_ORIG" | grep -v "^wait$" | sed "s/rtsp:\/\/localhost:8554/rtsp:\/\/localhost:\$RTSP_PORT/g" | sed "s/rtsp:\/\/127.0.0.1:8554/rtsp:\/\/127.0.0.1:\$RTSP_PORT/g" >> "$STARTMIC_SERVICE"
-
-# Add functions to handle termination and monitor processes
-cat >> "$STARTMIC_SERVICE" << 'EOF'
+    
+    # Append the original script content with modifications
+    cat "startmic.sh" | grep -v "^wait$" | \
+        sed "s/rtsp:\/\/localhost:8554/rtsp:\/\/localhost:\$RTSP_PORT/g" | \
+        sed "s/rtsp:\/\/127.0.0.1:8554/rtsp:\/\/127.0.0.1:\$RTSP_PORT/g" >> "$STARTMIC_SERVICE"
+    
+    # Add function for systemd monitoring
+    cat >> "$STARTMIC_SERVICE" << 'EOF'
 
 # Function to monitor and restart streams if needed
 capture_and_wait_for_children() {
     log info "Starting monitor loop for child processes..."
     log info "Using RTSP port: $RTSP_PORT"
     
-    # Get all child PIDs - note the corrected $ syntax for current PID
-    local children=$(pgrep -P $)
+    # Get all child PIDs
+    local children=$(pgrep -P $$)
     
     # Track restart attempts
     local restart_attempts=0
@@ -313,18 +366,38 @@ capture_and_wait_for_children() {
 # Start the monitor function at the end of the script
 capture_and_wait_for_children
 EOF
+    
+    chmod +x "$STARTMIC_SERVICE"
+    log INFO "Service-compatible script created successfully"
+}
 
-chmod +x "$STARTMIC_SERVICE"
-
-# Create systemd service file with improved configuration
-echo -e "${YELLOW}Creating systemd service...${NC}"
-SERVICE_FILE="/etc/systemd/system/audio-rtsp.service"
-if [ -f "$SERVICE_FILE" ]; then
-  echo -e "${YELLOW}Found existing service file, creating backup...${NC}"
-  cp "$SERVICE_FILE" "${SERVICE_FILE}.backup-${TIMESTAMP}"
-fi
-
-cat > "$SERVICE_FILE" << EOF
+# Create the systemd service file
+create_systemd_service() {
+    log INFO "Creating systemd service..."
+    
+    # Check for MediaMTX service
+    local MEDIA_DEPENDENCY="Wants=mediamtx.service"
+    if command_exists systemctl && systemctl list-unit-files | grep -q mediamtx.service; then
+        log INFO "Found mediamtx.service, setting as a soft dependency."
+        
+        # Check MediaMTX version if possible
+        if command_exists mediamtx; then
+            local MEDIAMTX_VERSION=$(mediamtx --version 2>&1 | grep -oP 'v\K[0-9]+\.[0-9]+\.[0-9]+' || echo "unknown")
+            log INFO "Found mediamtx version ${MEDIAMTX_VERSION}, setting as a soft dependency."
+        fi
+    else
+        log WARN "mediamtx.service not found. This service will be set as 'Wants' rather than 'Requires'."
+    fi
+    
+    # Create the service file
+    local SERVICE_FILE="/etc/systemd/system/audio-rtsp.service"
+    
+    # Backup existing service file if it exists
+    if [ -f "$SERVICE_FILE" ]; then
+        backup_file "$SERVICE_FILE"
+    fi
+    
+    cat > "$SERVICE_FILE" << EOF
 [Unit]
 Description=Audio RTSP Streaming Service
 Documentation=file:$CONFIG_DIR/config
@@ -359,13 +432,24 @@ TimeoutStopSec=20
 WantedBy=multi-user.target
 EOF
 
-# Create a log rotation config to prevent logs from filling up disk
-echo -e "${YELLOW}Setting up log rotation...${NC}"
-cat > /etc/logrotate.d/audio-rtsp << EOF
+    chmod 644 "$SERVICE_FILE"
+    log INFO "Systemd service file created successfully"
+}
+
+# Set up log rotation
+setup_log_rotation() {
+    log INFO "Setting up log rotation..."
+    
+    local ROTATION_FILE="/etc/logrotate.d/audio-rtsp"
+    if [ -f "$ROTATION_FILE" ]; then
+        backup_file "$ROTATION_FILE"
+    fi
+    
+    cat > "$ROTATION_FILE" << EOF
 $LOG_DIR/*.log {
     daily
     missingok
-    rotate $LOG_ROTATE_DAYS
+    rotate 7
     compress
     delaycompress
     notifempty
@@ -377,15 +461,20 @@ $LOG_DIR/*.log {
 }
 EOF
 
-# Create an improved helper script to check the status
-echo -e "${YELLOW}Creating status checking script...${NC}"
-STATUS_SCRIPT="/usr/local/bin/check-audio-rtsp.sh"
-if [ -f "$STATUS_SCRIPT" ]; then
-  echo -e "${YELLOW}Found existing status script, creating backup...${NC}"
-  cp "$STATUS_SCRIPT" "${STATUS_SCRIPT}.backup-${TIMESTAMP}"
-fi
+    chmod 644 "$ROTATION_FILE"
+    log INFO "Log rotation configured"
+}
 
-cat > "$STATUS_SCRIPT" << 'EOF'
+# Create the status script
+create_status_script() {
+    log INFO "Creating status checking script..."
+    
+    local STATUS_SCRIPT="/usr/local/bin/check-audio-rtsp.sh"
+    if [ -f "$STATUS_SCRIPT" ]; then
+        backup_file "$STATUS_SCRIPT"
+    fi
+    
+    cat > "$STATUS_SCRIPT" << 'EOF'
 #!/bin/bash
 # Set color codes
 RED='\033[0;31m'
@@ -483,17 +572,21 @@ fi
 echo -e "\n${YELLOW}Disk Space for Logs:${NC}"
 du -sh "$LOG_DIR/"
 EOF
-chmod +x "$STATUS_SCRIPT"
 
-# Create an improved uninstall script
-echo -e "${YELLOW}Creating uninstall script...${NC}"
-UNINSTALL_SCRIPT="/usr/local/bin/uninstall-audio-rtsp.sh"
-if [ -f "$UNINSTALL_SCRIPT" ]; then
-  echo -e "${YELLOW}Found existing uninstall script, creating backup...${NC}"
-  cp "$UNINSTALL_SCRIPT" "${UNINSTALL_SCRIPT}.backup-${TIMESTAMP}"
-fi
+    chmod +x "$STATUS_SCRIPT"
+    log INFO "Status script created successfully"
+}
 
-cat > "$UNINSTALL_SCRIPT" << 'EOF'
+# Create the uninstall script
+create_uninstall_script() {
+    log INFO "Creating uninstall script..."
+    
+    local UNINSTALL_SCRIPT="/usr/local/bin/uninstall-audio-rtsp.sh"
+    if [ -f "$UNINSTALL_SCRIPT" ]; then
+        backup_file "$UNINSTALL_SCRIPT"
+    fi
+    
+    cat > "$UNINSTALL_SCRIPT" << 'EOF'
 #!/bin/bash
 # Uninstall Audio RTSP Service
 
@@ -531,6 +624,7 @@ rm -f /usr/local/bin/startmic.sh
 rm -f /usr/local/bin/startmic.sh.original
 rm -f /usr/local/bin/check-audio-rtsp.sh
 rm -f /usr/local/bin/uninstall-audio-rtsp.sh
+rm -f /usr/local/bin/configure-audio-rtsp.sh
 
 echo -e "${YELLOW}Removing log configuration...${NC}"
 rm -f /etc/logrotate.d/audio-rtsp
@@ -555,12 +649,21 @@ fi
 
 echo -e "${GREEN}Uninstallation complete!${NC}"
 EOF
-chmod +x "$UNINSTALL_SCRIPT"
 
-# Create a configuration editor script
-echo -e "${YELLOW}Creating configuration editor script...${NC}"
-CONFIG_EDITOR="/usr/local/bin/configure-audio-rtsp.sh"
-cat > "$CONFIG_EDITOR" << 'EOF'
+    chmod +x "$UNINSTALL_SCRIPT"
+    log INFO "Uninstall script created successfully"
+}
+
+# Create configuration editor script
+create_config_editor() {
+    log INFO "Creating configuration editor script..."
+    
+    local CONFIG_EDITOR="/usr/local/bin/configure-audio-rtsp.sh"
+    if [ -f "$CONFIG_EDITOR" ]; then
+        backup_file "$CONFIG_EDITOR"
+    fi
+    
+    cat > "$CONFIG_EDITOR" << 'EOF'
 #!/bin/bash
 # Audio RTSP Configuration Editor
 
@@ -695,42 +798,96 @@ while true; do
   esac
 done
 EOF
-chmod +x "$CONFIG_EDITOR"
+
+    chmod +x "$CONFIG_EDITOR"
+    log INFO "Configuration editor script created successfully"
+}
 
 # Enable and start the service
-echo -e "${YELLOW}Enabling and starting service...${NC}"
-systemctl daemon-reload
-
-# Verify the service file is valid before enabling
-if systemctl cat audio-rtsp.service &>/dev/null; then
-    echo -e "${GREEN}Service file validated successfully${NC}"
-    systemctl enable audio-rtsp.service
+enable_and_start_service() {
+    log INFO "Enabling and starting service..."
     
-    # Try to start the service but handle failure gracefully
-    if systemctl start audio-rtsp.service; then
-        echo -e "${GREEN}Service started successfully${NC}"
+    # Reload systemd to recognize the new service
+    systemctl daemon-reload
+    
+    # Verify the service file is valid
+    if systemctl cat audio-rtsp.service &>/dev/null; then
+        log INFO "Service file validated successfully"
+        systemctl enable audio-rtsp.service
+        
+        # Try to start the service but handle failure gracefully
+        if systemctl start audio-rtsp.service; then
+            log INFO "Service started successfully"
+        else
+            log ERROR "Service failed to start. Check logs with:"
+            echo "journalctl -u audio-rtsp.service"
+            log ERROR "You may need to check your startmic.sh script for errors"
+            return 1
+        fi
     else
-        echo -e "${RED}Service failed to start. Check logs with:${NC}"
-        echo "journalctl -u audio-rtsp.service"
-        echo -e "${YELLOW}You may need to check your startmic.sh script for errors${NC}"
+        log ERROR "Error in service file. Installation incomplete."
+        return 1
     fi
-else
-    echo -e "${RED}Error in service file. Installation incomplete.${NC}"
-    exit 1
-fi
+    
+    return 0
+}
 
-echo -e "${GREEN}Installation complete!${NC}"
-echo -e "Audio RTSP streaming service is now set up to start automatically on boot."
-echo -e "Service management commands:"
-echo -e "  Check status: ${YELLOW}sudo systemctl status audio-rtsp${NC}"
-echo -e "  Start service: ${YELLOW}sudo systemctl start audio-rtsp${NC}"
-echo -e "  Stop service: ${YELLOW}sudo systemctl stop audio-rtsp${NC}"
-echo -e "  Restart service: ${YELLOW}sudo systemctl restart audio-rtsp${NC}"
-echo -e "Helper scripts:"
-echo -e "  Check service status: ${YELLOW}sudo check-audio-rtsp.sh${NC}"
-echo -e "  Edit configuration: ${YELLOW}sudo configure-audio-rtsp.sh${NC}"
-echo -e "  Uninstall service: ${YELLOW}sudo uninstall-audio-rtsp.sh${NC}"
-echo -e "Configuration and logs:"
-echo -e "  Config file: ${YELLOW}$CONFIG_FILE${NC}"
-echo -e "  Log directory: ${YELLOW}$LOG_DIR${NC}"
-echo -e "  View logs: ${YELLOW}sudo tail -f $LOG_DIR/audio-streams.log${NC}"
+# Print success message
+print_success_message() {
+    echo -e "${GREEN}Installation complete!${NC}"
+    echo -e "Audio RTSP streaming service is now set up to start automatically on boot."
+    echo -e "Service management commands:"
+    echo -e "  Check status: ${YELLOW}sudo systemctl status audio-rtsp${NC}"
+    echo -e "  Start service: ${YELLOW}sudo systemctl start audio-rtsp${NC}"
+    echo -e "  Stop service: ${YELLOW}sudo systemctl stop audio-rtsp${NC}"
+    echo -e "  Restart service: ${YELLOW}sudo systemctl restart audio-rtsp${NC}"
+    echo -e "Helper scripts:"
+    echo -e "  Check service status: ${YELLOW}sudo check-audio-rtsp.sh${NC}"
+    echo -e "  Edit configuration: ${YELLOW}sudo configure-audio-rtsp.sh${NC}"
+    echo -e "  Uninstall service: ${YELLOW}sudo uninstall-audio-rtsp.sh${NC}"
+    echo -e "Configuration and logs:"
+    echo -e "  Config file: ${YELLOW}$CONFIG_FILE${NC}"
+    echo -e "  Log directory: ${YELLOW}$LOG_DIR${NC}"
+    echo -e "  View logs: ${YELLOW}sudo tail -f $LOG_DIR/audio-streams.log${NC}"
+}
+
+# Main script execution
+echo -e "${BLUE}Audio RTSP Streaming Service Setup v${VERSION}${NC}"
+echo -e "${GREEN}Setting up Audio RTSP Streaming Service...${NC}"
+
+# Check if running as root
+check_root
+
+# Check dependencies
+check_dependencies
+
+# Validate original script exists and create backup
+check_startmic
+
+# Set up directories with proper permissions
+setup_directories
+
+# Create or update configuration file
+create_config_file
+
+# Install startmic.sh script
+install_startmic_script
+
+# Create systemd service 
+create_systemd_service
+
+# Set up log rotation
+setup_log_rotation
+
+# Create helper scripts
+create_status_script
+create_uninstall_script
+create_config_editor
+
+# Enable and start the service
+enable_and_start_service || exit 1
+
+# Print success message
+print_success_message
+
+exit 0
