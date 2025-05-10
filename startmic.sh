@@ -1,9 +1,15 @@
 #!/bin/bash
 # Enhanced Audio RTSP Streaming Script
-# Version: 5.2.0
+# Version: 5.2.1
 # Date: 2025-05-10
 # Description: Production-grade script for streaming audio from capture devices to RTSP
 #              With improved lock handling, atomic operations, and robust error recovery
+# Changes in v5.2.1:
+#  - Fixed syntax errors where closing braces were used instead of 'fi'
+#  - Enhanced lock management to ensure proper lock file descriptor cleanup in all error paths
+#  - Improved lock release function with additional validation
+#  - Added more detailed logging for lock operations
+#  - Added file descriptor validation before operations
 
 # Exit on error (controlled)
 set -o pipefail
@@ -178,17 +184,30 @@ if [ -f "$CONFIG_FILE" ]; then
     source "$CONFIG_FILE"
 fi
 
-# Function to acquire lock with timeout
+# Function to acquire lock with timeout - ENHANCED
 acquire_lock() {
     local lock_file="$1"
     local lock_fd="$2"
     local timeout="${3:-10}"  # Default timeout of 10 seconds
     
     # Make sure the directory exists
-    mkdir -p "$(dirname "$lock_file")" 2>/dev/null
+    mkdir -p "$(dirname "$lock_file")" 2>/dev/null || {
+        log "ERROR" "Failed to create lock directory: $(dirname "$lock_file")"
+        return 1
+    }
+    
+    # Check if the file descriptor is already open (shouldn't happen, but just in case)
+    if [ -e "/proc/$$/fd/$lock_fd" ]; then
+        log "WARNING" "File descriptor $lock_fd is already in use, closing it first"
+        # Try to close it first to prevent leaks
+        eval "exec $lock_fd>&-" 2>/dev/null
+    fi
     
     # Open the lock file
-    eval "exec $lock_fd>\"$lock_file\""
+    eval "exec $lock_fd>\"$lock_file\"" || {
+        log "ERROR" "Failed to open lock file: $lock_file"
+        return 1
+    }
     
     log "DEBUG" "Attempting to acquire lock: $lock_file (FD: $lock_fd, timeout: ${timeout}s)"
     
@@ -201,6 +220,8 @@ acquire_lock() {
                 # Check if process is still running
                 if kill -0 "$OLD_PID" 2>/dev/null; then
                     log "ERROR" "Another instance is already running (PID: $OLD_PID)"
+                    # Close the file descriptor before returning to prevent leaks
+                    eval "exec $lock_fd>&-"
                     return 1
                 else
                     log "WARNING" "Found stale PID file for non-existent process: $OLD_PID"
@@ -211,19 +232,29 @@ acquire_lock() {
                     rm -f "$lock_file" "$PID_FILE"
                     
                     # Try again
-                    eval "exec $lock_fd>\"$lock_file\""
+                    eval "exec $lock_fd>\"$lock_file\"" || {
+                        log "ERROR" "Failed to reopen lock file after cleanup"
+                        return 1
+                    }
+                    
                     if ! flock -w "$timeout" -n "$lock_fd"; then
                         log "ERROR" "Failed to acquire lock even after cleanup"
+                        # Close the file descriptor before returning to prevent leaks
+                        eval "exec $lock_fd>&-"
                         return 1
                     fi
                     log "INFO" "Successfully acquired lock after cleanup"
                 fi
             else
                 log "ERROR" "PID file contains invalid data"
+                # Close the file descriptor before returning to prevent leaks
+                eval "exec $lock_fd>&-"
                 return 1
             fi
         else
             log "ERROR" "Cannot acquire lock (timeout after ${timeout}s)"
+            # Close the file descriptor before returning to prevent leaks
+            eval "exec $lock_fd>&-"
             return 1
         fi
     fi
@@ -238,21 +269,33 @@ acquire_lock() {
     return 0
 }
 
-# Function to release lock
+# Function to release lock - ENHANCED
 release_lock() {
     local lock_fd="$1"
     
     log "DEBUG" "Releasing lock (FD: $lock_fd)"
     
-    # Close the file descriptor to release the lock
-    eval "exec $lock_fd>&-"
+    # Check if the file descriptor is valid and open
+    if [ -e "/proc/$$/fd/$lock_fd" ]; then
+        # Close the file descriptor to release the lock
+        eval "exec $lock_fd>&-"
+        log "DEBUG" "Lock file descriptor $lock_fd closed successfully"
+    else
+        log "WARNING" "Lock file descriptor $lock_fd not found or already closed"
+    fi
     
     # Remove PID file if it contains our PID
     if [[ -f "$PID_FILE" ]]; then
         local pid_contents
         pid_contents=$(cat "$PID_FILE" 2>/dev/null || echo "")
         if [[ "$pid_contents" == "$$" ]]; then
-            rm -f "$PID_FILE"
+            if rm -f "$PID_FILE"; then
+                log "DEBUG" "PID file removed successfully"
+            else
+                log "WARNING" "Failed to remove PID file: $PID_FILE"
+            fi
+        else
+            log "DEBUG" "PID file does not contain our PID, not removing"
         fi
     fi
 }
@@ -298,7 +341,7 @@ cleanup() {
     log "DEBUG" "Removing temporary files"
     rm -f "${TEMP_FILE}" "${TEMP_FILE}.pids" "${RUNTIME_DIR}/startmic_success"
     
-    # Release lock
+    # Release lock - even if we're in an error path, ensure the lock is released
     release_lock "$LOCK_FD"
     
     log "INFO" "Cleanup completed, exiting with code $exit_code"
@@ -315,7 +358,7 @@ trap 'cleanup 0 "Normal exit"' EXIT
 # Acquire lock
 if ! acquire_lock "$LOCK_FILE" "$LOCK_FD" 10; then
     log "FATAL" "Failed to acquire lock, another instance may be running"
-    # Don't call cleanup here as we don't have the lock
+    # Don't call cleanup here since we've already handled the lock release in acquire_lock
     exit 1
 fi
 
@@ -752,7 +795,7 @@ while read -r line; do
         if [ "$STREAM_ATTEMPTS" -gt $((MAX_STREAMS * 2)) ]; then
             log "WARNING" "Too many stream attempts, possible infinite loop, breaking"
             break
-        fi  # Fixed: Changed } to fi
+        fi
         
         # Check if this device should be excluded
         EXCLUDED=0
@@ -999,7 +1042,7 @@ monitor_streams() {
                 if [ "$running_processes" -lt "$STREAMS_CREATED" ]; then
                     log "WARNING" "Found $running_processes running streams, expected $STREAMS_CREATED"
                     # We might want to implement per-stream restart here in the future
-                fi  # Fixed: Changed } to fi in monitor_streams function
+                fi
                 
                 if [ "$running_processes" -gt "$STREAMS_CREATED" ]; then
                     log "WARNING" "Found $running_processes running streams, but only expected $STREAMS_CREATED"
