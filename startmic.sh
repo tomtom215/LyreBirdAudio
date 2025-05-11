@@ -1,5 +1,8 @@
 #!/bin/bash
 # Enhanced Audio RTSP Streaming Script
+#
+# https://raw.githubusercontent.com/tomtom215/mediamtx-rtsp-setup/refs/heads/main/startmic.sh
+#
 # Version: 5.2.1
 # Date: 2025-05-10
 # Description: Production-grade script for streaming audio from capture devices to RTSP
