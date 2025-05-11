@@ -3,19 +3,25 @@
 #
 # https://raw.githubusercontent.com/tomtom215/mediamtx-rtsp-setup/refs/heads/main/mediamtx-rtsp-audio-installer.sh
 #
-# Version: 3.0.0
-# Date: 2025-05-14
+# Version: 3.0.1
+# Date: 2025-05-11
 #
 # This script orchestrates the installation of the MediaMTX RTSP audio streaming platform
 # by coordinating the execution of dedicated component scripts rather than reimplementing
 # their functionality. This maintains a clear separation of responsibilities while
 # providing an enhanced unified installer experience.
+#
+# Changes in v3.0.1:
+# - Fixed dependency handling for setup_audio_rtsp.sh which requires startmic.sh
+# - Added proper working directory handling for component dependencies
+# - Enhanced error reporting when dependent scripts are missing
+# - Added verification step after downloading dependent scripts
 
 # Set strict error handling
 set -o pipefail
 
 # Define script version
-SCRIPT_VERSION="3.0.0"
+SCRIPT_VERSION="3.0.1"
 
 # Default configuration
 CONFIG_DIR="/etc/audio-rtsp"
@@ -533,6 +539,28 @@ predownload_dependency_scripts() {
                 log "INFO" "mediamtx-monitor.sh dependency already exists"
             fi
             ;;
+            
+        "setup_audio_rtsp.sh")
+            log "INFO" "Pre-downloading dependencies for audio RTSP setup..."
+            
+            # Download startmic.sh which is required by setup_audio_rtsp.sh
+            local startmic_url="https://raw.githubusercontent.com/tomtom215/mediamtx-rtsp-setup/refs/heads/main/startmic.sh"
+            local startmic_script="${working_dir}/startmic.sh"
+            
+            if [ ! -f "$startmic_script" ]; then
+                download_file "$startmic_url" "$working_dir" "startmic.sh" > /dev/null
+                chmod +x "$startmic_script"
+                
+                # Verify the script was downloaded correctly
+                if [ -f "$startmic_script" ] && [ -s "$startmic_script" ]; then
+                    log "INFO" "Downloaded startmic.sh dependency"
+                else
+                    error "Failed to download or verify startmic.sh dependency" 1
+                fi
+            else
+                log "INFO" "startmic.sh dependency already exists"
+            fi
+            ;;
     esac
 }
 
@@ -544,9 +572,9 @@ execute_component_script() {
     local working_dir
     
     # Determine where to run the script from
-    if [[ "$script_name" == "setup-monitor-script.sh" ]]; then
-        # For monitor setup, we need to work in a directory with the dependencies
-        working_dir="${TEMP_DIR}/component_scripts"
+    if [[ "$script_name" == "setup-monitor-script.sh" || "$script_name" == "setup_audio_rtsp.sh" ]]; then
+        # For scripts with dependencies, we need a working directory
+        working_dir="${TEMP_DIR}/component_scripts/${script_name%.sh}"
         ensure_directory "$working_dir"
         
         # Pre-download any required dependencies
@@ -582,6 +610,12 @@ execute_component_script() {
     
     # Change to the appropriate working directory
     cd "$working_dir" || error "Failed to change to working directory: $working_dir" 1
+    
+    # List directory contents in debug mode
+    if [ "$DEBUG_MODE" = true ]; then
+        debug "Working directory contents:"
+        ls -la "$working_dir"
+    fi
     
     # Run the script with the provided arguments
     if "$script_path" "${script_args[@]}"; then
