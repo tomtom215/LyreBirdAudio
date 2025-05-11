@@ -1,5 +1,7 @@
 #!/bin/bash
 #
+# https://raw.githubusercontent.com/tomtom215/mediamtx-rtsp-setup/refs/heads/main/install_mediamtx.sh
+#
 # Enhanced MediaMTX Installer with Advanced Validation Features
 # Version: 2.1.4
 # Date: 2025-05-11
