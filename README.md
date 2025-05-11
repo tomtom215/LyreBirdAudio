@@ -9,6 +9,9 @@ A comprehensive production-grade platform for setting up and managing robust RTS
 - [Features](#features)
 - [Requirements](#requirements)
 - [Installation](#installation)
+  - [Quick Installation](#quick-installation)
+  - [Advanced Installation Options](#advanced-installation-options)
+  - [All-in-One Installer](#all-in-one-installer)
 - [Configuration](#configuration)
   - [Global Configuration](#global-configuration)
   - [Device-Specific Configuration](#device-specific-configuration)
@@ -73,7 +76,7 @@ The platform consists of the following core components:
    - Stream monitoring and auto-recovery
    - Per-device configuration options
 
-4. **System Monitoring** (`mediamtx-monitor-fixed.sh`)
+4. **System Monitoring** (`mediamtx-monitor.sh`)
    - Resource usage monitoring (CPU, memory, file descriptors)
    - Four-level progressive recovery system
    - Trend analysis for predictive maintenance
@@ -83,6 +86,12 @@ The platform consists of the following core components:
    - Version availability validation
    - Checksum verification
    - Architecture compatibility checking
+
+6. **All-in-One Installer** (`mediamtx-rtsp-audio-installer.sh`)
+   - Single script to manage all aspects of installation
+   - Interactive menus for configuration
+   - Update, reinstall, and uninstall capabilities
+   - Troubleshooting and log management
 
 ## Features
 
@@ -96,6 +105,8 @@ The platform consists of the following core components:
 - **Device Blacklisting**: Exclude specific devices from streaming
 - **Advanced Resource Monitoring**: Tracks CPU, memory, and network with trend analysis
 - **Audio Processing**: Support for custom FFmpeg filters per device
+- **Deadman Switch Protection**: Prevents excessive reboot cycles
+- **Disk Space Monitoring**: Emergency cleanup for low disk space conditions
 
 ## Requirements
 
@@ -133,7 +144,7 @@ Before installation:
 
 ## Installation
 
-### Basic Installation
+### Quick Installation
 
 1. Clone the repository or download the scripts:
    ```bash
@@ -141,20 +152,40 @@ Before installation:
    cd mediamtx-rtsp-setup
    ```
 
-   Alternatively, using wget:
+   Alternatively, download all scripts at once with wget:
    ```bash
-   mkdir mediamtx-rtsp-setup && cd mediamtx-rtsp-setup
-   wget https://raw.githubusercontent.com/tomtom215/mediamtx-rtsp-setup/main/install_mediamtx.sh
-   wget https://raw.githubusercontent.com/tomtom215/mediamtx-rtsp-setup/main/setup_audio_rtsp.sh
-   wget https://raw.githubusercontent.com/tomtom215/mediamtx-rtsp-setup/main/startmic.sh
-   wget https://raw.githubusercontent.com/tomtom215/mediamtx-rtsp-setup/main/setup-monitor-script.sh
-   wget https://raw.githubusercontent.com/tomtom215/mediamtx-rtsp-setup/main/mediamtx-monitor.sh
-   wget https://raw.githubusercontent.com/tomtom215/mediamtx-rtsp-setup/main/mediamtx-version-Checker.sh
+   # Create directory, download all scripts, and make them executable in one command
+   mkdir -p mediamtx-rtsp-setup && cd mediamtx-rtsp-setup && \
+   wget --progress=bar:force:noscroll \
+     https://raw.githubusercontent.com/tomtom215/mediamtx-rtsp-setup/refs/heads/main/install_mediamtx.sh \
+     https://raw.githubusercontent.com/tomtom215/mediamtx-rtsp-setup/refs/heads/main/setup_audio_rtsp.sh \
+     https://raw.githubusercontent.com/tomtom215/mediamtx-rtsp-setup/refs/heads/main/startmic.sh \
+     https://raw.githubusercontent.com/tomtom215/mediamtx-rtsp-setup/refs/heads/main/setup-monitor-script.sh \
+     https://raw.githubusercontent.com/tomtom215/mediamtx-rtsp-setup/refs/heads/main/mediamtx-monitor.sh \
+     https://raw.githubusercontent.com/tomtom215/mediamtx-rtsp-setup/refs/heads/main/mediamtx-version-checker.sh \
+     https://raw.githubusercontent.com/tomtom215/mediamtx-rtsp-setup/refs/heads/main/mediamtx-rtsp-audio-installer.sh \
+     https://raw.githubusercontent.com/tomtom215/mediamtx-rtsp-setup/refs/heads/main/mediamtx-monitor-diagnostic-fix.sh && \
+   chmod +x *.sh
    ```
 
-2. Make scripts executable:
+   Or using curl if preferred:
    ```bash
-   chmod +x *.sh
+   # Create directory and download all scripts with curl
+   mkdir -p mediamtx-rtsp-setup && cd mediamtx-rtsp-setup && \
+   for script in install_mediamtx.sh setup_audio_rtsp.sh startmic.sh setup-monitor-script.sh \
+       mediamtx-monitor.sh mediamtx-version-checker.sh mediamtx-rtsp-audio-installer.sh \
+       mediamtx-monitor-diagnostic-fix.sh; do
+       curl -O --progress-bar https://raw.githubusercontent.com/tomtom215/mediamtx-rtsp-setup/refs/heads/main/$script
+   done && chmod +x *.sh
+   ```
+
+   Or download just the all-in-one installer (simplest approach):
+   ```bash
+   # Download only the all-in-one installer script
+   wget --progress=bar:force:noscroll \
+     -O mediamtx-rtsp-audio-installer.sh \
+     https://raw.githubusercontent.com/tomtom215/mediamtx-rtsp-setup/refs/heads/main/mediamtx-rtsp-audio-installer.sh && \
+   chmod +x mediamtx-rtsp-audio-installer.sh
    ```
 
 3. Install MediaMTX:
@@ -215,6 +246,60 @@ sudo ./install_mediamtx.sh --config-only --rtsp-port 8554
 
 # Force reinstallation of the same version
 sudo ./install_mediamtx.sh --force-install
+```
+
+### All-in-One Installer
+
+For a more user-friendly installation experience, you can use the all-in-one installer:
+
+```bash
+wget https://raw.githubusercontent.com/tomtom215/mediamtx-rtsp-setup/refs/heads/main/mediamtx-rtsp-audio-installer.sh
+chmod +x mediamtx-rtsp-audio-installer.sh
+sudo ./mediamtx-rtsp-audio-installer.sh
+```
+
+This script provides interactive menus and can handle installation, updates, reinstallation, uninstallation, status checking, troubleshooting, and log management.
+
+Available commands:
+```bash
+sudo ./mediamtx-rtsp-audio-installer.sh [COMMAND] [OPTIONS]
+```
+
+Commands:
+- `install` - Install MediaMTX and audio streaming platform
+- `uninstall` - Remove all installed components
+- `update` - Update to the latest version while preserving config
+- `reinstall` - Completely remove and reinstall
+- `status` - Show status of all components
+- `troubleshoot` - Run diagnostics and fix common issues
+- `logs` - View or manage logs
+
+Options:
+- `-v, --version VERSION` - Specify MediaMTX version
+- `-p, --rtsp-port PORT` - Specify RTSP port
+- `--rtmp-port PORT` - Specify RTMP port
+- `--hls-port PORT` - Specify HLS port
+- `--webrtc-port PORT` - Specify WebRTC port
+- `--metrics-port PORT` - Specify metrics port
+- `-d, --debug` - Enable debug mode
+- `-q, --quiet` - Minimal output
+- `-y, --yes` - Answer yes to all prompts
+- `-f, --force` - Force operation
+- `-h, --help` - Show help message
+
+Examples:
+```bash
+# Interactive installation
+sudo ./mediamtx-rtsp-audio-installer.sh
+
+# Silent installation with all defaults
+sudo ./mediamtx-rtsp-audio-installer.sh install -y -q
+
+# Update to latest version
+sudo ./mediamtx-rtsp-audio-installer.sh update
+
+# Troubleshoot installation issues
+sudo ./mediamtx-rtsp-audio-installer.sh troubleshoot
 ```
 
 ## Configuration
@@ -357,6 +442,7 @@ RESTART_COOLDOWN=300
 REBOOT_THRESHOLD=3
 ENABLE_AUTO_REBOOT=false
 REBOOT_COOLDOWN=1800
+MAX_REBOOTS_IN_DAY=5
 ```
 
 #### Key Recovery Parameters
@@ -372,6 +458,7 @@ REBOOT_COOLDOWN=1800
 | RESTART_COOLDOWN | Seconds between restarts | 300 |
 | REBOOT_THRESHOLD | Failed recoveries before reboot | 3 |
 | ENABLE_AUTO_REBOOT | Whether to allow system reboots | false |
+| MAX_REBOOTS_IN_DAY | Maximum allowed reboots in 24 hours | 5 |
 
 ## Usage
 
@@ -545,6 +632,7 @@ The monitoring system tracks several key resources:
 - **File Descriptors**: Open file handles for detecting resource leaks
 - **Process Uptime**: To enforce periodic restarts if needed
 - **Network Connectivity**: RTSP port accessibility
+- **Disk Space**: Monitors disk space and performs emergency cleanup if needed
 
 These metrics are tracked over time to detect trends and predict potential issues before they cause service interruptions.
 
@@ -579,6 +667,7 @@ The system employs a progressive recovery approach with four levels:
 - Makes one final recovery attempt
 - Initiates system reboot if all else fails
 - Requires `ENABLE_AUTO_REBOOT=true` in config
+- Protected by deadman switch to prevent reboot loops
 
 ## Logging
 
@@ -699,6 +788,18 @@ sudo journalctl -f -u mediamtx -u audio-rtsp -u mediamtx-monitor
 
 The platform includes several diagnostic tools:
 
+#### All-in-One Troubleshooter
+
+```bash
+sudo ./mediamtx-rtsp-audio-installer.sh troubleshoot
+```
+
+This interactive tool will:
+- Check system status
+- Verify services
+- Look for common issues
+- Offer to fix detected problems
+
 #### Stream Status Check
 
 ```bash
@@ -723,10 +824,22 @@ This shows:
 - Recovery history
 - Performance trends
 
+#### Monitor Diagnostic Fix Tool
+
+```bash
+sudo mediamtx-monitor-diagnostic-fix.sh
+```
+
+This tool:
+- Diagnoses issues with the monitoring service
+- Fixes common configuration problems
+- Creates a simplified monitor script if needed
+- Updates service configuration
+
 #### Version Checker
 
 ```bash
-sudo ./MediaMTX-Version-Checker.sh
+sudo ./mediamtx-version-checker.sh
 ```
 
 Verifies:
@@ -778,6 +891,11 @@ Verifies:
    grep ERROR /var/log/audio-rtsp/mediamtx-monitor.log
    ```
 
+4. Use the diagnostic fix tool for monitor issues:
+   ```bash
+   sudo mediamtx-monitor-diagnostic-fix.sh
+   ```
+
 ## Uninstallation
 
 ### Automated Uninstallation
@@ -793,6 +911,11 @@ This interactive script will:
 2. Remove scripts and configuration
 3. Ask if you want to remove log files
 4. Clean up systemd service files
+
+Alternatively, use the all-in-one installer:
+```bash
+sudo ./mediamtx-rtsp-audio-installer.sh uninstall
+```
 
 ### Manual Uninstallation
 
@@ -899,6 +1022,11 @@ For systems handling multiple audio streams, consider these performance optimiza
    CPU_SUSTAINED_PERIODS=5   # Wait longer before taking action
    ```
 
+4. Set a maximum number of streams:
+   ```
+   MAX_STREAMS=16            # Prevent resource exhaustion
+   ```
+
 #### Memory Optimization
 
 1. Limit maximum number of streams:
@@ -959,7 +1087,9 @@ Multiple levels of failure detection and recovery are implemented:
 2. **Stream Monitoring**: Detects and restarts failed streams
 3. **Progressive Recovery**: Escalates through recovery levels as needed
 4. **Optional Auto-Reboot**: Can trigger system reboot as last resort
-5. **Trend Analysis**: Detects gradually increasing resource usage before failure
+5. **Deadman Switch**: Prevents excessive reboot cycles
+6. **Trend Analysis**: Detects gradually increasing resource usage before failure
+7. **Disk Space Monitoring**: Emergency cleanup for low disk space conditions
 
 ### File Operations
 
@@ -977,7 +1107,7 @@ This software is released under the Apache 2.0 License.
 
 ### Contributors
 
-- Main project development and maintenance
+- Main project development and maintenance - Tom F
 - Based on original concept by Cberge908 [GitHub gist](https://gist.github.com/cberge908/ab7ddc1ac46fd63bb6935cd1f4341112)
 
 ### Acknowledgments
