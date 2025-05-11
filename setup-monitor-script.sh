@@ -1,5 +1,8 @@
 #!/bin/bash
 # MediaMTX Monitor Installation Script
+#
+# https://raw.githubusercontent.com/tomtom215/mediamtx-rtsp-setup/refs/heads/main/setup-monitor-script.sh
+#
 # Version: 1.0.1
 # Date: 2025-05-10
 # Description: Installs and configures the MediaMTX monitoring system
