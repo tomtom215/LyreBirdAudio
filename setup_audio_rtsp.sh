@@ -1,5 +1,8 @@
 #!/bin/bash
 # Streamlined Audio RTSP Streaming Service Setup Script
+#
+# https://raw.githubusercontent.com/tomtom215/mediamtx-rtsp-setup/refs/heads/main/setup_audio_rtsp.sh
+#
 # Version: 2.0.0
 # Date: 2025-05-10
 
