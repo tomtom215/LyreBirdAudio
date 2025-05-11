@@ -1894,7 +1894,7 @@ main() {
         if [ $((current_time - last_disk_check)) -ge "$DISK_CHECK_INTERVAL" ]; then
             check_disk_space
             last_disk_check=$current_time
-        }
+        fi
         
         # Log current status at a regular interval (every 5 minutes)
         if (( current_time % 300 < CPU_CHECK_INTERVAL )); then
