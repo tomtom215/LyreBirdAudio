@@ -776,12 +776,12 @@ cleanup_handler() {
         if [ "$lock_pid" = "$$" ]; then
             rm -f "/var/run/mediamtx-monitor.lock" 2>/dev/null || log "WARNING" "Failed to remove system lock file"
         fi
-    }
+    fi
     
     # Clean up temporary files
     if [ -d "${TEMP_DIR}" ]; then
         rm -rf "${TEMP_DIR}" 2>/dev/null || log "WARNING" "Failed to remove temp directory"
-    }
+    fi
     
     log "INFO" "Cleanup completed, exiting"
     exit 0
