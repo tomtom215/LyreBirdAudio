@@ -1,6 +1,8 @@
 #!/bin/bash
 # MediaMTX Resource Monitor with Enhanced Reliability
 #
+# https://raw.githubusercontent.com/tomtom215/mediamtx-rtsp-setup/refs/heads/main/mediamtx-monitor.sh
+#
 # Version: 1.1.0
 # Date: 2025-05-12
 # Description: Monitors MediaMTX health and resources with progressive recovery strategies
