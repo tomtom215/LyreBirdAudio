@@ -1,7 +1,7 @@
 #!/bin/bash
 # MediaMTX Monitor Service Diagnostic and Fix Script
 #
-#
+# https://raw.githubusercontent.com/tomtom215/mediamtx-rtsp-setup/refs/heads/main/mediamtx-monitor-diagnostic-fix.sh
 #
 # Version: 1.0.0
 # Date: 2025-05-15
