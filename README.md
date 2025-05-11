@@ -9,9 +9,9 @@ A comprehensive production-grade platform for setting up and managing robust RTS
 - [Features](#features)
 - [Requirements](#requirements)
 - [Installation](#installation)
-  - [Quick Installation](#quick-installation)
+  - [All-in-One Installation (Recommended)](#all-in-one-installation-recommended)
+  - [Manual Component Installation](#manual-component-installation)
   - [Advanced Installation Options](#advanced-installation-options)
-  - [All-in-One Installer](#all-in-one-installer)
 - [Configuration](#configuration)
   - [Global Configuration](#global-configuration)
   - [Device-Specific Configuration](#device-specific-configuration)
@@ -144,66 +144,76 @@ Before installation:
 
 ## Installation
 
-### Quick Installation
+This platform provides two installation methods:
 
-1. Clone the repository or download the scripts:
-   ```bash
-   git clone https://github.com/tomtom215/mediamtx-rtsp-setup.git
-   cd mediamtx-rtsp-setup
-   ```
+1. **All-in-One Installer**: A single script that handles the complete installation process with interactive menus
+2. **Manual Installation**: Step-by-step installation of individual components for more control
 
-   Alternatively, download all scripts at once with wget:
+> **⚠️ SECURITY WARNING**: Always review scripts before downloading and running them with sudo privileges. The installation scripts require root access to configure system services and modify system directories.
+
+### All-in-One Installation (Recommended)
+
+The simplest way to install the MediaMTX RTSP Audio Platform is using the all-in-one installer script:
+
+```bash
+# Download the installer script
+wget https://raw.githubusercontent.com/tomtom215/mediamtx-rtsp-setup/refs/heads/main/mediamtx-rtsp-audio-installer.sh
+
+# Make it executable
+chmod +x mediamtx-rtsp-audio-installer.sh
+
+# Run the installer
+sudo ./mediamtx-rtsp-audio-installer.sh
+```
+
+This will guide you through an interactive installation process, handling all the component setup automatically.
+
+For non-interactive installation with default settings:
+```bash
+sudo ./mediamtx-rtsp-audio-installer.sh install -y -q
+```
+
+### Manual Component Installation
+
+If you prefer to install components individually or want more control over the installation process:
+
+1. First, download all necessary scripts:
    ```bash
-   # Create directory, download all scripts, and make them executable in one command
-   mkdir -p mediamtx-rtsp-setup && cd mediamtx-rtsp-setup && \
+   # Create a directory for the scripts
+   mkdir -p mediamtx-rtsp-setup && cd mediamtx-rtsp-setup
+   
+   # Download all required scripts
    wget --progress=bar:force:noscroll \
      https://raw.githubusercontent.com/tomtom215/mediamtx-rtsp-setup/refs/heads/main/install_mediamtx.sh \
      https://raw.githubusercontent.com/tomtom215/mediamtx-rtsp-setup/refs/heads/main/setup_audio_rtsp.sh \
      https://raw.githubusercontent.com/tomtom215/mediamtx-rtsp-setup/refs/heads/main/startmic.sh \
      https://raw.githubusercontent.com/tomtom215/mediamtx-rtsp-setup/refs/heads/main/setup-monitor-script.sh \
-     https://raw.githubusercontent.com/tomtom215/mediamtx-rtsp-setup/refs/heads/main/mediamtx-monitor.sh \
-     https://raw.githubusercontent.com/tomtom215/mediamtx-rtsp-setup/refs/heads/main/mediamtx-version-checker.sh \
-     https://raw.githubusercontent.com/tomtom215/mediamtx-rtsp-setup/refs/heads/main/mediamtx-rtsp-audio-installer.sh \
-     https://raw.githubusercontent.com/tomtom215/mediamtx-rtsp-setup/refs/heads/main/mediamtx-monitor-diagnostic-fix.sh && \
+     https://raw.githubusercontent.com/tomtom215/mediamtx-rtsp-setup/refs/heads/main/mediamtx-monitor.sh
+   
+   # Make all scripts executable
    chmod +x *.sh
    ```
 
-   Or using curl if preferred:
+   Alternatively, if you prefer git:
    ```bash
-   # Create directory and download all scripts with curl
-   mkdir -p mediamtx-rtsp-setup && cd mediamtx-rtsp-setup && \
-   for script in install_mediamtx.sh setup_audio_rtsp.sh startmic.sh setup-monitor-script.sh \
-       mediamtx-monitor.sh mediamtx-version-checker.sh mediamtx-rtsp-audio-installer.sh \
-       mediamtx-monitor-diagnostic-fix.sh; do
-       curl -O --progress-bar https://raw.githubusercontent.com/tomtom215/mediamtx-rtsp-setup/refs/heads/main/$script
-   done && chmod +x *.sh
+   git clone https://github.com/tomtom215/mediamtx-rtsp-setup.git
+   cd mediamtx-rtsp-setup
+   chmod +x *.sh
    ```
 
-   Or download just the all-in-one installer (simplest approach):
+2. Install each component in sequence:
    ```bash
-   # Download only the all-in-one installer script
-   wget --progress=bar:force:noscroll \
-     -O mediamtx-rtsp-audio-installer.sh \
-     https://raw.githubusercontent.com/tomtom215/mediamtx-rtsp-setup/refs/heads/main/mediamtx-rtsp-audio-installer.sh && \
-   chmod +x mediamtx-rtsp-audio-installer.sh
-   ```
-
-3. Install MediaMTX:
-   ```bash
+   # Step 1: Install MediaMTX RTSP server
    sudo ./install_mediamtx.sh
-   ```
-
-4. Set up audio RTSP streaming:
-   ```bash
+   
+   # Step 2: Set up audio RTSP streaming
    sudo ./setup_audio_rtsp.sh
-   ```
-
-5. Set up monitoring system (recommended):
-   ```bash
+   
+   # Step 3: Set up monitoring system (recommended)
    sudo ./setup-monitor-script.sh
    ```
 
-6. Verify installation:
+3. Verify installation:
    ```bash
    # Check streaming status
    sudo check-audio-rtsp.sh
@@ -214,27 +224,20 @@ Before installation:
 
 ### Advanced Installation Options
 
-The installer supports various options for customization:
-
-#### MediaMTX Installer Options
+For customized installations, the MediaMTX installer supports various options:
 
 ```bash
 sudo ./install_mediamtx.sh [OPTIONS]
 ```
 
 Available options:
-- `-v, --version VERSION` - Specify MediaMTX version (default: v1.12.2, use 'latest' for most recent)
+- `-v, --version VERSION` - Specify MediaMTX version (default: v1.12.2)
 - `-p, --rtsp-port PORT` - Specify RTSP port (default: 18554)
 - `--rtmp-port PORT` - Specify RTMP port (default: 11935)
 - `--hls-port PORT` - Specify HLS port (default: 18888)
 - `--webrtc-port PORT` - Specify WebRTC port (default: 18889)
 - `--metrics-port PORT` - Specify metrics port (default: 19999)
-- `--skip-checksum` - Skip checksum verification (not recommended)
-- `--force-checksum` - Abort if checksum verification fails (most secure)
-- `--offline` - Do not attempt to download checksums
-- `--config-only` - Only update configuration file, not the binary
-- `--force-install` - Force installation even if same version is installed
-- `--debug` - Enable debug mode for verbose output
+- And other options for checksum verification and installation modes
 
 Examples:
 ```bash
@@ -243,24 +246,10 @@ sudo ./install_mediamtx.sh --version latest --rtsp-port 8554
 
 # Only update configuration
 sudo ./install_mediamtx.sh --config-only --rtsp-port 8554
-
-# Force reinstallation of the same version
-sudo ./install_mediamtx.sh --force-install
 ```
 
-### All-in-One Installer
+The all-in-one installer also supports various commands and options:
 
-For a more user-friendly installation experience, you can use the all-in-one installer:
-
-```bash
-wget https://raw.githubusercontent.com/tomtom215/mediamtx-rtsp-setup/refs/heads/main/mediamtx-rtsp-audio-installer.sh
-chmod +x mediamtx-rtsp-audio-installer.sh
-sudo ./mediamtx-rtsp-audio-installer.sh
-```
-
-This script provides interactive menus and can handle installation, updates, reinstallation, uninstallation, status checking, troubleshooting, and log management.
-
-Available commands:
 ```bash
 sudo ./mediamtx-rtsp-audio-installer.sh [COMMAND] [OPTIONS]
 ```
@@ -277,30 +266,11 @@ Commands:
 Options:
 - `-v, --version VERSION` - Specify MediaMTX version
 - `-p, --rtsp-port PORT` - Specify RTSP port
-- `--rtmp-port PORT` - Specify RTMP port
-- `--hls-port PORT` - Specify HLS port
-- `--webrtc-port PORT` - Specify WebRTC port
-- `--metrics-port PORT` - Specify metrics port
 - `-d, --debug` - Enable debug mode
 - `-q, --quiet` - Minimal output
 - `-y, --yes` - Answer yes to all prompts
 - `-f, --force` - Force operation
 - `-h, --help` - Show help message
-
-Examples:
-```bash
-# Interactive installation
-sudo ./mediamtx-rtsp-audio-installer.sh
-
-# Silent installation with all defaults
-sudo ./mediamtx-rtsp-audio-installer.sh install -y -q
-
-# Update to latest version
-sudo ./mediamtx-rtsp-audio-installer.sh update
-
-# Troubleshoot installation issues
-sudo ./mediamtx-rtsp-audio-installer.sh troubleshoot
-```
 
 ## Configuration
 
@@ -1107,7 +1077,7 @@ This software is released under the Apache 2.0 License.
 
 ### Contributors
 
-- Main project development and maintenance - Tom F
+- Main project development and maintenance
 - Based on original concept by Cberge908 [GitHub gist](https://gist.github.com/cberge908/ab7ddc1ac46fd63bb6935cd1f4341112)
 
 ### Acknowledgments
