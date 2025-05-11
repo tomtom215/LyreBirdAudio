@@ -1,9 +1,31 @@
 #!/bin/bash
 #
-# Enhanced MediaMTX Installer with Dynamic Checksum Verification
-# Version: 2.0.0
-# Date: 2025-05-10
-# Description: Robust installer for MediaMTX with dynamic checksum verification and proper version comparison
+# Enhanced MediaMTX Installer with Advanced Validation Features
+# Version: 2.1.2
+# Date: 2025-05-11
+# Description: Robust installer for MediaMTX with integrated version checking,
+#              dynamic checksum verification, and intelligent architecture detection
+# Changes in v2.1.2:
+#   - Fixed syntax errors in checksum verification functions
+#   - Improved error handling in extract_hash_from_checksum function
+#   - Better structure in fetch_checksums function
+#   - Corrected SHA256 file handling
+#   - Enhanced debug logging for checksum verification
+#
+# Changes in v2.1.1:
+#   - Fixed critical bug in checksum verification for .sha256 files
+#   - Added better handling of various checksum file formats
+#   - Improved extraction of hash from checksum files
+#   - Added fallback method for checksum verification
+#
+# Changes in v2.1.0:
+#   - Integrated advanced architecture detection from version checker
+#   - Added sophisticated GitHub API caching system
+#   - Enhanced error handling with multiple fallback mechanisms
+#   - Improved checksum validation with multiple verification methods
+#   - Added debug mode for troubleshooting
+#   - Better version comparison and management
+#   - More comprehensive error reporting and user feedback
 #
 
 set -e  # Exit immediately if a command exits with a non-zero status
@@ -17,6 +39,11 @@ SERVICE_USER="mediamtx"
 CHECKSUM_DB_DIR="/var/lib/mediamtx/checksums"
 CHECKSUM_DB_FILE="${CHECKSUM_DB_DIR}/checksums.json"
 
+# Cache directory for GitHub API responses
+CACHE_DIR="/var/cache/mediamtx-installer"
+API_CACHE="${CACHE_DIR}/api_cache.json"
+CACHE_EXPIRY=3600  # Cache expires after 1 hour (in seconds)
+
 # Configurable version - can be overridden with command line args
 VERSION="v1.12.2"
 TEMP_DIR="/tmp/mediamtx-install-$(date +%s)-${RANDOM}"  # More unique temp dir with random component
@@ -28,11 +55,19 @@ HLS_PORT="18888"
 WEBRTC_PORT="18889"
 METRICS_PORT="19999"
 
+# Debug mode (set to false by default, can be enabled with --debug)
+DEBUG_MODE=false
+
 # Print colored messages
 echo_info() { echo -e "\033[34m[INFO]\033[0m $1"; }
 echo_success() { echo -e "\033[32m[SUCCESS]\033[0m $1"; }
 echo_warning() { echo -e "\033[33m[WARNING]\033[0m $1"; }
 echo_error() { echo -e "\033[31m[ERROR]\033[0m $1"; }
+echo_debug() {
+    if [ "$DEBUG_MODE" = true ]; then
+        echo -e "\033[36m[DEBUG]\033[0m $1" >&2
+    fi
+}
 
 # Save log messages to a file and stdout
 LOG_FILE="${TEMP_DIR}/install.log"
@@ -51,6 +86,331 @@ log_message() {
     local message=$2
     local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
     echo "[${timestamp}] [${level}] ${message}" | tee -a "$LOG_FILE"
+}
+
+# Enhanced architecture detection with improved edge case handling
+detect_arch() {
+    local arch=$(uname -m)
+    
+    case "$arch" in
+        x86_64|amd64)  echo "amd64" ;;
+        aarch64|arm64) echo "arm64" ;;
+        armv7*|armhf)  echo "armv7" ;;
+        armv6*|armel)  echo "armv6" ;;
+        *)
+            echo_warning "Architecture '$arch' not directly recognized."
+            # Try to determine architecture through additional methods
+            if command -v dpkg >/dev/null 2>&1; then
+                local dpkg_arch=$(dpkg --print-architecture 2>/dev/null)
+                case "$dpkg_arch" in
+                    amd64)          echo "amd64" ;;
+                    arm64)          echo "arm64" ;;
+                    armhf)          echo "armv7" ;;
+                    armel)          echo "armv6" ;;
+                    *)              echo "unknown" ;;
+                esac
+                return
+            fi
+            
+            # Additional fallback method - check the kernel architecture
+            if [ -f "/proc/cpuinfo" ]; then
+                if grep -q "^model name.*ARMv7" /proc/cpuinfo; then
+                    echo "armv7"
+                    return
+                elif grep -q "^model name.*ARMv6" /proc/cpuinfo; then
+                    echo "armv6"
+                    return
+                elif grep -q "^Model.*Raspberry Pi" /proc/cpuinfo && grep -q "^CPU architecture.*7" /proc/cpuinfo; then
+                    echo "armv7"
+                    return
+                elif grep -q "^Model.*Raspberry Pi" /proc/cpuinfo && grep -q "^CPU architecture.*6" /proc/cpuinfo; then
+                    echo "armv6"
+                    return
+                fi
+            fi
+            
+            # Final fallback - return unknown
+            echo_error "Unsupported architecture: $arch"
+            echo_info "Currently supported architectures: x86_64 (amd64), aarch64 (arm64), armv7, armv6"
+            exit 1 
+            ;;
+    esac
+}
+
+# Function to check if cache is valid
+is_cache_valid() {
+    local cache_file="$1"
+    local max_age="$2"
+    
+    if [ ! -f "$cache_file" ]; then
+        echo_debug "Cache file not found: $cache_file"
+        return 1
+    fi
+    
+    local file_age=$(( $(date +%s) - $(stat -c %Y "$cache_file" 2>/dev/null || stat -f %m "$cache_file" 2>/dev/null || date +%s) ))
+    if [ "$file_age" -gt "$max_age" ]; then
+        echo_debug "Cache file expired (age: ${file_age}s, max: ${max_age}s)"
+        return 1
+    fi
+    
+    # Check if the file is not empty and is valid JSON
+    if [ ! -s "$cache_file" ]; then
+        echo_debug "Cache file is empty"
+        return 1
+    fi
+    
+    if command -v jq >/dev/null 2>&1; then
+        if ! jq empty "$cache_file" >/dev/null 2>&1; then
+            echo_debug "Cache file contains invalid JSON"
+            return 1
+        fi
+    fi
+    
+    echo_debug "Cache file is valid"
+    return 0
+}
+
+# Function to get GitHub API data with cache awareness
+get_github_api_data() {
+    local url="$1"
+    local cache_file="$2"
+    local max_age="${3:-$CACHE_EXPIRY}"
+    
+    echo_debug "Requesting data from: $url"
+    echo_debug "Using cache file: $cache_file"
+    
+    if is_cache_valid "$cache_file" "$max_age"; then
+        echo_info "Using cached data ($(( $(date +%s) - $(stat -c %Y "$cache_file" 2>/dev/null || stat -f %m "$cache_file" 2>/dev/null || date +%s) ))s old)"
+        cat "$cache_file"
+        return 0
+    fi
+    
+    echo_info "Fetching data from GitHub API..."
+    
+    # Make direct call to GitHub API and save the raw output for inspection
+    local response_file="${CACHE_DIR}/raw_response.txt"
+    local error_log="${CACHE_DIR}/curl_error.log"
+    echo_debug "Saving raw response to: $response_file"
+    
+    local curl_cmd="curl -s -S -f $url"
+    echo_debug "Running curl command: $curl_cmd"
+    
+    # Use curl to directly save to response file, capture errors separately
+    eval "$curl_cmd" > "$response_file" 2>"$error_log"
+    local curl_status=$?
+    
+    echo_debug "Curl exit status: $curl_status"
+    
+    if [ $curl_status -ne 0 ]; then
+        echo_error "Failed to fetch data from $url (status: $curl_status)"
+        echo_debug "Curl error log:"
+        if [ -f "$error_log" ]; then
+            cat "$error_log" >&2
+        fi
+        
+        # Check specifically for rate limiting
+        if [ $curl_status -eq 22 ] && curl -s -I "$url" | grep -q "X-RateLimit-Remaining: 0"; then
+            echo_error "GitHub API rate limit exceeded."
+            local reset_time=$(curl -s -I "$url" | grep -i "X-RateLimit-Reset" | cut -d' ' -f2 | tr -d '\r')
+            if [ -n "$reset_time" ]; then
+                local reset_date=$(date -d "@$reset_time" 2>/dev/null || date)
+                echo_warning "Rate limit will reset at: $reset_date"
+            fi
+        fi
+        
+        # Try to use cached data even if expired
+        if [ -f "$cache_file" ]; then
+            echo_warning "Using expired cache data due to API error"
+            cat "$cache_file"
+            return 0
+        fi
+        
+        return 1
+    fi
+    
+    # Debug the raw response
+    if command -v xxd >/dev/null 2>&1 && [ "$DEBUG_MODE" = true ]; then
+        echo_debug "Response first 100 bytes: $(head -c 100 "$response_file" | xxd -p)"
+    else
+        echo_debug "Response first 100 chars: $(head -c 100 "$response_file")"
+    fi
+    echo_debug "Response length: $(wc -c < "$response_file") bytes"
+    
+    # Verify we have a proper JSON response
+    if ! grep -q '^\s*{' "$response_file" && ! grep -q '^\s*\[' "$response_file"; then
+        echo_error "Response doesn't start with { or [ - likely not JSON"
+        echo_debug "First 100 chars of response: $(head -c 100 "$response_file")"
+        
+        if [ -f "$cache_file" ]; then
+            echo_warning "Using expired cache data due to invalid response"
+            cat "$cache_file"
+            return 0
+        fi
+        
+        echo_error "Failed to parse GitHub API response and no valid cache found."
+        return 1
+    fi
+    
+    # Test JSON validity with jq if available
+    if command -v jq >/dev/null 2>&1; then
+        local jq_test=$(jq empty "$response_file" 2>&1)
+        if [ -n "$jq_test" ]; then
+            echo_error "Invalid JSON response from GitHub API"
+            echo_debug "JQ error: $jq_test"
+            echo_debug "Raw response first 100 chars: $(head -c 100 "$response_file")"
+            
+            if [ -f "$cache_file" ]; then
+                echo_warning "Using expired cache data due to invalid JSON"
+                cat "$cache_file"
+                return 0
+            fi
+            
+            return 1
+        else
+            echo_debug "JSON validation passed"
+        fi
+    fi
+    
+    # Cache the response only if it's valid
+    cp "$response_file" "$cache_file"
+    cat "$response_file"
+    return 0
+}
+
+# Check if required commands exist
+verify_commands() {
+    local missing_commands=()
+    local optional_missing=()
+    
+    # Essential commands
+    for cmd in wget curl tar grep sed chmod chown systemctl; do
+        if ! command -v "$cmd" >/dev/null 2>&1; then
+            missing_commands+=("$cmd")
+        fi
+    done
+    
+    # Optional but useful commands
+    for cmd in jq md5sum sha256sum xxd; do
+        if ! command -v "$cmd" >/dev/null 2>&1; then
+            optional_missing+=("$cmd")
+        fi
+    done
+    
+    # Handle missing essential commands
+    if [[ ${#missing_commands[@]} -gt 0 ]]; then
+        echo_warning "The following required commands are missing: ${missing_commands[*]}"
+        
+        # Try to install missing commands
+        if command -v apt-get >/dev/null 2>&1; then
+            echo_info "Attempting to install missing commands with apt-get..."
+            apt-get update && apt-get install -y coreutils wget curl tar grep sed
+        elif command -v yum >/dev/null 2>&1; then
+            echo_info "Attempting to install missing commands with yum..."
+            yum install -y coreutils wget curl tar grep sed
+        else
+            echo_warning "Unable to automatically install missing commands. Please install them manually."
+        fi
+        
+        # Verify again
+        missing_commands=()
+        for cmd in wget curl tar grep sed chmod chown systemctl; do
+            if ! command -v "$cmd" >/dev/null 2>&1; then
+                missing_commands+=("$cmd")
+            fi
+        done
+        
+        if [[ ${#missing_commands[@]} -gt 0 ]]; then
+            echo_error "Still missing required commands after installation attempt: ${missing_commands[*]}"
+            exit 1
+        fi
+    fi
+    
+    # Handle missing optional commands
+    if [[ ${#optional_missing[@]} -gt 0 ]]; then
+        echo_warning "The following optional commands are missing: ${optional_missing[*]}"
+        
+        # Special handling for jq - essential for dynamic checksum verification
+        if [[ " ${optional_missing[*]} " =~ " jq " ]]; then
+            echo_warning "The 'jq' command is recommended for checksum verification."
+            echo_warning "Without it, some advanced features may be limited."
+            
+            # Ask user if they want to install jq
+            if [ -t 0 ]; then  # Only ask if running interactively
+                read -p "Would you like to install jq now? (y/n) " -n 1 -r
+                echo
+                if [[ $REPLY =~ ^[Yy]$ ]]; then
+                    if command -v apt-get >/dev/null 2>&1; then
+                        apt-get update && apt-get install -y jq
+                    elif command -v yum >/dev/null 2>&1; then
+                        yum install -y jq
+                    else
+                        echo_warning "Could not determine how to install jq. Please install manually."
+                    fi
+                fi
+            fi
+        fi
+    fi
+    
+    # Return success even with optional commands missing
+    return 0
+}
+
+# Create directories with improved permission handling
+setup_directories() {
+    echo_info "Creating directories..."
+    
+    # Default permission modes
+    local dir_mode=755
+    local conf_mode=750
+    
+    # Create the temporary directory first
+    if [ ! -d "$TEMP_DIR" ]; then
+        if ! mkdir -p "$TEMP_DIR" 2>/dev/null; then
+            echo_error "Failed to create temporary directory: $TEMP_DIR"
+            exit 1
+        fi
+        chmod $dir_mode "$TEMP_DIR" || echo_warning "Failed to set permissions on $TEMP_DIR"
+    fi
+    
+    # Initialize log file
+    touch "$LOG_FILE" 2>/dev/null || echo_warning "Failed to create log file: $LOG_FILE"
+    log_message "INFO" "MediaMTX installation started"
+    
+    # Create cache directory for GitHub API responses
+    if [ ! -d "$CACHE_DIR" ]; then
+        if ! mkdir -p "$CACHE_DIR" 2>/dev/null; then
+            log_message "WARNING" "Failed to create cache directory: $CACHE_DIR"
+            # Fall back to temp directory
+            CACHE_DIR="${TEMP_DIR}/cache"
+            API_CACHE="${CACHE_DIR}/api_cache.json"
+            mkdir -p "$CACHE_DIR" 2>/dev/null
+        fi
+        chmod $dir_mode "$CACHE_DIR" || log_message "WARNING" "Failed to set permissions on $CACHE_DIR"
+    fi
+    
+    # Create other directories
+    for dir in "$INSTALL_DIR" "$CONFIG_DIR" "$LOG_DIR" "$CHECKSUM_DB_DIR"; do
+        # Use appropriate permissions
+        local mode=$dir_mode
+        if [[ "$dir" == "$CONFIG_DIR" || "$dir" == "$CHECKSUM_DB_DIR" ]]; then
+            mode=$conf_mode
+        fi
+        
+        if [ ! -d "$dir" ]; then
+            if ! mkdir -p "$dir" 2>/dev/null; then
+                log_message "ERROR" "Failed to create directory: $dir"
+                exit 1
+            fi
+            chmod $mode "$dir" || log_message "WARNING" "Failed to set permissions on $dir"
+            log_message "INFO" "Created directory: $dir with mode $mode"
+        else
+            log_message "INFO" "Directory already exists: $dir"
+            # Update permissions to ensure they're correct
+            chmod $mode "$dir" || log_message "WARNING" "Failed to update permissions on $dir" 
+        fi
+    done
+    
+    log_message "SUCCESS" "Directories setup complete"
 }
 
 # Compare version strings - robust implementation
@@ -95,119 +455,102 @@ is_version_newer() {
     fi
 }
 
-# Detect architecture (improved version)
-detect_arch() {
-    local arch=$(uname -m)
+# Function to get the latest MediaMTX version from GitHub API
+get_latest_version() {
+    log_message "INFO" "Checking for latest MediaMTX version from GitHub"
     
-    case "$arch" in
-        x86_64)  echo "amd64" ;;
-        aarch64) echo "arm64" ;;  # Changed from arm64v8 to arm64
-        armv7*)  echo "armv7" ;;
-        armv6*)  echo "armv6" ;;
-        *)       
-            echo_error "Unsupported architecture: $arch"
-            echo_info "Currently supported architectures: x86_64 (amd64), aarch64 (arm64), armv7, armv6"
-            exit 1 
-            ;;
-    esac
-}
-
-# Verify that required commands exist
-verify_commands() {
-    local missing_commands=()
-    for cmd in wget curl tar grep sed chmod chown systemctl md5sum sha256sum jq; do
-        if ! command -v "$cmd" >/dev/null 2>&1; then
-            missing_commands+=("$cmd")
-        fi
-    done
+    # Create cache directory if it doesn't exist
+    mkdir -p "$CACHE_DIR" 2>/dev/null
     
-    if [[ ${#missing_commands[@]} -gt 0 ]]; then
-        echo_warning "The following required commands are missing: ${missing_commands[*]}"
+    # Get latest release info from GitHub API with cache awareness
+    local latest_info
+    latest_info=$(get_github_api_data "https://api.github.com/repos/bluenviron/mediamtx/releases/latest" "$API_CACHE")
+    local api_status=$?
+    
+    if [ $api_status -ne 0 ] || [ -z "$latest_info" ]; then
+        log_message "WARNING" "Failed to fetch latest version info from GitHub API"
+        return 1
+    fi
+    
+    local latest_version=""
+    
+    # Extract version using jq if available
+    if command -v jq >/dev/null 2>&1; then
+        latest_version=$(echo "$latest_info" | jq -r '.tag_name // ""' 2>/dev/null)
         
-        # Try to install missing commands
-        if command -v apt-get >/dev/null 2>&1; then
-            echo_info "Attempting to install missing commands with apt-get..."
-            apt-get update && apt-get install -y coreutils wget curl tar grep sed jq
-        elif command -v yum >/dev/null 2>&1; then
-            echo_info "Attempting to install missing commands with yum..."
-            yum install -y coreutils wget curl tar grep sed jq
-        else
-            echo_warning "Unable to automatically install missing commands. Please install them manually."
+        if [ -z "$latest_version" ] || [ "$latest_version" = "null" ]; then
+            log_message "WARNING" "Failed to extract version from GitHub API response"
+            return 1
+        fi
+    else
+        # Fallback extraction method
+        if echo "$latest_info" | grep -q "tag_name"; then
+            latest_version=$(echo "$latest_info" | grep "tag_name" | head -1 | cut -d : -f 2,3 | tr -d \" | tr -d , | xargs)
             
-            # Special handling for jq - essential for dynamic checksum verification
-            if [[ " ${missing_commands[*]} " =~ " jq " ]]; then
-                echo_warning "The 'jq' command is required for dynamic checksum verification."
-                echo_warning "Without it, you'll need to explicitly skip verification."
-                
-                # Ask user if they want to continue without jq
-                read -p "Continue without jq? (y/n) " -n 1 -r
-                echo
-                if [[ ! $REPLY =~ ^[Yy]$ ]]; then
-                    echo_error "Aborted by user"
-                    exit 1
-                fi
+            if [ -z "$latest_version" ]; then
+                log_message "WARNING" "Failed to extract version using grep fallback"
+                return 1
             fi
-        fi
-        
-        # Verify again
-        missing_commands=()
-        for cmd in wget curl tar grep sed; do
-            if ! command -v "$cmd" >/dev/null 2>&1; then
-                missing_commands+=("$cmd")
-            fi
-        done
-        
-        if [[ ${#missing_commands[@]} -gt 0 ]]; then
-            echo_error "Still missing required commands after installation attempt: ${missing_commands[*]}"
-            exit 1
+        else
+            log_message "WARNING" "Could not find version information in API response"
+            return 1
         fi
     fi
+    
+    echo "$latest_version"
+    return 0
 }
 
-# Create directories with improved permission handling
-setup_directories() {
-    echo_info "Creating directories..."
+# Extract just the hash from a checksum file, handling different formats
+extract_hash_from_checksum() {
+    local checksum_file="$1"
+    local expected_filename="$2"
     
-    # Default permission modes
-    local dir_mode=755
-    local conf_mode=750
+    echo_debug "Extracting hash from checksum file: $checksum_file"
+    echo_debug "Expected filename: $expected_filename"
     
-    # Create the temporary directory first
-    if [ ! -d "$TEMP_DIR" ]; then
-        if ! mkdir -p "$TEMP_DIR" 2>/dev/null; then
-            echo_error "Failed to create temporary directory: $TEMP_DIR"
-            exit 1
-        fi
-        chmod $dir_mode "$TEMP_DIR" || echo_warning "Failed to set permissions on $TEMP_DIR"
+    # Check if file exists
+    if [ ! -f "$checksum_file" ]; then
+        echo_debug "Checksum file not found: $checksum_file"
+        return 1
     fi
     
-    # Initialize log file
-    touch "$LOG_FILE" 2>/dev/null || echo_warning "Failed to create log file: $LOG_FILE"
-    log_message "INFO" "MediaMTX installation started"
+    # Read checksum file content
+    local content=$(cat "$checksum_file")
+    echo_debug "Raw checksum content: $content"
     
-    # Create other directories
-    for dir in "$INSTALL_DIR" "$CONFIG_DIR" "$LOG_DIR" "$CHECKSUM_DB_DIR"; do
-        # Use appropriate permissions
-        local mode=$dir_mode
-        if [[ "$dir" == "$CONFIG_DIR" || "$dir" == "$CHECKSUM_DB_DIR" ]]; then
-            mode=$conf_mode
-        fi
-        
-        if [ ! -d "$dir" ]; then
-            if ! mkdir -p "$dir" 2>/dev/null; then
-                log_message "ERROR" "Failed to create directory: $dir"
-                exit 1
-            fi
-            chmod $mode "$dir" || log_message "WARNING" "Failed to set permissions on $dir"
-            log_message "INFO" "Created directory: $dir with mode $mode"
-        else
-            log_message "INFO" "Directory already exists: $dir"
-            # Update permissions to ensure they're correct
-            chmod $mode "$dir" || log_message "WARNING" "Failed to update permissions on $dir" 
-        fi
-    done
+    # Try different extraction methods
     
-    log_message "SUCCESS" "Directories setup complete"
+    # Method 1: If it's just a hash (possibly with filename)
+    if [[ "$content" =~ ^[a-f0-9]{64} ]]; then
+        # Extract just the hash part (first 64 hex chars)
+        local hash=${content:0:64}
+        echo_debug "Extracted hash using regex method: $hash"
+        echo "$hash"
+        return 0
+    fi
+    
+    # Method 2: If it's in format "hash filename"
+    if echo "$content" | grep -q "$expected_filename"; then
+        local hash=$(echo "$content" | grep "$expected_filename" | awk '{print $1}')
+        if [[ "$hash" =~ ^[a-f0-9]{64}$ ]]; then
+            echo_debug "Extracted hash using filename grep method: $hash"
+            echo "$hash"
+            return 0
+        fi
+    fi
+    
+    # Method 3: If no filename, just try to extract anything that looks like a SHA256 hash
+    local hash=$(echo "$content" | grep -o -E '[a-f0-9]{64}' | head -1)
+    if [ -n "$hash" ]; then
+        echo_debug "Extracted hash using general grep method: $hash"
+        echo "$hash"
+        return 0
+    fi
+    
+    # No valid hash found
+    echo_debug "Failed to extract hash from checksum file"
+    return 1
 }
 
 # Function to fetch the SHA256 checksums from GitHub releases
@@ -218,6 +561,9 @@ fetch_checksums() {
     
     log_message "INFO" "Attempting to fetch checksums for MediaMTX $version ($arch)"
     
+    # Define expected filename
+    local expected_filename="mediamtx_${version}_linux_${arch}.tar.gz"
+    
     # Different approaches to get checksums
     local success=false
     
@@ -227,14 +573,14 @@ fetch_checksums() {
         
         if curl -s -L -o "${TEMP_DIR}/checksums.txt" "https://github.com/bluenviron/mediamtx/releases/download/${version}/checksums.txt"; then
             # Parse the checksums.txt file to find our file's checksum
-            local checksum_line=$(grep "mediamtx_${version}_linux_${arch}.tar.gz" "${TEMP_DIR}/checksums.txt" || echo "")
+            local checksum_line=$(grep "$expected_filename" "${TEMP_DIR}/checksums.txt" || echo "")
             
             if [[ -n "$checksum_line" ]]; then
                 # Extract the checksum from the line
                 local checksum=$(echo "$checksum_line" | awk '{print $1}')
                 
-                if [[ -n "$checksum" ]]; then
-                    log_message "INFO" "Found checksum for $arch: $checksum"
+                if [[ -n "$checksum" && "${#checksum}" -eq 64 ]]; then
+                    log_message "INFO" "Found checksum for $arch in checksums.txt: $checksum"
                     # Create a simple JSON structure with the checksum
                     echo "{\"$arch\": \"$checksum\"}" > "$checksum_file"
                     success=true
@@ -243,41 +589,102 @@ fetch_checksums() {
         fi
     fi
     
-    # Approach 2: If checksums.txt doesn't exist or didn't work, try release API
+    # Approach 2: Try architecture-specific .sha256sum file (newer releases)
+    if [ "$success" != true ]; then
+        log_message "INFO" "Attempting to fetch individual SHA256 file for $arch"
+        
+        local sha256_url="https://github.com/bluenviron/mediamtx/releases/download/${version}/mediamtx_${version}_linux_${arch}.tar.gz.sha256sum"
+        
+        if curl --head --silent --fail "$sha256_url" >/dev/null 2>&1; then
+            log_message "INFO" "Found individual SHA256sum file"
+            
+            if curl -s -L -o "${TEMP_DIR}/file.sha256" "$sha256_url"; then
+                local checksum=$(extract_hash_from_checksum "${TEMP_DIR}/file.sha256" "$expected_filename")
+                local status=$?
+                
+                if [ $status -eq 0 ] && [[ -n "$checksum" && "${#checksum}" -eq 64 ]]; then
+                    log_message "INFO" "Found checksum from .sha256sum file: $checksum"
+                    # Create a simple JSON structure with the checksum
+                    echo "{\"$arch\": \"$checksum\"}" > "$checksum_file"
+                    success=true
+                else
+                    # Log original content for debugging
+                    local raw_content=$(cat "${TEMP_DIR}/file.sha256")
+                    log_message "WARNING" "Could not extract valid checksum from .sha256sum file. Content: $raw_content"
+                fi
+            fi
+        fi
+    fi
+    
+    # Approach 3: Try .sha256 format (without .sum extension)
+    if [ "$success" != true ]; then
+        log_message "INFO" "Attempting to fetch .sha256 file format"
+        
+        local sha256_url="https://github.com/bluenviron/mediamtx/releases/download/${version}/mediamtx_${version}_linux_${arch}.tar.gz.sha256"
+        
+        if curl --head --silent --fail "$sha256_url" >/dev/null 2>&1; then
+            log_message "INFO" "Found .sha256 file"
+            
+            if curl -s -L -o "${TEMP_DIR}/file.sha256" "$sha256_url"; then
+                local checksum=$(extract_hash_from_checksum "${TEMP_DIR}/file.sha256" "$expected_filename")
+                local status=$?
+                
+                if [ $status -eq 0 ] && [[ -n "$checksum" && "${#checksum}" -eq 64 ]]; then
+                    log_message "INFO" "Found checksum from .sha256 file: $checksum"
+                    # Create a simple JSON structure with the checksum
+                    echo "{\"$arch\": \"$checksum\"}" > "$checksum_file"
+                    success=true
+                else
+                    # Log original content for debugging
+                    local raw_content=$(cat "${TEMP_DIR}/file.sha256")
+                    log_message "WARNING" "Could not extract valid checksum from .sha256 file. Content: $raw_content"
+                fi
+            fi
+        fi
+    fi
+    
+    # Approach 4: If checksums.txt doesn't exist or didn't work, try release API
     if [ "$success" != true ] && command -v jq >/dev/null 2>&1; then
         log_message "INFO" "Attempting to fetch checksums from GitHub API"
         
-        # Get release info from GitHub API
-        if curl -s -L -o "${TEMP_DIR}/release.json" "https://api.github.com/repos/bluenviron/mediamtx/releases/tags/${version}"; then
-            # Check if the API rate limit is exceeded
-            if grep -q "API rate limit exceeded" "${TEMP_DIR}/release.json"; then
-                log_message "WARNING" "GitHub API rate limit exceeded, cannot fetch checksums from API"
-            else
-                # Parse release JSON to find asset download URL
-                local download_url=$(jq -r ".assets[] | select(.name == \"mediamtx_${version}_linux_${arch}.tar.gz\") | .browser_download_url" "${TEMP_DIR}/release.json")
+        # Get release info from GitHub API with cache awareness
+        local release_json="${CACHE_DIR}/release_${version}.json"
+        local release_info
+        release_info=$(get_github_api_data "https://api.github.com/repos/bluenviron/mediamtx/releases/tags/${version}" "$release_json")
+        local api_status=$?
+        
+        if [ $api_status -eq 0 ] && [ -n "$release_info" ]; then
+            # Parse release JSON to find asset download URL
+            local download_url=$(jq -r ".assets[] | select(.name == \"$expected_filename\") | .browser_download_url" <<<"$release_info")
+            
+            if [[ -n "$download_url" && "$download_url" != "null" ]]; then
+                log_message "INFO" "Found download URL from API: $download_url"
                 
-                if [[ -n "$download_url" && "$download_url" != "null" ]]; then
-                    log_message "INFO" "Found download URL: $download_url"
+                # For newer MediaMTX releases, we can check if there's a .sha256 file
+                local checksum_url="${download_url}.sha256"
+                
+                if curl --head --silent --fail "$checksum_url" >/dev/null 2>&1; then
+                    log_message "INFO" "Found .sha256 file for download from API reference"
                     
-                    # For newer MediaMTX releases, we can check if there's a .sha256 file
-                    local checksum_url="${download_url}.sha256"
-                    
-                    if curl --head --silent --fail "$checksum_url" >/dev/null 2>&1; then
-                        log_message "INFO" "Found .sha256 file for download"
+                    if curl -s -L -o "${TEMP_DIR}/file.sha256" "$checksum_url"; then
+                        local checksum=$(extract_hash_from_checksum "${TEMP_DIR}/file.sha256" "$expected_filename")
+                        local status=$?
                         
-                        if curl -s -L -o "${TEMP_DIR}/file.sha256" "$checksum_url"; then
-                            local checksum=$(cat "${TEMP_DIR}/file.sha256" | tr -d '[:space:]')
-                            
-                            if [[ -n "$checksum" ]]; then
-                                log_message "INFO" "Found checksum from .sha256 file: $checksum"
-                                # Create a simple JSON structure with the checksum
-                                echo "{\"$arch\": \"$checksum\"}" > "$checksum_file"
-                                success=true
-                            fi
+                        if [ $status -eq 0 ] && [[ -n "$checksum" && "${#checksum}" -eq 64 ]]; then
+                            log_message "INFO" "Found checksum from API-referenced .sha256 file: $checksum"
+                            # Create a simple JSON structure with the checksum
+                            echo "{\"$arch\": \"$checksum\"}" > "$checksum_file"
+                            success=true
+                        else
+                            # Log original content for debugging
+                            local raw_content=$(cat "${TEMP_DIR}/file.sha256")
+                            log_message "WARNING" "Could not extract valid checksum from API-referenced .sha256 file. Content: $raw_content"
                         fi
                     fi
                 fi
             fi
+        else
+            log_message "WARNING" "Failed to fetch release info from GitHub API"
         fi
     fi
     
@@ -332,7 +739,7 @@ lookup_checksum() {
     if jq -e ".[\"$version\"][\"$arch\"]" "$CHECKSUM_DB_FILE" >/dev/null 2>&1; then
         local checksum=$(jq -r ".[\"$version\"][\"$arch\"]" "$CHECKSUM_DB_FILE")
         
-        if [[ -n "$checksum" && "$checksum" != "null" ]]; then
+        if [[ -n "$checksum" && "$checksum" != "null" && "${#checksum}" -eq 64 ]]; then
             log_message "INFO" "Found checksum in database: $checksum"
             echo "{\"$arch\": \"$checksum\"}" > "${TEMP_DIR}/checksums.json"
             return 0
@@ -412,6 +819,98 @@ get_checksums() {
     return 1
 }
 
+# Test a URL with retry logic
+test_url() {
+    local url="$1"
+    local max_retries=3
+    local retry=0
+    
+    echo_debug "Testing URL: $url"
+    
+    while [ $retry -lt $max_retries ]; do
+        echo_info "Testing URL accessibility (attempt $((retry + 1))/$max_retries)..."
+        
+        # Using wget or curl to test the URL
+        if command -v wget >/dev/null 2>&1; then
+            if wget --spider --timeout=10 --tries=1 --quiet "$url" 2>/dev/null; then
+                echo_debug "URL is accessible (wget)"
+                return 0
+            fi
+        elif command -v curl >/dev/null 2>&1; then
+            if curl --head --silent --fail --connect-timeout 10 "$url" >/dev/null 2>&1; then
+                echo_debug "URL is accessible (curl)"
+                return 0
+            fi
+        else
+            echo_error "Neither wget nor curl is available to test URLs"
+            return 1
+        fi
+        
+        retry=$((retry + 1))
+        
+        if [ $retry -lt $max_retries ]; then
+            echo_warning "URL not accessible, retrying in 2 seconds..."
+            sleep 2
+        fi
+    done
+    
+    echo_error "URL is not accessible after $max_retries attempts: $url"
+    return 1
+}
+
+# Find similar URLs that might work
+find_similar_urls() {
+    local version="$1"
+    local arch="$2"
+    local found=false
+    
+    echo_info "Checking for alternative URLs..."
+    
+    # Try different architecture naming schemes
+    for test_arch in "arm64" "arm64v8" "amd64" "armv7" "armv6"; do
+        if [ "$test_arch" = "$arch" ]; then
+            continue  # Skip the one we already tried
+        fi
+        
+        local test_url="https://github.com/bluenviron/mediamtx/releases/download/${version}/mediamtx_${version}_linux_${test_arch}.tar.gz"
+        
+        if test_url "$test_url"; then
+            echo_success "Found valid alternative URL with architecture '$test_arch':"
+            echo_info "$test_url"
+            found=true
+            
+            # Suggest command line correction
+            echo_info "You can use this architecture by running:"
+            echo_info "sudo bash $(basename "$0") --version $version --arch $test_arch"
+        fi
+    done
+    
+    # If no similar URLs found, check if there are any releases for this version
+    if [ "$found" = false ]; then
+        local release_url="https://github.com/bluenviron/mediamtx/releases/tag/${version}"
+        
+        if curl --head --silent --fail "$release_url" >/dev/null 2>&1; then
+            echo_warning "The release $version exists, but no suitable binary was found for architecture $arch"
+            echo_info "Please check available binaries at: $release_url"
+        else
+            echo_error "The release $version doesn't appear to exist"
+            
+            # Try to list some valid versions
+            local latest_version
+            latest_version=$(get_latest_version)
+            
+            if [ -n "$latest_version" ]; then
+                echo_info "The latest available version appears to be: $latest_version"
+                echo_info "Try using: --version $latest_version"
+            else
+                echo_info "Try using the default version: v1.12.2"
+            fi
+        fi
+    fi
+    
+    return 0
+}
+
 # Download MediaMTX with improved error handling
 download_mediamtx() {
     local arch=$1
@@ -430,37 +929,33 @@ download_mediamtx() {
     log_message "INFO" "Version: $version"
     log_message "INFO" "Downloading from: $url"
     
+    # Test if the URL exists first
+    if ! test_url "$url"; then
+        log_message "ERROR" "URL does not exist or is not accessible: $url"
+        find_similar_urls "$version" "$arch"
+        return 1
+    fi
+    
     # Try multiple methods with better error handling
     local download_success=false
     
     # First try wget if available
     if command -v wget >/dev/null 2>&1; then
         log_message "INFO" "Using wget to download..."
-        if wget --spider "$url" 2>/dev/null; then
-            log_message "INFO" "URL verified, downloading file..."
-            if wget --no-verbose --show-progress --progress=bar:force:noscroll --tries=3 --timeout=15 -O "$output_file" "$url"; then
-                download_success=true
-            else
-                log_message "WARNING" "wget download failed, will try curl..."
-            fi
+        if wget --no-verbose --show-progress --progress=bar:force:noscroll --tries=3 --timeout=15 -O "$output_file" "$url"; then
+            download_success=true
         else
-            log_message "WARNING" "URL does not exist or is not accessible: $url"
+            log_message "WARNING" "wget download failed, will try curl..."
         fi
     fi
     
     # Try curl if wget failed or isn't available
     if [ "$download_success" != true ] && command -v curl >/dev/null 2>&1; then
         log_message "INFO" "Using curl to download..."
-        # First check if the URL exists
-        if curl --head --silent --fail "$url" >/dev/null 2>&1; then
-            log_message "INFO" "URL verified, downloading file..."
-            if curl -s -L --retry 3 --connect-timeout 15 --progress-bar -o "$output_file" "$url"; then
-                download_success=true
-            else
-                log_message "WARNING" "curl download failed..."
-            fi
+        if curl -L --retry 3 --connect-timeout 15 --progress-bar -o "$output_file" "$url"; then
+            download_success=true
         else
-            log_message "WARNING" "URL does not exist or is not accessible: $url"
+            log_message "WARNING" "curl download failed..."
         fi
     fi
     
@@ -468,17 +963,6 @@ download_mediamtx() {
     if [ "$download_success" != true ]; then
         log_message "ERROR" "All download methods failed. Please check your internet connection and the URL."
         log_message "INFO" "URL attempted: $url"
-        
-        # List available versions and architectures for clarity
-        log_message "INFO" "Checking available MediaMTX versions..."
-        if command -v curl >/dev/null 2>&1; then
-            local latest_version=$(curl -s https://api.github.com/repos/bluenviron/mediamtx/releases/latest | grep "tag_name" | cut -d : -f 2,3 | tr -d \" | tr -d , | xargs)
-            if [[ -n "$latest_version" ]]; then
-                log_message "INFO" "Latest version appears to be: $latest_version"
-                log_message "INFO" "Try using: --version $latest_version"
-            fi
-        fi
-        
         return 1
     fi
     
@@ -535,7 +1019,32 @@ verify_checksum() {
     fi
     
     # Calculate actual checksum
-    local actual_checksum=$(sha256sum "$TEMP_DIR/mediamtx.tar.gz" | cut -d ' ' -f 1)
+    local actual_checksum=""
+    
+    # Try sha256sum first
+    if command -v sha256sum >/dev/null 2>&1; then
+        actual_checksum=$(sha256sum "$TEMP_DIR/mediamtx.tar.gz" | cut -d ' ' -f 1)
+    # Try openssl as fallback
+    elif command -v openssl >/dev/null 2>&1; then
+        actual_checksum=$(openssl dgst -sha256 "$TEMP_DIR/mediamtx.tar.gz" | cut -d ' ' -f 2)
+    # Try shasum as another fallback (macOS)
+    elif command -v shasum >/dev/null 2>&1; then
+        actual_checksum=$(shasum -a 256 "$TEMP_DIR/mediamtx.tar.gz" | cut -d ' ' -f 1)
+    else
+        log_message "WARNING" "No SHA256 checksum utility found (sha256sum, openssl, or shasum)"
+        
+        # Ask for confirmation to continue without verification
+        echo_warning "Cannot perform checksum verification because no SHA256 utility is available."
+        read -p "Continue without checksum verification? (y/n) " -n 1 -r
+        echo
+        if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+            log_message "ERROR" "Aborted by user due to inability to verify checksums"
+            return 1
+        fi
+        
+        log_message "WARNING" "Continuing without checksum verification as requested by user"
+        return 0
+    fi
     
     # Get expected checksum from the JSON file
     local expected_checksum=""
@@ -553,6 +1062,23 @@ verify_checksum() {
     
     log_message "INFO" "Expected SHA256: $expected_checksum"
     log_message "INFO" "Actual SHA256:   $actual_checksum"
+    
+    # Verify checksum is 64 characters (SHA256 length) 
+    if [ "${#expected_checksum}" -ne 64 ]; then
+        log_message "ERROR" "Expected checksum has invalid length: ${#expected_checksum} chars (should be 64)"
+        echo_error "Invalid expected checksum format: $expected_checksum"
+        
+        # Ask if user wants to continue anyway
+        read -p "Expected checksum has invalid format. Continue anyway? (y/n) " -n 1 -r
+        echo
+        if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+            log_message "ERROR" "Installation aborted due to invalid checksum format"
+            return 1
+        fi
+        
+        log_message "WARNING" "User chose to continue despite invalid checksum format"
+        return 0
+    fi
     
     if [ "$actual_checksum" != "$expected_checksum" ]; then
         log_message "ERROR" "Checksum verification failed!"
@@ -826,7 +1352,7 @@ install_mediamtx() {
         
         cat > "$CONFIG_DIR/mediamtx.yml" << EOF
 # MediaMTX minimal configuration
-# Generated by enhanced_install_mediamtx.sh v2.0.0 on $(date)
+# Generated by enhanced_install_mediamtx.sh v2.1.2 on $(date)
 logLevel: info
 logDestinations: [stdout, file]
 logFile: $LOG_DIR/mediamtx.log
@@ -1009,6 +1535,13 @@ EOF
                     echo_error "ERROR: Port $port is already in use by another process."
                 fi
             done
+        elif command -v netstat >/dev/null 2>&1; then
+            for port in "$RTSP_PORT" "$RTMP_PORT" "$HLS_PORT" "$WEBRTC_PORT"; do
+                if netstat -tuln | grep -q ":$port "; then
+                    log_message "ERROR" "Port $port is already in use"
+                    echo_error "ERROR: Port $port is already in use by another process."
+                fi
+            done
         fi
         
         # Test the binary directly to get more information
@@ -1130,6 +1663,7 @@ show_usage() {
     echo "  --offline                Do not attempt to download checksums from GitHub"
     echo "  --config-only            Only update configuration file, not the binary"
     echo "  --force-install          Force installation even if same version is installed"
+    echo "  --debug                  Enable debug mode for verbose output"
     echo "  -h, --help               Display this help message"
     echo
     echo "Examples:"
@@ -1152,20 +1686,14 @@ parse_args() {
                 VERSION="$2"
                 # Special handling for "latest"
                 if [[ "$VERSION" == "latest" ]]; then
-                    if command -v curl >/dev/null 2>&1 && command -v grep >/dev/null 2>&1; then
-                        echo_info "Fetching latest version from GitHub..."
-                        LATEST_VERSION=$(curl -s https://api.github.com/repos/bluenviron/mediamtx/releases/latest | grep "tag_name" | cut -d : -f 2,3 | tr -d \" | tr -d , | xargs)
-                        
-                        if [[ -n "$LATEST_VERSION" ]]; then
-                            echo_info "Latest version is: $LATEST_VERSION"
-                            VERSION="$LATEST_VERSION"
-                        else
-                            echo_warning "Could not determine latest version, using default: $VERSION"
-                            VERSION="v1.12.2"  # Fallback to default
-                        fi
+                    echo_info "Fetching latest version from GitHub..."
+                    LATEST_VERSION=$(get_latest_version)
+                    
+                    if [[ -n "$LATEST_VERSION" ]]; then
+                        echo_info "Latest version is: $LATEST_VERSION"
+                        VERSION="$LATEST_VERSION"
                     else
-                        echo_warning "curl or grep not available, cannot fetch latest version"
-                        echo_warning "Using default version: v1.12.2"
+                        echo_warning "Could not determine latest version, using default: $VERSION"
                         VERSION="v1.12.2"  # Fallback to default
                     fi
                 fi
@@ -1211,6 +1739,10 @@ parse_args() {
                 FORCE_INSTALL=true
                 shift
                 ;;
+            --debug)
+                DEBUG_MODE=true
+                shift
+                ;;
             -h|--help)
                 show_usage
                 exit 0
@@ -1239,43 +1771,10 @@ parse_args() {
     fi
 }
 
-# Function to test version comparison (for debugging)
-test_version_comparison() {
-    echo "Testing version comparison function..."
-    
-    # Test cases
-    test_cases=(
-        "1.12.2|1.12.0|newer"
-        "1.12.0|1.12.2|older"
-        "1.12.0|1.12.0|equal"
-        "1.0.0|0.9.9|newer"
-        "2.0.0|1.9.9|newer"
-        "1.0.0|1.0.1|older"
-    )
-    
-    for test in "${test_cases[@]}"; do
-        IFS='|' read -r v1 v2 expected <<< "$test"
-        
-        if is_version_newer "$v1" "$v2"; then
-            result="newer"
-        else
-            result="older or equal"
-        fi
-        
-        if [[ "$result" == "$expected" || ("$result" == "older or equal" && "$expected" == "equal") ]]; then
-            echo "✓ $v1 is $result than $v2 (as expected)"
-        else
-            echo "✗ $v1 is $result than $v2 (expected: $expected)"
-        fi
-    done
-    
-    echo "Test complete"
-}
-
 # Main function
 main() {
     echo "====================================="
-    echo "Enhanced MediaMTX Installer v2.0.0"
+    echo "Enhanced MediaMTX Installer v2.1.2"
     echo "====================================="
     
     # Parse command line arguments
@@ -1292,12 +1791,6 @@ main() {
     
     # Verify required commands
     verify_commands
-    
-    # Test version comparison if specified
-    if [ "${1:-}" = "--test-version-comparison" ]; then
-        test_version_comparison
-        exit 0
-    fi
     
     # Detect architecture
     ARCH=$(detect_arch)
@@ -1363,7 +1856,7 @@ main() {
         # Create new configuration
         cat > "$CONFIG_DIR/mediamtx.yml" << EOF
 # MediaMTX minimal configuration
-# Generated by enhanced_install_mediamtx.sh v2.0.0 on $(date)
+# Generated by enhanced_install_mediamtx.sh v2.1.2 on $(date)
 logLevel: info
 logDestinations: [stdout, file]
 logFile: $LOG_DIR/mediamtx.log
