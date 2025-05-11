@@ -1,5 +1,8 @@
 #!/bin/bash
 # Enhanced MediaMTX RTSP Audio Platform Installer
+#
+# https://raw.githubusercontent.com/tomtom215/mediamtx-rtsp-setup/refs/heads/main/mediamtx-rtsp-audio-installer.sh
+#
 # Version: 3.0.0
 # Date: 2025-05-14
 #
