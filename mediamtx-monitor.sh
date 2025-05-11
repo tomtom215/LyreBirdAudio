@@ -1,18 +1,19 @@
 #!/bin/bash
-# MediaMTX Resource Monitor
+# MediaMTX Resource Monitor with Enhanced Reliability
 #
-# https://raw.githubusercontent.com/tomtom215/mediamtx-rtsp-setup/refs/heads/main/mediamtx-monitor.sh
-#
-# Version: 1.0.3
-# Date: 2025-05-11
+# Version: 1.1.0
+# Date: 2025-05-12
 # Description: Monitors MediaMTX health and resources with progressive recovery strategies
 #              Handles CPU, memory, file descriptors and network monitoring
 #              Includes recovery levels and trend analysis
-#              Fixed timestamp initialization for cleaner reporting
-# Changes in v1.0.3:
-#   - Improved atomic write consistency throughout the script
-#   - Replaced direct file writes with atomic_write function calls
-#   - Fixed potential race conditions in state file operations
+#              Added enhanced reliability features for 24/7 operation
+# Changes in v1.1.0:
+#   - Added enhanced lock file recovery to prevent file descriptor leaks
+#   - Implemented disk space monitoring with emergency cleanup
+#   - Added deadman switch to prevent reboot loops
+#   - Added self-limiting resource usage for the monitor itself
+#   - Enhanced process uniqueness verification
+#   - Improved cleanup handler with comprehensive resource release
 
 # ======================================================================
 # Configuration and Setup
@@ -22,7 +23,7 @@
 set -o pipefail
 
 # Set script version
-SCRIPT_VERSION="1.0.3"
+SCRIPT_VERSION="1.1.0"
 
 # Create unique ID for this instance
 INSTANCE_ID="$$-$(date +%s)"
@@ -61,6 +62,20 @@ FILE_DESCRIPTOR_THRESHOLD=1000
 COMBINED_CPU_THRESHOLD=200
 COMBINED_CPU_WARNING=150
 
+# Disk space monitoring thresholds
+DISK_WARNING_THRESHOLD=80  # Warning at 80% disk usage
+DISK_CRITICAL_THRESHOLD=90 # Critical at 90% disk usage
+DISK_CHECK_INTERVAL=300    # Check disk space every 5 minutes
+
+# Deadman switch settings
+MAX_REBOOTS_IN_DAY=5       # Maximum allowed reboots in 24 hours
+REBOOT_HISTORY_FILE=""     # Will be set after STATE_DIR is finalized
+
+# Lock file settings 
+LOCK_FILE="${TEMP_DIR}/monitor.lock"
+LOCK_FD=9                  # File descriptor for lock file
+PID_FILE="${TEMP_DIR}/monitor.pid"
+
 # Color codes for terminal output
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -78,6 +93,102 @@ consecutive_failed_restarts=0
 uses_systemd=false
 
 # ======================================================================
+# Self-Limiting Resource Usage
+# ======================================================================
+
+# Set resource limits for the monitor itself to avoid becoming part of the problem
+set_resource_limits() {
+    if command -v ulimit >/dev/null 2>&1; then
+        # Set file descriptor limits (lower than the monitoring threshold)
+        local fd_limit=$((FILE_DESCRIPTOR_THRESHOLD / 2))
+        ulimit -n $fd_limit 2>/dev/null || true
+        
+        # Set virtual memory limit (512MB should be plenty for a monitoring script)
+        ulimit -v 524288 2>/dev/null || true
+        
+        # Limit CPU time (not supported on all systems)
+        ulimit -t 3600 2>/dev/null || true
+        
+        log "INFO" "Set self-limiting resource caps: $fd_limit file descriptors, 512MB virtual memory"
+    else
+        log "WARNING" "ulimit command not available, unable to set resource limits"
+    fi
+}
+
+# ======================================================================
+# Process Uniqueness Verification
+# ======================================================================
+
+# Verify this is the only instance of the monitor running
+verify_unique_instance() {
+    log "INFO" "Verifying monitor uniqueness"
+    
+    # Method 1: Check PID file
+    if [ -f "$PID_FILE" ]; then
+        local old_pid=$(cat "$PID_FILE" 2>/dev/null || echo "0")
+        if [[ -n "$old_pid" && "$old_pid" != "0" ]]; then
+            # Check if process still exists
+            if kill -0 "$old_pid" 2>/dev/null; then
+                # Process exists, check if it's actually our monitor
+                if ps -p "$old_pid" -o cmd= 2>/dev/null | grep -q "mediamtx-monitor"; then
+                    log "ERROR" "Another monitor instance is already running (PID: $old_pid)"
+                    return 1
+                else
+                    log "WARNING" "PID file exists but process is not a monitor. Cleaning up."
+                    rm -f "$PID_FILE"
+                fi
+            else
+                log "WARNING" "Found stale PID file. Cleaning up."
+                rm -f "$PID_FILE"
+            fi
+        fi
+    fi
+    
+    # Method 2: Look for other instances by command name
+    local script_name=$(basename "$0")
+    local other_instances=$(pgrep -f "$script_name" | grep -v "^$$\$" || true)
+    
+    if [ -n "$other_instances" ]; then
+        # Verify these are actually monitor processes, not just similarly named
+        local actual_monitors=0
+        for pid in $other_instances; do
+            if ps -p "$pid" -o cmd= 2>/dev/null | grep -q "mediamtx-monitor"; then
+                actual_monitors=$((actual_monitors + 1))
+                log "ERROR" "Found another monitor instance: PID $pid"
+            fi
+        done
+        
+        if [ "$actual_monitors" -gt 0 ]; then
+            log "ERROR" "Total of $actual_monitors other monitor instances detected"
+            return 1
+        fi
+    fi
+    
+    # Method 3: Check for system lock file (extra safety)
+    if [ -f "/var/run/mediamtx-monitor.lock" ]; then
+        local lock_pid=$(cat "/var/run/mediamtx-monitor.lock" 2>/dev/null || echo "0")
+        if [[ -n "$lock_pid" && "$lock_pid" != "0" ]] && kill -0 "$lock_pid" 2>/dev/null; then
+            log "ERROR" "System-wide lock file indicates another instance (PID: $lock_pid)"
+            return 1
+        else
+            log "WARNING" "Found stale system lock file. Cleaning up."
+            rm -f "/var/run/mediamtx-monitor.lock"
+        fi
+    fi
+    
+    # We appear to be unique - create the system lock file
+    mkdir -p "/var/run" 2>/dev/null || true
+    if echo "$$" > "/var/run/mediamtx-monitor.lock" 2>/dev/null; then
+        log "INFO" "Created system-wide lock file"
+    else
+        log "WARNING" "Could not create system-wide lock file. Continuing anyway."
+    fi
+    
+    log "INFO" "Monitor verified as unique instance"
+    return 0
+}
+
+# ======================================================================
 # Helper Functions
 # ======================================================================
 
@@ -86,6 +197,12 @@ handle_error() {
     local line_number=$1
     local error_code=$2
     echo "[$line_number] [ERROR] Error at line ${line_number}: Command exited with status ${error_code}" >> "$MONITOR_LOG"
+    
+    # Check for open file descriptors and clean them up
+    if [ -e "/proc/$$/fd/$LOCK_FD" ]; then
+        echo "[$line_number] [WARNING] Detected open lock file descriptor in error handler" >> "$MONITOR_LOG"
+        eval "exec $LOCK_FD>&-" 2>/dev/null
+    fi
 }
 
 # Trap for error handling
@@ -115,7 +232,7 @@ log() {
     cat "$temp_log_file" >> "$MONITOR_LOG"
     
     # If it's a recovery action, also log to the recovery log
-    if [[ "$level" == "RECOVERY" || "$level" == "REBOOT" ]]; then
+    if [[ "$level" == "RECOVERY" || "$level" == "REBOOT" || "$level" == "FATAL" ]]; then
         cat "$temp_log_file" >> "$RECOVERY_LOG"
     fi
     
@@ -128,7 +245,7 @@ log() {
             "WARNING")
                 echo -e "${YELLOW}[$timestamp] [$level]${NC} $message"
                 ;;
-            "ERROR")
+            "ERROR"|"FATAL")
                 echo -e "${RED}[$timestamp] [$level]${NC} $message"
                 ;;
             "RECOVERY")
@@ -207,6 +324,288 @@ atomic_append() {
 }
 
 # ======================================================================
+# Disk Space Monitoring
+# ======================================================================
+
+# Function to check disk space and take action if needed
+check_disk_space() {
+    local log_dir=$(dirname "$MONITOR_LOG")
+    
+    # Get disk usage percentage for the log directory
+    local disk_usage
+    if command_exists df; then
+        disk_usage=$(df -P "$log_dir" 2>/dev/null | awk 'NR==2 {print $5}' | tr -d '%')
+        
+        # If df failed or returned non-numeric, try an alternative approach
+        if [[ ! "$disk_usage" =~ ^[0-9]+$ ]]; then
+            log "WARNING" "Failed to get disk usage with df, trying alternative method"
+            disk_usage=$(df -P "$log_dir" 2>/dev/null | tail -1 | awk '{print int($3*100/$2)}')
+        fi
+        
+        # If still failed, set to unknown
+        if [[ ! "$disk_usage" =~ ^[0-9]+$ ]]; then
+            log "ERROR" "Failed to determine disk usage"
+            return 1
+        fi
+        
+        # Record disk usage for trend analysis
+        atomic_write "${STATE_DIR}/disk_usage" "$disk_usage"
+        
+        # Take action based on thresholds
+        if [ "$disk_usage" -ge "$DISK_CRITICAL_THRESHOLD" ]; then
+            log "ERROR" "Disk space critical: ${disk_usage}% used on log partition"
+            
+            # Emergency cleanup
+            log "RECOVERY" "Performing emergency log cleanup"
+            
+            # 1. Rotate logs immediately
+            if command_exists logrotate && [ -f "/etc/logrotate.d/audio-rtsp" ]; then
+                logrotate -f /etc/logrotate.d/audio-rtsp
+                log "INFO" "Forced log rotation"
+            fi
+            
+            # 2. Remove old rotated logs
+            find "$LOG_DIR" -name "*.gz" -type f -delete
+            log "INFO" "Removed compressed log archives"
+            
+            # 3. Truncate large logs
+            find "$LOG_DIR" -name "*.log" -type f -size +10M -exec truncate -s 5M {} \;
+            log "INFO" "Truncated oversized log files"
+            
+            # 4. Remove old state files
+            find "${STATE_DIR}" -type f -mtime +7 -delete
+            log "INFO" "Cleaned up old state files"
+            
+            # Check disk space again after cleanup
+            local new_usage=$(df -P "$log_dir" 2>/dev/null | awk 'NR==2 {print $5}' | tr -d '%')
+            log "INFO" "Disk usage after cleanup: ${new_usage}% (was ${disk_usage}%)"
+            
+            # If still critical, take more drastic measures
+            if [ "$new_usage" -ge "$DISK_CRITICAL_THRESHOLD" ]; then
+                log "ERROR" "Disk space still critical after cleanup"
+                
+                # Find and remove the largest files in the log directory
+                find "$LOG_DIR" -type f -not -path "*/state/*" | xargs du -h 2>/dev/null | sort -hr | head -10 | while read -r size file; do
+                    log "WARNING" "Removing large file: $file ($size)"
+                    rm -f "$file"
+                done
+                
+                # If we're being super aggressive, truncate ALL logs
+                find "$LOG_DIR" -name "*.log" -type f -exec truncate -s 0 {} \;
+                
+                # Add marker to avoid repeated aggressive cleanup
+                atomic_write "${STATE_DIR}/emergency_cleanup_performed" "$(date +%s)"
+            fi
+            
+            return 1
+        elif [ "$disk_usage" -ge "$DISK_WARNING_THRESHOLD" ]; then
+            log "WARNING" "Disk space warning: ${disk_usage}% used on log partition"
+            
+            # Perform lighter cleanup
+            log "INFO" "Performing preventative log cleanup"
+            
+            # 1. Remove old logs (older than 30 days)
+            find "$LOG_DIR" -name "*.log.*" -type f -mtime +30 -delete
+            
+            # 2. Compress large logs
+            find "$LOG_DIR" -name "*.log" -type f -size +50M -exec gzip -f {} \; 2>/dev/null || true
+            
+            return 0
+        else
+            # Normal disk usage
+            return 0
+        fi
+    else
+        log "WARNING" "df command not available to check disk space"
+        return 1
+    fi
+}
+
+# ======================================================================
+# Enhanced Lock File Recovery
+# ======================================================================
+
+# Acquire lock with enhanced error handling
+acquire_lock() {
+    local lock_file="$1"
+    local lock_fd="$2"
+    local timeout="${3:-10}"  # Default timeout of 10 seconds
+    
+    log "DEBUG" "Attempting to acquire lock: $lock_file (FD: $lock_fd, timeout: ${timeout}s)"
+    
+    # Check if file descriptor is already in use
+    if [ -e "/proc/$$/fd/$lock_fd" ]; then
+        log "WARNING" "File descriptor $lock_fd is already in use, closing it first"
+        eval "exec $lock_fd>&-" 2>/dev/null
+    fi
+    
+    # Make sure the directory exists
+    mkdir -p "$(dirname "$lock_file")" 2>/dev/null
+    
+    # Open the file descriptor
+    eval "exec $lock_fd>\"$lock_file\"" || {
+        log "ERROR" "Failed to open lock file: $lock_file"
+        return 1
+    }
+    
+    # Try to acquire the lock with timeout using flock
+    if command_exists flock; then
+        if ! flock -w "$timeout" -n "$lock_fd"; then
+            log "ERROR" "Failed to acquire lock within ${timeout}s timeout"
+            eval "exec $lock_fd>&-" 2>/dev/null
+            return 1
+        fi
+    else
+        # Fallback if flock is not available
+        log "WARNING" "flock command not available, using basic file locking"
+        
+        # Simple PID-based locking
+        if [ -s "$lock_file" ]; then
+            local pid_in_lock=$(cat "$lock_file" 2>/dev/null)
+            if [ -n "$pid_in_lock" ] && kill -0 "$pid_in_lock" 2>/dev/null; then
+                log "ERROR" "Process $pid_in_lock already holds the lock"
+                eval "exec $lock_fd>&-" 2>/dev/null
+                return 1
+            else
+                log "WARNING" "Stale lock found, overriding"
+            fi
+        fi
+    fi
+    
+    # Store our PID in the lock file
+    echo "$$" >&$lock_fd
+    
+    log "DEBUG" "Successfully acquired lock: $lock_file"
+    return 0
+}
+
+# Release lock with enhanced verification
+release_lock() {
+    local lock_fd="$1"
+    
+    log "DEBUG" "Releasing lock on file descriptor $lock_fd"
+    
+    # Verify the file descriptor exists before trying to close
+    if [ -e "/proc/$$/fd/$lock_fd" ]; then
+        # Close the file descriptor to release the lock
+        eval "exec $lock_fd>&-" 2>/dev/null
+        log "DEBUG" "Lock file descriptor closed"
+    else
+        log "WARNING" "File descriptor $lock_fd not found or already closed"
+    fi
+}
+
+# ======================================================================
+# Deadman Switch for Reboot Protection
+# ======================================================================
+
+# Initialize the deadman switch
+init_deadman_switch() {
+    REBOOT_HISTORY_FILE="${STATE_DIR}/reboot_history.txt"
+    
+    # Check for emergency override file
+    if [ -f "${CONFIG_DIR}/emergency_disable_reboot" ]; then
+        log "WARNING" "Found emergency reboot disable flag, auto-reboot will be disabled"
+        ENABLE_AUTO_REBOOT=false
+    fi
+    
+    # Create reboot history file if it doesn't exist
+    if [ ! -f "$REBOOT_HISTORY_FILE" ]; then
+        log "INFO" "Initializing reboot history tracking"
+        mkdir -p "$(dirname "$REBOOT_HISTORY_FILE")" 2>/dev/null
+        touch "$REBOOT_HISTORY_FILE"
+    fi
+    
+    # Clean up old entries (keep only last 30 days)
+    if [ -f "$REBOOT_HISTORY_FILE" ]; then
+        local current_time=$(date +%s)
+        local thirty_days_ago=$((current_time - 2592000))
+        
+        # Create a temporary file with only recent entries
+        local temp_file="${TEMP_DIR}/reboot_history.tmp"
+        
+        # Filter to keep only entries from the last 30 days
+        if [ -s "$REBOOT_HISTORY_FILE" ]; then
+            cat "$REBOOT_HISTORY_FILE" | while read -r timestamp; do
+                if [[ "$timestamp" =~ ^[0-9]+$ ]] && [ "$timestamp" -gt "$thirty_days_ago" ]; then
+                    echo "$timestamp" >> "$temp_file"
+                fi
+            done
+            
+            # Replace the original file
+            if [ -f "$temp_file" ]; then
+                mv "$temp_file" "$REBOOT_HISTORY_FILE"
+            else
+                # No valid entries, create empty file
+                > "$REBOOT_HISTORY_FILE"
+            fi
+        fi
+    fi
+    
+    log "INFO" "Deadman switch initialized"
+}
+
+# Check if we've exceeded the reboot limit
+check_reboot_limit() {
+    # If auto-reboot is disabled, no need to check
+    if [ "$ENABLE_AUTO_REBOOT" != true ]; then
+        return 1
+    fi
+    
+    if [ ! -f "$REBOOT_HISTORY_FILE" ]; then
+        log "WARNING" "Reboot history file not found"
+        return 0
+    fi
+    
+    local current_time=$(date +%s)
+    local day_ago=$((current_time - 86400))
+    local recent_reboots=0
+    
+    # Count reboots in the last 24 hours
+    while read -r timestamp; do
+        if [[ "$timestamp" =~ ^[0-9]+$ ]] && [ "$timestamp" -gt "$day_ago" ]; then
+            recent_reboots=$((recent_reboots + 1))
+        fi
+    done < "$REBOOT_HISTORY_FILE"
+    
+    log "INFO" "Found $recent_reboots reboots in the last 24 hours"
+    
+    # Update the counter in state
+    atomic_write "${STATE_DIR}/recent_reboots" "$recent_reboots"
+    
+    # Check if we've exceeded the limit
+    if [ "$recent_reboots" -ge "$MAX_REBOOTS_IN_DAY" ]; then
+        log "FATAL" "Too many reboots in 24 hours ($recent_reboots), disabling auto-reboot"
+        
+        # Create emergency disable file
+        atomic_write "${CONFIG_DIR}/emergency_disable_reboot" "1"
+        
+        # Disable auto-reboot for this session
+        ENABLE_AUTO_REBOOT=false
+        
+        # Send alert if possible
+        if command_exists wall; then
+            echo "ALERT: MediaMTX monitor has detected $recent_reboots reboots in 24 hours and has disabled auto-reboot." | wall
+        fi
+        
+        return 1
+    fi
+    
+    return 0
+}
+
+# Record a reboot in the history
+record_reboot() {
+    local current_time=$(date +%s)
+    
+    # Append the current timestamp to the history file
+    atomic_append "$REBOOT_HISTORY_FILE" "$current_time"
+    
+    # Also log the reboot
+    log "REBOOT" "Recorded reboot at $(date)"
+}
+
+# ======================================================================
 # Initialization Functions
 # ======================================================================
 
@@ -244,6 +643,10 @@ load_config() {
     chmod 755 "$STATE_DIR" "$STATS_DIR" 2>/dev/null || 
         log "WARNING" "Failed to set permissions on state directories"
     
+    # Update lock file location after finalizing directories
+    LOCK_FILE="${TEMP_DIR}/monitor.lock"
+    PID_FILE="${TEMP_DIR}/monitor.pid"
+    
     # Check if we can use systemctl to manage MediaMTX
     uses_systemd=false
     if command_exists systemctl; then
@@ -257,6 +660,18 @@ load_config() {
         log "WARNING" "systemd not available, using direct process management"
     fi
     
+    # Initialize deadman switch
+    init_deadman_switch
+    
+    # Set self-imposed resource limits
+    set_resource_limits
+    
+    # Verify this is the only instance running
+    if ! verify_unique_instance; then
+        log "FATAL" "Another instance of the monitor is already running, exiting"
+        exit 1
+    fi
+    
     # Load previous state if available
     load_previous_state
     
@@ -264,7 +679,7 @@ load_config() {
     trap cleanup_handler SIGINT SIGTERM HUP
 }
 
-# Load previous state from state files - FIXED VERSION
+# Load previous state from state files
 load_previous_state() {
     local current_time=$(date +%s)
     
@@ -327,17 +742,44 @@ load_previous_state() {
     log "INFO" "Loaded consecutive failed restarts: $consecutive_failed_restarts"
 }
 
-# Clean up function for exit
+# Clean up function for exit - ENHANCED with lock and resource handling
 cleanup_handler() {
     log "INFO" "Received shutdown signal, performing cleanup"
+    
+    # Extra context for debugging exit conditions
+    log "DEBUG" "Exit details: PID=$$, PPID=$PPID, Signal=$1"
     
     # Save current state
     atomic_write "${STATE_DIR}/last_restart_time" "$last_restart_time"
     atomic_write "${STATE_DIR}/last_reboot_time" "$last_reboot_time"
     atomic_write "${STATE_DIR}/consecutive_failed_restarts" "$consecutive_failed_restarts"
     
+    # Enhanced lock file recovery - check for any lingering lock
+    if [ -e "/proc/$$/fd/$LOCK_FD" ]; then
+        log "WARNING" "Detected lingering lock file descriptor on exit, forcing closure"
+        release_lock "$LOCK_FD"
+    fi
+    
+    # Remove our PID file if it contains our PID
+    if [ -f "$PID_FILE" ]; then
+        local pid_contents=$(cat "$PID_FILE" 2>/dev/null || echo "")
+        if [ "$pid_contents" = "$$" ]; then
+            rm -f "$PID_FILE" 2>/dev/null || log "WARNING" "Failed to remove PID file on exit"
+        fi
+    fi
+    
+    # Remove system-wide lock if it contains our PID
+    if [ -f "/var/run/mediamtx-monitor.lock" ]; then
+        local lock_pid=$(cat "/var/run/mediamtx-monitor.lock" 2>/dev/null || echo "")
+        if [ "$lock_pid" = "$$" ]; then
+            rm -f "/var/run/mediamtx-monitor.lock" 2>/dev/null || log "WARNING" "Failed to remove system lock file"
+        fi
+    }
+    
     # Clean up temporary files
-    rm -rf "${TEMP_DIR}"
+    if [ -d "${TEMP_DIR}" ]; then
+        rm -rf "${TEMP_DIR}" 2>/dev/null || log "WARNING" "Failed to remove temp directory"
+    }
     
     log "INFO" "Cleanup completed, exiting"
     exit 0
@@ -1000,7 +1442,7 @@ restart_ffmpeg_processes() {
     fi
 }
 
-# Progressive recovery with multiple levels
+# Progressive recovery with multiple levels - ENHANCED with deadman switch
 recover_mediamtx() {
     local reason="$1"
     local current_time
@@ -1286,11 +1728,22 @@ recover_mediamtx() {
             ;;
             
         4)
-            # Level 4: System reboot consideration
+            # Level 4: System reboot consideration - ENHANCED WITH DEADMAN SWITCH
             log "RECOVERY" "Level 4: Considering system reboot after multiple failed recoveries"
             
             # Check if auto reboot is enabled
             if [ "$ENABLE_AUTO_REBOOT" = true ]; then
+                # First, check with the deadman switch
+                if ! check_reboot_limit; then
+                    log "WARNING" "Deadman switch has disabled auto-reboot due to too many recent reboots"
+                    log "WARNING" "Attempting one more aggressive recovery instead"
+                    
+                    # Fall back to level 3 recovery when reboot is disabled
+                    recovery_level=3
+                    recover_mediamtx "EMERGENCY"
+                    return $?
+                fi
+                
                 # Check if we're within cooldown after recent reboot
                 if [ $((current_time - last_reboot_time)) -lt "$REBOOT_COOLDOWN" ]; then
                     log "WARNING" "In reboot cooldown period, attempting one more aggressive recovery"
@@ -1315,9 +1768,10 @@ recover_mediamtx() {
                     # If we got here, the final attempt failed
                     log "REBOOT" "Initiating system reboot after $consecutive_failed_restarts failed recoveries"
                     
-                    # Record reboot in state file - FIXED: Using atomic_write
+                    # Record reboot in state file and in deadman switch
                     atomic_write "${STATE_DIR}/last_reboot_time" "$(date +%s)"
                     last_reboot_time=$(date +%s)
+                    record_reboot
                     
                     # Write a detailed report before reboot
                     local reboot_file="${STATE_DIR}/reboot_reason_$(date +%Y%m%d%H%M%S).txt"
@@ -1397,6 +1851,7 @@ main() {
     consecutive_high_memory=0
     previous_cpu=0
     previous_memory=0
+    last_disk_check=0
     
     log "INFO" "Starting main monitoring loop with ${CPU_CHECK_INTERVAL}s interval"
     
@@ -1432,8 +1887,14 @@ main() {
         atomic_write "${STATE_DIR}/current_uptime" "$uptime"
         atomic_write "${STATE_DIR}/current_fd" "$file_descriptors"
         
-        # Log current status at a regular interval (every 5 minutes)
+        # Periodically check disk space
         current_time=$(date +%s)
+        if [ $((current_time - last_disk_check)) -ge "$DISK_CHECK_INTERVAL" ]; then
+            check_disk_space
+            last_disk_check=$current_time
+        }
+        
+        # Log current status at a regular interval (every 5 minutes)
         if (( current_time % 300 < CPU_CHECK_INTERVAL )); then
             log "INFO" "STATUS: MediaMTX (PID: $mediamtx_pid) - CPU: ${cpu_usage}%, Combined CPU: ${combined_cpu_usage}%, Memory: ${memory_usage}%, FDs: $file_descriptors, Uptime: ${uptime}s"
         fi
