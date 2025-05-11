@@ -56,30 +56,30 @@ The platform is designed for:
 
 The platform consists of the following core components:
 
-1. **MediaMTX Installer** (`install_mediamtx.sh`, v2.1.2)
+1. **MediaMTX Installer** (`install_mediamtx.sh`)
    - Secure and robust installation of the MediaMTX RTSP server
    - Architecture detection and checksum verification
    - Custom port configuration
    - Systemd integration
 
-2. **Audio RTSP Setup** (`setup_audio_rtsp.sh`, v2.0.0)
+2. **Audio RTSP Setup** (`setup_audio_rtsp.sh`)
    - Audio streaming service configuration
    - Log rotation setup
    - Helper scripts creation
 
-3. **Stream Management** (`startmic.sh`, v5.2.1)
+3. **Stream Management** (`startmic.sh`)
    - Audio device detection and stream configuration
    - Device mapping for consistent stream naming
    - Stream monitoring and auto-recovery
    - Per-device configuration options
 
-4. **System Monitoring** (`mediamtx-monitor-fixed.sh`, v1.0.3)
+4. **System Monitoring** (`mediamtx-monitor-fixed.sh`)
    - Resource usage monitoring (CPU, memory, file descriptors)
    - Four-level progressive recovery system
    - Trend analysis for predictive maintenance
    - System-wide health checks
 
-5. **Version Checker** (`MediaMTX-Version-Checker.sh`, v1.2.0)
+5. **Version Checker** (`MediaMTX-Version-Checker.sh`)
    - Version availability validation
    - Checksum verification
    - Architecture compatibility checking
