@@ -263,13 +263,13 @@ install_monitor_script() {
     # Destination script path
     local script_path="/usr/local/bin/mediamtx-monitor.sh"
     
-    # Check if mediamtx-monitor-fixed.sh exists in current directory
-    if [ -f "mediamtx-monitor-fixed.sh" ]; then
-        log "INFO" "Found mediamtx-monitor-fixed.sh in current directory"
-        cp "mediamtx-monitor-fixed.sh" "$script_path"
+    # Check if mediamtx-monitor.sh exists in current directory
+    if [ -f "mediamtx-monitor.sh" ]; then
+        log "INFO" "Found mediamtx-monitor.sh in current directory"
+        cp "mediamtx-monitor.sh" "$script_path"
     else
-        log "ERROR" "mediamtx-monitor-fixed.sh not found in current directory"
-        echo -e "${RED}mediamtx-monitor-fixed.sh script not found!${NC}"
+        log "ERROR" "mediamtx-monitor.sh not found in current directory"
+        echo -e "${RED}mediamtx-monitor.sh script not found!${NC}"
         echo -e "${YELLOW}Would you like to create a minimalist version? (Y/n) [default: Y]${NC}"
         read -t 10 -r create_min || create_min="y"
         
