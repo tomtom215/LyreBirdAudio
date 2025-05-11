@@ -149,9 +149,9 @@ This platform provides two installation methods:
 1. **All-in-One Installer**: A single script that handles the complete installation process with interactive menus
 2. **Manual Installation**: Step-by-step installation of individual components for more control
 
-> **⚠️ SECURITY WARNING**: Always review scripts before downloading and running them with sudo privileges. The installation scripts require root access to configure system services and modify system directories.
-
 ### All-in-One Installation (Recommended)
+
+> **⚠️ SECURITY WARNING**: Always review scripts before downloading and running them with sudo privileges. The installation scripts require root access to configure system services and modify system directories.
 
 The simplest way to install the MediaMTX RTSP Audio Platform is using the all-in-one installer script:
 
