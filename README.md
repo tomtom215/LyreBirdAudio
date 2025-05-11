@@ -148,8 +148,8 @@ Before installation:
    wget https://raw.githubusercontent.com/tomtom215/mediamtx-rtsp-setup/main/setup_audio_rtsp.sh
    wget https://raw.githubusercontent.com/tomtom215/mediamtx-rtsp-setup/main/startmic.sh
    wget https://raw.githubusercontent.com/tomtom215/mediamtx-rtsp-setup/main/setup-monitor-script.sh
-   wget https://raw.githubusercontent.com/tomtom215/mediamtx-rtsp-setup/main/mediamtx-monitor-fixed.sh
-   wget https://raw.githubusercontent.com/tomtom215/mediamtx-rtsp-setup/main/MediaMTX-Version-Checker.sh
+   wget https://raw.githubusercontent.com/tomtom215/mediamtx-rtsp-setup/main/mediamtx-monitor.sh
+   wget https://raw.githubusercontent.com/tomtom215/mediamtx-rtsp-setup/main/mediaMTX-Version-Checker.sh
    ```
 
 2. Make scripts executable:
