@@ -1,5 +1,8 @@
 #!/bin/bash
 # MediaMTX Version Checker with Debug Mode
+#
+# https://raw.githubusercontent.com/tomtom215/mediamtx-rtsp-setup/refs/heads/main/mediamtx-version-checker.sh
+#
 # Version: 1.2.1
 # Date: 2025-05-10
 # This script queries GitHub API to find available MediaMTX versions
