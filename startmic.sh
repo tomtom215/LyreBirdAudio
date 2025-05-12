@@ -3,16 +3,16 @@
 #
 # https://raw.githubusercontent.com/tomtom215/mediamtx-rtsp-setup/refs/heads/main/startmic.sh
 #
-# Version: 5.2.1
-# Date: 2025-05-10
+# Version: 5.3.0
+# Date: 2025-05-13
 # Description: Production-grade script for streaming audio from capture devices to RTSP
 #              With improved lock handling, atomic operations, and robust error recovery
-# Changes in v5.2.1:
-#  - Fixed syntax errors where closing braces were used instead of 'fi'
-#  - Enhanced lock management to ensure proper lock file descriptor cleanup in all error paths
-#  - Improved lock release function with additional validation
-#  - Added more detailed logging for lock operations
-#  - Added file descriptor validation before operations
+# Changes in v5.3.0:
+#  - Fixed lock management to prevent file descriptor leaks and race conditions
+#  - Enhanced process cleanup for more reliable service shutdown
+#  - Improved monitoring with cooldown periods to prevent restart loops
+#  - Added systemd service optimization for better restart behavior
+#  - Fixed error handling in all execution paths
 
 # Exit on error (controlled)
 set -o pipefail
@@ -163,7 +163,7 @@ log() {
     fi
 }
 
-# Write a file atomically
+# Function to ensure atomic writes to files
 atomic_write() {
     local file="$1"
     local content="$2"
@@ -171,13 +171,18 @@ atomic_write() {
     # Create directory if it doesn't exist
     mkdir -p "$(dirname "$file")" 2>/dev/null
     
-    # Write to temp file first
+    # Write to temp file first to ensure atomic operation
     local temp_file="${file}.tmp.$$"
     echo "$content" > "$temp_file"
     
     # Move atomically
-    mv "$temp_file" "$file"
-    return $?
+    if ! mv -f "$temp_file" "$file" 2>/dev/null; then
+        log "ERROR" "Failed to atomically write to $file"
+        rm -f "$temp_file" 2>/dev/null  # Clean up on failure
+        return 1
+    fi
+    
+    return 0
 }
 
 # Load configuration if available
@@ -187,11 +192,13 @@ if [ -f "$CONFIG_FILE" ]; then
     source "$CONFIG_FILE"
 fi
 
-# Function to acquire lock with timeout - ENHANCED
+# Enhanced lock management function with proper error handling
 acquire_lock() {
     local lock_file="$1"
     local lock_fd="$2"
     local timeout="${3:-10}"  # Default timeout of 10 seconds
+    
+    log "DEBUG" "Attempting to acquire lock: $lock_file (FD: $lock_fd, timeout: ${timeout}s)"
     
     # Make sure the directory exists
     mkdir -p "$(dirname "$lock_file")" 2>/dev/null || {
@@ -199,71 +206,74 @@ acquire_lock() {
         return 1
     }
     
-    # Check if the file descriptor is already open (shouldn't happen, but just in case)
+    # Check if file descriptor is already in use - close it properly first
     if [ -e "/proc/$$/fd/$lock_fd" ]; then
         log "WARNING" "File descriptor $lock_fd is already in use, closing it first"
-        # Try to close it first to prevent leaks
-        eval "exec $lock_fd>&-" 2>/dev/null
+        # Close FD safely
+        eval "exec $lock_fd>&-" 2>/dev/null || true
+        # Give the OS a moment to release the FD
+        sleep 0.1
     fi
     
-    # Open the lock file
-    eval "exec $lock_fd>\"$lock_file\"" || {
+    # Open the lock file descriptor - redirecting stderr to avoid error messages
+    eval "exec $lock_fd>\"$lock_file\"" 2>/dev/null || {
         log "ERROR" "Failed to open lock file: $lock_file"
         return 1
     }
     
-    log "DEBUG" "Attempting to acquire lock: $lock_file (FD: $lock_fd, timeout: ${timeout}s)"
+    # Verify the file descriptor is actually open
+    if [ ! -e "/proc/$$/fd/$lock_fd" ]; then
+        log "ERROR" "Failed to create valid file descriptor for lock"
+        return 1
+    fi
     
-    # Try to acquire the lock with timeout
-    if ! flock -w "$timeout" -n "$lock_fd"; then
-        # Check if there's a PID in the file
-        if [ -s "$PID_FILE" ]; then
-            OLD_PID=$(cat "$PID_FILE" 2>/dev/null || echo "0")
-            if [[ -n "$OLD_PID" && "$OLD_PID" != "0" ]]; then
-                # Check if process is still running
-                if kill -0 "$OLD_PID" 2>/dev/null; then
-                    log "ERROR" "Another instance is already running (PID: $OLD_PID)"
-                    # Close the file descriptor before returning to prevent leaks
-                    eval "exec $lock_fd>&-"
-                    return 1
-                else
-                    log "WARNING" "Found stale PID file for non-existent process: $OLD_PID"
-                    # We need to close and reopen the lock file
-                    eval "exec $lock_fd>&-"
-                    
-                    # Remove stale lock and PID file
-                    rm -f "$lock_file" "$PID_FILE"
-                    
-                    # Try again
-                    eval "exec $lock_fd>\"$lock_file\"" || {
-                        log "ERROR" "Failed to reopen lock file after cleanup"
-                        return 1
-                    }
-                    
-                    if ! flock -w "$timeout" -n "$lock_fd"; then
-                        log "ERROR" "Failed to acquire lock even after cleanup"
-                        # Close the file descriptor before returning to prevent leaks
-                        eval "exec $lock_fd>&-"
-                        return 1
+    # Try to acquire the lock with timeout using flock if available
+    if command -v flock >/dev/null 2>&1; then
+        if ! flock -w "$timeout" -n "$lock_fd" 2>/dev/null; then
+            # Handle failure to acquire lock
+            if [ -s "$PID_FILE" ]; then
+                local old_pid=$(cat "$PID_FILE" 2>/dev/null || echo "0")
+                if [[ -n "$old_pid" && "$old_pid" != "0" ]]; then
+                    # Check if process is still running
+                    if kill -0 "$old_pid" 2>/dev/null; then
+                        log "ERROR" "Another instance is already running (PID: $old_pid)"
+                    else
+                        log "WARNING" "Found stale PID file for non-existent process: $old_pid"
+                        # Clean up stale files
+                        eval "exec $lock_fd>&-" 2>/dev/null || true
+                        rm -f "$lock_file" "$PID_FILE" 2>/dev/null || true
+                        sleep 1
+                        
+                        # Try again with the lock acquisition
+                        acquire_lock "$lock_file" "$lock_fd" "$timeout"
+                        return $?
                     fi
-                    log "INFO" "Successfully acquired lock after cleanup"
                 fi
-            else
-                log "ERROR" "PID file contains invalid data"
-                # Close the file descriptor before returning to prevent leaks
-                eval "exec $lock_fd>&-"
-                return 1
             fi
-        else
-            log "ERROR" "Cannot acquire lock (timeout after ${timeout}s)"
-            # Close the file descriptor before returning to prevent leaks
-            eval "exec $lock_fd>&-"
+            
+            log "ERROR" "Failed to acquire lock (timeout after ${timeout}s)"
+            eval "exec $lock_fd>&-" 2>/dev/null || true
             return 1
+        fi
+    else
+        # Fallback if flock is not available
+        log "WARNING" "flock command not available, using basic file locking"
+        
+        # Simple PID-based locking
+        if [ -s "$lock_file" ]; then
+            local pid_in_lock=$(cat "$lock_file" 2>/dev/null)
+            if [ -n "$pid_in_lock" ] && kill -0 "$pid_in_lock" 2>/dev/null; then
+                log "ERROR" "Process $pid_in_lock already holds the lock"
+                eval "exec $lock_fd>&-" 2>/dev/null || true
+                return 1
+            else
+                log "WARNING" "Stale lock found, overriding"
+            fi
         fi
     fi
     
     # Lock acquired, write our PID to it
-    echo "$$" >&"$lock_fd"
+    echo "$$" >&$lock_fd 2>/dev/null || log "WARNING" "Failed to write PID to lock file"
     
     # Also write PID to PID file atomically
     atomic_write "$PID_FILE" "$$"
@@ -272,16 +282,18 @@ acquire_lock() {
     return 0
 }
 
-# Function to release lock - ENHANCED
+# Enhanced release_lock function with proper error handling
 release_lock() {
     local lock_fd="$1"
     
     log "DEBUG" "Releasing lock (FD: $lock_fd)"
     
-    # Check if the file descriptor is valid and open
+    # Check if the file descriptor exists and is open
     if [ -e "/proc/$$/fd/$lock_fd" ]; then
         # Close the file descriptor to release the lock
-        eval "exec $lock_fd>&-"
+        eval "exec $lock_fd>&-" 2>/dev/null || {
+            log "WARNING" "Failed to close lock file descriptor $lock_fd"
+        }
         log "DEBUG" "Lock file descriptor $lock_fd closed successfully"
     else
         log "WARNING" "Lock file descriptor $lock_fd not found or already closed"
@@ -289,10 +301,9 @@ release_lock() {
     
     # Remove PID file if it contains our PID
     if [[ -f "$PID_FILE" ]]; then
-        local pid_contents
-        pid_contents=$(cat "$PID_FILE" 2>/dev/null || echo "")
+        local pid_contents=$(cat "$PID_FILE" 2>/dev/null || echo "")
         if [[ "$pid_contents" == "$$" ]]; then
-            if rm -f "$PID_FILE"; then
+            if rm -f "$PID_FILE" 2>/dev/null; then
                 log "DEBUG" "PID file removed successfully"
             else
                 log "WARNING" "Failed to remove PID file: $PID_FILE"
@@ -303,20 +314,25 @@ release_lock() {
     fi
 }
 
-# Enhanced cleanup function
+# Enhanced cleanup function with reliable process cleanup
 cleanup() {
     local exit_code="${1:-0}"
     local reason="${2:-normal exit}"
     
     log "INFO" "Starting cleanup process (reason: $reason)"
     
-    # Stop all ffmpeg processes started by this script
+    # Use process group to ensure all child processes are terminated
+    local script_pgid=$(ps -o pgid= -p $$ | tr -d ' ')
+    
+    # First step: Stop ffmpeg processes more reliably
+    log "INFO" "Stopping ffmpeg processes..."
+    
+    # Method 1: Using stored PIDs
     if [ -f "${TEMP_FILE}.pids" ]; then
-        log "INFO" "Stopping ffmpeg processes"
         while read -r pid; do
             if kill -0 "$pid" 2>/dev/null; then
                 log "DEBUG" "Stopping ffmpeg process: $pid"
-                # First try SIGTERM for graceful shutdown
+                # First try SIGTERM
                 kill -15 "$pid" 2>/dev/null
                 
                 # Give it a moment to shut down
@@ -334,23 +350,119 @@ cleanup() {
                 fi
             fi
         done < "${TEMP_FILE}.pids"
-    else
-        # Fallback: try to stop relevant ffmpeg processes
-        log "INFO" "No PID file found, attempting to find and stop ffmpeg RTSP processes"
-        pkill -f "ffmpeg.*rtsp://localhost:$RTSP_PORT" 2>/dev/null || true
+    fi
+    
+    # Method 2: Find by pattern
+    pkill -15 -f "ffmpeg.*rtsp://localhost:$RTSP_PORT" 2>/dev/null || true
+    sleep 1
+    pkill -9 -f "ffmpeg.*rtsp://localhost:$RTSP_PORT" 2>/dev/null || true
+    
+    # Method 3: Kill all processes in our process group except ourselves
+    if [ -n "$script_pgid" ]; then
+        # Find all processes in our group except this script
+        local child_pids=""
+        child_pids=$(ps -eo pid,pgid | awk -v pgid="$script_pgid" -v self="$$" '$2==pgid && $1!=self {print $1}')
+        
+        if [ -n "$child_pids" ]; then
+            log "DEBUG" "Terminating child processes in group $script_pgid: $child_pids"
+            for child_pid in $child_pids; do
+                kill -15 "$child_pid" 2>/dev/null || true
+            done
+            sleep 1
+            # Force kill any remaining 
+            for child_pid in $child_pids; do
+                if kill -0 "$child_pid" 2>/dev/null; then
+                    kill -9 "$child_pid" 2>/dev/null || true
+                fi
+            done
+        fi
     fi
     
     # Remove temporary files
     log "DEBUG" "Removing temporary files"
-    rm -f "${TEMP_FILE}" "${TEMP_FILE}.pids" "${RUNTIME_DIR}/startmic_success"
+    rm -f "${TEMP_FILE}" "${TEMP_FILE}.pids" "${RUNTIME_DIR}/startmic_success" 2>/dev/null || true
     
-    # Release lock - even if we're in an error path, ensure the lock is released
+    # Release lock - ensure this is the last thing we do before exiting
     release_lock "$LOCK_FD"
     
     log "INFO" "Cleanup completed, exiting with code $exit_code"
     
     # Exit with the provided exit code
     exit "$exit_code"
+}
+
+# Function to modify service configuration with safe values
+configure_systemd_service() {
+    local SERVICE_FILE="/etc/systemd/system/audio-rtsp.service"
+    
+    # Check if service file exists
+    if [ ! -f "$SERVICE_FILE" ]; then
+        log "ERROR" "Service file not found: $SERVICE_FILE"
+        return 1
+    fi
+    
+    # Back up original service file
+    cp "$SERVICE_FILE" "${SERVICE_FILE}.bak.$(date +%Y%m%d%H%M%S)" 2>/dev/null || {
+        log "WARNING" "Failed to back up service file"
+    }
+    
+    log "INFO" "Updating service file with improved restart settings"
+    
+    # Update StartLimitIntervalSec and StartLimitBurst for better restart behavior
+    if grep -q "StartLimitIntervalSec" "$SERVICE_FILE"; then
+        sed -i 's/StartLimitIntervalSec=[0-9]\+/StartLimitIntervalSec=600/' "$SERVICE_FILE"
+    else
+        # Add it to the [Unit] section if it doesn't exist
+        sed -i '/\[Unit\]/a StartLimitIntervalSec=600' "$SERVICE_FILE"
+    fi
+    
+    if grep -q "StartLimitBurst" "$SERVICE_FILE"; then
+        sed -i 's/StartLimitBurst=[0-9]\+/StartLimitBurst=5/' "$SERVICE_FILE"
+    else
+        # Add it to the [Unit] section if it doesn't exist
+        sed -i '/\[Unit\]/a StartLimitBurst=5' "$SERVICE_FILE"
+    fi
+    
+    # Update RestartSec for longer delay between restarts
+    if grep -q "RestartSec" "$SERVICE_FILE"; then
+        sed -i 's/RestartSec=[0-9]\+/RestartSec=30/' "$SERVICE_FILE"
+    else
+        # Add it to the [Service] section if it doesn't exist
+        sed -i '/\[Service\]/a RestartSec=30' "$SERVICE_FILE"
+    fi
+    
+    # Add KillMode=mixed for better handling of child processes
+    if ! grep -q "KillMode" "$SERVICE_FILE"; then
+        sed -i '/\[Service\]/a KillMode=mixed' "$SERVICE_FILE"
+    else
+        sed -i 's/KillMode=.*/KillMode=mixed/' "$SERVICE_FILE"
+    fi
+    
+    # Add TimeoutStopSec for allowing cleaner shutdown
+    if ! grep -q "TimeoutStopSec" "$SERVICE_FILE"; then
+        sed -i '/\[Service\]/a TimeoutStopSec=20' "$SERVICE_FILE"
+    else
+        sed -i 's/TimeoutStopSec=.*/TimeoutStopSec=20/' "$SERVICE_FILE"
+    fi
+    
+    # Restart behavior
+    if grep -q "Restart=" "$SERVICE_FILE"; then
+        sed -i 's/Restart=.*/Restart=on-failure/' "$SERVICE_FILE"
+    else
+        sed -i '/\[Service\]/a Restart=on-failure' "$SERVICE_FILE"
+    fi
+    
+    log "INFO" "Service file updated successfully"
+    
+    # Reload systemd to apply changes
+    if command -v systemctl >/dev/null 2>&1; then
+        log "INFO" "Reloading systemd daemon..."
+        systemctl daemon-reload
+    else
+        log "WARNING" "systemctl not available, skipping daemon reload"
+    fi
+    
+    return 0
 }
 
 # Trap signals for clean exit
@@ -950,7 +1062,12 @@ fi
 # Write success marker for systemd
 atomic_write "${RUNTIME_DIR}/startmic_success" "STARTED"
 
-# Function to monitor and restart streams if needed
+# Configure systemd service for better restart behavior if running as service
+if [ -d "/run/systemd/system" ]; then
+    configure_systemd_service
+fi
+
+# Enhanced stream monitoring function with better stability
 monitor_streams() {
     log "INFO" "Starting monitor loop for child processes..."
     log "INFO" "Using RTSP port: $RTSP_PORT"
@@ -961,6 +1078,8 @@ monitor_streams() {
     local current_time=0
     local status_interval=300  # Log status every 5 minutes
     local last_status_time=0
+    local last_restart_time=0
+    local restart_cooldown=60  # Minimum seconds between restart attempts
     
     # Record start time
     local service_start_time=$(date +%s)
@@ -969,98 +1088,93 @@ monitor_streams() {
     # Create monitor state directory
     mkdir -p "${STATE_DIR}/monitoring" 2>/dev/null
     
-    # Monitor loop
+    # Keep the script running - critical for systemd
     while true; do
-        current_time=$(date +%s)
-        
-        # Periodic status logging
-        if [ $((current_time - last_status_time)) -ge "$status_interval" ]; then
-            local uptime=$((current_time - service_start_time))
-            local uptime_hours=$((uptime / 3600))
-            local uptime_minutes=$(( (uptime % 3600) / 60 ))
+        # Wrap everything in error handling
+        {
+            current_time=$(date +%s)
             
-            log "INFO" "Service status: Running for ${uptime_hours}h ${uptime_minutes}m, monitoring $STREAMS_CREATED streams"
-            last_status_time=$current_time
-            
-            # Log resource usage if available
-            if command -v free > /dev/null 2>&1; then
-                memory_usage=$(free | grep Mem | awk '{print int($3/$2 * 100)}')
-                log "INFO" "System memory usage: ${memory_usage}%"
-            fi
-            
-            if [ -f "/proc/loadavg" ]; then
-                load_avg=$(cat /proc/loadavg | cut -d' ' -f1)
-                log "INFO" "System load average: $load_avg"
-            fi
-        fi
-        
-        # Only check streams at specified interval
-        if [ $((current_time - last_check_time)) -ge "$STREAM_CHECK_INTERVAL" ]; then
-            last_check_time=$current_time
-            
-            # Check if any ffmpeg processes are still running
-            local running_processes=$(pgrep -f "ffmpeg.*rtsp://localhost:$RTSP_PORT" | wc -l)
-            
-            if [ "$running_processes" -eq 0 ] && [ "$STREAMS_CREATED" -gt 0 ]; then
-                log "WARNING" "No ffmpeg RTSP processes found. Attempting to restart streams..."
+            # Periodic status logging
+            if [ $((current_time - last_status_time)) -ge "$status_interval" ]; then
+                local uptime=$((current_time - service_start_time))
+                local uptime_hours=$((uptime / 3600))
+                local uptime_minutes=$(( (uptime % 3600) / 60 ))
                 
-                # Check if RTSP server is accessible
-                if ! check_mediamtx; then
-                    log "ERROR" "MediaMTX is not accessible on port $RTSP_PORT"
-                    
-                    # Try to restart MediaMTX
-                    log "INFO" "Attempting to restart MediaMTX"
-                    if command -v systemctl > /dev/null 2>&1 && systemctl list-unit-files | grep -q mediamtx.service; then
-                        systemctl restart mediamtx.service
-                        sleep 3
+                # Log resource usage if available
+                if command -v free > /dev/null 2>&1; then
+                    local memory_usage=$(free | grep Mem | awk '{print int($3/$2 * 100)}')
+                    log "INFO" "Service status: Running for ${uptime_hours}h ${uptime_minutes}m, memory usage: ${memory_usage}%"
+                else
+                    log "INFO" "Service status: Running for ${uptime_hours}h ${uptime_minutes}m"
+                fi
+                
+                # Track active ffmpeg processes
+                local running_processes=$(pgrep -c -f "ffmpeg.*rtsp://localhost:$RTSP_PORT" || echo "0")
+                log "INFO" "Active ffmpeg RTSP processes: $running_processes"
+                
+                last_status_time=$current_time
+            fi
+            
+            # Only check streams at specified interval
+            if [ $((current_time - last_check_time)) -ge "$STREAM_CHECK_INTERVAL" ]; then
+                last_check_time=$current_time
+                
+                # Check if any ffmpeg processes are still running
+                local running_processes=$(pgrep -c -f "ffmpeg.*rtsp://localhost:$RTSP_PORT" || echo "0")
+                
+                if [ "$running_processes" -eq 0 ] && [ "$STREAMS_CREATED" -gt 0 ]; then
+                    # Only attempt restart if we've waited long enough since last attempt
+                    if [ $((current_time - last_restart_time)) -ge "$restart_cooldown" ]; then
+                        log "WARNING" "No ffmpeg RTSP processes found. Attempting to restart streams..."
+                        
+                        # Increment restart attempts
+                        restart_attempts=$((restart_attempts + 1))
+                        last_restart_time=$current_time
+                        
+                        # Check RTSP server first
+                        if ! nc -z localhost $RTSP_PORT >/dev/null 2>&1; then
+                            log "ERROR" "RTSP server is not accessible on port $RTSP_PORT"
+                            
+                            # Try to restart MediaMTX
+                            log "INFO" "Attempting to restart MediaMTX"
+                            if command -v systemctl > /dev/null 2>&1 && systemctl list-unit-files | grep -q mediamtx.service; then
+                                systemctl restart mediamtx.service
+                                sleep 5  # Give it time to start
+                            fi
+                        fi
+                        
+                        # Check if max attempts reached
+                        if [ "$restart_attempts" -ge "$MAX_RESTART_ATTEMPTS" ]; then
+                            log "ERROR" "Maximum restart attempts ($MAX_RESTART_ATTEMPTS) reached."
+                            log "ERROR" "Exiting monitoring to allow systemd to handle service restart"
+                            atomic_write "${STATE_DIR}/restart_failures" "$restart_attempts"
+                            cleanup 1 "Maximum restart attempts reached"
+                        else
+                            log "INFO" "Waiting for systemd to restart the service (attempt $restart_attempts/$MAX_RESTART_ATTEMPTS)"
+                            atomic_write "${STATE_DIR}/restart_attempts" "$restart_attempts"
+                            # Exit with error so systemd will restart the service
+                            cleanup 1 "No active streams found"
+                        fi
                     else
-                        # Try direct start if systemd not available
-                        start_mediamtx
+                        # Still in cooldown period
+                        log "INFO" "In restart cooldown period, next check in $((restart_cooldown - (current_time - last_restart_time)))s"
                     fi
-                    
-                    # Check again after restart attempt
-                    if ! check_mediamtx; then
-                        log "ERROR" "MediaMTX is still not accessible after restart attempt"
+                else
+                    # Reset restart counter if we have processes running
+                    if [ "$restart_attempts" -gt 0 ] && [ "$running_processes" -gt 0 ]; then
+                        log "INFO" "Streams are now running. Resetting restart counter."
+                        restart_attempts=0
+                        atomic_write "${STATE_DIR}/restart_attempts" "0"
                     fi
-                fi
-                
-                # Increment restart attempts
-                restart_attempts=$((restart_attempts + 1))
-                
-                # Check if we've hit the maximum number of restart attempts
-                if [ "$restart_attempts" -ge "$MAX_RESTART_ATTEMPTS" ]; then
-                    log "ERROR" "Maximum restart attempts ($MAX_RESTART_ATTEMPTS) reached. Exiting monitor..."
-                    cleanup 1 "Maximum restart attempts reached"
-                fi
-                
-                # Sleep to avoid rapid restart cycles
-                log "INFO" "Waiting ${RESTART_DELAY}s before restart attempt ${restart_attempts}/${MAX_RESTART_ATTEMPTS}..."
-                sleep "$RESTART_DELAY"
-                
-                # Exit for systemd restart (more reliable than trying to restart ourselves)
-                log "INFO" "Exiting for service restart"
-                cleanup 1 "Exiting for service restart due to missing streams"
-            else
-                # Check if we have the expected number of streams
-                if [ "$running_processes" -lt "$STREAMS_CREATED" ]; then
-                    log "WARNING" "Found $running_processes running streams, expected $STREAMS_CREATED"
-                    # We might want to implement per-stream restart here in the future
-                fi
-                
-                if [ "$running_processes" -gt "$STREAMS_CREATED" ]; then
-                    log "WARNING" "Found $running_processes running streams, but only expected $STREAMS_CREATED"
-                    # This might indicate duplicate processes or external ffmpeg instances
-                fi
-                
-                # Reset restart attempts counter if streams are running
-                if [ "$restart_attempts" -gt 0 ] && [ "$running_processes" -gt 0 ]; then
-                    log "INFO" "Streams appear to be running again. Resetting restart counter."
-                    restart_attempts=0
                 fi
             fi
-        fi
+        } || {
+            # Error handler
+            log "ERROR" "Exception in monitor loop: $?"
+            sleep 5  # Prevent rapid error loops
+        }
         
-        # Sleep to avoid high CPU usage
+        # Sleep for a safe interval
         sleep 5
     done
 }
