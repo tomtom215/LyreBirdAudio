@@ -3,25 +3,26 @@
 #
 # https://raw.githubusercontent.com/tomtom215/mediamtx-rtsp-setup/refs/heads/main/mediamtx-rtsp-audio-installer.sh
 #
-# Version: 3.0.1
-# Date: 2025-05-11
+# Version: 3.0.2
+# Date: 2025-05-13
 #
 # This script orchestrates the installation of the MediaMTX RTSP audio streaming platform
 # by coordinating the execution of dedicated component scripts rather than reimplementing
 # their functionality. This maintains a clear separation of responsibilities while
 # providing an enhanced unified installer experience.
 #
-# Changes in v3.0.1:
-# - Fixed dependency handling for setup_audio_rtsp.sh which requires startmic.sh
-# - Added proper working directory handling for component dependencies
-# - Enhanced error reporting when dependent scripts are missing
-# - Added verification step after downloading dependent scripts
+# Changes in v3.0.2:
+# - Fixed component script execution and dependency handling
+# - Improved error handling and validation for downloaded scripts
+# - Enhanced working directory management for component dependencies
+# - Fixed verification of downloaded scripts before execution
+# - Added more detailed debug logging for troubleshooting
 
 # Set strict error handling
 set -o pipefail
 
 # Define script version
-SCRIPT_VERSION="3.0.1"
+SCRIPT_VERSION="3.0.2"
 
 # Default configuration
 CONFIG_DIR="/etc/audio-rtsp"
@@ -518,7 +519,7 @@ safe_kill_process() {
 # Component Script Operations
 # ======================================================================
 
-# Pre-download required scripts for a specific component
+# Pre-download required scripts for a specific component - FIXED
 predownload_dependency_scripts() {
     local component="$1"
     local working_dir="$2"
@@ -534,7 +535,26 @@ predownload_dependency_scripts() {
             if [ ! -f "$monitor_script" ]; then
                 download_file "$monitor_url" "$working_dir" "mediamtx-monitor.sh" > /dev/null
                 chmod +x "$monitor_script"
-                log "INFO" "Downloaded mediamtx-monitor.sh dependency"
+                
+                # Verify the script was downloaded correctly
+                if [ -f "$monitor_script" ] && [ -s "$monitor_script" ]; then
+                    log "INFO" "Downloaded mediamtx-monitor.sh dependency"
+                    # Also ensure the main script is downloaded
+                    local setup_url="https://raw.githubusercontent.com/tomtom215/mediamtx-rtsp-setup/refs/heads/main/setup-monitor-script.sh"
+                    local setup_script="${working_dir}/setup-monitor-script.sh"
+                    download_file "$setup_url" "$working_dir" "setup-monitor-script.sh" > /dev/null
+                    chmod +x "$setup_script"
+                    
+                    if [ ! -f "$setup_script" ] || [ ! -s "$setup_script" ]; then
+                        log "ERROR" "Failed to download or verify setup-monitor-script.sh"
+                        return 1
+                    else
+                        log "INFO" "Downloaded and verified setup-monitor-script.sh"
+                    fi
+                else
+                    log "ERROR" "Failed to download or verify mediamtx-monitor.sh dependency"
+                    return 1
+                fi
             else
                 log "INFO" "mediamtx-monitor.sh dependency already exists"
             fi
@@ -555,21 +575,46 @@ predownload_dependency_scripts() {
                 if [ -f "$startmic_script" ] && [ -s "$startmic_script" ]; then
                     log "INFO" "Downloaded startmic.sh dependency"
                 else
-                    error "Failed to download or verify startmic.sh dependency" 1
+                    log "ERROR" "Failed to download or verify startmic.sh dependency"
+                    return 1
                 fi
             else
                 log "INFO" "startmic.sh dependency already exists"
             fi
+            
+            # Ensure setup_audio_rtsp.sh is also downloaded
+            local setup_url="https://raw.githubusercontent.com/tomtom215/mediamtx-rtsp-setup/refs/heads/main/setup_audio_rtsp.sh"
+            local setup_script="${working_dir}/setup_audio_rtsp.sh"
+            
+            if [ ! -f "$setup_script" ]; then
+                log "INFO" "Downloading main script setup_audio_rtsp.sh..."
+                download_file "$setup_url" "$working_dir" "setup_audio_rtsp.sh" > /dev/null
+                chmod +x "$setup_script"
+                
+                # Verify the script was downloaded correctly
+                if [ -f "$setup_script" ] && [ -s "$setup_script" ]; then
+                    log "INFO" "Downloaded setup_audio_rtsp.sh successfully"
+                else
+                    log "ERROR" "Failed to download or verify setup_audio_rtsp.sh"
+                    return 1
+                fi
+            else
+                log "INFO" "setup_audio_rtsp.sh already exists"
+            fi
             ;;
     esac
+    
+    return 0
 }
 
-# Execute a component script with appropriate options
+# Execute a component script with appropriate options - FIXED
 execute_component_script() {
     local script_name="$1"
     shift
     local script_args=("$@")
     local working_dir
+    local script_path=""
+    local download_success=false
     
     # Determine where to run the script from
     if [[ "$script_name" == "setup-monitor-script.sh" || "$script_name" == "setup_audio_rtsp.sh" ]]; then
@@ -584,24 +629,63 @@ execute_component_script() {
         working_dir="$(pwd)"
     fi
     
+    log "INFO" "Checking for script: ${script_name}"
+    
     # First check if the script exists in the current directory
     if [ -f "./${script_name}" ]; then
-        local script_path="./${script_name}"
+        script_path="./${script_name}"
+        log "INFO" "Found ${script_name} in current directory"
+        download_success=true
     # Then check in standard locations
     elif [ -f "/usr/local/bin/${script_name}" ]; then
-        local script_path="/usr/local/bin/${script_name}"
+        script_path="/usr/local/bin/${script_name}"
+        log "INFO" "Found ${script_name} in /usr/local/bin"
+        download_success=true
     # Finally, try to download it if not found
     else
-        log "INFO" "Script ${script_name} not found locally, trying to download it..."
+        log "INFO" "Script ${script_name} not found locally, downloading it..."
         local download_url="https://raw.githubusercontent.com/tomtom215/mediamtx-rtsp-setup/refs/heads/main/${script_name}"
-        local script_path=$(download_file "$download_url" "$working_dir" "$script_name")
-        chmod +x "$script_path"
+        
+        # Use working directory for download location
+        script_path="${working_dir}/${script_name}"
+        
+        # Download using wget or curl
+        if command_exists wget; then
+            if [ "$QUIET_MODE" = true ]; then
+                wget -q "$download_url" -O "$script_path" && download_success=true
+            else
+                wget --progress=bar:force:noscroll "$download_url" -O "$script_path" && download_success=true
+            fi
+        elif command_exists curl; then
+            if [ "$QUIET_MODE" = true ]; then
+                curl -s -L "$download_url" -o "$script_path" && download_success=true
+            else
+                curl -L --progress-bar "$download_url" -o "$script_path" && download_success=true
+            fi
+        else
+            log "ERROR" "Neither wget nor curl is available. Cannot download scripts."
+            return 1
+        fi
+        
+        if [ "$download_success" = false ]; then
+            log "ERROR" "Failed to download ${script_name}"
+            return 1
+        fi
+        
+        log "INFO" "Successfully downloaded ${script_name} to ${script_path}"
+    fi
+    
+    # Verify script exists after download attempt
+    if [ ! -f "$script_path" ]; then
+        log "ERROR" "Script file not found after download attempt: $script_path"
+        return 1
     fi
     
     # Make sure the script is executable
-    if [ ! -x "$script_path" ]; then
-        chmod +x "$script_path" || error "Failed to make ${script_name} executable" 1
-    fi
+    chmod +x "$script_path" || {
+        log "ERROR" "Failed to make ${script_name} executable"
+        return 1
+    }
     
     log "INFO" "Executing ${script_name}..."
     
@@ -609,7 +693,10 @@ execute_component_script() {
     local current_dir="$(pwd)"
     
     # Change to the appropriate working directory
-    cd "$working_dir" || error "Failed to change to working directory: $working_dir" 1
+    cd "$working_dir" || {
+        log "ERROR" "Failed to change to working directory: $working_dir"
+        return 1
+    }
     
     # List directory contents in debug mode
     if [ "$DEBUG_MODE" = true ]; then
@@ -625,7 +712,18 @@ execute_component_script() {
         return 0
     else
         local exit_code=$?
-        error "${script_name} failed with exit code ${exit_code}" $exit_code
+        log "ERROR" "${script_name} failed with exit code ${exit_code}"
+        
+        # Additional debug info for failed scripts
+        if [ -f "$script_path" ]; then
+            log "DEBUG" "Script exists at: $script_path"
+            log "DEBUG" "Script size: $(du -h "$script_path" | cut -f1)"
+            log "DEBUG" "Script permissions: $(ls -la "$script_path" | awk '{print $1}')"
+            log "DEBUG" "Script first line: $(head -n 1 "$script_path")"
+        else
+            log "ERROR" "Script disappeared during execution: $script_path"
+        fi
+        
         # Change back to original directory even on error
         cd "$current_dir"
         return $exit_code
