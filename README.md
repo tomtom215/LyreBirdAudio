@@ -1,5 +1,7 @@
 # MediaMTX RTSP Audio Streaming Platform
 
+# Currently this is not in a working state, please do not expect it to work until this meesage has been removed. 
+
 A comprehensive production-grade platform for setting up and managing robust RTSP audio streaming with MediaMTX. This project includes automated installation, configuration, monitoring, and recovery components designed for reliability in mission-critical environments.
 
 ## Table of Contents
