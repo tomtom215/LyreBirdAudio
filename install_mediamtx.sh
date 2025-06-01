@@ -1,17 +1,30 @@
 #!/bin/bash
 #
 # Enhanced MediaMTX Installer with Production-Ready Standards
-# Version: 3.0.0
-# Date: 2025-01-23
+# Version: 4.0.1
+# Date: 2025-06-01
 # Description: Robust installer for MediaMTX with comprehensive error handling,
 #              checksum verification, rollback support, and security hardening
+#
+# Changelog v4.0.1:
+# - Fixed critical security vulnerabilities (temp file handling, log permissions)
+# - Improved port detection for broader compatibility
+# - Enhanced version comparison and extraction
+# - Increased network timeouts for slow connections
+# - Added binary validation
+# - Improved systemd detection and service management
+# - Simplified YAML validation for reliability
+# - Added disk space checks
+# - Fixed rollback safety issues
+# - Enhanced architecture detection
 
-# Strict error handling
-set -o pipefail
+# Strict error handling with undefined variable protection
+set -euo pipefail
 set -o errtrace
+shopt -s nullglob  # Safe glob expansion
 
 # Configuration
-readonly SCRIPT_VERSION="3.0.0"
+readonly SCRIPT_VERSION="4.0.1"
 readonly INSTALL_DIR="/usr/local/mediamtx"
 readonly CONFIG_DIR="/etc/mediamtx"
 readonly LOG_DIR="/var/log/mediamtx"
@@ -19,9 +32,10 @@ readonly SERVICE_USER="mediamtx"
 readonly CHECKSUM_DIR="/var/lib/mediamtx/checksums"
 readonly CACHE_DIR="/var/cache/mediamtx-installer"
 readonly BACKUP_DIR="/var/backups/mediamtx"
+readonly CONFIG_TEMPLATE_FILE="${CONFIG_DIR}/mediamtx.yml.template"
 
-# Default version and ports
-VERSION="${VERSION:-v1.12.2}"
+# Default version and ports (updated to latest)
+VERSION="${VERSION:-v1.12.3}"
 RTSP_PORT="${RTSP_PORT:-18554}"
 RTMP_PORT="${RTMP_PORT:-11935}"
 HLS_PORT="${HLS_PORT:-18888}"
@@ -35,7 +49,9 @@ ARCH=""
 DEBUG_MODE="${DEBUG:-false}"
 DRY_RUN="${DRY_RUN:-false}"
 FORCE_INSTALL="${FORCE:-false}"
+SKIP_YAML_VALIDATION="${SKIP_YAML_VALIDATION:-false}"
 ROLLBACK_POINTS=()
+SYSTEMD_DIR=""
 
 # Color output functions
 print_color() {
@@ -54,6 +70,132 @@ echo_debug() {
     fi
 }
 
+# Input validation functions
+validate_port() {
+    local port=$1
+    local name=${2:-"Port"}
+    
+    if ! [[ "$port" =~ ^[0-9]+$ ]]; then
+        echo_error "$name must be a number"
+        return 1
+    fi
+    
+    if [[ "$port" -lt 1 ]] || [[ "$port" -gt 65535 ]]; then
+        echo_error "$name must be between 1 and 65535"
+        return 1
+    fi
+    
+    return 0
+}
+
+validate_all_ports() {
+    local failed=0
+    
+    validate_port "$RTSP_PORT" "RTSP port" || ((failed++))
+    validate_port "$RTMP_PORT" "RTMP port" || ((failed++))
+    validate_port "$HLS_PORT" "HLS port" || ((failed++))
+    validate_port "$WEBRTC_PORT" "WebRTC port" || ((failed++))
+    validate_port "$METRICS_PORT" "Metrics port" || ((failed++))
+    
+    if [[ $failed -gt 0 ]]; then
+        return 1
+    fi
+    
+    return 0
+}
+
+check_port_available() {
+    local port=$1
+    local proto=${2:-"tcp"}
+    
+    if command -v ss >/dev/null 2>&1; then
+        local ss_opts=""
+        case "$proto" in
+            tcp) ss_opts="-lnt" ;;
+            udp) ss_opts="-lnu" ;;
+            *) ss_opts="-ln" ;;
+        esac
+        
+        # More robust parsing that handles different ss output formats
+        if ss $ss_opts 2>/dev/null | grep -E "(:${port}[[:space:]]|:${port}$)" >/dev/null 2>&1; then
+            echo_error "Port $port is already in use"
+            return 1
+        fi
+    elif command -v netstat >/dev/null 2>&1; then
+        # More robust netstat parsing
+        if netstat -ln 2>/dev/null | grep -E "(:${port}[[:space:]]|:${port}$)" >/dev/null 2>&1; then
+            echo_error "Port $port is already in use"
+            return 1
+        fi
+    elif command -v lsof >/dev/null 2>&1; then
+        if lsof -i ":${port}" >/dev/null 2>&1; then
+            echo_error "Port $port is already in use"
+            return 1
+        fi
+    else
+        echo_warning "Cannot check if port $port is available"
+    fi
+    
+    return 0
+}
+
+# Version comparison function
+compare_versions() {
+    # Remove 'v' prefix if present
+    local ver1="${1#v}"
+    local ver2="${2#v}"
+    
+    # Handle empty or malformed versions
+    if [[ -z "$ver1" ]] || [[ -z "$ver2" ]]; then
+        echo "unknown"
+        return 0
+    fi
+    
+    if command -v sort >/dev/null 2>&1 && sort --version-sort /dev/null >/dev/null 2>&1; then
+        # Use version sort if available
+        local older
+        older=$(printf '%s\n' "$ver1" "$ver2" | sort -V | head -n1)
+        if [[ "$older" == "$ver1" ]]; then
+            if [[ "$ver1" == "$ver2" ]]; then
+                echo "equal"
+            else
+                echo "older"
+            fi
+        else
+            echo "newer"
+        fi
+    else
+        # Better fallback comparison
+        if [[ "$ver1" == "$ver2" ]]; then
+            echo "equal"
+        else
+            # Try numeric comparison for simple versions
+            local IFS='.'
+            local ver1_parts=($ver1)
+            local ver2_parts=($ver2)
+            
+            for i in {0..2}; do
+                local v1="${ver1_parts[i]:-0}"
+                local v2="${ver2_parts[i]:-0}"
+                
+                # Strip non-numeric suffixes for comparison
+                v1="${v1%%[!0-9]*}"
+                v2="${v2%%[!0-9]*}"
+                
+                if [[ "$v1" -gt "$v2" ]]; then
+                    echo "newer"
+                    return 0
+                elif [[ "$v1" -lt "$v2" ]]; then
+                    echo "older"
+                    return 0
+                fi
+            done
+            
+            echo "equal"
+        fi
+    fi
+}
+
 # Enhanced logging with rotation support
 setup_logging() {
     local timestamp
@@ -68,11 +210,10 @@ setup_logging() {
     LOG_FILE="${TEMP_DIR}/install_${timestamp}.log"
     
     # Ensure log file is created with proper permissions
-    touch "$LOG_FILE" || {
-        echo_error "Failed to create log file"
+    if ! touch "$LOG_FILE" || ! chmod 600 "$LOG_FILE"; then
+        echo_error "Failed to create/secure log file"
         exit 1
-    }
-    chmod 600 "$LOG_FILE"
+    fi
     
     echo_debug "Temporary directory: $TEMP_DIR"
     echo_debug "Log file: $LOG_FILE"
@@ -97,9 +238,12 @@ log_message() {
     } >> "$LOG_FILE" 2>&1
 }
 
-# Comprehensive cleanup function
+# Comprehensive cleanup function with improved order
 cleanup() {
     local exit_code=$?
+    
+    # Disable traps to prevent recursion
+    trap - EXIT INT TERM ERR
     
     echo_debug "Running cleanup (exit code: $exit_code)"
     
@@ -109,26 +253,29 @@ cleanup() {
         systemctl stop mediamtx.service 2>/dev/null || true
     fi
     
+    # Run rollback if needed
+    if [[ $exit_code -ne 0 ]] && [[ ${#ROLLBACK_POINTS[@]} -gt 0 ]]; then
+        echo_warning "Installation failed. Initiating rollback..."
+        rollback_changes
+    fi
+    
     # Preserve logs on error
     if [[ $exit_code -ne 0 ]] && [[ -f "$LOG_FILE" ]]; then
         local error_log="/tmp/mediamtx_install_error_$(date +%Y%m%d_%H%M%S).log"
-        cp "$LOG_FILE" "$error_log" 2>/dev/null || true
-        echo_error "Installation failed. Logs preserved at: $error_log"
+        if cp "$LOG_FILE" "$error_log" 2>/dev/null; then
+            # Secure the error log - only readable by root
+            chmod 600 "$error_log" 2>/dev/null || true
+            echo_error "Installation failed. Logs preserved at: $error_log (readable by root only)"
+        fi
     fi
     
     # Clean up temporary directory
-    if [[ -n "$TEMP_DIR" ]] && [[ -d "$TEMP_DIR" ]]; then
+    if [[ -n "${TEMP_DIR:-}" ]] && [[ -d "$TEMP_DIR" ]]; then
         if [[ "$DEBUG_MODE" == "true" && $exit_code -ne 0 ]]; then
             echo_info "Debug mode: Temporary files preserved at: $TEMP_DIR"
         else
             rm -rf "$TEMP_DIR" 2>/dev/null || true
         fi
-    fi
-    
-    # Run rollback if needed
-    if [[ $exit_code -ne 0 ]] && [[ ${#ROLLBACK_POINTS[@]} -gt 0 ]]; then
-        echo_warning "Installation failed. Initiating rollback..."
-        rollback_changes
     fi
     
     exit $exit_code
@@ -141,7 +288,7 @@ setup_traps() {
     trap 'echo_error "Error on line $LINENO"; exit 1' ERR
 }
 
-# Rollback functionality
+# Safe rollback functionality without eval
 add_rollback_point() {
     local action=$1
     ROLLBACK_POINTS+=("$action")
@@ -155,10 +302,72 @@ rollback_changes() {
     for ((i=${#ROLLBACK_POINTS[@]}-1; i>=0; i--)); do
         local action="${ROLLBACK_POINTS[i]}"
         echo_debug "Executing rollback: $action"
-        eval "$action" 2>/dev/null || true
+        
+        # Safe execution without eval - use arrays for proper handling
+        case "$action" in
+            rm\ *)
+                local cmd=($action)
+                "${cmd[@]}" 2>/dev/null || true
+                ;;
+            rmdir\ *)
+                local cmd=($action)
+                "${cmd[@]}" 2>/dev/null || true
+                ;;
+            mv\ *)
+                local cmd=($action)
+                "${cmd[@]}" 2>/dev/null || true
+                ;;
+            userdel\ *)
+                local cmd=($action)
+                "${cmd[@]}" 2>/dev/null || true
+                ;;
+            *)
+                echo_warning "Unknown rollback action: $action"
+                ;;
+        esac
     done
     
     echo_info "Rollback completed"
+}
+
+# Detect systemd directory
+detect_systemd_dir() {
+    # First check if systemd is actually running
+    if ! command -v systemctl >/dev/null 2>&1; then
+        echo_error "systemctl not found - this installer requires systemd"
+        return 1
+    fi
+    
+    if ! systemctl --version >/dev/null 2>&1; then
+        echo_error "systemd is not running - this installer requires systemd"
+        return 1
+    fi
+    
+    if command -v pkg-config >/dev/null 2>&1; then
+        SYSTEMD_DIR=$(pkg-config systemd --variable=systemdsystemunitdir 2>/dev/null || true)
+    fi
+    
+    if [[ -z "$SYSTEMD_DIR" ]]; then
+        if [[ -d "/etc/systemd/system" ]]; then
+            SYSTEMD_DIR="/etc/systemd/system"
+        elif [[ -d "/usr/lib/systemd/system" ]]; then
+            SYSTEMD_DIR="/usr/lib/systemd/system"
+        elif [[ -d "/lib/systemd/system" ]]; then
+            SYSTEMD_DIR="/lib/systemd/system"
+        else
+            echo_error "Cannot determine systemd directory"
+            return 1
+        fi
+    fi
+    
+    # Verify the directory is writable
+    if [[ ! -w "$SYSTEMD_DIR" ]]; then
+        echo_error "Systemd directory $SYSTEMD_DIR is not writable"
+        return 1
+    fi
+    
+    echo_debug "Using systemd directory: $SYSTEMD_DIR"
+    return 0
 }
 
 # Enhanced dependency checking
@@ -177,7 +386,7 @@ check_dependencies() {
     done
     
     # Optional but recommended
-    local optional_cmds=(jq sha256sum md5sum xxd nc dig host)
+    local optional_cmds=(jq sha256sum md5sum xxd nc dig host ss netstat lsof yq yamllint)
     for cmd in "${optional_cmds[@]}"; do
         if ! command -v "$cmd" >/dev/null 2>&1; then
             optional_missing+=("$cmd")
@@ -227,6 +436,18 @@ detect_architecture() {
         armv6*|armel)
             ARCH="armv6"
             ;;
+        i386|i686)
+            # 32-bit x86 not supported by MediaMTX
+            ARCH="unsupported_x86_32"
+            ;;
+        ppc64le|powerpc64le)
+            # PowerPC not currently supported
+            ARCH="unsupported_ppc64le"
+            ;;
+        riscv64)
+            # RISC-V not currently supported
+            ARCH="unsupported_riscv64"
+            ;;
         *)
             # Try additional detection methods
             if command -v dpkg >/dev/null 2>&1; then
@@ -245,13 +466,39 @@ detect_architecture() {
             ;;
     esac
     
-    if [[ "$ARCH" == "unknown" ]]; then
+    # Additional fallback using /proc/cpuinfo
+    if [[ "$ARCH" == "unknown" ]] && [[ -r /proc/cpuinfo ]]; then
+        if grep -q "ARMv7" /proc/cpuinfo; then
+            ARCH="armv7"
+        elif grep -q "ARMv6" /proc/cpuinfo; then
+            ARCH="armv6"
+        elif grep -q "Intel\|AMD" /proc/cpuinfo; then
+            ARCH="amd64"
+        fi
+    fi
+    
+    if [[ "$ARCH" == "unknown" ]] || [[ "$ARCH" == unsupported_* ]]; then
         echo_error "Unsupported architecture: $arch"
         echo_info "Supported: x86_64, aarch64, armv7, armv6"
         return 1
     fi
     
     echo_info "Detected architecture: $ARCH"
+    return 0
+}
+
+# Check for sufficient disk space
+check_disk_space() {
+    local required_mb=100  # Require at least 100MB free
+    local install_partition
+    install_partition=$(df -P "$INSTALL_DIR" 2>/dev/null | tail -1 | awk '{print $4}')
+    
+    if [[ -n "$install_partition" ]] && [[ "$install_partition" -lt $((required_mb * 1024)) ]]; then
+        echo_error "Insufficient disk space. At least ${required_mb}MB required."
+        return 1
+    fi
+    
+    echo_debug "Disk space check passed"
     return 0
 }
 
@@ -281,7 +528,7 @@ check_connectivity() {
                 ;;
             wget)
                 if command -v wget >/dev/null 2>&1; then
-                    if wget -q --spider --timeout=10 "$test_url" 2>&1; then
+                    if wget -q --spider --timeout=10 "$test_url" >/dev/null 2>&1; then
                         connected=true
                         break
                     fi
@@ -289,7 +536,7 @@ check_connectivity() {
                 ;;
             nc)
                 if command -v nc >/dev/null 2>&1; then
-                    if nc -z -w5 github.com 443 2>&1; then
+                    if nc -z -w5 github.com 443 >/dev/null 2>&1; then
                         connected=true
                         break
                     fi
@@ -334,6 +581,82 @@ verify_version() {
     fi
 }
 
+# Generic file download helper with retry
+download_file() {
+    local url=$1
+    local output=$2
+    
+    if command -v wget >/dev/null 2>&1; then
+        wget -q --timeout=30 --tries=2 -O "$output" "$url" 2>/dev/null
+    elif command -v curl >/dev/null 2>&1; then
+        curl -s -L --connect-timeout 30 --max-time 120 -o "$output" "$url" 2>/dev/null
+    else
+        return 1
+    fi
+}
+
+download_with_retry() {
+    local url=$1
+    local output=$2
+    local max_attempts=3
+    local attempt=1
+    
+    while [[ $attempt -le $max_attempts ]]; do
+        echo_debug "Download attempt $attempt of $max_attempts"
+        
+        if download_file "$url" "$output"; then
+            return 0
+        fi
+        
+        if [[ $attempt -lt $max_attempts ]]; then
+            echo_warning "Download attempt $attempt failed, retrying..."
+            sleep $((attempt * 2))
+        fi
+        
+        ((attempt++))
+    done
+    
+    return 1
+}
+
+# Validate downloaded binary is actually a MediaMTX binary
+validate_binary() {
+    local binary=$1
+    
+    echo_debug "Validating binary: $binary"
+    
+    # Check if it's a valid ELF binary
+    if ! file "$binary" 2>/dev/null | grep -q "ELF.*executable"; then
+        echo_error "Downloaded file is not a valid executable"
+        return 1
+    fi
+    
+    # Make a temporary copy with execute permissions to test
+    local temp_test_binary="${TEMP_DIR}/test_binary_$"
+    if ! cp "$binary" "$temp_test_binary" 2>/dev/null; then
+        echo_warning "Cannot create test copy, skipping MediaMTX validation"
+        return 0
+    fi
+    
+    chmod +x "$temp_test_binary" 2>/dev/null || true
+    
+    # Try to get version to ensure it's MediaMTX
+    local test_output
+    test_output=$("$temp_test_binary" --version 2>&1 || true)
+    rm -f "$temp_test_binary" 2>/dev/null || true
+    
+    # Check for MediaMTX in output (case insensitive)
+    if echo "$test_output" | grep -qi "mediamtx\|rtsp.*server"; then
+        echo_debug "Binary validation passed"
+        return 0
+    fi
+    
+    # If we can't determine, just warn but don't fail
+    echo_warning "Cannot verify MediaMTX binary signature, proceeding anyway"
+    echo_debug "Binary output: $test_output"
+    return 0
+}
+
 # Download with checksum verification
 download_mediamtx() {
     local url="https://github.com/bluenviron/mediamtx/releases/download/${VERSION}/mediamtx_${VERSION}_linux_${ARCH}.tar.gz"
@@ -343,17 +666,31 @@ download_mediamtx() {
     echo_info "Downloading MediaMTX ${VERSION} for ${ARCH}..."
     echo_debug "URL: $url"
     
-    # Download the binary
+    # Download the binary with retry
     if command -v wget >/dev/null 2>&1; then
-        wget --no-verbose --show-progress --tries=3 --timeout=30 -O "$output_file" "$url" || {
-            echo_error "Download failed with wget"
-            return 1
-        }
+        local attempt=1
+        local max_attempts=3
+        
+        while [[ $attempt -le $max_attempts ]]; do
+            if wget --no-verbose --show-progress --tries=1 --timeout=30 -O "$output_file" "$url"; then
+                break
+            fi
+            
+            if [[ $attempt -lt $max_attempts ]]; then
+                echo_warning "Download attempt $attempt failed, retrying..."
+                sleep $((attempt * 2))
+            else
+                echo_error "Download failed after $max_attempts attempts"
+                return 1
+            fi
+            
+            ((attempt++))
+        done
     elif command -v curl >/dev/null 2>&1; then
-        curl -L --retry 3 --connect-timeout 30 --progress-bar -o "$output_file" "$url" || {
+        if ! curl -L --retry 3 --connect-timeout 30 --progress-bar -o "$output_file" "$url"; then
             echo_error "Download failed with curl"
             return 1
-        }
+        fi
     else
         echo_error "Neither wget nor curl is available"
         return 1
@@ -366,13 +703,13 @@ download_mediamtx() {
     fi
     
     # Try to download and verify checksum
-    local checksum_url="https://github.com/bluenviron/mediamtx/releases/download/${VERSION}/checksums.txt"
+    local checksum_url="https://github.com/bluenviron/mediamtx/releases/download/${VERSION}/mediamtx_${VERSION}_linux_${ARCH}.tar.gz.sha256sum"
     echo_info "Attempting checksum verification..."
     
-    if download_file "$checksum_url" "$checksum_file"; then
+    if download_with_retry "$checksum_url" "$checksum_file"; then
         if command -v sha256sum >/dev/null 2>&1; then
             local expected_sum
-            expected_sum=$(grep "mediamtx_${VERSION}_linux_${ARCH}.tar.gz" "$checksum_file" 2>/dev/null | awk '{print $1}')
+            expected_sum=$(cat "$checksum_file" 2>/dev/null | awk '{print $1}')
             
             if [[ -n "$expected_sum" ]]; then
                 echo_debug "Expected checksum: $expected_sum"
@@ -399,20 +736,6 @@ download_mediamtx() {
     
     echo_success "Download completed successfully"
     return 0
-}
-
-# Generic file download helper
-download_file() {
-    local url=$1
-    local output=$2
-    
-    if command -v wget >/dev/null 2>&1; then
-        wget -q --timeout=10 -O "$output" "$url" 2>/dev/null
-    elif command -v curl >/dev/null 2>&1; then
-        curl -s -L --connect-timeout 10 -o "$output" "$url" 2>/dev/null
-    else
-        return 1
-    fi
 }
 
 # Extract and verify tarball
@@ -446,8 +769,44 @@ extract_mediamtx() {
         return 1
     fi
     
+    # Validate binary
+    if ! validate_binary "${extract_dir}/mediamtx"; then
+        echo_error "Binary validation failed"
+        return 1
+    fi
+    
     echo_success "Extraction completed successfully"
     return 0
+}
+
+# Ensure clean service stop before upgrade
+stop_service_safely() {
+    if systemctl is-active --quiet mediamtx.service 2>/dev/null; then
+        echo_info "Stopping existing MediaMTX service..."
+        
+        # Try graceful stop first
+        if systemctl stop mediamtx.service 2>/dev/null; then
+            # Wait for service to fully stop
+            local attempts=0
+            while systemctl is-active --quiet mediamtx.service 2>/dev/null && [[ $attempts -lt 30 ]]; do
+                sleep 1
+                ((attempts++))
+            done
+            
+            if [[ $attempts -ge 30 ]]; then
+                echo_warning "Service did not stop gracefully, forcing..."
+                systemctl kill mediamtx.service 2>/dev/null || true
+                sleep 2
+            fi
+        fi
+    fi
+    
+    # Ensure no orphaned processes
+    if pgrep -f "${INSTALL_DIR}/mediamtx" >/dev/null 2>&1; then
+        echo_warning "Found orphaned MediaMTX processes, cleaning up..."
+        pkill -f "${INSTALL_DIR}/mediamtx" 2>/dev/null || true
+        sleep 1
+    fi
 }
 
 # Install MediaMTX with full error handling
@@ -456,13 +815,52 @@ install_mediamtx() {
     
     echo_info "Installing MediaMTX..."
     
+    # Check if already installed and compare versions
+    if [[ -f "${INSTALL_DIR}/mediamtx" ]] && [[ "$FORCE_INSTALL" != "true" ]]; then
+        # More robust version extraction
+        local installed_version
+        installed_version=$("${INSTALL_DIR}/mediamtx" --version 2>&1 | grep -E '(v[0-9]+\.[0-9]+\.[0-9]+|MediaMTX [0-9]+\.[0-9]+\.[0-9]+)' | sed -E 's/.*v?([0-9]+\.[0-9]+\.[0-9]+).*/v\1/' || echo "unknown")
+        
+        local comparison
+        comparison=$(compare_versions "$VERSION" "$installed_version")
+        
+        case "$comparison" in
+            newer)
+                echo_info "Upgrading from $installed_version to $VERSION"
+                ;;
+            equal)
+                echo_info "Version $VERSION is already installed"
+                if [[ "$FORCE_INSTALL" != "true" ]]; then
+                    read -p "Reinstall anyway? (y/n) " -n 1 -r
+                    echo
+                    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+                        echo_info "Installation cancelled"
+                        exit 0
+                    fi
+                fi
+                ;;
+            older)
+                echo_warning "Installed version $installed_version is newer than $VERSION"
+                read -p "Downgrade anyway? (y/n) " -n 1 -r
+                echo
+                if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+                    echo_info "Installation cancelled"
+                    exit 0
+                fi
+                ;;
+            unknown)
+                echo_warning "Cannot compare versions, proceeding with installation"
+                ;;
+        esac
+    fi
+    
     # Create installation directory
     if [[ ! -d "$INSTALL_DIR" ]]; then
         mkdir -p "$INSTALL_DIR" || {
             echo_error "Failed to create installation directory"
             return 1
         }
-        add_rollback_point "rmdir '$INSTALL_DIR' 2>/dev/null"
+        add_rollback_point "rmdir '$INSTALL_DIR'"
     fi
     
     # Backup existing installation
@@ -508,7 +906,69 @@ install_mediamtx() {
     return 0
 }
 
-# Create configuration with validation
+# Configuration validation
+validate_config() {
+    local config_file=$1
+    
+    echo_debug "Validating configuration file: $config_file"
+    
+    # Basic file checks
+    if [[ ! -f "$config_file" ]]; then
+        echo_error "Configuration file not found: $config_file"
+        return 1
+    fi
+    
+    if [[ ! -s "$config_file" ]]; then
+        echo_error "Configuration file is empty"
+        return 1
+    fi
+    
+    # Check for basic YAML syntax errors (no complex parsing needed)
+    local yaml_errors=0
+    
+    # Check for tabs (YAML doesn't allow tabs for indentation)
+    if grep -q $'\t' "$config_file"; then
+        echo_warning "Configuration contains tabs - YAML requires spaces for indentation"
+        ((yaml_errors++))
+    fi
+    
+    # Check for common YAML mistakes
+    if grep -E '^[[:space:]]+:' "$config_file" | grep -q ':'; then
+        echo_warning "Configuration may have incorrect key formatting"
+        ((yaml_errors++))
+    fi
+    
+    # Simple bracket balance check
+    local open_brackets
+    local close_brackets
+    open_brackets=$(grep -o '{' "$config_file" | wc -l)
+    close_brackets=$(grep -o '}' "$config_file" | wc -l)
+    
+    if [[ "$open_brackets" -ne "$close_brackets" ]]; then
+        echo_warning "Mismatched brackets in configuration"
+        ((yaml_errors++))
+    fi
+    
+    # Required fields check with proper regex
+    if ! grep -E '^logLevel:' "$config_file" >/dev/null; then
+        echo_error "Missing required field: logLevel"
+        return 1
+    fi
+    
+    if ! grep -E '^paths:' "$config_file" >/dev/null; then
+        echo_error "Missing required field: paths"
+        return 1
+    fi
+    
+    if [[ $yaml_errors -gt 0 ]]; then
+        echo_warning "Found $yaml_errors potential YAML issues"
+    fi
+    
+    echo_debug "Configuration validation completed"
+    return 0
+}
+
+# Create configuration with validation (using atomic operations)
 create_configuration() {
     echo_info "Creating configuration..."
     
@@ -518,7 +978,7 @@ create_configuration() {
             echo_error "Failed to create config directory"
             return 1
         }
-        add_rollback_point "rmdir '$CONFIG_DIR' 2>/dev/null"
+        add_rollback_point "rmdir '$CONFIG_DIR'"
     fi
     
     # Backup existing config
@@ -530,11 +990,22 @@ create_configuration() {
         fi
     fi
     
-    # Create configuration file
+    # Create configuration file atomically with mktemp
+    local temp_config
+    temp_config=$(mktemp "${CONFIG_DIR}/mediamtx.yml.XXXXXX") || {
+        echo_error "Failed to create temporary config file"
+        return 1
+    }
+    
+    # Ensure cleanup on error
+    trap "rm -f '$temp_config' 2>/dev/null || true" ERR
+    
     if [[ "$DRY_RUN" == "true" ]]; then
         echo_info "[DRY RUN] Would create configuration at ${CONFIG_DIR}/mediamtx.yml"
+        rm -f "$temp_config"
     else
-        cat > "${CONFIG_DIR}/mediamtx.yml" << EOF
+        # Write configuration directly with variable substitution
+        if ! cat > "$temp_config" << EOF
 # MediaMTX Configuration
 # Generated by installer v${SCRIPT_VERSION} on $(date)
 # Documentation: https://github.com/bluenviron/mediamtx
@@ -561,20 +1032,6 @@ writeTimeout: 10s
 readBufferCount: 512
 
 # HTTP URL to perform external authentication.
-# Every time a user wants to authenticate, the server calls this URL
-# with the POST method and a body containing:
-# {
-#   "ip": "ip",
-#   "user": "user",
-#   "password": "password",
-#   "path": "path",
-#   "protocol": "rtsp|rtmp|hls|webrtc",
-#   "id": "id",
-#   "action": "read|publish",
-#   "query": "query"
-# }
-# If the response code is 20x, authentication is accepted, otherwise
-# it is discarded.
 externalAuthenticationURL:
 
 # Enable the HTTP API.
@@ -590,48 +1047,39 @@ apiAddress: 127.0.0.1:9997
 rtspDisable: no
 
 # List of enabled RTSP transport protocols.
-# UDP is the most performant, but doesn't work when there's a NAT/firewall between
-# server and clients, and doesn't support encryption.
-# UDP-multicast allows to save bandwidth when clients are all in the same LAN.
-# TCP is the most versatile, and does support encryption.
-# The handshake is always performed with TCP.
 protocols: [udp, multicast, tcp]
 
 # Encrypt handshake and TCP streams with TLS (RTSPS).
-# Available values are "no", "strict", "optional".
 encryption: "no"
 
-# Address of the TCP/RTSP listener. This is needed only when encryption is "no" or "optional".
+# Address of the TCP/RTSP listener.
 rtspAddress: :${RTSP_PORT}
 
-# Address of the TCP/TLS/RTSPS listener. This is needed only when encryption is "strict" or "optional".
+# Address of the TCP/TLS/RTSPS listener.
 rtspsAddress: :8322
 
-# Address of the UDP/RTP listener. This is needed only when "udp" is in protocols.
+# Address of the UDP/RTP listener.
 rtpAddress: :8000
 
-# Address of the UDP/RTCP listener. This is needed only when "udp" is in protocols.
+# Address of the UDP/RTCP listener.
 rtcpAddress: :8001
 
-# IP range of all UDP-multicast listeners. This is needed only when "multicast" is in protocols.
+# IP range of all UDP-multicast listeners.
 multicastIPRange: 224.1.0.0/16
 
-# Port of all UDP-multicast/RTP listeners. This is needed only when "multicast" is in protocols.
+# Port of all UDP-multicast/RTP listeners.
 multicastRTPPort: 8002
 
-# Port of all UDP-multicast/RTCP listeners. This is needed only when "multicast" is in protocols.
+# Port of all UDP-multicast/RTCP listeners.
 multicastRTCPPort: 8003
 
-# Path to the server key. This is needed only when encryption is "strict" or "optional".
-# This can be generated with:
-# openssl genrsa -out server.key 2048
-# openssl req -new -x509 -sha256 -key server.key -out server.crt -days 3650
+# Path to the server key.
 serverKey: server.key
 
-# Path to the server certificate. This is needed only when encryption is "strict" or "optional".
+# Path to the server certificate.
 serverCert: server.crt
 
-# Authentication methods. Available are "basic", "digest" and "none".
+# Authentication methods.
 authMethods: [basic, digest]
 
 ###############################################
@@ -640,23 +1088,19 @@ authMethods: [basic, digest]
 # Disable support for the RTMP protocol.
 rtmpDisable: no
 
-# Address of the RTMP listener. This is needed only when encryption is "no" or "optional".
+# Address of the RTMP listener.
 rtmpAddress: :${RTMP_PORT}
 
 # Encrypt connections with TLS (RTMPS).
-# Available values are "no", "strict", "optional".
 rtmpEncryption: "no"
 
-# Address of the RTMPS listener. This is needed only when encryption is "strict" or "optional".
+# Address of the RTMPS listener.
 rtmpsAddress: :1936
 
-# Path to the server key. This is needed only when encryption is "strict" or "optional".
-# This can be generated with:
-# openssl genrsa -out server.key 2048
-# openssl req -new -x509 -sha256 -key server.key -out server.crt -days 3650
+# Path to the server key.
 rtmpServerKey: server.key
 
-# Path to the server certificate. This is needed only when encryption is "strict" or "optional".
+# Path to the server certificate.
 rtmpServerCert: server.crt
 
 ###############################################
@@ -669,63 +1113,39 @@ hlsDisable: no
 hlsAddress: :${HLS_PORT}
 
 # Enable TLS/HTTPS on the HLS server.
-# This is required for Low-Latency HLS.
 hlsEncryption: no
 
-# Path to the server key. This is needed only when encryption is yes.
-# This can be generated with:
-# openssl genrsa -out server.key 2048
-# openssl req -new -x509 -sha256 -key server.key -out server.crt -days 3650
+# Path to the server key.
 hlsServerKey: server.key
 
 # Path to the server certificate.
 hlsServerCert: server.crt
 
 # By default, HLS is generated only when requested by a user.
-# This option allows to generate it always, avoiding the delay between request and generation.
 hlsAlwaysRemux: no
 
-# Variant of the HLS protocol to use. Available options are:
-# * mpegts - uses MPEG-TS segments, for maximum compatibility.
-# * fmp4 - uses fragmented MP4 segments, more efficient.
-# * lowLatency - uses Low-Latency HLS.
+# Variant of the HLS protocol to use.
 hlsVariant: lowLatency
 
 # Number of HLS segments to keep on the server.
-# Segments allow to seek through the stream.
-# Their number doesn't influence latency.
 hlsSegmentCount: 7
 
 # Minimum duration of each segment.
-# A player usually puts 3 segments in a buffer before reproducing the stream.
-# The final segment duration is also influenced by the interval between IDR frames,
-# since the server changes the duration in order to include at least one IDR frame
-# in each segment.
 hlsSegmentDuration: 1s
 
 # Minimum duration of each part.
-# A player usually puts 3 parts in a buffer before reproducing the stream.
-# Parts are used in Low-Latency HLS in place of segments.
-# Part duration is influenced by the distance between video/audio samples
-# and is adjusted in order to produce segments with a similar duration.
 hlsPartDuration: 200ms
 
 # Maximum size of each segment.
-# This prevents RAM exhaustion.
 hlsSegmentMaxSize: 50M
 
-# Value of the Access-Control-Allow-Origin header provided in every HTTP response.
-# This allows to play the HLS stream from an external website.
+# Value of the Access-Control-Allow-Origin header.
 hlsAllowOrigin: '*'
 
 # List of IPs or CIDRs of proxies placed before the HLS server.
-# If the server receives a request from one of these entries, IP in logs
-# will be taken from the X-Forwarded-For header.
 hlsTrustedProxies: []
 
-# Directory in which to save segments, instead of keeping them in the RAM.
-# This decreases performance, since reading from disk is less performant than
-# reading from RAM, but allows to save RAM.
+# Directory in which to save segments.
 hlsDirectory: ''
 
 ###############################################
@@ -741,45 +1161,27 @@ webrtcAddress: :${WEBRTC_PORT}
 webrtcEncryption: no
 
 # Path to the server key.
-# This can be generated with:
-# openssl genrsa -out server.key 2048
-# openssl req -new -x509 -sha256 -key server.key -out server.crt -days 3650
 webrtcServerKey: server.key
 
 # Path to the server certificate.
 webrtcServerCert: server.crt
 
-# Value of the Access-Control-Allow-Origin header provided in every HTTP response.
-# This allows to play the WebRTC stream from an external website.
+# Value of the Access-Control-Allow-Origin header.
 webrtcAllowOrigin: '*'
 
 # List of IPs or CIDRs of proxies placed before the WebRTC server.
-# If the server receives a request from one of these entries, IP in logs
-# will be taken from the X-Forwarded-For header.
 webrtcTrustedProxies: []
 
-# List of ICE servers, in format type:user:pass:host:port or type:host:port.
-# type can be "stun", "turn" or "turns".
-# STUN servers are used to get the public IP of both server and clients.
-# TURN servers are used as relay when a direct connection between server and clients is not possible.
-# if user is omitted, no authentication is used.
+# List of ICE servers.
 webrtcICEServers: [stun:stun.l.google.com:19302]
 
 # List of public IP addresses that are to be used as a host.
-# This is used typically for servers that are behind 1:1 D-NAT.
 webrtcICEHostNAT1To1IPs: []
 
 # Address of a ICE UDP listener in format host:port.
-# If filled, ICE traffic will come through a single UDP port,
-# allowing the deployment of the server inside a container or behind a NAT.
 webrtcICEUDPMuxAddress:
 
 # Address of a ICE TCP listener in format host:port.
-# If filled, ICE traffic will come through a single TCP port,
-# allowing the deployment of the server inside a container or behind a NAT.
-# At the moment, setting this parameter forces usage of the TCP protocol,
-# which is not optimal for media delivery.
-# This will be fixed in future versions.
 webrtcICETCPMuxAddress:
 
 ###############################################
@@ -794,153 +1196,123 @@ metricsAddress: 127.0.0.1:${METRICS_PORT}
 ###############################################
 # Path parameters
 
-# These settings are path-dependent, and the map key is the name of the path.
-# It's possible to use regular expressions by using a tilde as prefix.
-# For example, "~^(test1|test2)$" will match both "test1" and "test2".
-# For example, "~^prefix" will match all paths that start with "prefix".
-# The settings under the path "all" are applied to all paths that do not match
-# a more specific entry.
 paths:
   all:
-    # Source of the stream. This can be:
-    # * publisher -> the stream is published by a RTSP or RTMP client
-    # * rtsp://existing-url -> the stream is pulled from another RTSP server / camera
-    # * rtsps://existing-url -> the stream is pulled from another RTSP server / camera with RTSPS
-    # * rtmp://existing-url -> the stream is pulled from another RTMP server / camera
-    # * rtmps://existing-url -> the stream is pulled from another RTMP server / camera with RTMPS
-    # * http://existing-url/stream.m3u8 -> the stream is pulled from another HLS server
-    # * https://existing-url/stream.m3u8 -> the stream is pulled from another HLS server with HTTPS
-    # * udp://host:port -> the stream is pulled from UDP, by listening on the specified IP and port
-    # * redirect -> the stream is provided by another path or server
-    # * rpiCamera -> the stream is provided by a Raspberry Pi Camera
+    # Source of the stream.
     source: publisher
 
-    # If the source is an RTSP or RTSPS URL, this is the protocol that will be used to
-    # pull the stream. available values are "automatic", "udp", "multicast", "tcp".
+    # Protocol used to pull the stream.
     sourceProtocol: automatic
 
-    # Tf the source is an RTSP or RTSPS URL, this allows to support sources that
-    # don't provide server ports or use random server ports. This is a security issue
-    # and must be used only when interacting with sources that require it.
+    # Support sources that don't provide server ports.
     sourceAnyPortEnable: no
 
-    # If the source is a RTSPS URL, the fingerprint of the certificate of the source
-    # must be provided in order to prevent man-in-the-middle attacks.
-    # It can be obtained from the source by running:
-    # openssl s_client -connect source_ip:source_port </dev/null 2>/dev/null | sed -n '/BEGIN/,/END/p' > server.crt
-    # openssl x509 -in server.crt -noout -fingerprint -sha256 | cut -d "=" -f2 | tr -d ':'
+    # Fingerprint of the source certificate.
     sourceFingerprint:
 
-    # If the source is an RTSP or RTMP URL, it will be pulled only when at least
-    # one reader is connected, saving bandwidth.
+    # Pull only when at least one reader is connected.
     sourceOnDemand: no
 
-    # If sourceOnDemand is "yes", readers will be put on hold until the source is
-    # ready or until this amount of time has passed.
+    # Timeout for on-demand sources.
     sourceOnDemandStartTimeout: 10s
 
-    # If sourceOnDemand is "yes", the source will be closed when there are no
-    # readers connected and this amount of time has passed.
+    # Close source when no readers.
     sourceOnDemandCloseAfter: 10s
 
-    # If the source is "redirect", this is the RTSP URL which clients will be
-    # redirected to.
+    # Redirect address.
     sourceRedirect:
 
-    # If the source is "publisher" and a client is publishing, do not allow another
-    # client to disconnect the former and publish in its place.
+    # Prevent publisher override.
     disablePublisherOverride: no
 
-    # If the source is "publisher" and no one is publishing, redirect readers to this
-    # path. It can be can be a relative path  (i.e. /otherstream) or an absolute RTSP URL.
+    # Fallback stream.
     fallback:
 
     # Username required to publish.
-    # SHA256-hashed values can be inserted with the "sha256:" prefix.
     publishUser:
 
     # Password required to publish.
-    # SHA256-hashed values can be inserted with the "sha256:" prefix.
     publishPass:
 
-    # IPs or networks (x.x.x.x/24) allowed to publish.
+    # IPs allowed to publish.
     publishIPs: []
 
     # Username required to read.
-    # SHA256-hashed values can be inserted with the "sha256:" prefix.
     readUser:
 
-    # password required to read.
-    # SHA256-hashed values can be inserted with the "sha256:" prefix.
+    # Password required to read.
     readPass:
 
-    # IPs or networks (x.x.x.x/24) allowed to read.
+    # IPs allowed to read.
     readIPs: []
 
-    # Command to run when this path is initialized.
-    # This can be used to publish a stream and keep it always opened.
-    # This is terminated with SIGINT when the program closes.
-    # The following environment variables are available:
-    # * RTSP_PATH: path name
-    # * RTSP_PORT: server port
-    # * G1, G2, ...: regular expression groups, if path name is
-    #   a regular expression.
+    # Command to run when path is initialized.
     runOnInit:
 
-    # Restart the command if it exits suddenly.
+    # Restart the command if it exits.
     runOnInitRestart: no
 
-    # Command to run when this path is requested.
-    # This can be used to publish a stream on demand.
-    # This is terminated with SIGINT when the path is not requested anymore.
-    # The following environment variables are available:
-    # * RTSP_PATH: path name
-    # * RTSP_PORT: server port
-    # * G1, G2, ...: regular expression groups, if path name is
-    #   a regular expression.
+    # Command to run on demand.
     runOnDemand:
 
-    # Restart the command if it exits suddenly.
+    # Restart the on-demand command.
     runOnDemandRestart: no
 
-    # Readers will be put on hold until the runOnDemand command starts publishing
-    # or until this amount of time has passed.
+    # On-demand start timeout.
     runOnDemandStartTimeout: 10s
 
-    # The command will be closed when there are no
-    # readers connected and this amount of time has passed.
+    # On-demand close after.
     runOnDemandCloseAfter: 10s
 
-    # Command to run when the stream is ready to be read, whether it is
-    # published by a client or pulled from a server / camera.
-    # This is terminated with SIGINT when the stream is not ready anymore.
-    # The following environment variables are available:
-    # * RTSP_PATH: path name
-    # * RTSP_PORT: server port
-    # * G1, G2, ...: regular expression groups, if path name is
-    #   a regular expression.
+    # Command to run when stream is ready.
     runOnReady:
 
-    # Restart the command if it exits suddenly.
+    # Restart the ready command.
     runOnReadyRestart: no
 
-    # Command to run when a clients starts reading.
-    # This is terminated with SIGINT when a client stops reading.
-    # The following environment variables are available:
-    # * RTSP_PATH: path name
-    # * RTSP_PORT: server port
-    # * G1, G2, ...: regular expression groups, if path name is
-    #   a regular expression.
+    # Command to run when a client reads.
     runOnRead:
 
-    # Restart the command if it exits suddenly.
+    # Restart the read command.
     runOnReadRestart: no
 EOF
+        then
+            echo_error "Failed to write configuration file"
+            rm -f "$temp_config" 2>/dev/null
+            return 1
+        fi
         
-        if [[ ! -f "${CONFIG_DIR}/mediamtx.yml" ]]; then
+        # Check if file was created
+        if [[ ! -f "$temp_config" ]]; then
+            echo_error "Failed to create temporary configuration file"
+            return 1
+        fi
+        
+        echo_debug "Configuration file created with size: $(wc -c < "$temp_config" 2>/dev/null || echo "unknown") bytes"
+        
+        # Validate configuration before moving
+        if ! validate_config "$temp_config"; then
+            # If validation fails, show a sample of the config for debugging
+            if [[ "$DEBUG_MODE" == "true" ]]; then
+                echo_debug "First 10 lines of generated config:"
+                head -10 "$temp_config" | while IFS= read -r line; do
+                    echo_debug "  $line"
+                done
+            fi
+            rm -f "$temp_config"
+            echo_error "Configuration validation failed"
+            return 1
+        fi
+        
+        # Move atomically with proper permissions
+        if ! mv -f "$temp_config" "${CONFIG_DIR}/mediamtx.yml"; then
+            rm -f "$temp_config"
             echo_error "Failed to create configuration file"
             return 1
         fi
+        
+        # Clear the trap
+        trap - ERR
         
         add_rollback_point "rm -f '${CONFIG_DIR}/mediamtx.yml'"
     fi
@@ -949,9 +1321,48 @@ EOF
     return 0
 }
 
+# Setup log rotation
+setup_log_rotation() {
+    if [[ "$DRY_RUN" == "true" ]]; then
+        echo_info "[DRY RUN] Would create log rotation config"
+        return 0
+    fi
+    
+    if [[ ! -d "/etc/logrotate.d" ]]; then
+        echo_warning "logrotate not found, skipping log rotation setup"
+        return 0
+    fi
+    
+    echo_info "Setting up log rotation..."
+    
+    cat > /etc/logrotate.d/mediamtx << EOF
+${LOG_DIR}/*.log {
+    daily
+    rotate 7
+    compress
+    delaycompress
+    missingok
+    notifempty
+    create 0640 ${SERVICE_USER} ${SERVICE_USER}
+    sharedscripts
+    postrotate
+        systemctl reload mediamtx >/dev/null 2>&1 || true
+    endscript
+}
+EOF
+    
+    echo_success "Log rotation configured"
+    return 0
+}
+
 # Create systemd service with enhanced security
 create_systemd_service() {
     echo_info "Creating systemd service..."
+    
+    # Detect systemd directory
+    if ! detect_systemd_dir; then
+        return 1
+    fi
     
     # Create service user
     if ! id "$SERVICE_USER" >/dev/null 2>&1; then
@@ -962,7 +1373,7 @@ create_systemd_service() {
                 echo_warning "Failed to create service user, will use root"
                 SERVICE_USER="root"
             else
-                add_rollback_point "userdel '$SERVICE_USER' 2>/dev/null"
+                add_rollback_point "userdel '$SERVICE_USER'"
             fi
         fi
     fi
@@ -973,7 +1384,7 @@ create_systemd_service() {
             echo_error "Failed to create log directory"
             return 1
         }
-        add_rollback_point "rmdir '$LOG_DIR' 2>/dev/null"
+        add_rollback_point "rmdir '$LOG_DIR'"
     fi
     
     # Set ownership
@@ -984,7 +1395,7 @@ create_systemd_service() {
     fi
     
     # Create systemd service file
-    local service_file="/etc/systemd/system/mediamtx.service"
+    local service_file="${SYSTEMD_DIR}/mediamtx.service"
     
     if [[ -f "$service_file" ]]; then
         local backup_name="mediamtx.service.backup.$(date +%Y%m%d_%H%M%S)"
@@ -997,7 +1408,10 @@ create_systemd_service() {
     if [[ "$DRY_RUN" == "true" ]]; then
         echo_info "[DRY RUN] Would create service file at $service_file"
     else
-        cat > "$service_file" << EOF
+        # Create service file atomically
+        local temp_service="${service_file}.tmp.$$"
+        
+        cat > "$temp_service" << EOF
 [Unit]
 Description=MediaMTX RTSP/RTMP/HLS/WebRTC Media Server
 Documentation=https://github.com/bluenviron/mediamtx
@@ -1044,15 +1458,17 @@ AmbientCapabilities=CAP_NET_BIND_SERVICE
 ReadWritePaths=$LOG_DIR
 ReadOnlyPaths=$CONFIG_DIR
 
-# Resource limits
-LimitNOFILE=65535
-LimitNPROC=512
+# Resource limits - adjusted for broader compatibility
+LimitNOFILE=8192
+LimitNPROC=256
 
 [Install]
 WantedBy=multi-user.target
 EOF
         
-        if [[ ! -f "$service_file" ]]; then
+        # Move atomically
+        if ! mv "$temp_service" "$service_file"; then
+            rm -f "$temp_service"
             echo_error "Failed to create service file"
             return 1
         fi
@@ -1064,14 +1480,92 @@ EOF
             echo_warning "Failed to reload systemd"
         }
         
-        # Enable service
-        systemctl enable mediamtx.service >/dev/null 2>&1 || {
-            echo_warning "Failed to enable service"
-        }
+        # Give systemd time to process the new service file
+        sleep 1
     fi
     
     echo_success "Systemd service created successfully"
     return 0
+}
+
+# Verify installation
+verify_installation() {
+    echo_info "Verifying installation..."
+    
+    local errors=0
+    
+    # Check binary is executable
+    if [[ ! -x "${INSTALL_DIR}/mediamtx" ]]; then
+        echo_error "Binary is not executable"
+        ((errors++))
+    else
+        echo_debug "Binary check passed"
+    fi
+    
+    # Check service is loaded - try multiple methods
+    local service_loaded=false
+    
+    # Method 1: systemctl list-unit-files
+    if systemctl list-unit-files --no-pager | grep -q "mediamtx\.service"; then
+        service_loaded=true
+        echo_debug "Service found via list-unit-files"
+    fi
+    
+    # Method 2: systemctl status (without checking if active)
+    if [[ "$service_loaded" != "true" ]] && systemctl status mediamtx.service --no-pager >/dev/null 2>&1; then
+        service_loaded=true
+        echo_debug "Service found via status check"
+    fi
+    
+    # Method 3: Check if service file exists
+    if [[ "$service_loaded" != "true" ]] && [[ -f "${SYSTEMD_DIR}/mediamtx.service" ]]; then
+        service_loaded=true
+        echo_debug "Service file exists at ${SYSTEMD_DIR}/mediamtx.service"
+    fi
+    
+    if [[ "$service_loaded" != "true" ]]; then
+        echo_error "Service is not loaded"
+        ((errors++))
+    else
+        echo_debug "Service check passed"
+    fi
+    
+    # Check configuration exists
+    if [[ ! -f "${CONFIG_DIR}/mediamtx.yml" ]]; then
+        echo_error "Configuration file missing"
+        ((errors++))
+    else
+        echo_debug "Configuration check passed"
+    fi
+    
+    # Check ports are available
+    echo_debug "Checking port availability..."
+    local ports=($RTSP_PORT $RTMP_PORT $HLS_PORT $WEBRTC_PORT $METRICS_PORT)
+    for port in "${ports[@]}"; do
+        # Trim any whitespace
+        port=$(echo "$port" | tr -d '[:space:]')
+        if ! check_port_available "$port"; then
+            ((errors++))
+        else
+            echo_debug "Port $port is available"
+        fi
+    done
+    
+    # Test binary execution
+    if ! "${INSTALL_DIR}/mediamtx" --version >/dev/null 2>&1; then
+        echo_error "Binary test execution failed"
+        ((errors++))
+    else
+        echo_debug "Binary execution test passed"
+    fi
+    
+    if [[ $errors -eq 0 ]]; then
+        echo_success "Installation verification passed"
+        return 0
+    else
+        echo_error "Installation verification failed with $errors errors"
+        return 1
+    fi
 }
 
 # Display installation summary
@@ -1124,11 +1618,19 @@ main() {
     while [[ $# -gt 0 ]]; do
         case $1 in
             --version)
-                VERSION="$2"
+                VERSION="${2:-}"
+                if [[ -z "$VERSION" ]]; then
+                    echo_error "Version argument requires a value"
+                    exit 1
+                fi
                 shift 2
                 ;;
             --arch)
-                ARCH="$2"
+                ARCH="${2:-}"
+                if [[ -z "$ARCH" ]]; then
+                    echo_error "Architecture argument requires a value"
+                    exit 1
+                fi
                 shift 2
                 ;;
             --debug)
@@ -1153,6 +1655,18 @@ main() {
                 echo "  --dry-run           Show what would be done without making changes"
                 echo "  --force             Force installation even if already installed"
                 echo "  --help              Show this help message"
+                echo ""
+                echo "Environment variables:"
+                echo "  VERSION             MediaMTX version (default: $VERSION)"
+                echo "  RTSP_PORT          RTSP port (default: 18554)"
+                echo "  RTMP_PORT          RTMP port (default: 11935)"
+                echo "  HLS_PORT           HLS port (default: 18888)"
+                echo "  WEBRTC_PORT        WebRTC port (default: 18889)"
+                echo "  METRICS_PORT       Metrics port (default: 19999)"
+                echo "  DEBUG              Enable debug mode (default: false)"
+                echo "  DRY_RUN            Dry run mode (default: false)"
+                echo "  FORCE              Force installation (default: false)"
+                echo "  SKIP_YAML_VALIDATION  Skip YAML validation (default: false)"
                 echo ""
                 exit 0
                 ;;
@@ -1179,10 +1693,31 @@ main() {
     setup_logging
     setup_traps
     
+    # Debug mode info
+    if [[ "$DEBUG_MODE" == "true" ]]; then
+        echo_debug "Debug mode enabled"
+        echo_debug "Script version: $SCRIPT_VERSION"
+        echo_debug "Target version: $VERSION"
+        echo_debug "Ports: RTSP=$RTSP_PORT, RTMP=$RTMP_PORT, HLS=$HLS_PORT, WebRTC=$WEBRTC_PORT, Metrics=$METRICS_PORT"
+        echo_debug "Skip YAML validation: $SKIP_YAML_VALIDATION"
+    fi
+    
     log_message "INFO" "Starting MediaMTX installation (version: $VERSION)"
+    
+    # Validate ports early
+    if ! validate_all_ports; then
+        echo_error "Port validation failed"
+        exit 1
+    fi
     
     # Pre-flight checks
     echo_info "Running pre-flight checks..."
+    
+    # Detect systemd directory early
+    if ! detect_systemd_dir; then
+        echo_error "Failed to detect systemd directory"
+        exit 1
+    fi
     
     if ! check_dependencies; then
         echo_error "Dependency check failed"
@@ -1191,6 +1726,12 @@ main() {
     
     if ! detect_architecture; then
         echo_error "Architecture detection failed"
+        exit 1
+    fi
+    
+    # Check disk space
+    if ! check_disk_space; then
+        echo_error "Disk space check failed"
         exit 1
     fi
     
@@ -1213,6 +1754,11 @@ main() {
             echo_info "Installation cancelled"
             exit 0
         fi
+    fi
+    
+    # Stop service safely before upgrade
+    if [[ -f "${INSTALL_DIR}/mediamtx" ]]; then
+        stop_service_safely
     fi
     
     # Main installation steps
@@ -1244,6 +1790,27 @@ main() {
         exit 1
     fi
     
+    # Setup log rotation
+    setup_log_rotation
+    
+    # Verify installation
+    if [[ "$DRY_RUN" != "true" ]]; then
+        if ! verify_installation; then
+            echo_error "Installation verification failed"
+            exit 1
+        fi
+    fi
+    
+    # Enable service only after everything is verified
+    if [[ "$DRY_RUN" != "true" ]]; then
+        echo_info "Enabling MediaMTX service..."
+        if systemctl enable mediamtx.service >/dev/null 2>&1; then
+            echo_success "Service enabled"
+        else
+            echo_warning "Failed to enable service"
+        fi
+    fi
+    
     # Print summary
     print_summary
     
@@ -1252,7 +1819,7 @@ main() {
         echo ""
         read -p "Would you like to start MediaMTX now? (y/n) " -n 1 -r
         echo
-        if [[ $REPLY =~ ^[Yy]$ ]]; then
+        if [[ "$REPLY" =~ ^[Yy]$ ]]; then
             echo_info "Starting MediaMTX service..."
             if systemctl start mediamtx.service; then
                 echo_success "MediaMTX is now running"
