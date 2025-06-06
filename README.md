@@ -30,7 +30,7 @@ The system is designed for unattended operation with automatic recovery from dev
 
 ## Pre-Installation Cleanup
 
-Ideally this is deployed on a fresh OS installation, and if possible on a dedicated device (like a Raspberry Pi) to avoid port conflicts, service issues and resource consumption. However with that being said you want to still continue: if you have existing MediaMTX installations or audio streaming setups, run these cleanup steps:
+Ideally this is deployed on a fresh OS installation, and if possible on a dedicated device (like a Raspberry Pi) to avoid port conflicts, service issues and resource contention. However with that being said you want to still continue: if you have existing MediaMTX installations or audio streaming setups, run these cleanup steps:
 
 ### 1. Check for Existing MediaMTX Services
 
