@@ -30,7 +30,7 @@ The system is designed for unattended operation with automatic recovery from dev
 
 ## Pre-Installation Cleanup
 
-Ideally this is deployed on a fresh OS installation, and if possible on a dedicated device (like a Raspberry Pi) to avoid port conflicts, service issues and resource contention. However with that being said you want to still continue: if you have existing MediaMTX installations or audio streaming setups, run these cleanup steps:
+Ideally, this would be deployed on a fresh operating system (OS) installation and, if possible, on a dedicated device, such as a Raspberry Pi for one to two microphones or an x86 PC for two or more microphones, to avoid port conflicts, service issues, and resource contention. However, if you have existing MediaMTX installations or audio streaming setups, run these cleanup steps.
 
 ### 1. Check for Existing MediaMTX Services
 
@@ -364,7 +364,15 @@ sudo rm -f /var/log/mediamtx*
 
 ## Support
 
+Please keep in mind that this is a personal project that was created out of a desire to listen to more birds. I will do my best to support issues, but I cannot make guarantees.
+
 For issues and feature requests, please use the [GitHub issue tracker](https://github.com/tomtom215/mediamtx-rtsp-setup/issues).
+
+## Confirmed deployments
+
+Did this project help you? Did you use it to do something cool? Are you an organization that uses this?
+
+Let me know! I am super curious if this gets put to use in some real-world scenarios beyond my back yard deployment and would love to hear from you!
 
 ## License and Contributors
 
