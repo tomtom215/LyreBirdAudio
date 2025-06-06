@@ -30,7 +30,7 @@ The system is designed for unattended operation with automatic recovery from dev
 
 ## Pre-Installation Cleanup
 
-If you have existing MediaMTX installations or audio streaming setups, run these cleanup steps:
+Ideally this is deployed on a fresh OS installation, and if possible on a dedicated device (like a Raspberry Pi) to avoid port conflicts, service issues and resource consumption. However with that being said you want to still continue: if you have existing MediaMTX installations or audio streaming setups, run these cleanup steps:
 
 ### 1. Check for Existing MediaMTX Services
 
@@ -89,7 +89,7 @@ if [ -d "/etc/mediamtx" ]; then
     sudo cp -r /etc/mediamtx /etc/mediamtx.backup.$(date +%Y%m%d-%H%M%S)
 fi
 
-# Check for existing udev rules
+# Check for existing udev rules and create a backup
 if [ -f "/etc/udev/rules.d/99-usb-soundcards.rules" ]; then
     echo "Found existing USB soundcard rules"
     sudo cp /etc/udev/rules.d/99-usb-soundcards.rules \
