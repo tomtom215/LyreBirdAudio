@@ -393,3 +393,5 @@ This software is released under the Apache 2.0 License.
 This project is not officially affiliated with the MediaMTX project.
 
 Always review scripts before running them with sudo privileges.
+
+I assume no liability for use, assume no responsibility for support and promise no additional maintainence if life changes happen, major dependency changes, etc.
