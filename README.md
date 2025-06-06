@@ -1,367 +1,370 @@
-# MediaMTX Audio Stream Manager
+# MediaMTX RTSP Audio Streaming Setup
 
-# Currently this is not in a working state, please issues and bugs until this meesage has been removed. 
+A set of Linux utilities for creating reliable 24/7 RTSP audio streams from USB microphones using MediaMTX and FFmpeg.
 
-Automatic MediaMTX configuration and management for continuous 24/7 RTSP audio streaming from USB audio devices.
+## This is currently in development - expect bugs until this banner is removed
 
 ## Overview
 
-This script automatically detects USB audio devices and creates MediaMTX configurations with FFmpeg publishers for continuous RTSP audio streams. It includes automatic recovery, device hot-plug support, and comprehensive monitoring capabilities.
+This repository provides three scripts that work together to create persistent, automatically-managed RTSP audio streams from USB audio devices:
 
-### Key Features
+- **usb-audio-mapper.sh** - Creates persistent device names for USB audio devices using udev rules
+- **install_mediamtx.sh** - Installs, updates, and manages MediaMTX
+- **mediamtx-stream-manager.sh** - Automatically configures and manages RTSP audio streams
 
-- Automatic USB audio device detection and configuration
-- Self-healing FFmpeg streams with intelligent restart logic
-- Per-device audio parameter customization
-- Comprehensive logging and monitoring
-- Systemd service integration
-- Clean process management with proper signal handling
+The system is designed for unattended operation with automatic recovery from device disconnections and process failures.
 
 ## Requirements
 
-### System Requirements
+- Linux system with systemd
+- Root access (sudo)
+- USB audio devices
+- Required packages:
+  - `ffmpeg`
+  - `curl` or `wget`
+  - `tar`
+  - `jq`
+  - `arecord` (part of alsa-utils)
+  - `lsusb` (part of usbutils)
+  - `udevadm` (part of systemd)
 
-- Linux-based operating system with ALSA support
-- Root/sudo access for device access and service management
-- USB audio devices compatible with ALSA
+## Pre-Installation Cleanup
 
-### Software Dependencies
+If you have existing MediaMTX installations or audio streaming setups, run these cleanup steps:
 
-- MediaMTX v1.12.3 or later (install using provided install_mediamtx.sh script)
-- FFmpeg with opus, aac, and mp3 codec support
-- Standard utilities: bash, jq, curl, arecord
-- Python3 with yaml module (optional, for configuration validation)
+### 1. Check for Existing MediaMTX Services
 
-### Network Requirements
+```bash
+# Check if MediaMTX systemd service is running
+if systemctl is-active --quiet mediamtx; then
+    echo "MediaMTX service is running. Stopping..."
+    sudo systemctl stop mediamtx
+    sudo systemctl disable mediamtx
+fi
 
-- Port 8554 (RTSP server)
-- Port 9997 (MediaMTX API)
-- Port 9998 (MediaMTX metrics)
+# Check for mediamtx-audio service from this toolset
+if systemctl is-active --quiet mediamtx-audio; then
+    echo "MediaMTX audio service is running. Stopping..."
+    sudo systemctl stop mediamtx-audio
+    sudo systemctl disable mediamtx-audio
+fi
+```
+
+### 2. Stop Existing MediaMTX Processes
+
+```bash
+# Kill any running MediaMTX processes
+sudo pkill -f mediamtx || true
+
+# Kill any FFmpeg processes streaming to MediaMTX
+sudo pkill -f "ffmpeg.*rtsp://localhost:8554" || true
+```
+
+### 3. Check for Port Conflicts
+
+```bash
+# Check if RTSP port 8554 is in use
+sudo lsof -i :8554 && echo "Port 8554 is in use. Please stop the process using it."
+
+# Check if API port 9997 is in use
+sudo lsof -i :9997 && echo "Port 9997 is in use. Please stop the process using it."
+```
+
+### 4. Release Audio Devices
+
+```bash
+# Check what's using audio devices
+lsof /dev/snd/* 2>/dev/null || echo "No processes using audio devices"
+
+# If PulseAudio is monopolizing USB devices, temporarily suspend it
+systemctl --user stop pulseaudio.socket pulseaudio.service 2>/dev/null || true
+```
+
+### 5. Check for Existing Configuration
+
+```bash
+# Backup existing MediaMTX configuration if present
+if [ -d "/etc/mediamtx" ]; then
+    echo "Found existing MediaMTX configuration"
+    sudo cp -r /etc/mediamtx /etc/mediamtx.backup.$(date +%Y%m%d-%H%M%S)
+fi
+
+# Check for existing udev rules
+if [ -f "/etc/udev/rules.d/99-usb-soundcards.rules" ]; then
+    echo "Found existing USB soundcard rules"
+    sudo cp /etc/udev/rules.d/99-usb-soundcards.rules \
+         /etc/udev/rules.d/99-usb-soundcards.rules.backup.$(date +%Y%m%d-%H%M%S)
+fi
+```
 
 ## Installation
 
-1. Download the script to your desired location:
-```bash
-wget https://your-repo/mediamtx-audio-stream-manager.sh
-chmod +x mediamtx-audio-stream-manager.sh
-```
+### 1. Install Dependencies
 
-2. Install MediaMTX if not already installed:
 ```bash
-# Use the companion install_mediamtx.sh script or install manually
-sudo wget -O /usr/local/bin/mediamtx https://github.com/bluenviron/mediamtx/releases/download/v1.12.3/mediamtx_v1.12.3_linux_amd64.tar.gz
-sudo chmod +x /usr/local/bin/mediamtx
-```
-
-3. Install required dependencies:
-```bash
+# Debian/Ubuntu
 sudo apt-get update
-sudo apt-get install -y ffmpeg jq curl alsa-utils python3-yaml
+sudo apt-get install ffmpeg curl wget tar jq alsa-utils usbutils
+
+# RHEL/CentOS/Fedora
+sudo yum install ffmpeg curl wget tar jq alsa-utils usbutils
 ```
 
-4. Create systemd service (optional):
+### 2. Clone Repository
+
 ```bash
-sudo ./mediamtx-audio-stream-manager.sh install
+git clone https://github.com/tomtom215/mediamtx-rtsp-setup/
+cd mediamtx-rtsp-setup
+chmod +x *.sh
 ```
 
-## Configuration
+### 3. Map USB Audio Devices
 
-### Audio Device Configuration
+Run the USB audio mapper for each microphone to create persistent device names:
 
-The script creates a configuration file at `/etc/mediamtx/audio-devices.conf` where you can customize per-device audio parameters.
-
-Default parameters:
-- Sample Rate: 48000 Hz
-- Channels: 2 (stereo)
-- Format: s16le
-- Codec: opus
-- Bitrate: 128k
-- ALSA Buffer: 100000 microseconds
-- ALSA Period: 20000 microseconds
-
-To override settings for a specific device:
 ```bash
-# Edit /etc/mediamtx/audio-devices.conf
-DEVICE_USB_BLUE_YETI_SAMPLE_RATE=44100
-DEVICE_USB_BLUE_YETI_CHANNELS=1
-DEVICE_USB_BLUE_YETI_ALSA_BUFFER=200000
+sudo ./usb-audio-mapper.sh
 ```
 
-Device names are sanitized to uppercase with underscores. Check the device variable prefix using:
+Follow the interactive prompts to:
+1. Select your sound card number
+2. Select the corresponding USB device
+3. Provide a friendly name (e.g., `conference-mic-1`)
+
+**Important**: Reboot after mapping each device to ensure proper detection.
+
+For non-interactive mapping:
 ```bash
-sudo ./mediamtx-audio-stream-manager.sh config
+sudo ./usb-audio-mapper.sh -n -d "Device Name" -v 1234 -p 5678 -f friendly-name
 ```
 
-### Stream Path Naming
+### 4. Install MediaMTX
 
-Stream paths are automatically generated from device names:
-- Special characters are replaced with underscores
-- Names are converted to lowercase
-- Consecutive underscores are collapsed
+```bash
+sudo ./install_mediamtx.sh install
+```
 
-Example: `usb-Blue_Yeti_Audio-00` becomes `rtsp://localhost:8554/blue_yeti_audio_00`
+This will:
+- Download the latest MediaMTX release
+- Install the binary to `/usr/local/bin/`
+- Create configuration directory at `/etc/mediamtx/`
+- Create systemd service (optional)
 
-## Usage
+### 5. Configure and Start Audio Streams
+
+```bash
+sudo ./mediamtx-stream-manager.sh start
+```
+
+This will:
+- Detect all USB audio devices
+- Generate MediaMTX configuration
+- Start MediaMTX server on port 8554
+- Start FFmpeg processes for each audio device
+- Display available RTSP stream URLs
+
+## Operation
 
 ### Basic Commands
 
 ```bash
 # Start all streams
-sudo ./mediamtx-audio-stream-manager.sh start
+sudo ./mediamtx-stream-manager.sh start
 
 # Stop all streams
-sudo ./mediamtx-audio-stream-manager.sh stop
+sudo ./mediamtx-stream-manager.sh stop
 
 # Restart all streams
-sudo ./mediamtx-audio-stream-manager.sh restart
+sudo ./mediamtx-stream-manager.sh restart
 
 # Check status
-sudo ./mediamtx-audio-stream-manager.sh status
-
-# View configuration
-sudo ./mediamtx-audio-stream-manager.sh config
+sudo ./mediamtx-stream-manager.sh status
 
 # Monitor streams in real-time
-sudo ./mediamtx-audio-stream-manager.sh monitor
+sudo ./mediamtx-stream-manager.sh monitor
 
-# Debug stream issues
-sudo ./mediamtx-audio-stream-manager.sh debug
-```
-
-### Systemd Service
-
-If installed as a systemd service:
-```bash
-# Enable automatic startup
-sudo systemctl enable mediamtx-audio
-
-# Start service
-sudo systemctl start mediamtx-audio
-
-# Check service status
-sudo systemctl status mediamtx-audio
-
-# View service logs
-sudo journalctl -u mediamtx-audio -f
+# Show configuration
+sudo ./mediamtx-stream-manager.sh config
 ```
 
 ### Accessing Streams
 
-Streams are available via RTSP at:
+Once running, streams are available at:
 ```
-rtsp://localhost:8554/<stream_path>
+rtsp://localhost:8554/<device-name>
 ```
 
-Test stream playback:
+Example playback commands:
 ```bash
-# Using ffplay
-ffplay rtsp://localhost:8554/<stream_path>
+# FFplay
+ffplay rtsp://localhost:8554/conference_mic_1
 
-# Using VLC
-vlc rtsp://localhost:8554/<stream_path>
+# VLC
+vlc rtsp://localhost:8554/conference_mic_1
 
-# Using ffmpeg (verify stream)
-ffmpeg -i rtsp://localhost:8554/<stream_path> -t 10 -f null -
+# MPV
+mpv rtsp://localhost:8554/conference_mic_1
 ```
 
-## File Locations
+### Service Management
 
-- Main configuration: `/etc/mediamtx/mediamtx.yml`
-- Device configuration: `/etc/mediamtx/audio-devices.conf`
-- Manager log: `/var/log/mediamtx-audio-manager.log`
-- MediaMTX log: `/var/log/mediamtx.log`
-- FFmpeg logs: `/var/lib/mediamtx-ffmpeg/<stream_name>.log`
-- PID files: `/var/run/mediamtx-audio.pid`, `/var/lib/mediamtx-ffmpeg/*.pid`
+To run as a system service:
+
+```bash
+# Create systemd service
+sudo ./mediamtx-stream-manager.sh install
+
+# Enable and start service
+sudo systemctl enable mediamtx-audio
+sudo systemctl start mediamtx-audio
+```
+
+## Configuration
+
+### Audio Device Settings
+
+Edit `/etc/mediamtx/audio-devices.conf` to customize per-device settings:
+
+```bash
+# Device-specific overrides
+DEVICE_CONFERENCE_MIC_1_SAMPLE_RATE=44100
+DEVICE_CONFERENCE_MIC_1_CHANNELS=1
+DEVICE_CONFERENCE_MIC_1_CODEC=opus
+DEVICE_CONFERENCE_MIC_1_BITRATE=96k
+```
+
+Available parameters:
+- `SAMPLE_RATE`: Audio sample rate (default: 48000)
+- `CHANNELS`: Number of channels (default: 2)
+- `FORMAT`: Audio format (default: s16le)
+- `CODEC`: Output codec - opus, aac, mp3, pcm (default: opus)
+- `BITRATE`: Encoding bitrate (default: 128k)
+- `ALSA_BUFFER`: ALSA buffer size in microseconds (default: 100000)
+- `ALSA_PERIOD`: ALSA period size in microseconds (default: 20000)
+- `THREAD_QUEUE`: FFmpeg thread queue size (default: 8192)
+
+### MediaMTX Configuration
+
+The MediaMTX configuration is automatically generated at `/etc/mediamtx/mediamtx.yml`. Manual edits will be overwritten on restart.
 
 ## Troubleshooting
 
-### No Audio Devices Detected
-
-1. Verify USB devices are connected:
-```bash
-lsusb
-arecord -l
-```
-
-2. Check device permissions:
-```bash
-ls -la /dev/snd/
-```
-
-3. Ensure user is in audio group:
-```bash
-sudo usermod -a -G audio $USER
-```
-
-### Stream Not Starting
-
-1. Check device accessibility:
-```bash
-sudo ./mediamtx-audio-stream-manager.sh debug
-```
-
-2. Review FFmpeg logs:
-```bash
-sudo tail -50 /var/lib/mediamtx-ffmpeg/*.log
-```
-
-3. Verify MediaMTX is running:
-```bash
-sudo ./mediamtx-audio-stream-manager.sh status
-ps aux | grep mediamtx
-```
-
-### Audio Quality Issues
-
-1. Increase ALSA buffer size in device configuration:
-```bash
-DEVICE_<NAME>_ALSA_BUFFER=200000
-```
-
-2. Try different audio formats if device supports them:
-```bash
-DEVICE_<NAME>_FORMAT=s24le
-```
-
-3. Adjust thread queue size for stability:
-```bash
-DEVICE_<NAME>_THREAD_QUEUE=16384
-```
-
-### High CPU Usage
-
-1. Avoid PCM codec for network streams (uses excessive bandwidth)
-2. Use compressed codecs: opus (recommended), aac, or mp3
-3. Check for multiple FFmpeg instances:
-```bash
-ps aux | grep ffmpeg
-```
-
-### Port Conflicts
-
-1. Check if ports are in use:
-```bash
-sudo lsof -i :8554
-sudo lsof -i :9997
-sudo lsof -i :9998
-```
-
-2. Stop conflicting services or change MediaMTX ports in configuration
-
-## Monitoring
-
-### API Endpoints
-
-- Stream list: `http://localhost:9997/v3/paths/list`
-- Stream details: `http://localhost:9997/v3/paths/get/<stream_path>`
-- Metrics: `http://localhost:9998/metrics`
-
-### Log Monitoring
+### Check Logs
 
 ```bash
-# Manager logs
+# Stream manager log
 tail -f /var/log/mediamtx-audio-manager.log
 
-# MediaMTX logs
+# MediaMTX log
 tail -f /var/log/mediamtx.log
 
-# FFmpeg logs
-tail -f /var/lib/mediamtx-ffmpeg/*.log
+# FFmpeg logs for specific stream
+tail -f /var/lib/mediamtx-ffmpeg/<stream-name>.log
+```
 
-# All logs
-sudo ./mediamtx-audio-stream-manager.sh debug
+### Common Issues
+
+**No audio devices detected**
+```bash
+# Check USB devices
+lsusb
+# Check ALSA devices
+arecord -l
+# Test USB port detection
+sudo ./usb-audio-mapper.sh --test
+```
+
+**Stream not working**
+```bash
+# Debug specific stream
+sudo ./mediamtx-stream-manager.sh debug
+
+# Test audio device
+arecord -D hw:0,0 -f S16_LE -r 48000 -c 2 -d 5 test.wav
+```
+
+**High CPU usage**
+- Switch from PCM to compressed codec (opus/aac)
+- Reduce sample rate or channels
+- Increase ALSA buffer size
+
+**Audio crackling or dropouts**
+- Increase `ALSA_BUFFER` in device configuration
+- Increase `THREAD_QUEUE` for the device
+- Check USB bandwidth and try different USB ports
+
+**Port conflicts**
+```bash
+# Find what's using MediaMTX ports
+sudo lsof -i :8554  # RTSP port
+sudo lsof -i :9997  # API port
+sudo lsof -i :9998  # Metrics port
+```
+
+**PulseAudio interference**
+```bash
+# Temporarily disable PulseAudio
+systemctl --user stop pulseaudio.socket pulseaudio.service
+
+# Re-enable after setup
+systemctl --user start pulseaudio.socket pulseaudio.service
 ```
 
 ## Uninstallation
 
-### Complete Removal
-
-1. Stop all services:
+### Remove MediaMTX
 ```bash
-sudo ./mediamtx-audio-stream-manager.sh stop
+sudo ./install_mediamtx.sh uninstall
+```
+
+### Remove Audio Stream Service
+```bash
 sudo systemctl stop mediamtx-audio
 sudo systemctl disable mediamtx-audio
-```
-
-2. Remove systemd service:
-```bash
 sudo rm /etc/systemd/system/mediamtx-audio.service
-sudo systemctl daemon-reload
 ```
 
-3. Remove configuration and logs:
+### Remove USB Device Mappings
+```bash
+sudo rm /etc/udev/rules.d/99-usb-soundcards.rules
+sudo udevadm control --reload-rules
+```
+
+### Clean Configuration and Logs
 ```bash
 sudo rm -rf /etc/mediamtx
-sudo rm -f /var/log/mediamtx*
 sudo rm -rf /var/lib/mediamtx-ffmpeg
+sudo rm -f /var/log/mediamtx*
 ```
 
-4. Remove PID files:
-```bash
-sudo rm -f /var/run/mediamtx-audio.pid
-```
+## Limitations and Future Improvements
 
-5. Remove the script:
-```bash
-rm mediamtx-audio-stream-manager.sh
-```
+### Current Limitations
 
-### Partial Cleanup
+- No built-in authentication or encryption for RTSP streams
+- Audio-only (no video support)
+- Limited to USB audio devices
+- No web-based management interface
+- Manual device mapping required for each microphone
+- No built-in stream recording functionality
+- Single-user system (no multi-tenancy)
+- No automatic codec negotiation with clients
 
-To remove only stream data while preserving configuration:
-```bash
-sudo ./mediamtx-audio-stream-manager.sh stop
-sudo rm -rf /var/lib/mediamtx-ffmpeg/*
-sudo rm -f /var/log/mediamtx*.log
-```
+### Potential Future Enhancements - Not Promised or Currently Planned
 
-## Technical Details
-
-### Architecture
-
-The system consists of three main components:
-
-1. **MediaMTX Server**: RTSP server that handles client connections
-2. **FFmpeg Publishers**: One per audio device, publishes audio to MediaMTX
-3. **Wrapper Scripts**: Monitor and restart FFmpeg processes as needed
-
-### Recovery Mechanism
-
-- Wrapper scripts monitor FFmpeg processes and restart on failure
-- Smart backoff delays prevent rapid restart loops
-- Device removal detection stops unnecessary restart attempts
-- Extended delays after multiple short runs indicate persistent issues
-
-### Signal Handling
-
-- Proper signal propagation ensures clean shutdown
-- Lock files prevent concurrent operations
-- PID tracking enables precise process management
-
-## Known Limitations
-
-1. USB audio devices must be ALSA-compatible
-2. Device hot-plug requires manual restart to detect new devices
-3. Maximum path name length restrictions apply
-4. Some USB devices may require specific ALSA parameters for stability
+- RTSP authentication and TLS encryption support
+- Web-based monitoring and configuration interface
+- Automatic USB device discovery and mapping
+- Stream recording with configurable retention
+- Support for network audio devices (not just USB)
+- REST API for programmatic control
+- Prometheus metrics export
+- Stream health monitoring and alerting
+- Dynamic codec selection based on client capabilities
 
 ## Support
 
-For issues or questions:
-1. Check the troubleshooting section
-2. Review logs for error messages
-3. Verify all dependencies are installed
-4. Ensure devices are properly connected and recognized by the system
-
-## License
-
-[Specify your license here]
-
-## Version History
-
-- 7.3.0: Fixed syntax errors, improved MediaMTX v1.12.3 compatibility
-- 7.2.0: Complete rewrite for MediaMTX official schema
-- Earlier versions: Legacy implementations
+For issues and feature requests, please use the [GitHub issue tracker](https://github.com/tomtom215/mediamtx-rtsp-setup/issues).
 
 ## License and Contributors
 
@@ -369,7 +372,7 @@ This software is released under the Apache 2.0 License.
 
 ### Contributors
 
-- Main project development and maintenance
+- Main project development and maintenance - [Tom F](https://github.com/tomtom215)
 - Based on original concept by Cberge908 [GitHub gist](https://gist.github.com/cberge908/ab7ddc1ac46fd63bb6935cd1f4341112)
 
 ### Acknowledgments
