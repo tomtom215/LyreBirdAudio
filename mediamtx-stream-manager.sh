@@ -4,7 +4,7 @@
 # This script automatically detects USB microphones and creates MediaMTX 
 # configurations for continuous 24/7 RTSP audio streams.
 #
-# Version: 7.3.0 - Fixed syntax errors and improved reliability
+# Version: 8.0.2 - Fixed collision detection during config generation
 # Compatible with MediaMTX v1.12.3+
 #
 # Requirements:
@@ -242,7 +242,51 @@ get_device_config() {
     fi
 }
 
-# Detect USB audio devices
+# Helper function to verify udev names are properly set
+verify_udev_names() {
+    log INFO "Checking for udev-assigned friendly names..."
+    
+    local found_friendly=0
+    local total_cards=0
+    local total_usb_cards=0
+    
+    if [[ -f "/proc/asound/cards" ]]; then
+        while IFS= read -r line; do
+            if [[ "$line" =~ ^\ *([0-9]+)\ .*\[([^]]+)\] ]]; then
+                local card_num="${BASH_REMATCH[1]}"
+                local card_name="${BASH_REMATCH[2]}"
+                # Trim whitespace from card name
+                card_name="$(echo "$card_name" | xargs)"
+                ((total_cards++))
+                
+                # Skip non-USB cards
+                if [[ ! -f "/proc/asound/card${card_num}/usbid" ]]; then
+                    continue
+                fi
+                
+                ((total_usb_cards++))
+                
+                # Check if this looks like a friendly name
+                # Friendly names are typically short, lowercase, alphanumeric
+                if [[ "$card_name" =~ ^[a-z][a-z0-9_-]{0,31}$ ]]; then
+                    log INFO "Card $card_num has friendly name: $card_name"
+                    ((found_friendly++))
+                else
+                    log INFO "Card $card_num has default name: $card_name"
+                fi
+            fi
+        done < "/proc/asound/cards"
+    fi
+    
+    if [[ $found_friendly -gt 0 ]]; then
+        log INFO "Found $found_friendly/$total_usb_cards USB cards with friendly names"
+    else
+        log WARN "No udev-assigned friendly names found. Stream names will use device info."
+        log WARN "Run usb-audio-mapper.sh to assign friendly names to your devices."
+    fi
+}
+
+# Detect USB audio devices - enhanced to include card number
 detect_audio_devices() {
     local devices=()
     
@@ -259,6 +303,7 @@ detect_audio_devices() {
                     local card_num="${BASH_REMATCH[1]}"
                     
                     if [[ -f "/proc/asound/card${card_num}/usbid" ]]; then
+                        # Include card number in the output
                         devices+=("${device_name}:${card_num}")
                     fi
                 fi
@@ -305,13 +350,91 @@ check_audio_device() {
     return 1
 }
 
-# Generate stream path name
+# Generate stream path name with friendly names when available
 generate_stream_path() {
     local device_name="$1"
-    local base_path
+    local card_num="${2:-}"  # Optional card number parameter
+    local check_collisions="${3:-true}"  # Optional parameter to disable collision check
+    local base_path=""
+    local final_path=""
     
-    base_path="$(sanitize_path_name "$device_name")"
-    echo "$base_path"
+    # First, try to get the friendly name from /proc/asound/cards if we have card_num
+    if [[ -n "$card_num" ]] && [[ -f "/proc/asound/cards" ]]; then
+        local card_info
+        card_info=$(grep -E "^ *${card_num} " /proc/asound/cards 2>/dev/null || true)
+        
+        if [[ -n "$card_info" ]]; then
+            # Extract the name between square brackets [name]
+            if [[ "$card_info" =~ \[([^]]+)\] ]]; then
+                local card_name="${BASH_REMATCH[1]}"
+                # Trim whitespace from card name
+                card_name="$(echo "$card_name" | xargs)"
+                
+                # Check if this looks like a udev-assigned friendly name
+                # (typically short, lowercase, no spaces or special chars)
+                if [[ "$card_name" =~ ^[a-z][a-z0-9_-]{0,31}$ ]]; then
+                    log DEBUG "Found udev-friendly name: $card_name"
+                    base_path="$card_name"
+                else
+                    log DEBUG "Card name '$card_name' doesn't look like udev name, using fallback"
+                fi
+            fi
+        fi
+    fi
+    
+    # If we didn't get a friendly name, fall back to the original logic
+    if [[ -z "$base_path" ]]; then
+        base_path="$(sanitize_path_name "$device_name")"
+        log DEBUG "Using sanitized device name: $base_path"
+    fi
+    
+    # Only check for collisions if requested (not during config generation)
+    if [[ "$check_collisions" == "true" ]]; then
+        # Check if this base path is already in use by checking active streams
+        local collision_check="${base_path}"
+        local suffix=0
+        
+        # Check against existing FFmpeg PID files to detect active streams
+        while [[ -f "${FFMPEG_PID_DIR}/${collision_check}.pid" ]]; do
+            # Check if the PID is actually running
+            if [[ -f "${FFMPEG_PID_DIR}/${collision_check}.pid" ]]; then
+                local existing_pid
+                existing_pid=$(cat "${FFMPEG_PID_DIR}/${collision_check}.pid" 2>/dev/null || echo "0")
+                
+                if kill -0 "$existing_pid" 2>/dev/null; then
+                    # Process is running, we need a different name
+                    suffix=$((suffix + 1))
+                    collision_check="${base_path}_${suffix}"
+                    log DEBUG "Name collision detected, trying: $collision_check"
+                else
+                    # Stale PID file, clean it up
+                    log DEBUG "Cleaning stale PID file for: $collision_check"
+                    rm -f "${FFMPEG_PID_DIR}/${collision_check}.pid"
+                    break
+                fi
+            fi
+        done
+        
+        final_path="$collision_check"
+    else
+        final_path="$base_path"
+    fi
+    
+    # Additional validation - ensure the path is MediaMTX compatible
+    # MediaMTX has specific requirements for path names
+    if [[ ! "$final_path" =~ ^[a-zA-Z][a-zA-Z0-9_-]*$ ]]; then
+        log WARN "Path '$final_path' may not be MediaMTX compatible, adding prefix"
+        final_path="stream_${final_path}"
+    fi
+    
+    # Ensure reasonable length (MediaMTX may have limits)
+    if [[ ${#final_path} -gt 64 ]]; then
+        log WARN "Path name too long, truncating"
+        final_path="${final_path:0:64}"
+    fi
+    
+    log DEBUG "Generated stream path: $final_path (from device: $device_name)"
+    echo "$final_path"
 }
 
 # Test audio device capabilities with fallback
@@ -720,7 +843,13 @@ start_all_ffmpeg_streams() {
         return 0
     fi
     
+    # Verify udev names before starting
+    verify_udev_names
+    
     log INFO "Starting FFmpeg streams for ${#devices[@]} devices"
+    
+    # Array to store actual stream paths used
+    local -a stream_paths_used=()
     
     local success_count=0
     for device_info in "${devices[@]}"; do
@@ -731,8 +860,12 @@ start_all_ffmpeg_streams() {
             continue
         fi
         
+        # Generate stream path with card number for friendly name lookup
         local stream_path
-        stream_path="$(generate_stream_path "$device_name")"
+        stream_path="$(generate_stream_path "$device_name" "$card_num")"
+        
+        # Store the actual path used
+        stream_paths_used+=("${device_info}:${stream_path}")
         
         if start_ffmpeg_stream "$device_name" "$card_num" "$stream_path"; then
             ((success_count++))
@@ -740,6 +873,10 @@ start_all_ffmpeg_streams() {
     done
     
     log INFO "Started $success_count/${#devices[@]} FFmpeg streams"
+    
+    # Export the stream paths for use by the caller
+    STREAM_PATHS_USED=("${stream_paths_used[@]}")
+    
     return 0
 }
 
@@ -820,8 +957,12 @@ EOF
                 continue
             fi
             
+            # Generate stream path with card number for friendly name lookup
+            # Don't check for collisions during config generation
             local stream_path
-            stream_path="$(generate_stream_path "$device_name")"
+            stream_path="$(generate_stream_path "$device_name" "$card_num" "false")"
+            
+            log DEBUG "Config: device=$device_name card=$card_num path=$stream_path"
             
             # Make sure we haven't already added this path
             if [[ "$added_paths" =~ ":${stream_path}:" ]]; then
@@ -936,17 +1077,19 @@ start_mediamtx() {
         log INFO "MediaMTX started successfully (PID: $pid)"
         
         # Start FFmpeg streams
+        # Declare array to store stream paths
+        local -a STREAM_PATHS_USED=()
         start_all_ffmpeg_streams
         
         # Show results
         echo
         echo -e "${GREEN}=== Available RTSP Streams ===${NC}"
         local success_count=0
-        if [[ ${#devices[@]} -gt 0 ]]; then
-            for device_info in "${devices[@]}"; do
-                IFS=':' read -r device_name card_num <<< "$device_info"
-                local stream_path
-                stream_path="$(generate_stream_path "$device_name")"
+        
+        # Use the stored stream paths from start_all_ffmpeg_streams
+        if [[ ${#STREAM_PATHS_USED[@]} -gt 0 ]]; then
+            for stream_info in "${STREAM_PATHS_USED[@]}"; do
+                IFS=':' read -r device_name card_num stream_path <<< "$stream_info"
                 
                 # Validate stream is actually working
                 if validate_stream "$stream_path"; then
@@ -956,6 +1099,36 @@ start_mediamtx() {
                     echo -e "${RED}✗${NC} rtsp://localhost:8554/${stream_path} (failed to start)"
                 fi
             done
+        else
+            # Fallback to re-detecting if STREAM_PATHS_USED is empty
+            if [[ ${#devices[@]} -gt 0 ]]; then
+                for device_info in "${devices[@]}"; do
+                    IFS=':' read -r device_name card_num <<< "$device_info"
+                    # Look for the PID file to find the actual stream path used
+                    local found_stream=""
+                    for pid_file in "${FFMPEG_PID_DIR}"/*.pid; do
+                        if [[ -f "$pid_file" ]]; then
+                            local stream_name
+                            stream_name="$(basename "$pid_file" .pid)"
+                            # Check if this might be for our device
+                            if [[ "$stream_name" == *"$(sanitize_path_name "$device_name")"* ]] || 
+                               grep -q "CARD_NUM=\"${card_num}\"" "${FFMPEG_PID_DIR}/${stream_name}.sh" 2>/dev/null; then
+                                found_stream="$stream_name"
+                                break
+                            fi
+                        fi
+                    done
+                    
+                    if [[ -n "$found_stream" ]]; then
+                        if validate_stream "$found_stream"; then
+                            echo -e "${GREEN}✓${NC} rtsp://localhost:8554/${found_stream}"
+                            ((success_count++))
+                        else
+                            echo -e "${RED}✗${NC} rtsp://localhost:8554/${found_stream} (failed to start)"
+                        fi
+                    fi
+                done
+            fi
         fi
         echo
         echo -e "${GREEN}Successfully started ${success_count}/${#devices[@]} streams${NC}"
@@ -1076,21 +1249,66 @@ show_status() {
     if [[ ${#devices[@]} -eq 0 ]]; then
         echo "  No devices found"
     else
+        # Build a map of actual running streams first
+        declare -A running_streams
+        declare -A stream_to_device
+        
+        # Find all running FFmpeg processes
+        for pid_file in "${FFMPEG_PID_DIR}"/*.pid; do
+            if [[ -f "$pid_file" ]]; then
+                local stream_name
+                stream_name="$(basename "$pid_file" .pid)"
+                
+                if kill -0 "$(cat "$pid_file")" 2>/dev/null; then
+                    running_streams["$stream_name"]=1
+                    
+                    # Extract card number from wrapper script
+                    local wrapper="${FFMPEG_PID_DIR}/${stream_name}.sh"
+                    if [[ -f "$wrapper" ]]; then
+                        local card_num_from_wrapper
+                        card_num_from_wrapper=$(grep -E "^CARD_NUM=" "$wrapper" | cut -d= -f2 | tr -d '"')
+                        if [[ -n "$card_num_from_wrapper" ]]; then
+                            stream_to_device["$card_num_from_wrapper"]="$stream_name"
+                        fi
+                    fi
+                fi
+            fi
+        done
+        
         # Debug: show raw device info
         if [[ "${DEBUG:-false}" == "true" ]]; then
             echo "  Raw device list:"
             for device_info in "${devices[@]}"; do
                 echo "    - $device_info"
             done
+            echo "  Running streams: ${!running_streams[*]}"
             echo
         fi
         
         for device_info in "${devices[@]}"; do
             IFS=':' read -r device_name card_num <<< "$device_info"
-            local stream_path
-            stream_path="$(generate_stream_path "$device_name")"
             
-            echo "  - $device_name (card $card_num) → rtsp://localhost:8554/$stream_path"
+            # Find the actual stream name for this card
+            local actual_stream_path="${stream_to_device[$card_num]}"
+            
+            # If not found in our map, look for it
+            if [[ -z "$actual_stream_path" ]]; then
+                # Try to find by matching device name in PID files
+                for stream_name in "${!running_streams[@]}"; do
+                    local wrapper="${FFMPEG_PID_DIR}/${stream_name}.sh"
+                    if [[ -f "$wrapper" ]] && grep -q "CARD_NUM=\"${card_num}\"" "$wrapper"; then
+                        actual_stream_path="$stream_name"
+                        break
+                    fi
+                done
+            fi
+            
+            # If still not found, generate what it should be (but this is just for display)
+            if [[ -z "$actual_stream_path" ]]; then
+                actual_stream_path="$(generate_stream_path "$device_name" "$card_num")"
+            fi
+            
+            echo "  - $device_name (card $card_num) → rtsp://localhost:8554/$actual_stream_path"
             
             local sample_rate channels format codec
             sample_rate="$(get_device_config "$device_name" "SAMPLE_RATE" "$DEFAULT_SAMPLE_RATE")"
@@ -1100,32 +1318,28 @@ show_status() {
             
             echo "    Settings: ${sample_rate}Hz, ${channels}ch, ${format}, ${codec}"
             
-            local pid_file
-            pid_file="$(get_ffmpeg_pid_file "$stream_path")"
-            if [[ -f "$pid_file" ]] && kill -0 "$(cat "$pid_file")" 2>/dev/null; then
-                local wrapper_pid
-                wrapper_pid="$(cat "$pid_file")"
-                echo -e "    Wrapper: ${GREEN}Running${NC} (PID: ${wrapper_pid})"
-                
-                # Check for actual FFmpeg process
-                if pgrep -P "${wrapper_pid}" -f "ffmpeg" >/dev/null 2>&1; then
-                    echo -e "    FFmpeg: ${GREEN}Active${NC}"
+            # Check if this stream is actually running
+            if [[ -n "${running_streams[$actual_stream_path]}" ]]; then
+                local pid_file="${FFMPEG_PID_DIR}/${actual_stream_path}.pid"
+                if [[ -f "$pid_file" ]]; then
+                    local wrapper_pid
+                    wrapper_pid="$(cat "$pid_file")"
+                    echo -e "    Wrapper: ${GREEN}Running${NC} (PID: ${wrapper_pid})"
                     
-                    # Check stream health
-                    if validate_stream "$stream_path" 1; then
+                    # Check for actual FFmpeg process
+                    if pgrep -P "${wrapper_pid}" -f "ffmpeg" >/dev/null 2>&1; then
+                        echo -e "    FFmpeg: ${GREEN}Active${NC}"
                         echo -e "    Stream: ${GREEN}Healthy${NC}"
                     else
-                        echo -e "    Stream: ${YELLOW}Unstable${NC}"
+                        echo -e "    FFmpeg: ${YELLOW}Starting/Restarting${NC}"
                     fi
-                else
-                    echo -e "    FFmpeg: ${YELLOW}Starting/Restarting${NC}"
                 fi
             else
                 echo -e "    Status: ${RED}Not running${NC}"
             fi
             
             # Show last error if available
-            local ffmpeg_log="${FFMPEG_PID_DIR}/${stream_path}.log"
+            local ffmpeg_log="${FFMPEG_PID_DIR}/${actual_stream_path}.log"
             if [[ -f "$ffmpeg_log" ]] && [[ -s "$ffmpeg_log" ]]; then
                 local last_error
                 last_error="$(grep -E "(error|Error|ERROR)" "$ffmpeg_log" | tail -1 | cut -c1-80)"
@@ -1236,22 +1450,42 @@ test_streams() {
     echo -e "${CYAN}=== Stream Test Commands ===${NC}"
     echo
     
-    local devices=()
-    readarray -t devices < <(detect_audio_devices)
+    # Get actual running streams
+    declare -A running_streams
+    declare -A stream_to_card
     
-    if [[ ${#devices[@]} -eq 0 ]]; then
-        echo "No USB audio devices detected"
+    for pid_file in "${FFMPEG_PID_DIR}"/*.pid; do
+        if [[ -f "$pid_file" ]]; then
+            local stream_name
+            stream_name="$(basename "$pid_file" .pid)"
+            
+            if kill -0 "$(cat "$pid_file")" 2>/dev/null; then
+                running_streams["$stream_name"]=1
+                
+                # Extract card number from wrapper script
+                local wrapper="${FFMPEG_PID_DIR}/${stream_name}.sh"
+                if [[ -f "$wrapper" ]]; then
+                    local card_num
+                    card_num=$(grep -E "^CARD_NUM=" "$wrapper" | cut -d= -f2 | tr -d '"')
+                    if [[ -n "$card_num" ]]; then
+                        stream_to_card["$stream_name"]="$card_num"
+                    fi
+                fi
+            fi
+        fi
+    done
+    
+    if [[ ${#running_streams[@]} -eq 0 ]]; then
+        echo "No streams are currently running"
+        echo
+        echo "Start streams first with: $0 start"
         return 1
     fi
     
-    echo "Test playback commands for each stream:"
+    echo "Test playback commands for each running stream:"
     echo
     
-    for device_info in "${devices[@]}"; do
-        IFS=':' read -r device_name card_num <<< "$device_info"
-        local stream_path
-        stream_path="$(generate_stream_path "$device_name")"
-        
+    for stream_path in "${!running_streams[@]}"; do
         echo "Stream: $stream_path"
         echo "  ffplay rtsp://localhost:8554/${stream_path}"
         echo "  vlc rtsp://localhost:8554/${stream_path}"
@@ -1276,14 +1510,33 @@ debug_streams() {
         return 1
     fi
     
-    local devices=()
-    readarray -t devices < <(detect_audio_devices)
+    # Get actual running streams
+    declare -A running_streams
+    declare -A stream_to_card
     
-    for device_info in "${devices[@]}"; do
-        IFS=':' read -r device_name card_num <<< "$device_info"
-        local stream_path
-        stream_path="$(generate_stream_path "$device_name")"
-        
+    for pid_file in "${FFMPEG_PID_DIR}"/*.pid; do
+        if [[ -f "$pid_file" ]]; then
+            local stream_name
+            stream_name="$(basename "$pid_file" .pid)"
+            
+            if kill -0 "$(cat "$pid_file")" 2>/dev/null; then
+                running_streams["$stream_name"]=1
+                
+                # Extract card number from wrapper script
+                local wrapper="${FFMPEG_PID_DIR}/${stream_name}.sh"
+                if [[ -f "$wrapper" ]]; then
+                    local card_num
+                    card_num=$(grep -E "^CARD_NUM=" "$wrapper" | cut -d= -f2 | tr -d '"')
+                    if [[ -n "$card_num" ]]; then
+                        stream_to_card["$stream_name"]="$card_num"
+                    fi
+                fi
+            fi
+        fi
+    done
+    
+    # Debug each running stream
+    for stream_path in "${!running_streams[@]}"; do
         echo "Stream: $stream_path"
         
         # Check wrapper and FFmpeg
@@ -1321,9 +1574,14 @@ debug_streams() {
     
     # Test stream with verbose output
     echo "Testing stream connectivity..."
-    if [[ ${#devices[@]} -gt 0 ]]; then
+    if [[ ${#running_streams[@]} -gt 0 ]]; then
+        # Get first running stream
         local test_stream
-        test_stream="$(generate_stream_path "${devices[0]%%:*}")"
+        for stream in "${!running_streams[@]}"; do
+            test_stream="$stream"
+            break
+        done
+        
         echo "Test command: ffmpeg -loglevel verbose -i rtsp://localhost:8554/${test_stream} -t 2 -f null -"
         timeout 5 ffmpeg -loglevel verbose -i "rtsp://localhost:8554/${test_stream}" -t 2 -f null - 2>&1 | tail -20
     fi
@@ -1347,13 +1605,50 @@ monitor_streams() {
         echo -e "${CYAN}=== Stream Monitor - $(date) ===${NC}"
         echo
         
+        # Get actual running streams
+        declare -A running_streams
+        declare -A stream_to_card
+        declare -A card_to_stream
+        
+        for pid_file in "${FFMPEG_PID_DIR}"/*.pid; do
+            if [[ -f "$pid_file" ]]; then
+                local stream_name
+                stream_name="$(basename "$pid_file" .pid)"
+                
+                if kill -0 "$(cat "$pid_file")" 2>/dev/null; then
+                    running_streams["$stream_name"]=1
+                    
+                    # Extract card number from wrapper script
+                    local wrapper="${FFMPEG_PID_DIR}/${stream_name}.sh"
+                    if [[ -f "$wrapper" ]]; then
+                        local card_num
+                        card_num=$(grep -E "^CARD_NUM=" "$wrapper" | cut -d= -f2 | tr -d '"')
+                        if [[ -n "$card_num" ]]; then
+                            stream_to_card["$stream_name"]="$card_num"
+                            card_to_stream["$card_num"]="$stream_name"
+                        fi
+                    fi
+                fi
+            fi
+        done
+        
+        # Show status for each device
         local devices=()
         readarray -t devices < <(detect_audio_devices)
         
         for device_info in "${devices[@]}"; do
             IFS=':' read -r device_name card_num <<< "$device_info"
-            local stream_path
-            stream_path="$(generate_stream_path "$device_name")"
+            
+            # Find the actual stream name for this card
+            local stream_path="${card_to_stream[$card_num]}"
+            
+            if [[ -z "$stream_path" ]]; then
+                # Device not running
+                echo "Stream: [card $card_num - $device_name]"
+                echo -e "  Status: ${RED}Not running${NC}"
+                echo
+                continue
+            fi
             
             echo "Stream: $stream_path"
             
@@ -1443,7 +1738,7 @@ EOF
 # Show help
 show_help() {
     cat << EOF
-MediaMTX Audio Stream Manager v7.3.0
+MediaMTX Audio Stream Manager v8.0.2
 
 Automatically configures MediaMTX for continuous 24/7 RTSP audio streaming
 from USB audio devices using the official MediaMTX v1.12.3 configuration schema.
@@ -1477,12 +1772,12 @@ Default audio settings:
     ALSA buffer: 100ms
     ALSA period: 20ms
 
-Stability features:
-    - Automatic format fallback for incompatible devices
-    - Smart restart delays with backoff
-    - Extended timeouts for 24/7 operation
-    - Clock drift compensation
-    - Robust stream validation
+New in v8.0.2:
+    - Automatic detection of udev-assigned friendly names
+    - Stream paths use friendly names when available
+    - Fallback to device info when no udev rules exist
+    - Fixed status display to show actual running stream names
+    - Fixed collision detection during config generation
 
 Troubleshooting:
     - Check device access: arecord -l
@@ -1493,6 +1788,7 @@ Troubleshooting:
     - Monitor streams: $0 monitor
 
 Common issues:
+    - Ugly stream names: Run usb-audio-mapper.sh to assign friendly names
     - Clients disconnecting: Check codec compatibility (avoid PCM for network streams)
     - No audio: Check ALSA buffer settings in config
     - Format errors: Script now auto-fallbacks to s16le
