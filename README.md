@@ -420,7 +420,7 @@ sudo rm -f /var/log/mediamtx*
 - Single-user system (no multi-tenancy)
 - No automatic codec negotiation with clients
 
-### Planned Enhancements
+### Possible Enhancements (Not Planned)
 
 - RTSP authentication and TLS encryption support
 - Web-based monitoring and configuration interface
