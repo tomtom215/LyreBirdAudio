@@ -4,7 +4,7 @@
 # This script automatically detects USB microphones and creates MediaMTX 
 # configurations for continuous 24/7 RTSP audio streams.
 #
-# Version: 8.0.3 - Fixed systemd timeout and filesystem permissions
+# Version: 8.0.4 - Fixed device testing logic and reduced unnecessary warnings
 # Compatible with MediaMTX v1.12.3+
 #
 # Requirements:
@@ -47,6 +47,10 @@ readonly DEFAULT_PROBESIZE="5000000"       # 5MB probe size
 readonly STREAM_STARTUP_DELAY="${STREAM_STARTUP_DELAY:-10}"  # Can be overridden via environment
 readonly STREAM_VALIDATION_ATTEMPTS="3"
 readonly STREAM_VALIDATION_DELAY="5"
+
+# Device test settings
+readonly DEVICE_TEST_ENABLED="${DEVICE_TEST_ENABLED:-false}"  # Disable by default
+readonly DEVICE_TEST_TIMEOUT="${DEVICE_TEST_TIMEOUT:-3}"      # Increased timeout
 
 # Color codes
 readonly RED='\033[0;31m'
@@ -444,6 +448,12 @@ test_audio_device_safe() {
     local channels="$3"
     local format="$4"
     
+    # Skip device testing if disabled
+    if [[ "${DEVICE_TEST_ENABLED}" != "true" ]]; then
+        log DEBUG "Device testing disabled, assuming device supports requested format"
+        return 0
+    fi
+    
     # Convert format for arecord
     local arecord_format
     case "$format" in
@@ -453,17 +463,55 @@ test_audio_device_safe() {
         *) arecord_format="S16_LE" ;;
     esac
     
-    # Test with requested parameters
-    if timeout 2 arecord -D "hw:${card_num},0" -f "${arecord_format}" -r "${sample_rate}" -c "${channels}" -d 1 2>/dev/null | head -c 1000 >/dev/null; then
+    log DEBUG "Testing device hw:${card_num},0 with ${arecord_format} ${sample_rate}Hz ${channels}ch"
+    
+    # Test with requested parameters - direct hw access
+    if timeout "${DEVICE_TEST_TIMEOUT}" arecord -D "hw:${card_num},0" -f "${arecord_format}" -r "${sample_rate}" -c "${channels}" -d 1 -t raw 2>/dev/null | head -c 1000 >/dev/null; then
+        log DEBUG "Device test passed with hw:${card_num},0"
         return 0
     fi
     
     # If that fails, try with plughw for automatic format conversion
-    if timeout 2 arecord -D "plughw:${card_num},0" -f "${arecord_format}" -r "${sample_rate}" -c "${channels}" -d 1 2>/dev/null | head -c 1000 >/dev/null; then
+    log DEBUG "Testing with plughw:${card_num},0 for automatic format conversion"
+    if timeout "${DEVICE_TEST_TIMEOUT}" arecord -D "plughw:${card_num},0" -f "${arecord_format}" -r "${sample_rate}" -c "${channels}" -d 1 -t raw 2>/dev/null | head -c 1000 >/dev/null; then
+        log DEBUG "Device test passed with plughw:${card_num},0"
         return 0
     fi
     
+    log DEBUG "Device test failed for card ${card_num}"
     return 1
+}
+
+# Get supported formats for a device
+get_device_capabilities() {
+    local card_num="$1"
+    local capabilities=""
+    
+    if command -v arecord &>/dev/null; then
+        # Try to get hardware parameters
+        local hw_params
+        hw_params=$(timeout 2 arecord -D "hw:${card_num},0" --dump-hw-params 2>&1 || true)
+        
+        if [[ -n "$hw_params" ]]; then
+            # Extract supported sample rates
+            local rates
+            rates=$(echo "$hw_params" | grep -E "^RATE:" | sed 's/RATE: //' || true)
+            
+            # Extract supported formats
+            local formats
+            formats=$(echo "$hw_params" | grep -E "^FORMAT:" | sed 's/FORMAT: //' || true)
+            
+            # Extract supported channels
+            local channels
+            channels=$(echo "$hw_params" | grep -E "^CHANNELS:" | sed 's/CHANNELS: //' || true)
+            
+            if [[ -n "$rates" ]] || [[ -n "$formats" ]] || [[ -n "$channels" ]]; then
+                capabilities="Rates: ${rates:-unknown}, Formats: ${formats:-unknown}, Channels: ${channels:-unknown}"
+            fi
+        fi
+    fi
+    
+    echo "${capabilities:-Unable to determine capabilities}"
 }
 
 # Validate stream is working
@@ -561,16 +609,38 @@ start_ffmpeg_stream() {
     
     log INFO "Configuring $device_name: ${sample_rate}Hz, ${channels}ch, ${format} format, ${codec} codec"
     
-    # Test device capabilities and use fallback if needed
-    if ! test_audio_device_safe "$card_num" "$sample_rate" "$channels" "$format"; then
-        log WARN "Device test failed with ${format}, trying fallback to s16le"
-        format="s16le"
-        if ! test_audio_device_safe "$card_num" "$sample_rate" "$channels" "$format"; then
-            log WARN "Device test still failing, will use plughw for format conversion"
+    # Determine if we need format conversion based on device test or configuration
+    local use_plughw="true"  # Default to using plughw for better compatibility
+    local format_to_use="$format"
+    
+    # Only run device test if enabled
+    if [[ "${DEVICE_TEST_ENABLED}" == "true" ]]; then
+        if test_audio_device_safe "$card_num" "$sample_rate" "$channels" "$format"; then
+            log INFO "Device supports requested format directly"
+            use_plughw="false"
+        else
+            # Try common fallback formats
+            for fallback_format in "s16le" "s24le" "s32le"; do
+                if [[ "$fallback_format" != "$format" ]]; then
+                    log DEBUG "Testing fallback format: $fallback_format"
+                    if test_audio_device_safe "$card_num" "$sample_rate" "$channels" "$fallback_format"; then
+                        log WARN "Device doesn't support $format, using $fallback_format instead"
+                        format_to_use="$fallback_format"
+                        use_plughw="false"
+                        break
+                    fi
+                fi
+            done
+            
+            if [[ "$use_plughw" == "true" ]]; then
+                log INFO "Using plughw for automatic format conversion"
+            fi
         fi
+    else
+        log DEBUG "Device testing disabled, using plughw for compatibility"
     fi
     
-    log INFO "Starting FFmpeg for $stream_path with format: $format"
+    log INFO "Starting FFmpeg for $stream_path with format: $format_to_use"
     
     # Create wrapper script
     local wrapper_script="${FFMPEG_PID_DIR}/${stream_path}.sh"
@@ -593,11 +663,12 @@ RESTART_COUNT=0
 RESTART_DELAY=10
 MAX_SHORT_RUNS=3
 SHORT_RUN_COUNT=0
+USE_PLUGHW="${use_plughw}"
 
 # Audio parameters
 SAMPLE_RATE="${sample_rate}"
 CHANNELS="${channels}"
-FORMAT="${format}"
+FORMAT="${format_to_use}"
 OUTPUT_CODEC="${codec}"
 BITRATE="${bitrate}"
 ALSA_BUFFER="${alsa_buffer}"
@@ -625,10 +696,18 @@ build_ffmpeg_cmd() {
     cmd+=" -hide_banner"
     cmd+=" -loglevel warning"
     
+    # Choose device based on USE_PLUGHW
+    local audio_device
+    if [[ "${USE_PLUGHW}" == "true" ]]; then
+        audio_device="plughw:${CARD_NUM},0"
+    else
+        audio_device="hw:${CARD_NUM},0"
+    fi
+    
     # Input options - thread_queue_size must come BEFORE -i
     cmd+=" -f alsa"
     cmd+=" -thread_queue_size ${THREAD_QUEUE}"
-    cmd+=" -i plughw:${CARD_NUM},0"
+    cmd+=" -i ${audio_device}"
     
     # Force input format
     cmd+=" -ar ${SAMPLE_RATE}"
@@ -1432,6 +1511,7 @@ show_config() {
         echo "  ALSA buffer: ${DEFAULT_ALSA_BUFFER}μs"
         echo "  ALSA period: ${DEFAULT_ALSA_PERIOD}μs"
         echo "  Thread queue: ${DEFAULT_THREAD_QUEUE}"
+        echo "  Device testing: ${DEVICE_TEST_ENABLED}"
         echo
         
         for device_info in "${devices[@]}"; do
@@ -1448,26 +1528,28 @@ show_config() {
             if check_audio_device "$card_num"; then
                 echo -e "  Access: ${GREEN}OK${NC}"
                 
-                # Test device with current settings
-                local sample_rate channels format
-                sample_rate="$(get_device_config "$device_name" "SAMPLE_RATE" "$DEFAULT_SAMPLE_RATE")"
-                channels="$(get_device_config "$device_name" "CHANNELS" "$DEFAULT_CHANNELS")"
-                format="$(get_device_config "$device_name" "FORMAT" "$DEFAULT_FORMAT")"
-                
-                if test_audio_device_safe "$card_num" "$sample_rate" "$channels" "$format"; then
-                    echo -e "  Settings test: ${GREEN}PASS${NC}"
+                # Only test device if enabled
+                if [[ "${DEVICE_TEST_ENABLED}" == "true" ]]; then
+                    # Test device with current settings
+                    local sample_rate channels format
+                    sample_rate="$(get_device_config "$device_name" "SAMPLE_RATE" "$DEFAULT_SAMPLE_RATE")"
+                    channels="$(get_device_config "$device_name" "CHANNELS" "$DEFAULT_CHANNELS")"
+                    format="$(get_device_config "$device_name" "FORMAT" "$DEFAULT_FORMAT")"
+                    
+                    if test_audio_device_safe "$card_num" "$sample_rate" "$channels" "$format"; then
+                        echo -e "  Settings test: ${GREEN}PASS${NC}"
+                    else
+                        echo -e "  Settings test: ${YELLOW}FALLBACK${NC} (will use compatible format)"
+                    fi
                 else
-                    echo -e "  Settings test: ${YELLOW}FALLBACK${NC} (will use compatible format)"
+                    echo "  Settings test: Skipped (testing disabled)"
                 fi
                 
                 # Show device capabilities
-                if command -v arecord &>/dev/null; then
-                    local caps
-                    caps="$(arecord -D "hw:${card_num},0" --dump-hw-params 2>&1 | grep -E "(RATE|CHANNELS|FORMAT)" | head -5 || true)"
-                    if [[ -n "$caps" ]]; then
-                        echo "  Capabilities:"
-                        echo "$caps" | sed 's/^/    /'
-                    fi
+                local caps
+                caps="$(get_device_capabilities "$card_num")"
+                if [[ -n "$caps" ]]; then
+                    echo "  Capabilities: $caps"
                 fi
             else
                 echo -e "  Access: ${RED}FAILED${NC}"
@@ -1778,12 +1860,15 @@ EOF
     echo "  sudo systemctl edit mediamtx-audio"
     echo "  Add: Environment=\"PARALLEL_STREAM_START=true\""
     echo "  Add: Environment=\"STREAM_STARTUP_DELAY=5\""
+    echo ""
+    echo "To disable device testing (recommended for production):"
+    echo "  Add: Environment=\"DEVICE_TEST_ENABLED=false\""
 }
 
 # Show help
 show_help() {
     cat << EOF
-MediaMTX Audio Stream Manager v8.0.3
+MediaMTX Audio Stream Manager v8.0.4
 
 Automatically configures MediaMTX for continuous 24/7 RTSP audio streaming
 from USB audio devices using the official MediaMTX v1.12.3 configuration schema.
@@ -1817,16 +1902,19 @@ Default audio settings:
     ALSA buffer: 100ms
     ALSA period: 20ms
 
-New in v8.0.3:
-    - Fixed systemd service timeout for multiple devices
-    - Fixed filesystem permissions for systemd service
-    - Added configurable startup delay (STREAM_STARTUP_DELAY)
-    - Added parallel stream start option (PARALLEL_STREAM_START)
-    - Extended systemd timeout to 5 minutes for large deployments
+New in v8.0.4:
+    - Fixed device testing logic that was failing unnecessarily
+    - Added DEVICE_TEST_ENABLED environment variable (default: false)
+    - Improved fallback format detection
+    - Better device capability detection
+    - Cleaner startup messages without false warnings
+    - Always uses plughw by default for better compatibility
 
 Environment variables:
     STREAM_STARTUP_DELAY=10     Seconds to wait after starting each stream (default: 10)
     PARALLEL_STREAM_START=false Start all streams in parallel (default: false)
+    DEVICE_TEST_ENABLED=false   Enable device format testing (default: false)
+    DEVICE_TEST_TIMEOUT=3       Device test timeout in seconds (default: 3)
     DEBUG=true                  Enable debug logging (default: false)
 
 Troubleshooting:
@@ -1838,11 +1926,11 @@ Troubleshooting:
     - Monitor streams: $0 monitor
 
 Common issues:
-    - Systemd timeout: Update service with 'sudo $0 install' and reload
+    - Device test warnings: Set DEVICE_TEST_ENABLED=false (now default)
     - Ugly stream names: Run usb-audio-mapper.sh to assign friendly names
     - Clients disconnecting: Check codec compatibility (avoid PCM for network streams)
     - No audio: Check ALSA buffer settings in config
-    - Format errors: Script now auto-fallbacks to s16le
+    - Format errors: Script now defaults to plughw for compatibility
     - High CPU with PCM: Use compressed codecs (opus/aac)
     - Crackling: Increase ALSA_BUFFER in device config
 
