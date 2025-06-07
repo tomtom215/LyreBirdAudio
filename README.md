@@ -31,7 +31,7 @@ The system is designed for unattended operation with automatic recovery from dev
 
 ## Pre-Installation Cleanup
 
-If you have existing MediaMTX installations or audio streaming setups, run these cleanup commands:
+If you are on a fresh OS installation, you can skip this part. If you have existing MediaMTX installations or audio streaming setups, run these cleanup commands:
 
 ```bash
 # Stop MediaMTX systemd service if running
