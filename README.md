@@ -14,7 +14,7 @@ This repository provides three scripts that work together to create persistent, 
 
 The system is designed for unattended operation with automatic recovery from device disconnections and process failures.
 
-## Key Features (v8.0.2)
+## Key Features
 
 - **Automatic Friendly Names**: When udev rules are configured via `usb-audio-mapper.sh`, streams automatically use friendly names (e.g., `rtsp://localhost:8554/mic1` instead of `rtsp://localhost:8554/usb_audio_device_12345678`)
 - **Smart Stream Path Management**: Automatic collision detection prevents duplicate stream names
