@@ -4,7 +4,7 @@
 # This script automatically detects USB microphones and creates MediaMTX 
 # configurations for continuous 24/7 RTSP audio streams.
 #
-# Version: 8.0.2 - Fixed collision detection during config generation
+# Version: 8.0.3 - Fixed systemd timeout and filesystem permissions
 # Compatible with MediaMTX v1.12.3+
 #
 # Requirements:
@@ -44,7 +44,7 @@ readonly DEFAULT_ANALYZEDURATION="5000000" # 5 seconds
 readonly DEFAULT_PROBESIZE="5000000"       # 5MB probe size
 
 # Connection settings
-readonly STREAM_STARTUP_DELAY="10"
+readonly STREAM_STARTUP_DELAY="${STREAM_STARTUP_DELAY:-10}"  # Can be overridden via environment
 readonly STREAM_VALIDATION_ATTEMPTS="3"
 readonly STREAM_VALIDATION_DELAY="5"
 
@@ -851,7 +851,12 @@ start_all_ffmpeg_streams() {
     # Array to store actual stream paths used
     local -a stream_paths_used=()
     
+    # Check if we should start streams in parallel (for faster startup with many devices)
+    local parallel_start="${PARALLEL_STREAM_START:-false}"
+    
     local success_count=0
+    local -a start_pids=()
+    
     for device_info in "${devices[@]}"; do
         IFS=':' read -r device_name card_num <<< "$device_info"
         
@@ -867,10 +872,37 @@ start_all_ffmpeg_streams() {
         # Store the actual path used
         stream_paths_used+=("${device_info}:${stream_path}")
         
-        if start_ffmpeg_stream "$device_name" "$card_num" "$stream_path"; then
-            ((success_count++))
+        if [[ "$parallel_start" == "true" ]] && [[ ${#devices[@]} -gt 3 ]]; then
+            # Start in background for parallel processing
+            (
+                if start_ffmpeg_stream "$device_name" "$card_num" "$stream_path"; then
+                    echo "SUCCESS:${device_info}:${stream_path}"
+                else
+                    echo "FAILED:${device_info}:${stream_path}"
+                fi
+            ) &
+            start_pids+=($!)
+        else
+            # Sequential start (default for reliability)
+            if start_ffmpeg_stream "$device_name" "$card_num" "$stream_path"; then
+                ((success_count++))
+            fi
         fi
     done
+    
+    # If we started in parallel, wait for all to complete
+    if [[ "$parallel_start" == "true" ]] && [[ ${#start_pids[@]} -gt 0 ]]; then
+        log INFO "Waiting for parallel stream starts to complete..."
+        for pid in "${start_pids[@]}"; do
+            if wait "$pid"; then
+                local result
+                result=$(wait "$pid" 2>&1)
+                if [[ "$result" =~ ^SUCCESS: ]]; then
+                    ((success_count++))
+                fi
+            fi
+        done
+    fi
     
     log INFO "Started $success_count/${#devices[@]} FFmpeg streams"
     
@@ -1704,16 +1736,21 @@ StartLimitBurst=5
 User=root
 Group=audio
 
+# Extended timeout for multiple devices
+TimeoutStartSec=300
+TimeoutStopSec=60
+
 # Resource limits
 LimitNOFILE=65536
 LimitNPROC=4096
 LimitRTPRIO=99
 LimitNICE=-19
 
-# Security
+# Security - removed ProtectSystem=full to allow writing to /etc
 PrivateTmp=yes
-ProtectSystem=full
+ProtectSystem=false
 NoNewPrivileges=yes
+ReadWritePaths=/etc/mediamtx /var/lib/mediamtx-ffmpeg /var/log
 
 # Environment
 Environment="HOME=/root"
@@ -1733,12 +1770,20 @@ EOF
     echo "Systemd service created: $service_file"
     echo "Enable: sudo systemctl enable mediamtx-audio"
     echo "Start: sudo systemctl start mediamtx-audio"
+    echo ""
+    echo "Note: The service has a 5-minute startup timeout to handle multiple devices."
+    echo "If you have many devices, startup may take 15-30 seconds per device."
+    echo ""
+    echo "For faster startup with many devices, you can enable parallel starts:"
+    echo "  sudo systemctl edit mediamtx-audio"
+    echo "  Add: Environment=\"PARALLEL_STREAM_START=true\""
+    echo "  Add: Environment=\"STREAM_STARTUP_DELAY=5\""
 }
 
 # Show help
 show_help() {
     cat << EOF
-MediaMTX Audio Stream Manager v8.0.2
+MediaMTX Audio Stream Manager v8.0.3
 
 Automatically configures MediaMTX for continuous 24/7 RTSP audio streaming
 from USB audio devices using the official MediaMTX v1.12.3 configuration schema.
@@ -1772,12 +1817,17 @@ Default audio settings:
     ALSA buffer: 100ms
     ALSA period: 20ms
 
-New in v8.0.2:
-    - Automatic detection of udev-assigned friendly names
-    - Stream paths use friendly names when available
-    - Fallback to device info when no udev rules exist
-    - Fixed status display to show actual running stream names
-    - Fixed collision detection during config generation
+New in v8.0.3:
+    - Fixed systemd service timeout for multiple devices
+    - Fixed filesystem permissions for systemd service
+    - Added configurable startup delay (STREAM_STARTUP_DELAY)
+    - Added parallel stream start option (PARALLEL_STREAM_START)
+    - Extended systemd timeout to 5 minutes for large deployments
+
+Environment variables:
+    STREAM_STARTUP_DELAY=10     Seconds to wait after starting each stream (default: 10)
+    PARALLEL_STREAM_START=false Start all streams in parallel (default: false)
+    DEBUG=true                  Enable debug logging (default: false)
 
 Troubleshooting:
     - Check device access: arecord -l
@@ -1788,6 +1838,7 @@ Troubleshooting:
     - Monitor streams: $0 monitor
 
 Common issues:
+    - Systemd timeout: Update service with 'sudo $0 install' and reload
     - Ugly stream names: Run usb-audio-mapper.sh to assign friendly names
     - Clients disconnecting: Check codec compatibility (avoid PCM for network streams)
     - No audio: Check ALSA buffer settings in config
