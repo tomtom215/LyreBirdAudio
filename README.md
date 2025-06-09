@@ -2,8 +2,6 @@
 
 A set of Linux utilities for creating reliable 24/7 RTSP audio streams from USB microphones using MediaMTX and FFmpeg.
 
-## This is currently in development - expect bugs until this banner is removed
-
 ## Overview
 
 This repository provides three scripts that work together to create persistent, automatically-managed RTSP audio streams from USB audio devices:
