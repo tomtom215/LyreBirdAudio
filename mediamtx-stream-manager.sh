@@ -4,7 +4,7 @@
 # This script automatically detects USB microphones and creates MediaMTX 
 # configurations for continuous 24/7 RTSP audio streams.
 #
-# Version: 8.0.5 - Added friendly name support in audio-devices.conf
+# Version: 8.0.5 - Fixed device config to support udev friendly names
 # Compatible with MediaMTX v1.12.3+
 #
 # Requirements:
@@ -178,8 +178,17 @@ load_device_config() {
 save_device_config() {
     cat > "${DEVICE_CONFIG_FILE}" << 'EOF'
 # Audio device configuration
-# Format: DEVICE_<sanitized_name>_<parameter>=value
+# Format: DEVICE_<name>_<parameter>=value
 # IMPORTANT: Variable names must be ALL UPPERCASE
+
+# You can use EITHER:
+# 1. The udev-assigned friendly name (if using usb-audio-mapper.sh)
+#    Example: DEVICE_MIC1_SAMPLE_RATE=44100
+# 2. The sanitized device name from /dev/snd/by-id/
+#    Example: DEVICE_USB_BLUE_MICROPHONES_YETI_STEREO_MICROPHONE_SAMPLE_RATE=44100
+
+# The script will check for both naming styles automatically.
+# Friendly names are recommended for simplicity!
 
 # Universal defaults:
 # - Sample Rate: 48000 Hz
@@ -193,22 +202,14 @@ save_device_config() {
 # - ALSA_PERIOD: 20000 (microseconds - decrease for lower latency)
 # - THREAD_QUEUE: 8192 (packets - increase if seeing buffer underruns)
 
-# FRIENDLY NAME SUPPORT (NEW):
-# You can now define friendly names for your devices!
-# Format: DEVICE_<sanitized_name>_FRIENDLY_NAME="your-friendly-name"
-# Example:
-# DEVICE_USB_AUDIO_DEVICE_FRIENDLY_NAME="studio-mic"
-# DEVICE_USB_BLUE_YETI_STEREO_MICROPHONE_FRIENDLY_NAME="blue-yeti"
-# DEVICE_USB_C_MEDIA_ELECTRONICS_USB_PNPDEVICE_FRIENDLY_NAME="webcam"
-#
-# Rules for friendly names:
-# - Must contain only lowercase letters, numbers, hyphens, and underscores
-# - Must start with a letter
-# - Should be short and descriptive
-# - Will be used as the RTSP stream path (e.g., rtsp://localhost:8554/studio-mic)
+# Example overrides using friendly names:
+# DEVICE_MIC1_SAMPLE_RATE=44100
+# DEVICE_MIC1_CHANNELS=1
+# DEVICE_MIC1_ALSA_BUFFER=200000
+# DEVICE_HEADSET1_CODEC=aac
+# DEVICE_HEADSET1_BITRATE=96k
 
-# Example device configurations:
-# DEVICE_USB_BLUE_YETI_FRIENDLY_NAME="blue-yeti"
+# Example overrides using full device names:
 # DEVICE_USB_BLUE_YETI_SAMPLE_RATE=44100
 # DEVICE_USB_BLUE_YETI_CHANNELS=1
 # DEVICE_USB_BLUE_YETI_ALSA_BUFFER=200000
@@ -217,8 +218,8 @@ save_device_config() {
 # Only use s24le or s32le if you're certain your device supports it
 
 # For devices with stability issues:
-# DEVICE_USB_GENERIC_AUDIO_ALSA_BUFFER=200000
-# DEVICE_USB_GENERIC_AUDIO_THREAD_QUEUE=16384
+# DEVICE_MIC1_ALSA_BUFFER=200000
+# DEVICE_MIC1_THREAD_QUEUE=16384
 
 # Codec recommendations:
 # - opus: Best for real-time streaming (low latency, good quality)
@@ -226,7 +227,34 @@ save_device_config() {
 # - mp3: Legacy device support
 # - pcm: Avoid for network streams (uses excessive bandwidth)
 
+# Note: Run './mediamtx-stream-manager.sh status' to see the exact
+# variable names you should use for each detected device.
+
 EOF
+}
+
+# Get friendly name for a card if it exists
+get_card_friendly_name() {
+    local card_num="$1"
+    local friendly_name=""
+    
+    if [[ -f "/proc/asound/cards" ]]; then
+        local card_info
+        card_info=$(grep -E "^ *${card_num} " /proc/asound/cards 2>/dev/null || true)
+        
+        if [[ -n "$card_info" ]] && [[ "$card_info" =~ \[([^]]+)\] ]]; then
+            local card_name="${BASH_REMATCH[1]}"
+            # Trim whitespace
+            card_name="$(echo "$card_name" | xargs)"
+            
+            # Check if this looks like a udev-assigned friendly name
+            if [[ "$card_name" =~ ^[a-z][a-z0-9_-]{0,31}$ ]]; then
+                friendly_name="$card_name"
+            fi
+        fi
+    fi
+    
+    echo "$friendly_name"
 }
 
 # Sanitize device name for use as variable name
@@ -243,22 +271,40 @@ sanitize_path_name() {
     echo "$name" | tr '[:upper:]' '[:lower:]' | sed 's/[^0-9a-z]/_/g' | sed 's/__*/_/g' | sed 's/^_*//;s/_*$//'
 }
 
-# Get device configuration
+# Get device configuration - enhanced to check friendly names
 get_device_config() {
     local device_name="$1"
     local param="$2"
     local default_value="$3"
+    local card_num="${4:-}"  # Optional card number parameter
     
+    # First, try the sanitized device name
     local safe_name
     safe_name="$(sanitize_device_name "$device_name")"
-    
     local config_key="DEVICE_${safe_name^^}_${param^^}"
     
     if [[ -n "${!config_key+x}" ]]; then
         echo "${!config_key}"
-    else
-        echo "$default_value"
+        return 0
     fi
+    
+    # If we have a card number, try the friendly name
+    if [[ -n "$card_num" ]]; then
+        local friendly_name
+        friendly_name="$(get_card_friendly_name "$card_num")"
+        
+        if [[ -n "$friendly_name" ]]; then
+            local friendly_key="DEVICE_${friendly_name^^}_${param^^}"
+            
+            if [[ -n "${!friendly_key+x}" ]]; then
+                echo "${!friendly_key}"
+                return 0
+            fi
+        fi
+    fi
+    
+    # Return default if neither found
+    echo "$default_value"
 }
 
 # Helper function to verify udev names are properly set
@@ -286,8 +332,8 @@ verify_udev_names() {
                 ((total_usb_cards++))
                 
                 # Check if this looks like a friendly name
-                # Updated pattern to be less restrictive
-                if [[ "$card_name" =~ ^[a-zA-Z][a-zA-Z0-9_-]{0,63}$ ]] && [[ ! "$card_name" =~ (USB|Audio|Device|Microphone|Webcam) ]]; then
+                # Friendly names are typically short, lowercase, alphanumeric
+                if [[ "$card_name" =~ ^[a-z][a-z0-9_-]{0,31}$ ]]; then
                     log INFO "Card $card_num has friendly name: $card_name"
                     ((found_friendly++))
                 else
@@ -300,7 +346,8 @@ verify_udev_names() {
     if [[ $found_friendly -gt 0 ]]; then
         log INFO "Found $found_friendly/$total_usb_cards USB cards with friendly names"
     else
-        log INFO "No udev-assigned friendly names found. You can define friendly names in ${DEVICE_CONFIG_FILE}"
+        log WARN "No udev-assigned friendly names found. Stream names will use device info."
+        log WARN "Run usb-audio-mapper.sh to assign friendly names to your devices."
     fi
 }
 
@@ -376,51 +423,18 @@ generate_stream_path() {
     local base_path=""
     local final_path=""
     
-    # First, check if we have a friendly name defined in the config
-    local config_friendly_name
-    config_friendly_name="$(get_device_config "$device_name" "FRIENDLY_NAME" "")"
-    
-    if [[ -n "$config_friendly_name" ]]; then
-        # Validate the friendly name
-        if [[ "$config_friendly_name" =~ ^[a-zA-Z][a-zA-Z0-9_-]{0,63}$ ]]; then
-            log DEBUG "Using config-defined friendly name: $config_friendly_name"
-            base_path="$config_friendly_name"
-        else
-            log WARN "Invalid friendly name '$config_friendly_name' in config (must start with letter, contain only letters/numbers/hyphens/underscores)"
-        fi
-    fi
-    
-    # If no config friendly name, try to get from /proc/asound/cards
-    if [[ -z "$base_path" ]] && [[ -n "$card_num" ]] && [[ -f "/proc/asound/cards" ]]; then
-        local card_info
-        card_info=$(grep -E "^ *${card_num} " /proc/asound/cards 2>/dev/null || true)
+    # First, try to get the friendly name from /proc/asound/cards if we have card_num
+    if [[ -n "$card_num" ]] && [[ -f "/proc/asound/cards" ]]; then
+        local friendly_name
+        friendly_name="$(get_card_friendly_name "$card_num")"
         
-        if [[ -n "$card_info" ]]; then
-            # Extract the name between square brackets [name]
-            if [[ "$card_info" =~ \[([^]]+)\] ]]; then
-                local card_name="${BASH_REMATCH[1]}"
-                # Trim whitespace from card name
-                card_name="$(echo "$card_name" | xargs)"
-                
-                # Check if this looks like a udev-assigned friendly name
-                # Less restrictive pattern: allow uppercase and longer names
-                if [[ "$card_name" =~ ^[a-zA-Z][a-zA-Z0-9_-]{0,63}$ ]]; then
-                    # Additional check: if it contains common generic terms, it's probably not a friendly name
-                    if [[ ! "$card_name" =~ (USB|Audio|Device|Microphone|Webcam|Generic|Unknown) ]]; then
-                        log DEBUG "Found udev-friendly name: $card_name"
-                        # Convert to lowercase for consistency
-                        base_path="$(echo "$card_name" | tr '[:upper:]' '[:lower:]')"
-                    else
-                        log DEBUG "Card name '$card_name' contains generic terms, using fallback"
-                    fi
-                else
-                    log DEBUG "Card name '$card_name' doesn't match friendly name pattern"
-                fi
-            fi
+        if [[ -n "$friendly_name" ]]; then
+            log DEBUG "Found udev-friendly name: $friendly_name"
+            base_path="$friendly_name"
         fi
     fi
     
-    # If we still don't have a friendly name, fall back to the original logic
+    # If we didn't get a friendly name, fall back to the original logic
     if [[ -z "$base_path" ]]; then
         base_path="$(sanitize_path_name "$device_name")"
         log DEBUG "Using sanitized device name: $base_path"
@@ -630,16 +644,16 @@ start_ffmpeg_stream() {
         return 1
     fi
     
-    # Get device configuration
+    # Get device configuration - now with card number for friendly name support
     local sample_rate channels format codec bitrate alsa_buffer alsa_period thread_queue
-    sample_rate="$(get_device_config "$device_name" "SAMPLE_RATE" "$DEFAULT_SAMPLE_RATE")"
-    channels="$(get_device_config "$device_name" "CHANNELS" "$DEFAULT_CHANNELS")"
-    format="$(get_device_config "$device_name" "FORMAT" "$DEFAULT_FORMAT")"
-    codec="$(get_device_config "$device_name" "CODEC" "$DEFAULT_CODEC")"
-    bitrate="$(get_device_config "$device_name" "BITRATE" "$DEFAULT_BITRATE")"
-    alsa_buffer="$(get_device_config "$device_name" "ALSA_BUFFER" "$DEFAULT_ALSA_BUFFER")"
-    alsa_period="$(get_device_config "$device_name" "ALSA_PERIOD" "$DEFAULT_ALSA_PERIOD")"
-    thread_queue="$(get_device_config "$device_name" "THREAD_QUEUE" "$DEFAULT_THREAD_QUEUE")"
+    sample_rate="$(get_device_config "$device_name" "SAMPLE_RATE" "$DEFAULT_SAMPLE_RATE" "$card_num")"
+    channels="$(get_device_config "$device_name" "CHANNELS" "$DEFAULT_CHANNELS" "$card_num")"
+    format="$(get_device_config "$device_name" "FORMAT" "$DEFAULT_FORMAT" "$card_num")"
+    codec="$(get_device_config "$device_name" "CODEC" "$DEFAULT_CODEC" "$card_num")"
+    bitrate="$(get_device_config "$device_name" "BITRATE" "$DEFAULT_BITRATE" "$card_num")"
+    alsa_buffer="$(get_device_config "$device_name" "ALSA_BUFFER" "$DEFAULT_ALSA_BUFFER" "$card_num")"
+    alsa_period="$(get_device_config "$device_name" "ALSA_PERIOD" "$DEFAULT_ALSA_PERIOD" "$card_num")"
+    thread_queue="$(get_device_config "$device_name" "THREAD_QUEUE" "$DEFAULT_THREAD_QUEUE" "$card_num")"
     
     log INFO "Configuring $device_name: ${sample_rate}Hz, ${channels}ch, ${format} format, ${codec} codec"
     
@@ -1455,18 +1469,23 @@ show_status() {
             
             echo "  - $device_name (card $card_num) → rtsp://localhost:8554/$actual_stream_path"
             
-            # Check if a friendly name is configured
+            # Get device friendly name if available
             local friendly_name
-            friendly_name="$(get_device_config "$device_name" "FRIENDLY_NAME" "")"
+            friendly_name="$(get_card_friendly_name "$card_num")"
             if [[ -n "$friendly_name" ]]; then
                 echo "    Friendly name: $friendly_name"
             fi
             
+            # Show which config variables to use
+            local sanitized_name
+            sanitized_name="$(sanitize_device_name "$device_name")"
+            echo "    Config variables: DEVICE_${sanitized_name^^}_* or DEVICE_${friendly_name^^}_*"
+            
             local sample_rate channels format codec
-            sample_rate="$(get_device_config "$device_name" "SAMPLE_RATE" "$DEFAULT_SAMPLE_RATE")"
-            channels="$(get_device_config "$device_name" "CHANNELS" "$DEFAULT_CHANNELS")"
-            format="$(get_device_config "$device_name" "FORMAT" "$DEFAULT_FORMAT")"
-            codec="$(get_device_config "$device_name" "CODEC" "$DEFAULT_CODEC")"
+            sample_rate="$(get_device_config "$device_name" "SAMPLE_RATE" "$DEFAULT_SAMPLE_RATE" "$card_num")"
+            channels="$(get_device_config "$device_name" "CHANNELS" "$DEFAULT_CHANNELS" "$card_num")"
+            format="$(get_device_config "$device_name" "FORMAT" "$DEFAULT_FORMAT" "$card_num")"
+            codec="$(get_device_config "$device_name" "CODEC" "$DEFAULT_CODEC" "$card_num")"
             
             echo "    Settings: ${sample_rate}Hz, ${channels}ch, ${format}, ${codec}"
             
@@ -1561,19 +1580,17 @@ show_config() {
             echo "Device: $device_name"
             echo "  Card: $card_num"
             
+            # Show friendly name if available
+            local friendly_name
+            friendly_name="$(get_card_friendly_name "$card_num")"
+            if [[ -n "$friendly_name" ]]; then
+                echo "  Friendly name: $friendly_name"
+                echo "  Variable prefix: DEVICE_${friendly_name^^}_ (recommended)"
+            fi
+            
             local sanitized_name
             sanitized_name="$(sanitize_device_name "$device_name")"
-            echo "  Variable prefix: DEVICE_${sanitized_name^^}_"
-            
-            # Check for friendly name
-            local friendly_name
-            friendly_name="$(get_device_config "$device_name" "FRIENDLY_NAME" "")"
-            if [[ -n "$friendly_name" ]]; then
-                echo -e "  Friendly name: ${GREEN}${friendly_name}${NC}"
-            else
-                echo "  Friendly name: (not configured)"
-                echo "  To set: DEVICE_${sanitized_name^^}_FRIENDLY_NAME=\"your-name\""
-            fi
+            echo "  Alternative prefix: DEVICE_${sanitized_name^^}_"
             
             # Check audio access
             if check_audio_device "$card_num"; then
@@ -1583,9 +1600,9 @@ show_config() {
                 if [[ "${DEVICE_TEST_ENABLED}" == "true" ]]; then
                     # Test device with current settings
                     local sample_rate channels format
-                    sample_rate="$(get_device_config "$device_name" "SAMPLE_RATE" "$DEFAULT_SAMPLE_RATE")"
-                    channels="$(get_device_config "$device_name" "CHANNELS" "$DEFAULT_CHANNELS")"
-                    format="$(get_device_config "$device_name" "FORMAT" "$DEFAULT_FORMAT")"
+                    sample_rate="$(get_device_config "$device_name" "SAMPLE_RATE" "$DEFAULT_SAMPLE_RATE" "$card_num")"
+                    channels="$(get_device_config "$device_name" "CHANNELS" "$DEFAULT_CHANNELS" "$card_num")"
+                    format="$(get_device_config "$device_name" "FORMAT" "$DEFAULT_FORMAT" "$card_num")"
                     
                     if test_audio_device_safe "$card_num" "$sample_rate" "$channels" "$format"; then
                         echo -e "  Settings test: ${GREEN}PASS${NC}"
@@ -1954,18 +1971,20 @@ Default audio settings:
     ALSA period: 20ms
 
 New in v8.0.5:
-    - Added support for friendly names in audio-devices.conf
-    - Less restrictive pattern matching for existing friendly names
-    - Better detection of generic vs custom device names
-    - Clearer status display showing configured friendly names
-    - Example: DEVICE_USB_BLUE_YETI_FRIENDLY_NAME="blue-yeti"
+    - Fixed device configuration to support udev-assigned friendly names
+    - Config now accepts both DEVICE_MIC1_* and full device name formats
+    - Enhanced status display to show which config variables to use
+    - Better detection and use of friendly names throughout the system
+    - Improved configuration examples and documentation
 
-Setting Friendly Names:
-    1. Run: $0 config
-    2. Note the "Variable prefix" for your device
-    3. Edit ${DEVICE_CONFIG_FILE}
-    4. Add: DEVICE_<YOUR_PREFIX>_FRIENDLY_NAME="your-name"
-    5. Restart: $0 restart
+Friendly Name Support:
+    If you've used usb-audio-mapper.sh to assign friendly names:
+    - Your streams will use the friendly names (mic1, mic2, etc.)
+    - Configure using: DEVICE_MIC1_SAMPLE_RATE=44100
+    
+    Without friendly names:
+    - Streams use sanitized device names
+    - Configure using full device name (see 'status' command)
 
 Environment variables:
     STREAM_STARTUP_DELAY=10     Seconds to wait after starting each stream (default: 10)
@@ -1983,8 +2002,8 @@ Troubleshooting:
     - Monitor streams: $0 monitor
 
 Common issues:
-    - Ugly stream names: Set friendly names in ${DEVICE_CONFIG_FILE}
     - Device test warnings: Set DEVICE_TEST_ENABLED=false (now default)
+    - Ugly stream names: Run usb-audio-mapper.sh to assign friendly names
     - Clients disconnecting: Check codec compatibility (avoid PCM for network streams)
     - No audio: Check ALSA buffer settings in config
     - Format errors: Script now defaults to plughw for compatibility
