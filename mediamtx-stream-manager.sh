@@ -4,7 +4,7 @@
 # This script automatically detects USB microphones and creates MediaMTX 
 # configurations for continuous 24/7 RTSP audio streams.
 #
-# Version: 8.0.4 - Fixed device testing logic and reduced unnecessary warnings
+# Version: 8.1.0 - Enhanced service restart handling and cleanup
 # Compatible with MediaMTX v1.12.3+
 #
 # Requirements:
@@ -29,6 +29,8 @@ readonly LOG_FILE="/var/log/mediamtx-audio-manager.log"
 readonly MEDIAMTX_LOG="/var/log/mediamtx.log"
 readonly MEDIAMTX_BIN="/usr/local/bin/mediamtx"
 readonly TEMP_CONFIG="/tmp/mediamtx-audio-$$.yml"
+readonly RESTART_MARKER="/var/run/mediamtx-audio.restart"
+readonly CLEANUP_MARKER="/var/run/mediamtx-audio.cleanup"
 
 # Audio stability settings
 readonly DEFAULT_SAMPLE_RATE="48000"
@@ -47,6 +49,8 @@ readonly DEFAULT_PROBESIZE="5000000"       # 5MB probe size
 readonly STREAM_STARTUP_DELAY="${STREAM_STARTUP_DELAY:-10}"  # Can be overridden via environment
 readonly STREAM_VALIDATION_ATTEMPTS="3"
 readonly STREAM_VALIDATION_DELAY="5"
+readonly USB_STABILIZATION_DELAY="${USB_STABILIZATION_DELAY:-5}"  # Wait for USB to stabilize
+readonly RESTART_STABILIZATION_DELAY="${RESTART_STABILIZATION_DELAY:-10}"  # Extra delay on restart
 
 # Device test settings
 readonly DEVICE_TEST_ENABLED="${DEVICE_TEST_ENABLED:-false}"  # Disable by default
@@ -65,6 +69,7 @@ cleanup() {
     local exit_code=$?
     rm -f "${TEMP_CONFIG}"
     rm -f "${LOCK_FILE}"
+    rm -f "${CLEANUP_MARKER}"
     exit "${exit_code}"
 }
 
@@ -114,7 +119,17 @@ acquire_lock() {
     done
     
     if [[ $count -ge $timeout ]]; then
-        error_exit "Failed to acquire lock after ${timeout} seconds" 5
+        # Force cleanup if lock is stale
+        local lock_pid
+        if [[ -f "${LOCK_FILE}" ]]; then
+            lock_pid="$(cat "${LOCK_FILE}" 2>/dev/null || echo "")"
+            if [[ -n "$lock_pid" ]] && ! kill -0 "$lock_pid" 2>/dev/null; then
+                log WARN "Removing stale lock file (PID $lock_pid not running)"
+                rm -f "${LOCK_FILE}"
+            else
+                error_exit "Failed to acquire lock after ${timeout} seconds" 5
+            fi
+        fi
     fi
     
     echo $$ > "${LOCK_FILE}"
@@ -164,6 +179,155 @@ setup_directories() {
     touch "${MEDIAMTX_LOG}"
     chmod 666 "${MEDIAMTX_LOG}"
     chmod 644 "${LOG_FILE}"
+}
+
+# Detect if we're in a restart scenario
+is_restart_scenario() {
+    # Check if restart marker exists and is recent (within 60 seconds)
+    if [[ -f "${RESTART_MARKER}" ]]; then
+        local marker_age
+        marker_age="$(( $(date +%s) - $(stat -c %Y "${RESTART_MARKER}" 2>/dev/null || echo 0) ))"
+        if [[ $marker_age -lt 60 ]]; then
+            return 0
+        fi
+    fi
+    
+    # Check if MediaMTX or FFmpeg processes are still dying
+    if pgrep -f "${MEDIAMTX_BIN}" >/dev/null 2>&1 || pgrep -f "ffmpeg.*rtsp://localhost:8554" >/dev/null 2>&1; then
+        return 0
+    fi
+    
+    return 1
+}
+
+# Mark restart scenario
+mark_restart() {
+    touch "${RESTART_MARKER}"
+}
+
+# Clear restart marker
+clear_restart_marker() {
+    rm -f "${RESTART_MARKER}"
+}
+
+# Enhanced cleanup of stale processes and files
+cleanup_stale_processes() {
+    log INFO "Performing comprehensive cleanup of stale processes and files"
+    
+    # Mark that we're in cleanup mode
+    touch "${CLEANUP_MARKER}"
+    
+    # Step 1: Kill all FFmpeg wrapper scripts
+    log DEBUG "Terminating FFmpeg wrapper scripts"
+    for pid_file in "${FFMPEG_PID_DIR}"/*.pid; do
+        if [[ -f "$pid_file" ]]; then
+            local pid
+            pid="$(cat "$pid_file" 2>/dev/null || echo "")"
+            if [[ -n "$pid" ]]; then
+                # Try graceful termination first
+                kill -TERM "$pid" 2>/dev/null || true
+                # Kill children
+                pkill -TERM -P "$pid" 2>/dev/null || true
+            fi
+        fi
+    done
+    
+    # Step 2: Wait briefly for graceful termination
+    sleep 2
+    
+    # Step 3: Force kill any remaining wrapper processes
+    for pid_file in "${FFMPEG_PID_DIR}"/*.pid; do
+        if [[ -f "$pid_file" ]]; then
+            local pid
+            pid="$(cat "$pid_file" 2>/dev/null || echo "")"
+            if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+                log DEBUG "Force killing wrapper PID $pid"
+                kill -KILL "$pid" 2>/dev/null || true
+                pkill -KILL -P "$pid" 2>/dev/null || true
+            fi
+            rm -f "$pid_file"
+        fi
+    done
+    
+    # Step 4: Kill any orphaned FFmpeg processes
+    log DEBUG "Killing orphaned FFmpeg processes"
+    pkill -TERM -f "ffmpeg.*rtsp://localhost:8554" 2>/dev/null || true
+    sleep 1
+    pkill -KILL -f "ffmpeg.*rtsp://localhost:8554" 2>/dev/null || true
+    
+    # Step 5: Kill MediaMTX if running outside our control
+    if [[ -f "${PID_FILE}" ]]; then
+        local mediamtx_pid
+        mediamtx_pid="$(cat "${PID_FILE}" 2>/dev/null || echo "")"
+        if [[ -n "$mediamtx_pid" ]]; then
+            if ! kill -0 "$mediamtx_pid" 2>/dev/null; then
+                log DEBUG "Removing stale MediaMTX PID file"
+                rm -f "${PID_FILE}"
+            fi
+        fi
+    fi
+    
+    # Kill any MediaMTX processes not matching our PID
+    pkill -TERM -f "${MEDIAMTX_BIN}" 2>/dev/null || true
+    sleep 1
+    pkill -KILL -f "${MEDIAMTX_BIN}" 2>/dev/null || true
+    
+    # Step 6: Clean up all temporary files
+    log DEBUG "Cleaning temporary files"
+    rm -f "${FFMPEG_PID_DIR}"/*.pid
+    rm -f "${FFMPEG_PID_DIR}"/*.sh
+    rm -f "${FFMPEG_PID_DIR}"/*.log
+    rm -f "${FFMPEG_PID_DIR}"/*.log.old
+    rm -f /tmp/mediamtx-audio-*.yml
+    
+    # Step 7: Reset ALSA if needed (helps with device issues)
+    if command -v alsactl &>/dev/null; then
+        log DEBUG "Resetting ALSA state"
+        alsactl init 2>/dev/null || true
+    fi
+    
+    # Clear cleanup marker
+    rm -f "${CLEANUP_MARKER}"
+    
+    log INFO "Cleanup completed"
+}
+
+# Wait for USB audio subsystem to stabilize
+wait_for_usb_stabilization() {
+    local max_wait="${1:-30}"
+    local stable_count_needed=2
+    local stable_count=0
+    local last_device_count=0
+    local elapsed=0
+    
+    log INFO "Waiting for USB audio subsystem to stabilize..."
+    
+    while [[ $elapsed -lt $max_wait ]]; do
+        local current_device_count
+        current_device_count="$(detect_audio_devices | wc -l)"
+        
+        if [[ $current_device_count -eq $last_device_count ]] && [[ $current_device_count -gt 0 ]]; then
+            ((stable_count++))
+            if [[ $stable_count -ge $stable_count_needed ]]; then
+                log INFO "USB audio subsystem stable with $current_device_count devices"
+                return 0
+            fi
+        else
+            stable_count=0
+            last_device_count=$current_device_count
+        fi
+        
+        sleep 2
+        ((elapsed+=2))
+    done
+    
+    if [[ $last_device_count -gt 0 ]]; then
+        log WARN "USB audio subsystem stabilization timeout, proceeding with $last_device_count devices"
+        return 0
+    else
+        log ERROR "No USB audio devices detected after ${max_wait} seconds"
+        return 1
+    fi
 }
 
 # Load device configuration
@@ -664,6 +828,7 @@ RESTART_DELAY=10
 MAX_SHORT_RUNS=3
 SHORT_RUN_COUNT=0
 USE_PLUGHW="${use_plughw}"
+CLEANUP_MARKER="${CLEANUP_MARKER}"
 
 # Audio parameters
 SAMPLE_RATE="${sample_rate}"
@@ -763,6 +928,12 @@ check_device_exists() {
 
 # Main loop
 while true; do
+    # Check if cleanup is in progress
+    if [[ -f "${CLEANUP_MARKER}" ]]; then
+        log_message "Cleanup in progress, stopping wrapper for ${STREAM_PATH}"
+        break
+    fi
+    
     if [[ ! -f "${PID_FILE}" ]]; then
         log_message "PID file removed, stopping wrapper for ${STREAM_PATH}"
         break
@@ -1123,6 +1294,17 @@ is_mediamtx_running() {
 start_mediamtx() {
     acquire_lock
     
+    # Check if this is a restart scenario
+    if is_restart_scenario; then
+        log INFO "Detected restart scenario, performing enhanced cleanup"
+        cleanup_stale_processes
+        wait_for_usb_stabilization 20
+        clear_restart_marker
+    else
+        # Still do basic cleanup
+        cleanup_stale_processes
+    fi
+    
     # Kill existing processes
     if pgrep -f "${MEDIAMTX_BIN}" >/dev/null; then
         if systemctl is-active mediamtx >/dev/null 2>&1; then
@@ -1147,6 +1329,13 @@ start_mediamtx() {
     log INFO "Starting MediaMTX..."
     
     setup_directories
+    
+    # Wait for USB devices to be ready
+    if ! wait_for_usb_stabilization; then
+        log ERROR "USB audio subsystem not ready"
+        release_lock
+        return 1
+    fi
     
     # Check for devices
     local devices=()
@@ -1204,7 +1393,7 @@ start_mediamtx() {
                 
                 # Validate stream is actually working
                 if validate_stream "$stream_path"; then
-                    echo -e "${GREEN}✓${NC} rtsp://localhost:8554/${stream_path}"
+                    echo -e "${GREEN}✔${NC} rtsp://localhost:8554/${stream_path}"
                     ((success_count++))
                 else
                     echo -e "${RED}✗${NC} rtsp://localhost:8554/${stream_path} (failed to start)"
@@ -1232,7 +1421,7 @@ start_mediamtx() {
                     
                     if [[ -n "$found_stream" ]]; then
                         if validate_stream "$found_stream"; then
-                            echo -e "${GREEN}✓${NC} rtsp://localhost:8554/${found_stream}"
+                            echo -e "${GREEN}✔${NC} rtsp://localhost:8554/${found_stream}"
                             ((success_count++))
                         else
                             echo -e "${RED}✗${NC} rtsp://localhost:8554/${found_stream} (failed to start)"
@@ -1318,8 +1507,9 @@ stop_mediamtx() {
 
 # Restart MediaMTX
 restart_mediamtx() {
+    mark_restart
     stop_mediamtx
-    sleep 5
+    sleep "${RESTART_STABILIZATION_DELAY}"
     start_mediamtx
 }
 
@@ -1836,6 +2026,9 @@ ReadWritePaths=/etc/mediamtx /var/lib/mediamtx-ffmpeg /var/log
 
 # Environment
 Environment="HOME=/root"
+Environment="USB_STABILIZATION_DELAY=10"
+Environment="RESTART_STABILIZATION_DELAY=15"
+Environment="DEVICE_TEST_ENABLED=false"
 WorkingDirectory=${SCRIPT_DIR}
 
 # Audio priority
@@ -1853,25 +2046,28 @@ EOF
     echo "Enable: sudo systemctl enable mediamtx-audio"
     echo "Start: sudo systemctl start mediamtx-audio"
     echo ""
-    echo "Note: The service has a 5-minute startup timeout to handle multiple devices."
-    echo "If you have many devices, startup may take 15-30 seconds per device."
+    echo "Note: The service has enhanced restart handling for system updates."
+    echo "It will automatically detect and handle service restarts gracefully."
     echo ""
     echo "For faster startup with many devices, you can enable parallel starts:"
     echo "  sudo systemctl edit mediamtx-audio"
     echo "  Add: Environment=\"PARALLEL_STREAM_START=true\""
     echo "  Add: Environment=\"STREAM_STARTUP_DELAY=5\""
     echo ""
-    echo "To disable device testing (recommended for production):"
-    echo "  Add: Environment=\"DEVICE_TEST_ENABLED=false\""
+    echo "The service includes:"
+    echo "  - USB stabilization delay for restart scenarios"
+    echo "  - Enhanced cleanup of stale processes"
+    echo "  - Automatic detection of restart conditions"
+    echo "  - Device testing disabled by default for stability"
 }
 
 # Show help
 show_help() {
     cat << EOF
-MediaMTX Audio Stream Manager v8.0.4
+MediaMTX Audio Stream Manager v8.1.0
 
 Automatically configures MediaMTX for continuous 24/7 RTSP audio streaming
-from USB audio devices using the official MediaMTX v1.12.3 configuration schema.
+from USB audio devices with enhanced service restart handling.
 
 Usage: ${SCRIPT_NAME} [COMMAND]
 
@@ -1902,37 +2098,37 @@ Default audio settings:
     ALSA buffer: 100ms
     ALSA period: 20ms
 
-New in v8.0.4:
-    - Fixed device testing logic that was failing unnecessarily
-    - Added DEVICE_TEST_ENABLED environment variable (default: false)
-    - Improved fallback format detection
-    - Better device capability detection
-    - Cleaner startup messages without false warnings
-    - Always uses plughw by default for better compatibility
+New in v8.1.0:
+    - Enhanced service restart handling for system updates
+    - Automatic cleanup of stale processes and PID files
+    - USB audio subsystem stabilization detection
+    - Restart scenario detection and special handling
+    - Improved process termination logic
+    - ALSA state reset on cleanup
+    - Better handling of forced service restarts
+    - Cleanup marker to prevent race conditions
 
 Environment variables:
-    STREAM_STARTUP_DELAY=10     Seconds to wait after starting each stream (default: 10)
-    PARALLEL_STREAM_START=false Start all streams in parallel (default: false)
-    DEVICE_TEST_ENABLED=false   Enable device format testing (default: false)
-    DEVICE_TEST_TIMEOUT=3       Device test timeout in seconds (default: 3)
-    DEBUG=true                  Enable debug logging (default: false)
+    STREAM_STARTUP_DELAY=10            Seconds to wait after starting each stream
+    PARALLEL_STREAM_START=false        Start all streams in parallel
+    DEVICE_TEST_ENABLED=false          Enable device format testing
+    DEVICE_TEST_TIMEOUT=3              Device test timeout in seconds
+    USB_STABILIZATION_DELAY=5          Wait for USB to stabilize (seconds)
+    RESTART_STABILIZATION_DELAY=10     Extra delay on restart (seconds)
+    DEBUG=true                         Enable debug logging
 
-Troubleshooting:
-    - Check device access: arecord -l
-    - View logs: tail -f ${LOG_FILE}
-    - Check FFmpeg logs: tail -f ${FFMPEG_PID_DIR}/*.log
-    - Monitor MediaMTX: tail -f ${MEDIAMTX_LOG}
-    - Test device: arecord -D hw:N,0 -f S16_LE -r 48000 -c 2 -d 5 test.wav
-    - Monitor streams: $0 monitor
+Troubleshooting service restarts:
+    - Check logs: journalctl -u mediamtx-audio -f
+    - Manual cleanup: $0 stop && sleep 10 && $0 start
+    - Force reset: pkill -9 mediamtx ffmpeg && rm -f /var/run/mediamtx*
+    - Check USB devices: lsusb && arecord -l
 
 Common issues:
-    - Device test warnings: Set DEVICE_TEST_ENABLED=false (now default)
-    - Ugly stream names: Run usb-audio-mapper.sh to assign friendly names
-    - Clients disconnecting: Check codec compatibility (avoid PCM for network streams)
-    - No audio: Check ALSA buffer settings in config
-    - Format errors: Script now defaults to plughw for compatibility
-    - High CPU with PCM: Use compressed codecs (opus/aac)
-    - Crackling: Increase ALSA_BUFFER in device config
+    - Service restart problems: Now automatically handled
+    - Device not reappearing: USB stabilization delay helps
+    - Stale processes: Enhanced cleanup on start
+    - Ugly stream names: Run usb-audio-mapper.sh
+    - Format errors: Script defaults to plughw for compatibility
 
 EOF
 }
