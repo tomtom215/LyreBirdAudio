@@ -2,7 +2,7 @@
 
 A robust Linux solution for creating lightweight and reliable 24/7 RTSP audio streams from USB microphones using MediaMTX and FFmpeg, with automatic recovery and service management.
 
-#### Original problem statement - "I have a linux mini PC and one or more USB microphones that I want to use to setup streams to listen to birds." 
+#### Original problem statement - "I have a linux mini PC and one or more USB microphones that I want to use to setup streams so that I can listen to birds." 
 
 This turns out to be way more complex than originally anticipated and a lightweight solution to run all day unattended was not easily found.
 
