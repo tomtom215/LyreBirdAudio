@@ -1,6 +1,12 @@
 # LyreBirdAudio - RTSP Audio Streaming Suite
 
-A robust Linux solution for creating reliable 24/7 RTSP audio streams from USB microphones using MediaMTX and FFmpeg, with automatic recovery and service management.
+A robust Linux solution for creating lightweight and reliable 24/7 RTSP audio streams from USB microphones using MediaMTX and FFmpeg, with automatic recovery and service management.
+
+#### Original problem statement - "I have a linux mini PC and one or more USB microphones that I want to use to setup streams to listen to birds." 
+
+This turns out to be way more complex than originally anticipated and a lightweight solution to run all day unattended was not easily found.
+
+Named after the Australian lyrebird, a remarkable bird that can perfectly mimic and reproduce any sound it hears - just as LyreBirdAudio faithfully captures and streams audio from any USB microphone
 
 ## What Problem Does This Solve?
 
