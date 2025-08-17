@@ -1,24 +1,189 @@
 # MediaMTX RTSP Audio Streaming Setup
 
-A set of Linux utilities for creating reliable 24/7 RTSP audio streams from USB microphones using MediaMTX and FFmpeg.
+A robust Linux solution for creating reliable 24/7 RTSP audio streams from USB microphones using MediaMTX and FFmpeg, with automatic recovery and service management.
 
 ## Overview
 
-This repository provides three scripts that work together to create persistent, automatically-managed RTSP audio streams from USB audio devices:
+This repository provides three integrated scripts that work together to create persistent, automatically-managed RTSP audio streams from USB audio devices:
 
 - **usb-audio-mapper.sh** - Creates persistent device names for USB audio devices using udev rules
-- **install_mediamtx.sh** - Installs, updates, and manages MediaMTX
-- **mediamtx-stream-manager.sh** - Automatically configures and manages RTSP audio streams
+- **install_mediamtx.sh** - Installs, updates, and manages MediaMTX with intelligent service detection
+- **mediamtx-stream-manager.sh** - Automatically configures and manages RTSP audio streams with enhanced restart handling
 
-The system is designed for unattended operation with automatic recovery from device disconnections and process failures.
+The system is designed for unattended operation with automatic recovery from device disconnections, process failures, and system updates.
 
-## What's New in mediamtx-stream-manager.sh v8.0.4
+## Problem This Solves
 
-- **Human-Readable Stream Names**: Streams now use friendly names (e.g., `conference-mic-1`) when devices are mapped with usb-audio-mapper.sh
-- **Improved Compatibility**: Device testing disabled by default for better compatibility
-- **Better Fallback Support**: Enhanced format detection and automatic fallback to plughw
-- **Cleaner Operation**: Reduced unnecessary warnings during startup
-- **Environmental Control**: New environment variables for fine-tuning behavior
+### Service Restart Issues During System Updates
+When system services restart (during updates, reboots, or manual restarts), USB audio streaming setups often face:
+- Stale processes that prevent clean restarts
+- USB devices not being ready when services start
+- PID file conflicts from previous runs
+- FFmpeg processes not terminating properly
+- Race conditions between cleanup and restart operations
+- Loss of stream configuration during ungraceful shutdowns
+
+### Version 8.1.0 addresses these issues with:
+- **Enhanced cleanup procedures** that properly terminate all child processes
+- **USB stabilization detection** that waits for devices to be ready
+- **Restart scenario detection** that applies special handling during service restarts
+- **Atomic cleanup operations** using marker files to prevent race conditions
+- **ALSA state reset** to recover from device conflicts
+- **Graceful process termination** with proper signal cascading
+
+## What's New
+
+### v8.1.0 - Service Restart Reliability Update
+
+**Breaking Changes: None** - This version is fully backward compatible with v8.0.4 configurations.
+
+**Key Improvements:**
+- **Enhanced Service Restart Handling**: Automatic detection and special handling of restart scenarios
+- **Comprehensive Process Cleanup**: Ensures all FFmpeg wrappers and child processes terminate properly
+- **USB Stabilization Detection**: Waits for USB audio subsystem to stabilize before starting streams
+- **Restart Markers**: Prevents race conditions during rapid stop/start cycles
+- **ALSA State Management**: Resets ALSA state during cleanup to resolve device conflicts
+- **Cleanup Markers**: Atomic operations to prevent interference during cleanup
+- **Improved Signal Handling**: Proper cascading of termination signals to all child processes
+- **Extended Timeouts**: Configurable delays for USB stabilization and restart scenarios
+
+**Important Note for Upgraders**: While there are no breaking configuration changes, the improved restart handling includes additional delays for stability. If your automation scripts depend on precise timing, you may need to adjust for the new USB_STABILIZATION_DELAY (10 seconds) and RESTART_STABILIZATION_DELAY (15 seconds) when services restart.
+
+### v8.0.4 Features (Previous Release)
+- Human-readable stream names when devices are mapped with usb-audio-mapper.sh
+- Improved compatibility with device testing disabled by default
+- Better fallback support with automatic format detection
+- Environmental control for fine-tuning behavior
+
+## Upgrade Instructions
+
+### For Users Upgrading from v8.0.4 or Earlier
+
+**IMPORTANT**: Version 8.1.0 is fully backward compatible. Your existing configurations and stream names will be preserved.
+
+#### 1. Stop Current Services
+```bash
+# If using systemd service
+sudo systemctl stop mediamtx-audio
+
+# If using stream manager directly
+sudo ./mediamtx-stream-manager.sh stop
+
+# Wait for complete shutdown
+sleep 10
+```
+
+#### 2. Backup Current Configuration
+```bash
+# Create backup directory
+sudo mkdir -p /etc/mediamtx/backup-$(date +%Y%m%d)
+
+# Backup configurations
+sudo cp /etc/mediamtx/*.conf /etc/mediamtx/backup-$(date +%Y%m%d)/
+sudo cp /etc/mediamtx/*.yml /etc/mediamtx/backup-$(date +%Y%m%d)/
+
+# Backup any custom scripts
+[ -f ./mediamtx-stream-manager.sh ] && cp ./mediamtx-stream-manager.sh ./mediamtx-stream-manager.sh.backup
+```
+
+#### 3. Update Scripts
+```bash
+# Clone or pull latest version
+git pull origin main
+
+# Or download specific files
+wget https://raw.githubusercontent.com/tomtom215/mediamtx-rtsp-setup/main/mediamtx-stream-manager.sh
+wget https://raw.githubusercontent.com/tomtom215/mediamtx-rtsp-setup/main/install_mediamtx.sh
+
+# Make scripts executable
+chmod +x *.sh
+```
+
+#### 4. Update MediaMTX Binary (Optional but Recommended)
+```bash
+# The installer now handles running instances intelligently
+sudo ./install_mediamtx.sh update
+```
+
+#### 5. Update Systemd Service (If Using Systemd)
+```bash
+# Recreate service with new parameters
+sudo ./mediamtx-stream-manager.sh install
+
+# Reload systemd
+sudo systemctl daemon-reload
+
+# The new service includes enhanced restart parameters
+```
+
+#### 6. Configure New Environment Variables (Recommended)
+```bash
+# Edit service for optimal production settings
+sudo systemctl edit mediamtx-audio
+
+# Add these recommended production values:
+[Service]
+Environment="USB_STABILIZATION_DELAY=10"
+Environment="RESTART_STABILIZATION_DELAY=15"
+Environment="DEVICE_TEST_ENABLED=false"
+Environment="STREAM_STARTUP_DELAY=10"
+Environment="PARALLEL_STREAM_START=false"
+
+# Note: These are the optimal values used by the installer
+# when creating a new systemd service. If you forget to set
+# these, the script will use less optimal defaults.
+```
+
+#### 7. Start Services
+```bash
+# If using systemd
+sudo systemctl start mediamtx-audio
+sudo systemctl status mediamtx-audio
+
+# If using stream manager directly
+sudo ./mediamtx-stream-manager.sh start
+```
+
+#### 8. Verify Streams and Configuration
+```bash
+# Check all streams are running
+sudo ./mediamtx-stream-manager.sh status
+
+# Verify environment variables are set correctly
+sudo systemctl show mediamtx-audio | grep Environment
+
+# Expected output should include:
+# Environment=USB_STABILIZATION_DELAY=10
+# Environment=RESTART_STABILIZATION_DELAY=15
+# Environment=DEVICE_TEST_ENABLED=false
+
+# If these values are missing or different, update them:
+sudo systemctl edit mediamtx-audio
+# Add the Environment lines shown above
+
+# Monitor for stability
+sudo journalctl -u mediamtx-audio -f
+```
+
+**Critical**: Ensure USB_STABILIZATION_DELAY is 10 (not 5) and RESTART_STABILIZATION_DELAY is 15 (not 10) for optimal production performance. These higher values prevent race conditions during service restarts.
+
+### Rollback Procedure (If Needed)
+
+If you encounter issues after upgrading:
+
+```bash
+# Stop services
+sudo systemctl stop mediamtx-audio
+
+# Restore backup script
+[ -f ./mediamtx-stream-manager.sh.backup ] && mv ./mediamtx-stream-manager.sh.backup ./mediamtx-stream-manager.sh
+
+# Restore configurations
+sudo cp /etc/mediamtx/backup-$(date +%Y%m%d)/* /etc/mediamtx/
+
+# Restart with old version
+sudo systemctl start mediamtx-audio
+```
 
 ## Requirements
 
@@ -27,36 +192,58 @@ The system is designed for unattended operation with automatic recovery from dev
 - USB audio devices
 - Required packages: `ffmpeg`, `curl` or `wget`, `tar`, `jq`, `arecord` (alsa-utils), `lsusb` (usbutils), `udevadm` (systemd)
 
-## Pre-Installation Cleanup
+## Hardware Recommendations and Limitations
 
-If you are on a fresh OS installation, you can skip this part. If you have existing MediaMTX installations or audio streaming setups, run these cleanup commands:
+### Raspberry Pi Limitations
 
-```bash
-# Stop MediaMTX systemd service if running
-sudo systemctl stop mediamtx 2>/dev/null || true
-sudo systemctl disable mediamtx 2>/dev/null || true
+Due to USB bandwidth and power constraints, Raspberry Pi devices have the following practical limits for simultaneous USB microphone streaming:
 
-# Stop mediamtx-audio service if running
-sudo systemctl stop mediamtx-audio 2>/dev/null || true
-sudo systemctl disable mediamtx-audio 2>/dev/null || true
+- **Raspberry Pi Zero W**: Maximum 1 USB microphone
+  - Limited USB bandwidth and processing power
+  - Suitable for single-stream applications only
+  
+- **Raspberry Pi 3B/4/5**: Maximum 2 USB microphones
+  - USB bandwidth becomes saturated with more than 2 audio streams
+  - Power delivery limitations may cause device dropouts with multiple microphones
+  - CPU may struggle with more than 2 simultaneous encoding streams
 
-# Kill any running MediaMTX processes
-sudo pkill -f mediamtx || true
+### Recommended Hardware for Multiple Microphones
 
-# Kill any FFmpeg processes streaming to MediaMTX
-sudo pkill -f "ffmpeg.*rtsp://localhost:8554" || true
+For deployments requiring more than 2 simultaneous microphone streams:
 
-# Check if ports are in use
-sudo lsof -i :8554 || echo "Port 8554 is free"
-sudo lsof -i :9997 || echo "Port 9997 is free"
+- **Linux Mini PCs** (Recommended for 3+ microphones)
+  - Intel N100 processor-based systems work excellently
+  - Dedicated USB controllers provide better bandwidth
+  - More stable power delivery for multiple devices
+  - Can reliably handle 4-8 simultaneous streams depending on model
 
-# Stop PulseAudio temporarily (if it's monopolizing USB devices)
-systemctl --user stop pulseaudio.socket pulseaudio.service 2>/dev/null || true
+### USB Hub Considerations
 
-# Backup existing configurations
-[ -d "/etc/mediamtx" ] && sudo cp -r /etc/mediamtx "/etc/mediamtx.backup.$(date +%Y%m%d-%H%M%S)"
-[ -f "/etc/udev/rules.d/99-usb-soundcards.rules" ] && sudo cp /etc/udev/rules.d/99-usb-soundcards.rules "/etc/udev/rules.d/99-usb-soundcards.rules.backup.$(date +%Y%m%d-%H%M%S)"
-```
+If you must use USB hubs for connecting multiple microphones:
+
+1. **Always use powered USB hubs**
+   - Bus-powered hubs cannot provide sufficient power for multiple audio devices
+   - Inadequate power causes random disconnections and audio dropouts
+
+2. **Choose high-quality hubs**
+   - Cheap hubs introduce electrical interference and noise
+   - Look for hubs with individual port power switches
+   - Industrial-grade hubs recommended for production deployments
+
+3. **Avoid daisy-chaining**
+   - Connect hubs directly to the host computer
+   - Multiple hub levels increase latency and reduce reliability
+
+4. **Consider USB bandwidth**
+   - Even with powered hubs, you're still limited by the host's USB controller bandwidth
+   - Spreading devices across multiple USB controllers (if available) improves performance
+
+### Production Deployment Guidelines
+
+- **1-2 microphones**: Raspberry Pi 4 or 5 (with good cooling)
+- **3-4 microphones**: Intel N100 mini PC or equivalent
+- **5-8 microphones**: Higher-spec mini PC with multiple USB controllers
+- **9+ microphones**: Consider multiple streaming servers or professional audio interfaces
 
 ## Installation
 
@@ -114,6 +301,7 @@ This command will:
 - Install the binary to `/usr/local/bin/`
 - Create configuration directory at `/etc/mediamtx/`
 - Create systemd service (optional)
+- Detect existing stream management setups
 
 ### 5. Configure and Start Audio Streams
 
@@ -245,35 +433,38 @@ Available parameters:
 
 ### Environment Variables
 
-Control script behavior with environment variables:
+Control script behavior with environment variables. The values shown below are the **optimal production settings** that are automatically configured when using systemd service:
 
 ```bash
-# Disable device testing (recommended for production)
-export DEVICE_TEST_ENABLED=false  # Default: false
+# Core Settings (Optimal Production Values)
+export DEVICE_TEST_ENABLED=false          # Disable device testing (critical for production)
+export STREAM_STARTUP_DELAY=10            # Seconds to wait after starting each stream
+export PARALLEL_STREAM_START=false        # Sequential starts are more reliable
+export DEVICE_TEST_TIMEOUT=3              # Device test timeout if testing enabled
+export DEBUG=false                         # Disable debug logging in production
 
-# Adjust stream startup delay
-export STREAM_STARTUP_DELAY=5     # Default: 10 seconds
+# v8.1.0 Restart Handling Settings (Optimal Production Values)
+export USB_STABILIZATION_DELAY=10         # Wait for USB to stabilize (systemd default: 10)
+export RESTART_STABILIZATION_DELAY=15     # Extra delay on restart (systemd default: 15)
+export CLEANUP_MARKER=/var/run/mediamtx-audio.cleanup  # Cleanup coordination file
+export RESTART_MARKER=/var/run/mediamtx-audio.restart  # Restart detection file
 
-# Enable parallel stream starts (faster with many devices)
-export PARALLEL_STREAM_START=true # Default: false
-
-# Set device test timeout
-export DEVICE_TEST_TIMEOUT=5      # Default: 3 seconds
-
-# Enable debug logging
-export DEBUG=true                 # Default: false
+# IMPORTANT: The systemd service automatically uses these optimal values.
+# Manual runs use lower defaults (5 and 10 respectively) unless you export these.
 ```
 
-For systemd service, add environment variables:
+For systemd service, these are automatically set, but you can override them:
 
 ```bash
 sudo systemctl edit mediamtx-audio
 
-# Add in the editor:
+# Add in the editor to override defaults:
 [Service]
 Environment="DEVICE_TEST_ENABLED=false"
-Environment="STREAM_STARTUP_DELAY=5"
-Environment="PARALLEL_STREAM_START=true"
+Environment="USB_STABILIZATION_DELAY=10"
+Environment="RESTART_STABILIZATION_DELAY=15"
+Environment="STREAM_STARTUP_DELAY=10"
+Environment="PARALLEL_STREAM_START=false"
 ```
 
 ### MediaMTX Configuration
@@ -300,7 +491,15 @@ sudo tail -f /var/log/mediamtx*.log /var/lib/mediamtx-ffmpeg/*.log
 
 ### Common Issues and Solutions
 
-**Ugly stream names like `usb_0d8c_0134_00`**
+#### Service Restart Problems (Resolved in v8.1.0)
+Previous versions had issues with:
+- Stale processes preventing clean restarts
+- USB devices not ready after restart
+- PID file conflicts
+
+Version 8.1.0 automatically handles these scenarios with enhanced cleanup and USB stabilization detection.
+
+#### Ugly Stream Names
 ```bash
 # Map your devices to friendly names
 sudo ./usb-audio-mapper.sh
@@ -308,7 +507,7 @@ sudo ./usb-audio-mapper.sh
 sudo reboot
 ```
 
-**No audio devices detected**
+#### No Audio Devices Detected
 ```bash
 # Check USB devices
 lsusb
@@ -318,9 +517,13 @@ arecord -l
 
 # Test USB port detection
 sudo ./usb-audio-mapper.sh --test
+
+# If devices missing after reboot, increase stabilization delay
+export USB_STABILIZATION_DELAY=20
+sudo ./mediamtx-stream-manager.sh restart
 ```
 
-**Stream not working**
+#### Stream Not Working
 ```bash
 # Debug all streams
 sudo ./mediamtx-stream-manager.sh debug
@@ -330,7 +533,7 @@ arecord -D hw:N,0 -f S16_LE -r 48000 -c 2 -d 5 test.wav
 aplay test.wav
 ```
 
-**High CPU usage**
+#### High CPU Usage
 ```bash
 # Edit device configuration
 sudo nano /etc/mediamtx/audio-devices.conf
@@ -340,7 +543,7 @@ DEVICE_YOUR_DEVICE_CODEC=opus
 DEVICE_YOUR_DEVICE_BITRATE=64k
 ```
 
-**Audio crackling or dropouts**
+#### Audio Crackling or Dropouts
 ```bash
 # Edit device configuration
 sudo nano /etc/mediamtx/audio-devices.conf
@@ -350,7 +553,7 @@ DEVICE_YOUR_DEVICE_ALSA_BUFFER=200000
 DEVICE_YOUR_DEVICE_THREAD_QUEUE=16384
 ```
 
-**Port conflicts**
+#### Port Conflicts
 ```bash
 # Find what's using MediaMTX ports
 sudo lsof -i :8554  # RTSP port
@@ -361,7 +564,7 @@ sudo lsof -i :9998  # Metrics port
 sudo kill -9 <PID>
 ```
 
-**PulseAudio interference**
+#### PulseAudio Interference
 ```bash
 # Temporarily disable PulseAudio
 systemctl --user stop pulseaudio.socket pulseaudio.service
@@ -370,11 +573,59 @@ systemctl --user stop pulseaudio.socket pulseaudio.service
 systemctl --user start pulseaudio.socket pulseaudio.service
 ```
 
-**Device format warnings during startup**
+#### Device Format Warnings During Startup
 ```bash
 # These are harmless if streams work - disable testing:
 export DEVICE_TEST_ENABLED=false
 sudo ./mediamtx-stream-manager.sh restart
+```
+
+#### Manual Cleanup After Failed Service Stop
+```bash
+# Force cleanup if automatic cleanup fails
+sudo pkill -9 mediamtx ffmpeg
+sudo rm -f /var/run/mediamtx*
+sudo rm -f /var/lib/mediamtx-ffmpeg/*.pid
+
+# Clean up v8.1.0 marker files if present
+sudo rm -f /var/run/mediamtx-audio.cleanup
+sudo rm -f /var/run/mediamtx-audio.restart
+
+# Then start fresh
+sudo ./mediamtx-stream-manager.sh start
+```
+
+**Note**: Version 8.1.0 uses marker files (.cleanup and .restart) to coordinate cleanup operations and prevent race conditions. These are automatically managed but can be manually removed if needed during troubleshooting.
+
+## Pre-Installation Cleanup
+
+If you have existing MediaMTX installations or audio streaming setups, run these cleanup commands:
+
+```bash
+# Stop MediaMTX systemd service if running
+sudo systemctl stop mediamtx 2>/dev/null || true
+sudo systemctl disable mediamtx 2>/dev/null || true
+
+# Stop mediamtx-audio service if running
+sudo systemctl stop mediamtx-audio 2>/dev/null || true
+sudo systemctl disable mediamtx-audio 2>/dev/null || true
+
+# Kill any running MediaMTX processes
+sudo pkill -f mediamtx || true
+
+# Kill any FFmpeg processes streaming to MediaMTX
+sudo pkill -f "ffmpeg.*rtsp://localhost:8554" || true
+
+# Check if ports are in use
+sudo lsof -i :8554 || echo "Port 8554 is free"
+sudo lsof -i :9997 || echo "Port 9997 is free"
+
+# Stop PulseAudio temporarily (if it's monopolizing USB devices)
+systemctl --user stop pulseaudio.socket pulseaudio.service 2>/dev/null || true
+
+# Backup existing configurations
+[ -d "/etc/mediamtx" ] && sudo cp -r /etc/mediamtx "/etc/mediamtx.backup.$(date +%Y%m%d-%H%M%S)"
+[ -f "/etc/udev/rules.d/99-usb-soundcards.rules" ] && sudo cp /etc/udev/rules.d/99-usb-soundcards.rules "/etc/udev/rules.d/99-usb-soundcards.rules.backup.$(date +%Y%m%d-%H%M%S)"
 ```
 
 ## Uninstallation
@@ -405,7 +656,35 @@ sudo rm -rf /var/lib/mediamtx-ffmpeg
 sudo rm -f /var/log/mediamtx*
 ```
 
-## Limitations and Future Improvements
+## Tips for Production Use
+
+1. **Always use friendly names** - Run usb-audio-mapper.sh for each device
+2. **Disable device testing** - Set `DEVICE_TEST_ENABLED=false` (critical for stability)
+3. **Use optimal delay settings** - Set `USB_STABILIZATION_DELAY=10` and `RESTART_STABILIZATION_DELAY=15`
+4. **Use compressed codecs** - Opus or AAC instead of PCM for network efficiency
+5. **Sequential stream startup** - Keep `PARALLEL_STREAM_START=false` for reliability
+6. **Monitor logs regularly** - Set up log rotation for long-term operation
+7. **Use systemd service** - For automatic startup and recovery with optimal settings
+8. **Test failover** - Verify streams recover after unplugging/replugging devices
+9. **Configure appropriate delays** - The systemd defaults (10/15 seconds) work well for most hardware
+10. **Regular updates** - Keep MediaMTX and scripts updated for bug fixes and improvements
+
+### Optimal Production Configuration
+
+When running in production, ensure these settings are configured:
+
+```bash
+# For systemd service (automatically set by v8.1.0 installer)
+USB_STABILIZATION_DELAY=10        # Not 5 (the script default)
+RESTART_STABILIZATION_DELAY=15    # Not 10 (the script default)
+DEVICE_TEST_ENABLED=false         # Critical for stability
+STREAM_STARTUP_DELAY=10           # Allow time for device initialization
+PARALLEL_STREAM_START=false       # Sequential is more reliable
+```
+
+These values are automatically configured when installing the systemd service with v8.1.0, but if you're running the script manually or upgrading from an older version, make sure to export these values or add them to your systemd service configuration.
+
+## Known Limitations
 
 ### Current Limitations
 
@@ -418,7 +697,7 @@ sudo rm -f /var/log/mediamtx*
 - Single-user system (no multi-tenancy)
 - No automatic codec negotiation with clients
 
-### Possible Enhancements (Not Planned)
+### Possible Future Enhancements
 
 - RTSP authentication and TLS encryption support
 - Web-based monitoring and configuration interface
@@ -429,15 +708,6 @@ sudo rm -f /var/log/mediamtx*
 - Prometheus metrics export
 - Stream health monitoring and alerting
 - Dynamic codec selection based on client capabilities
-
-## Tips for Production Use
-
-1. **Always use friendly names** - Run usb-audio-mapper.sh for each device
-2. **Disable device testing** - Set `DEVICE_TEST_ENABLED=false`
-3. **Use compressed codecs** - Opus or AAC instead of PCM
-4. **Monitor logs regularly** - Set up log rotation for long-term operation
-5. **Use systemd service** - For automatic startup and recovery
-6. **Test failover** - Verify streams recover after unplugging/replugging devices
 
 ## Support
 
