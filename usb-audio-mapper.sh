@@ -1,10 +1,12 @@
 #!/bin/bash
 # usb-soundcard-mapper.sh - Automatically map USB sound cards to persistent names
+# Part of LyreBirdAudio - RTSP Audio Streaming Suite
+# https://github.com/tomtom215/LyreBirdAudio
 #
 # This script creates udev rules for USB sound cards to ensure they maintain 
 # consistent names across reboots, with symlinks for easy access.
 #
-# Version: 2.0 (Revised for enhanced robustness)
+# Version: 1.0.0
 # Changes: Added error checking, atomic file operations, dependency checks
 
 # Set bash strict mode for better error handling
@@ -1297,7 +1299,8 @@ non_interactive_mapping() {
 
 # Display help with enhanced options
 show_help() {
-    echo "USB Sound Card Mapper - Create persistent names for USB sound devices"
+    echo "USB Sound Card Mapper v1.0.0 - Create persistent names for USB sound devices"
+    echo "Part of LyreBirdAudio - RTSP Audio Streaming Suite"
     echo
     echo "Usage: $0 [options]"
     echo "Options:"

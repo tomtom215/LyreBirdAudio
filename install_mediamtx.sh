@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 #
 # MediaMTX Installation Manager - Production-Ready Install/Update/Uninstall
-# Version: 5.2.0
+# Version: 1.0.0
+# Part of LyreBirdAudio - RTSP Audio Streaming Suite
+# https://github.com/tomtom215/LyreBirdAudio
 #
 # This script provides a robust, secure, and configurable installation manager
 # for MediaMTX with comprehensive error handling and validation.
@@ -63,7 +65,7 @@ set -o errtrace
 set -o functrace
 
 # Script metadata
-readonly SCRIPT_VERSION="5.2.0"
+readonly SCRIPT_VERSION="1.0.0"
 readonly SCRIPT_NAME="$(basename "${BASH_SOURCE[0]}")"
 readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 readonly SCRIPT_PID="$$"

@@ -1,10 +1,12 @@
 #!/bin/bash
 # mediamtx-audio-stream-manager.sh - Automatic MediaMTX audio stream configuration
+# Part of LyreBirdAudio - RTSP Audio Streaming Suite
+# https://github.com/tomtom215/LyreBirdAudio
 #
 # This script automatically detects USB microphones and creates MediaMTX 
 # configurations for continuous 24/7 RTSP audio streams.
 #
-# Version: 8.1.0 - Enhanced service restart handling and cleanup
+# Version: 1.0.0 - Production release with enhanced service handling
 # Compatible with MediaMTX v1.12.3+
 #
 # Requirements:
@@ -2064,7 +2066,8 @@ EOF
 # Show help
 show_help() {
     cat << EOF
-MediaMTX Audio Stream Manager v8.1.0
+MediaMTX Audio Stream Manager v1.0.0
+Part of LyreBirdAudio - RTSP Audio Streaming Suite
 
 Automatically configures MediaMTX for continuous 24/7 RTSP audio streaming
 from USB audio devices with enhanced service restart handling.

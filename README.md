@@ -1,10 +1,10 @@
-# MediaMTX RTSP Audio Streaming Setup
+# LyreBirdAudio - RTSP Audio Streaming Suite
 
 A robust Linux solution for creating reliable 24/7 RTSP audio streams from USB microphones using MediaMTX and FFmpeg, with automatic recovery and service management.
 
 ## Overview
 
-This repository provides three integrated scripts that work together to create persistent, automatically-managed RTSP audio streams from USB audio devices:
+LyreBirdAudio provides three integrated scripts that work together to create persistent, automatically-managed RTSP audio streams from USB audio devices:
 
 - **usb-audio-mapper.sh** - Creates persistent device names for USB audio devices using udev rules
 - **install_mediamtx.sh** - Installs, updates, and manages MediaMTX with intelligent service detection
@@ -23,7 +23,7 @@ When system services restart (during updates, reboots, or manual restarts), USB 
 - Race conditions between cleanup and restart operations
 - Loss of stream configuration during ungraceful shutdowns
 
-### Version 8.1.0 addresses these issues with:
+### LyreBirdAudio v1.0.0 addresses these issues with:
 - **Enhanced cleanup procedures** that properly terminate all child processes
 - **USB stabilization detection** that waits for devices to be ready
 - **Restart scenario detection** that applies special handling during service restarts
@@ -31,13 +31,48 @@ When system services restart (during updates, reboots, or manual restarts), USB 
 - **ALSA state reset** to recover from device conflicts
 - **Graceful process termination** with proper signal cascading
 
-## What's New
+**For users upgrading from v8.0.4 or earlier**: These enhancements were introduced in v8.1.0 and are now part of LyreBirdAudio v1.0.0. See the [Upgrading from Previous Versions](#upgrading-from-previous-versions) section for detailed upgrade instructions.
 
-### v8.1.0 - Service Restart Reliability Update
+## Version History and Migration
 
-**Breaking Changes: None** - This version is fully backward compatible with v8.0.4 configurations.
+### LyreBirdAudio v1.0.0 (Current)
+This is a rebrand and version reset of the former mediamtx-rtsp-setup project. All functionality from v8.1.0 is preserved.
 
-**Key Improvements:**
+### Previous Version Mapping
+If you're upgrading from mediamtx-rtsp-setup:
+- **mediamtx-stream-manager.sh v8.1.0** → LyreBirdAudio v1.0.0 (all features included)
+- **mediamtx-stream-manager.sh v8.0.4** → Upgrade to LyreBirdAudio v1.0.0 recommended
+- **install_mediamtx.sh v5.2.0** → Now part of LyreBirdAudio v1.0.0
+- **usb-audio-mapper.sh v2.0** → Now part of LyreBirdAudio v1.0.0
+
+### Important Notes for v8.0.4 Users
+Version 8.0.4 users upgrading to LyreBirdAudio v1.0.0 will gain:
+- Enhanced service restart handling during system updates
+- Automatic cleanup of stale processes
+- USB stabilization detection
+- Restart scenario detection
+- ALSA state reset on cleanup
+- Better handling of forced service restarts
+- Cleanup markers to prevent race conditions
+
+**Note**: While there are no breaking configuration changes, the improved restart handling includes additional delays for stability. If your automation scripts depend on precise timing, you may need to adjust for the new USB_STABILIZATION_DELAY (10 seconds) and RESTART_STABILIZATION_DELAY (15 seconds) when services restart.
+
+## Features
+
+### Core Capabilities
+- **Automatic USB Audio Detection**: Discovers and configures all connected USB audio devices
+- **Persistent Device Naming**: Maps USB devices to friendly, consistent names across reboots
+- **24/7 Reliability**: Auto-restart on failures with intelligent backoff strategies
+- **Service Management**: Full systemd integration with proper dependency handling
+- **Multiple Codec Support**: Opus (default), AAC, MP3, and PCM
+- **Real-time Monitoring**: Live stream status and health monitoring
+- **Graceful Recovery**: Handles USB disconnections and reconnections seamlessly
+
+### v1.0.0 - Production Release
+
+LyreBirdAudio v1.0.0 is a rebrand of mediamtx-rtsp-setup with all features from v8.1.0 included.
+
+**Key Features (includes all v8.1.0 enhancements):**
 - **Enhanced Service Restart Handling**: Automatic detection and special handling of restart scenarios
 - **Comprehensive Process Cleanup**: Ensures all FFmpeg wrappers and child processes terminate properly
 - **USB Stabilization Detection**: Waits for USB audio subsystem to stabilize before starting streams
@@ -46,144 +81,12 @@ When system services restart (during updates, reboots, or manual restarts), USB 
 - **Cleanup Markers**: Atomic operations to prevent interference during cleanup
 - **Improved Signal Handling**: Proper cascading of termination signals to all child processes
 - **Extended Timeouts**: Configurable delays for USB stabilization and restart scenarios
+- **Human-readable stream names**: When devices are mapped with usb-audio-mapper.sh
+- **Improved compatibility**: Device testing disabled by default
+- **Better fallback support**: Automatic format detection
+- **Environmental control**: For fine-tuning behavior
 
-**Important Note for Upgraders**: While there are no breaking configuration changes, the improved restart handling includes additional delays for stability. If your automation scripts depend on precise timing, you may need to adjust for the new USB_STABILIZATION_DELAY (10 seconds) and RESTART_STABILIZATION_DELAY (15 seconds) when services restart.
-
-### v8.0.4 Features (Previous Release)
-- Human-readable stream names when devices are mapped with usb-audio-mapper.sh
-- Improved compatibility with device testing disabled by default
-- Better fallback support with automatic format detection
-- Environmental control for fine-tuning behavior
-
-## Upgrade Instructions
-
-### For Users Upgrading from v8.0.4 or Earlier
-
-**IMPORTANT**: Version 8.1.0 is fully backward compatible. Your existing configurations and stream names will be preserved.
-
-#### 1. Stop Current Services
-```bash
-# If using systemd service
-sudo systemctl stop mediamtx-audio
-
-# If using stream manager directly
-sudo ./mediamtx-stream-manager.sh stop
-
-# Wait for complete shutdown
-sleep 10
-```
-
-#### 2. Backup Current Configuration
-```bash
-# Create backup directory
-sudo mkdir -p /etc/mediamtx/backup-$(date +%Y%m%d)
-
-# Backup configurations
-sudo cp /etc/mediamtx/*.conf /etc/mediamtx/backup-$(date +%Y%m%d)/
-sudo cp /etc/mediamtx/*.yml /etc/mediamtx/backup-$(date +%Y%m%d)/
-
-# Backup any custom scripts
-[ -f ./mediamtx-stream-manager.sh ] && cp ./mediamtx-stream-manager.sh ./mediamtx-stream-manager.sh.backup
-```
-
-#### 3. Update Scripts
-```bash
-# Clone or pull latest version
-git pull origin main
-
-# Or download specific files
-wget https://raw.githubusercontent.com/tomtom215/mediamtx-rtsp-setup/main/mediamtx-stream-manager.sh
-wget https://raw.githubusercontent.com/tomtom215/mediamtx-rtsp-setup/main/install_mediamtx.sh
-
-# Make scripts executable
-chmod +x *.sh
-```
-
-#### 4. Update MediaMTX Binary (Optional but Recommended)
-```bash
-# The installer now handles running instances intelligently
-sudo ./install_mediamtx.sh update
-```
-
-#### 5. Update Systemd Service (If Using Systemd)
-```bash
-# Recreate service with new parameters
-sudo ./mediamtx-stream-manager.sh install
-
-# Reload systemd
-sudo systemctl daemon-reload
-
-# The new service includes enhanced restart parameters
-```
-
-#### 6. Configure New Environment Variables (Recommended)
-```bash
-# Edit service for optimal production settings
-sudo systemctl edit mediamtx-audio
-
-# Add these recommended production values:
-[Service]
-Environment="USB_STABILIZATION_DELAY=10"
-Environment="RESTART_STABILIZATION_DELAY=15"
-Environment="DEVICE_TEST_ENABLED=false"
-Environment="STREAM_STARTUP_DELAY=10"
-Environment="PARALLEL_STREAM_START=false"
-
-# Note: These are the optimal values used by the installer
-# when creating a new systemd service. If you forget to set
-# these, the script will use less optimal defaults.
-```
-
-#### 7. Start Services
-```bash
-# If using systemd
-sudo systemctl start mediamtx-audio
-sudo systemctl status mediamtx-audio
-
-# If using stream manager directly
-sudo ./mediamtx-stream-manager.sh start
-```
-
-#### 8. Verify Streams and Configuration
-```bash
-# Check all streams are running
-sudo ./mediamtx-stream-manager.sh status
-
-# Verify environment variables are set correctly
-sudo systemctl show mediamtx-audio | grep Environment
-
-# Expected output should include:
-# Environment=USB_STABILIZATION_DELAY=10
-# Environment=RESTART_STABILIZATION_DELAY=15
-# Environment=DEVICE_TEST_ENABLED=false
-
-# If these values are missing or different, update them:
-sudo systemctl edit mediamtx-audio
-# Add the Environment lines shown above
-
-# Monitor for stability
-sudo journalctl -u mediamtx-audio -f
-```
-
-**Critical**: Ensure USB_STABILIZATION_DELAY is 10 (not 5) and RESTART_STABILIZATION_DELAY is 15 (not 10) for optimal production performance. These higher values prevent race conditions during service restarts.
-
-### Rollback Procedure (If Needed)
-
-If you encounter issues after upgrading:
-
-```bash
-# Stop services
-sudo systemctl stop mediamtx-audio
-
-# Restore backup script
-[ -f ./mediamtx-stream-manager.sh.backup ] && mv ./mediamtx-stream-manager.sh.backup ./mediamtx-stream-manager.sh
-
-# Restore configurations
-sudo cp /etc/mediamtx/backup-$(date +%Y%m%d)/* /etc/mediamtx/
-
-# Restart with old version
-sudo systemctl start mediamtx-audio
-```
+**Important Upgrade Note**: If upgrading from v8.0.4 or earlier, you MUST configure the new environment variables for stability. The enhanced restart handling requires USB_STABILIZATION_DELAY=10 and RESTART_STABILIZATION_DELAY=15. See [Upgrading from Previous Versions](#upgrading-from-previous-versions) for detailed instructions.
 
 ## Requirements
 
@@ -260,7 +163,7 @@ sudo yum install -y ffmpeg curl wget tar jq alsa-utils usbutils
 ### 2. Clone Repository
 
 ```bash
-git clone https://github.com/tomtom215/mediamtx-rtsp-setup/ && cd mediamtx-rtsp-setup && chmod +x *.sh
+git clone https://github.com/tomtom215/LyreBirdAudio.git && cd LyreBirdAudio && chmod +x *.sh
 ```
 
 ### 3. Map USB Audio Devices (Recommended for Friendly Names)
@@ -315,6 +218,184 @@ This will:
 - Start MediaMTX server on port 8554
 - Start FFmpeg processes for each audio device
 - Display available RTSP stream URLs
+
+## Upgrading from Previous Versions
+
+### For Users Upgrading from mediamtx-rtsp-setup (v8.0.4, v8.1.0, or earlier)
+
+**IMPORTANT**: LyreBirdAudio v1.0.0 is fully backward compatible. Your existing configurations and stream names will be preserved.
+
+#### 1. Stop Current Services
+```bash
+# If using systemd service
+sudo systemctl stop mediamtx-audio
+
+# If using stream manager directly
+sudo ./mediamtx-stream-manager.sh stop
+
+# Wait for complete shutdown
+sleep 10
+```
+
+#### 2. Backup Current Configuration
+```bash
+# Create backup directory
+sudo mkdir -p /etc/mediamtx/backup-$(date +%Y%m%d)
+
+# Backup configurations
+sudo cp /etc/mediamtx/*.conf /etc/mediamtx/backup-$(date +%Y%m%d)/
+sudo cp /etc/mediamtx/*.yml /etc/mediamtx/backup-$(date +%Y%m%d)/
+
+# Backup any custom scripts
+[ -f ./mediamtx-stream-manager.sh ] && cp ./mediamtx-stream-manager.sh ./mediamtx-stream-manager.sh.backup
+```
+
+#### 3. Update Scripts
+```bash
+# Clone or pull latest LyreBirdAudio version
+git clone https://github.com/tomtom215/LyreBirdAudio.git
+cd LyreBirdAudio
+
+# Or if updating existing clone
+git pull origin main
+
+# Make scripts executable
+chmod +x *.sh
+```
+
+#### 4. Update MediaMTX Binary (Optional but Recommended)
+```bash
+# The installer now handles running instances intelligently
+sudo ./install_mediamtx.sh update
+```
+
+#### 5. Update Systemd Service (If Using Systemd)
+```bash
+# Recreate service with new parameters
+sudo ./mediamtx-stream-manager.sh install
+
+# Reload systemd
+sudo systemctl daemon-reload
+
+# The new service includes enhanced restart parameters
+```
+
+#### 6. Configure Environment Variables (Critical for Stability)
+```bash
+# Edit service for optimal production settings
+sudo systemctl edit mediamtx-audio
+
+# Add these recommended production values:
+[Service]
+Environment="USB_STABILIZATION_DELAY=10"
+Environment="RESTART_STABILIZATION_DELAY=15"
+Environment="DEVICE_TEST_ENABLED=false"
+Environment="STREAM_STARTUP_DELAY=10"
+Environment="PARALLEL_STREAM_START=false"
+
+# Note: These are the optimal values used by the installer
+# when creating a new systemd service. If you forget to set
+# these, the script will use less optimal defaults.
+```
+
+#### 7. Start Services
+```bash
+# If using systemd
+sudo systemctl start mediamtx-audio
+sudo systemctl status mediamtx-audio
+
+# If using stream manager directly
+sudo ./mediamtx-stream-manager.sh start
+```
+
+#### 8. Verify Streams and Configuration
+```bash
+# Check all streams are running
+sudo ./mediamtx-stream-manager.sh status
+
+# Verify environment variables are set correctly
+sudo systemctl show mediamtx-audio | grep Environment
+
+# Expected output should include:
+# Environment=USB_STABILIZATION_DELAY=10
+# Environment=RESTART_STABILIZATION_DELAY=15
+# Environment=DEVICE_TEST_ENABLED=false
+
+# If these values are missing or different, update them:
+sudo systemctl edit mediamtx-audio
+# Add the Environment lines shown above
+
+# Monitor for stability
+sudo journalctl -u mediamtx-audio -f
+```
+
+**Critical**: Ensure USB_STABILIZATION_DELAY is 10 (not 5) and RESTART_STABILIZATION_DELAY is 15 (not 10) for optimal production performance. These higher values prevent race conditions during service restarts.
+
+### Rollback Procedure (If Needed)
+
+If you encounter issues after upgrading:
+
+```bash
+# Stop services
+sudo systemctl stop mediamtx-audio
+
+# Restore backup script
+[ -f ./mediamtx-stream-manager.sh.backup ] && mv ./mediamtx-stream-manager.sh.backup ./mediamtx-stream-manager.sh
+
+# Restore configurations
+sudo cp /etc/mediamtx/backup-$(date +%Y%m%d)/* /etc/mediamtx/
+
+# Restart with old version
+sudo systemctl start mediamtx-audio
+```
+
+### What's Preserved During Upgrade
+
+- ✅ All device configurations in `/etc/mediamtx/audio-devices.conf`
+- ✅ Your custom device names and mappings
+- ✅ Udev rules for USB devices
+- ✅ Stream names and paths
+- ✅ All your audio device settings (sample rates, codecs, etc.)
+- ✅ Systemd service configurations (with updates for new features)
+
+### What's New After Upgrade
+
+- Version numbers unified to v1.0.0
+- Enhanced restart handling (if environment variables are configured)
+- Better cleanup procedures
+- Improved USB stabilization detection
+- Project rebranded as LyreBirdAudio
+
+## Pre-Installation Cleanup
+
+If you need to completely remove existing installations and start fresh, run these cleanup commands:
+
+```bash
+# Stop MediaMTX systemd service if running
+sudo systemctl stop mediamtx 2>/dev/null || true
+sudo systemctl disable mediamtx 2>/dev/null || true
+
+# Stop mediamtx-audio service if running
+sudo systemctl stop mediamtx-audio 2>/dev/null || true
+sudo systemctl disable mediamtx-audio 2>/dev/null || true
+
+# Kill any running MediaMTX processes
+sudo pkill -f mediamtx || true
+
+# Kill any FFmpeg processes streaming to MediaMTX
+sudo pkill -f "ffmpeg.*rtsp://localhost:8554" || true
+
+# Check if ports are in use
+sudo lsof -i :8554 || echo "Port 8554 is free"
+sudo lsof -i :9997 || echo "Port 9997 is free"
+
+# Stop PulseAudio temporarily (if it's monopolizing USB devices)
+systemctl --user stop pulseaudio.socket pulseaudio.service 2>/dev/null || true
+
+# Backup existing configurations
+[ -d "/etc/mediamtx" ] && sudo cp -r /etc/mediamtx "/etc/mediamtx.backup.$(date +%Y%m%d-%H%M%S)"
+[ -f "/etc/udev/rules.d/99-usb-soundcards.rules" ] && sudo cp /etc/udev/rules.d/99-usb-soundcards.rules "/etc/udev/rules.d/99-usb-soundcards.rules.backup.$(date +%Y%m%d-%H%M%S)"
+```
 
 ## Operation
 
@@ -443,7 +524,7 @@ export PARALLEL_STREAM_START=false        # Sequential starts are more reliable
 export DEVICE_TEST_TIMEOUT=3              # Device test timeout if testing enabled
 export DEBUG=false                         # Disable debug logging in production
 
-# v8.1.0 Restart Handling Settings (Optimal Production Values)
+# v1.0.0 Restart Handling Settings (Optimal Production Values)
 export USB_STABILIZATION_DELAY=10         # Wait for USB to stabilize (systemd default: 10)
 export RESTART_STABILIZATION_DELAY=15     # Extra delay on restart (systemd default: 15)
 export CLEANUP_MARKER=/var/run/mediamtx-audio.cleanup  # Cleanup coordination file
@@ -491,13 +572,13 @@ sudo tail -f /var/log/mediamtx*.log /var/lib/mediamtx-ffmpeg/*.log
 
 ### Common Issues and Solutions
 
-#### Service Restart Problems (Resolved in v8.1.0)
+#### Service Restart Problems (Resolved in v1.0.0)
 Previous versions had issues with:
 - Stale processes preventing clean restarts
 - USB devices not ready after restart
 - PID file conflicts
 
-Version 8.1.0 automatically handles these scenarios with enhanced cleanup and USB stabilization detection.
+LyreBirdAudio v1.0.0 automatically handles these scenarios with enhanced cleanup and USB stabilization detection.
 
 #### Ugly Stream Names
 ```bash
@@ -587,7 +668,7 @@ sudo pkill -9 mediamtx ffmpeg
 sudo rm -f /var/run/mediamtx*
 sudo rm -f /var/lib/mediamtx-ffmpeg/*.pid
 
-# Clean up v8.1.0 marker files if present
+# Clean up v1.0.0 marker files if present
 sudo rm -f /var/run/mediamtx-audio.cleanup
 sudo rm -f /var/run/mediamtx-audio.restart
 
@@ -595,38 +676,7 @@ sudo rm -f /var/run/mediamtx-audio.restart
 sudo ./mediamtx-stream-manager.sh start
 ```
 
-**Note**: Version 8.1.0 uses marker files (.cleanup and .restart) to coordinate cleanup operations and prevent race conditions. These are automatically managed but can be manually removed if needed during troubleshooting.
-
-## Pre-Installation Cleanup
-
-If you have existing MediaMTX installations or audio streaming setups, run these cleanup commands:
-
-```bash
-# Stop MediaMTX systemd service if running
-sudo systemctl stop mediamtx 2>/dev/null || true
-sudo systemctl disable mediamtx 2>/dev/null || true
-
-# Stop mediamtx-audio service if running
-sudo systemctl stop mediamtx-audio 2>/dev/null || true
-sudo systemctl disable mediamtx-audio 2>/dev/null || true
-
-# Kill any running MediaMTX processes
-sudo pkill -f mediamtx || true
-
-# Kill any FFmpeg processes streaming to MediaMTX
-sudo pkill -f "ffmpeg.*rtsp://localhost:8554" || true
-
-# Check if ports are in use
-sudo lsof -i :8554 || echo "Port 8554 is free"
-sudo lsof -i :9997 || echo "Port 9997 is free"
-
-# Stop PulseAudio temporarily (if it's monopolizing USB devices)
-systemctl --user stop pulseaudio.socket pulseaudio.service 2>/dev/null || true
-
-# Backup existing configurations
-[ -d "/etc/mediamtx" ] && sudo cp -r /etc/mediamtx "/etc/mediamtx.backup.$(date +%Y%m%d-%H%M%S)"
-[ -f "/etc/udev/rules.d/99-usb-soundcards.rules" ] && sudo cp /etc/udev/rules.d/99-usb-soundcards.rules "/etc/udev/rules.d/99-usb-soundcards.rules.backup.$(date +%Y%m%d-%H%M%S)"
-```
+**Note**: LyreBirdAudio v1.0.0 uses marker files (.cleanup and .restart) to coordinate cleanup operations and prevent race conditions. These are automatically managed but can be manually removed if needed during troubleshooting.
 
 ## Uninstallation
 
@@ -669,12 +719,27 @@ sudo rm -f /var/log/mediamtx*
 9. **Configure appropriate delays** - The systemd defaults (10/15 seconds) work well for most hardware
 10. **Regular updates** - Keep MediaMTX and scripts updated for bug fixes and improvements
 
+### Critical for Upgrading Users
+
+**If you're upgrading from v8.0.4 or earlier**, the most important change is setting the correct environment variables. The old defaults were:
+- USB_STABILIZATION_DELAY=5 (old default)
+- RESTART_STABILIZATION_DELAY=10 (old default)
+
+**You MUST update these to the new optimal values**:
+- USB_STABILIZATION_DELAY=10 (new optimal)
+- RESTART_STABILIZATION_DELAY=15 (new optimal)
+
+These longer delays are critical for preventing race conditions during service restarts, especially during system updates. Users who don't update these values may experience:
+- Streams failing to start after reboot
+- USB devices not being detected
+- Service restart failures during system updates
+
 ### Optimal Production Configuration
 
 When running in production, ensure these settings are configured:
 
 ```bash
-# For systemd service (automatically set by v8.1.0 installer)
+# For systemd service (automatically set by v1.0.0 installer)
 USB_STABILIZATION_DELAY=10        # Not 5 (the script default)
 RESTART_STABILIZATION_DELAY=15    # Not 10 (the script default)
 DEVICE_TEST_ENABLED=false         # Critical for stability
@@ -682,7 +747,7 @@ STREAM_STARTUP_DELAY=10           # Allow time for device initialization
 PARALLEL_STREAM_START=false       # Sequential is more reliable
 ```
 
-These values are automatically configured when installing the systemd service with v8.1.0, but if you're running the script manually or upgrading from an older version, make sure to export these values or add them to your systemd service configuration.
+These values are automatically configured when installing the systemd service with LyreBirdAudio v1.0.0, but if you're running the script manually or upgrading from an older version, make sure to export these values or add them to your systemd service configuration.
 
 ## Known Limitations
 
@@ -711,11 +776,14 @@ These values are automatically configured when installing the systemd service wi
 
 ## Support
 
-For issues and feature requests, please use the [GitHub issue tracker](https://github.com/tomtom215/mediamtx-rtsp-setup/issues).
+For issues and feature requests, please use the [GitHub issue tracker](https://github.com/tomtom215/LyreBirdAudio/issues).
 
 ## License and Contributors
 
 This software is released under the Apache 2.0 License.
+
+### Project Name
+LyreBirdAudio - Named after the Lyrebird, known for its extraordinary ability to accurately reproduce sounds.
 
 ### Contributors
 
