@@ -25,10 +25,12 @@ USB audio streaming on Linux faces numerous challenges:
 - Full systemd integration for 24/7 operation
 - Friendly device names instead of cryptic USB identifiers
 - Centralized management of multiple audio streams
+- **NEW: Unified Setup Wizard** for complete system management
 
 ## Key Features
 
 ### Core Capabilities
+- **Unified Management Wizard**: Interactive menu-driven interface for complete system control
 - **Automatic USB Audio Detection**: Discovers and configures all connected USB audio devices
 - **Persistent Device Naming**: Maps USB devices to friendly, consistent names across reboots
 - **24/7 Reliability**: Auto-restart on failures with intelligent backoff strategies
@@ -36,14 +38,17 @@ USB audio streaming on Linux faces numerous challenges:
 - **Multiple Codec Support**: Opus (default), AAC, MP3, and PCM
 - **Real-time Monitoring**: Live stream status and health monitoring
 - **Graceful Recovery**: Handles USB disconnections and reconnections seamlessly
+- **Configuration Backup/Restore**: Save and restore complete system configurations
 
 ### Production Features (v1.0.0)
+- **Interactive Setup Wizard**: Step-by-step guided installation and configuration
 - **Enhanced Service Restart Handling**: Automatic detection and special handling of restart scenarios
 - **Comprehensive Process Cleanup**: Ensures all FFmpeg wrappers and child processes terminate properly
 - **USB Stabilization Detection**: Waits for USB audio subsystem to stabilize before starting streams
 - **ALSA State Management**: Resets ALSA state during cleanup to resolve device conflicts
 - **Human-readable Stream Names**: When devices are mapped with usb-audio-mapper.sh
 - **Environmental Control**: Fine-tuning behavior through environment variables
+- **System Health Monitoring**: Built-in diagnostics and troubleshooting tools
 
 ## Hardware Requirements and Recommendations
 
@@ -89,7 +94,89 @@ If using USB hubs:
 - **5-8 microphones**: Higher-spec mini PC with multiple USB controllers
 - **9+ microphones**: Consider multiple streaming servers or professional audio interfaces
 
-## Quick Start Installation
+## Installation Methods
+
+LyreBirdAudio offers two installation methods:
+1. **Setup Wizard (Recommended)** - Interactive guided installation
+2. **Manual Installation** - Step-by-step command line installation
+
+---
+
+## Method 1: Using the Setup Wizard (Recommended)
+
+The LyreBirdAudio Setup Wizard provides an interactive, menu-driven interface for managing all aspects of your audio streaming system.
+
+### Quick Start with Wizard
+
+```bash
+# 1. Install dependencies
+sudo apt-get update && sudo apt-get install -y ffmpeg curl wget tar jq alsa-utils usbutils
+
+# 2. Clone repository
+git clone https://github.com/tomtom215/LyreBirdAudio.git
+cd LyreBirdAudio
+chmod +x *.sh
+
+# 3. Launch the wizard
+sudo ./lyrebird-wizard.sh
+
+```
+
+### Wizard Features
+
+#### Main Menu Options
+1. **Quick Setup (First Time)** - Complete guided installation for new users
+2. **MediaMTX Management** - Install, update, uninstall MediaMTX
+3. **Stream Management** - Start, stop, monitor streams
+4. **USB Device Management** - Map devices to friendly names
+5. **Configuration & Backup** - Manage settings and create backups
+6. **Troubleshooting** - Debug issues and view logs
+
+#### Quick Setup Process
+The wizard's Quick Setup will guide you through:
+1. Installing MediaMTX
+2. Mapping USB audio devices (with automatic reboot handling)
+3. Configuring the stream manager
+4. Starting audio streams
+5. Verifying everything is working
+
+#### Advanced Features
+- **Resume capability**: If interrupted, the wizard remembers where you left off
+- **Health monitoring**: Real-time system health checks
+- **Backup/Restore**: Save and restore complete configurations
+- **Environment variable management**: Easy configuration of production settings
+- **Comprehensive diagnostics**: Built-in troubleshooting tools
+
+### Using the Wizard for Daily Operations
+
+```bash
+# Check system status
+sudo ./lyrebird-wizard.sh
+# Select: 7 (Refresh Status)
+
+# Start/Stop streams
+sudo ./lyrebird-wizard.sh
+# Select: 3 (Stream Management) → 1 (Start) or 2 (Stop)
+
+# Monitor streams live
+sudo ./lyrebird-wizard.sh
+# Select: 3 (Stream Management) → 5 (Monitor Streams)
+# Press 'q' to exit monitoring
+
+# View logs and troubleshoot
+sudo ./lyrebird-wizard.sh
+# Select: 6 (Troubleshooting)
+
+# Backup configuration
+sudo ./lyrebird-wizard.sh
+# Select: 5 (Configuration & Backup) → 6 (Backup Configuration)
+```
+
+---
+
+## Method 2: Manual Installation (Advanced Users)
+
+For users who prefer direct command-line control or need to automate installation.
 
 ### 1. Install Dependencies
 
@@ -144,10 +231,19 @@ rtsp://localhost:8554/conference-mic-1
 rtsp://localhost:8554/meeting-room-mic
 ```
 
+---
+
 ## Basic Operation
 
 ### Stream Management Commands
 
+#### Using the Wizard
+```bash
+# Launch wizard for interactive management
+sudo ./lyrebird-wizard.sh
+```
+
+#### Using Direct Commands
 ```bash
 # Start all streams
 sudo ./mediamtx-stream-manager.sh start
@@ -164,6 +260,13 @@ sudo ./mediamtx-stream-manager.sh monitor
 
 ### Run as System Service
 
+#### Using the Wizard
+```bash
+sudo ./lyrebird-wizard.sh
+# Select: 3 (Stream Management) → Follow prompts
+```
+
+#### Using Direct Commands
 ```bash
 # Create systemd service
 sudo ./mediamtx-stream-manager.sh install
@@ -181,13 +284,13 @@ sudo systemctl status mediamtx-audio
 ### Test Your Streams
 
 ```bash
-# FFplay
+# Get stream URLs from wizard
+sudo ./lyrebird-wizard.sh
+# Select: 3 (Stream Management) → 8 (Test Stream Playback)
+
+# Or test manually
 ffplay rtsp://localhost:8554/conference-mic-1
-
-# VLC
 vlc rtsp://localhost:8554/conference-mic-1
-
-# MPV
 mpv rtsp://localhost:8554/conference-mic-1
 ```
 
@@ -195,6 +298,13 @@ mpv rtsp://localhost:8554/conference-mic-1
 
 ### Audio Device Settings
 
+#### Using the Wizard
+```bash
+sudo ./lyrebird-wizard.sh
+# Select: 5 (Configuration & Backup) → 2 (Edit Audio Device Settings)
+```
+
+#### Manual Configuration
 Edit `/etc/mediamtx/audio-devices.conf` to customize per-device settings:
 
 ```bash
@@ -215,8 +325,14 @@ Available parameters:
 
 ### Environment Variables for Production
 
-Critical settings for production deployments:
+#### Using the Wizard
+```bash
+sudo ./lyrebird-wizard.sh
+# Select: 5 (Configuration & Backup) → 5 (Set Environment Variables)
+# Select: 1 (Quick setup with recommended production values)
+```
 
+#### Manual Configuration
 ```bash
 # For systemd service, edit the service:
 sudo systemctl edit mediamtx-audio
@@ -230,11 +346,37 @@ Environment="STREAM_STARTUP_DELAY=10"
 Environment="PARALLEL_STREAM_START=false"
 ```
 
+## Backup and Restore
+
+### Using the Wizard (Recommended)
+```bash
+# Create backup
+sudo ./lyrebird-wizard.sh
+# Select: 5 (Configuration & Backup) → 6 (Backup Configuration)
+
+# List backups
+# Select: 5 (Configuration & Backup) → 8 (List Backups)
+
+# Restore backup
+# Select: 5 (Configuration & Backup) → 7 (Restore Configuration)
+```
+
+### Manual Backup
+```bash
+# Create backup directory
+sudo mkdir -p /etc/mediamtx/backup-$(date +%Y%m%d)
+
+# Backup configurations
+sudo cp /etc/mediamtx/*.conf /etc/mediamtx/backup-$(date +%Y%m%d)/
+sudo cp /etc/mediamtx/*.yml /etc/mediamtx/backup-$(date +%Y%m%d)/
+sudo cp /etc/udev/rules.d/99-usb-soundcards.rules /etc/mediamtx/backup-$(date +%Y%m%d)/
+```
+
 ## Version History and Upgrading
 
 ### Current Version: LyreBirdAudio v1.0.0
 
-This is a rebrand and version reset of the former mediamtx-rtsp-setup project. All functionality from v8.1.0 is preserved.
+This is a rebrand and version reset of the former mediamtx-rtsp-setup project. All functionality from v8.1.0 is preserved, plus the new Setup Wizard.
 
 ### Previous Version Mapping
 If upgrading from mediamtx-rtsp-setup:
@@ -242,8 +384,17 @@ If upgrading from mediamtx-rtsp-setup:
 - **mediamtx-stream-manager.sh v8.0.4** → Upgrade to LyreBirdAudio v1.0.0 recommended
 - **install_mediamtx.sh v5.2.0** → Now part of LyreBirdAudio v1.0.0
 - **usb-audio-mapper.sh v2.0** → Now part of LyreBirdAudio v1.0.0
+- **NEW: lyrebird-wizard.sh v1.0.0** → Unified management interface
 
 ### Enhancements in v1.0.0 (from v8.0.4)
+
+#### New Setup Wizard
+- Interactive menu-driven interface for all operations
+- Guided first-time installation with automatic error recovery
+- System health monitoring and diagnostics
+- Configuration backup and restore functionality
+- Resume capability for interrupted installations
+- Comprehensive troubleshooting tools
 
 #### Service Restart Reliability
 When system services restart (during updates, reboots, or manual restarts), older versions faced:
@@ -280,6 +431,15 @@ sleep 10
 ```
 
 #### 2. Backup Current Configuration
+
+##### Using the Wizard (Recommended)
+```bash
+# After getting the new scripts
+sudo ./lyrebird-wizard.sh
+# Select: 5 (Configuration & Backup) → 6 (Backup Configuration)
+```
+
+##### Manual Backup
 ```bash
 # Create backup directory
 sudo mkdir -p /etc/mediamtx/backup-$(date +%Y%m%d)
@@ -298,6 +458,14 @@ chmod +x *.sh
 ```
 
 #### 4. Update MediaMTX Binary (Optional but Recommended)
+
+##### Using the Wizard
+```bash
+sudo ./lyrebird-wizard.sh
+# Select: 2 (MediaMTX Management) → 2 (Update MediaMTX)
+```
+
+##### Manual Update
 ```bash
 sudo ./install_mediamtx.sh update
 ```
@@ -310,6 +478,15 @@ sudo systemctl daemon-reload
 ```
 
 #### 6. Configure Environment Variables (Critical)
+
+##### Using the Wizard (Recommended)
+```bash
+sudo ./lyrebird-wizard.sh
+# Select: 5 (Configuration & Backup) → 5 (Set Environment Variables)
+# Select: 1 (Quick setup with recommended production values)
+```
+
+##### Manual Configuration
 ```bash
 # Edit service for optimal production settings
 sudo systemctl edit mediamtx-audio
@@ -332,6 +509,15 @@ sudo systemctl status mediamtx-audio
 ```
 
 #### 8. Verify Configuration
+
+##### Using the Wizard
+```bash
+sudo ./lyrebird-wizard.sh
+# Select: 7 (Refresh Status) to see current state
+# Select: 3 (Stream Management) → 4 (Stream Status) for details
+```
+
+##### Manual Verification
 ```bash
 # Check all streams are running
 sudo ./mediamtx-stream-manager.sh status
@@ -352,6 +538,15 @@ sudo journalctl -u mediamtx-audio -f
 - ✅ Systemd service configurations (with updates for new features)
 
 ### Rollback Procedure (If Needed)
+
+##### Using the Wizard
+```bash
+sudo ./lyrebird-wizard.sh
+# Select: 5 (Configuration & Backup) → 7 (Restore Configuration)
+# Enter the backup name from before the upgrade
+```
+
+##### Manual Rollback
 ```bash
 # Stop services
 sudo systemctl stop mediamtx-audio
@@ -365,16 +560,53 @@ sudo systemctl start mediamtx-audio
 
 ## Troubleshooting
 
+### Using the Setup Wizard (Recommended)
+
+The wizard includes comprehensive troubleshooting tools:
+
+```bash
+sudo ./lyrebird-wizard.sh
+# Select: 6 (Troubleshooting)
+
+# Available options:
+# 1. View MediaMTX Logs
+# 2. View Stream Manager Logs
+# 3. View System Logs
+# 4. Check Port Availability
+# 5. Clean Stale Processes
+# 6. Clean PID Files
+# 7. Run Full Diagnostics
+# 8. Check Disk Space
+# 9. Test Audio Devices
+# 10. System Health Details
+```
+
 ### Common Issues and Solutions
 
 #### Ugly Stream Names
 Map your devices to friendly names:
+
+##### Using the Wizard
+```bash
+sudo ./lyrebird-wizard.sh
+# Select: 4 (USB Device Management) → 1 (Map USB Audio Device)
+```
+
+##### Manual Mapping
 ```bash
 sudo ./usb-audio-mapper.sh
 sudo reboot
 ```
 
 #### No Audio Devices Detected
+
+##### Using the Wizard
+```bash
+sudo ./lyrebird-wizard.sh
+# Select: 6 (Troubleshooting) → 9 (Test Audio Devices)
+```
+
+##### Manual Testing
 ```bash
 # Check USB devices
 lsusb
@@ -391,6 +623,14 @@ sudo ./mediamtx-stream-manager.sh restart
 ```
 
 #### Stream Not Working
+
+##### Using the Wizard
+```bash
+sudo ./lyrebird-wizard.sh
+# Select: 3 (Stream Management) → 6 (Debug Streams)
+```
+
+##### Manual Debug
 ```bash
 # Debug all streams
 sudo ./mediamtx-stream-manager.sh debug
@@ -415,6 +655,14 @@ DEVICE_YOUR_DEVICE_THREAD_QUEUE=16384
 ```
 
 #### Port Conflicts
+
+##### Using the Wizard
+```bash
+sudo ./lyrebird-wizard.sh
+# Select: 6 (Troubleshooting) → 4 (Check Port Availability)
+```
+
+##### Manual Check
 ```bash
 # Find what's using MediaMTX ports
 sudo lsof -i :8554  # RTSP port
@@ -425,6 +673,15 @@ sudo kill -9 <PID>
 ```
 
 #### Manual Cleanup After Failed Service Stop
+
+##### Using the Wizard
+```bash
+sudo ./lyrebird-wizard.sh
+# Select: 6 (Troubleshooting) → 5 (Clean Stale Processes)
+# Select: 6 (Troubleshooting) → 6 (Clean PID Files)
+```
+
+##### Manual Cleanup
 ```bash
 # Force cleanup if automatic cleanup fails
 sudo pkill -9 mediamtx ffmpeg
@@ -441,6 +698,14 @@ sudo ./mediamtx-stream-manager.sh start
 
 ### Check Logs
 
+##### Using the Wizard
+```bash
+sudo ./lyrebird-wizard.sh
+# Select: 6 (Troubleshooting)
+# Choose log type to view (MediaMTX, Stream Manager, or System)
+```
+
+##### Manual Log Checking
 ```bash
 # Stream manager log
 sudo tail -f /var/log/mediamtx-audio-manager.log
@@ -500,6 +765,7 @@ sudo reboot
 8. **Test failover** - Verify streams recover after unplugging/replugging devices
 9. **Configure appropriate delays** - The systemd defaults (10/15 seconds) work well
 10. **Regular updates** - Keep MediaMTX and scripts updated
+11. **Use the wizard for monitoring** - Regular health checks help prevent issues
 
 ### Optimal Production Configuration
 
@@ -512,14 +778,30 @@ STREAM_STARTUP_DELAY=10           # Allow time for device initialization
 PARALLEL_STREAM_START=false       # Sequential is more reliable
 ```
 
+The wizard can set these automatically through:
+```bash
+sudo ./lyrebird-wizard.sh
+# Select: 5 (Configuration & Backup) → 5 (Set Environment Variables)
+# Select: 1 (Quick setup with recommended production values)
+```
+
 ## Uninstallation
 
-### Remove MediaMTX
+### Using the Wizard
+
+```bash
+sudo ./lyrebird-wizard.sh
+# Select: 2 (MediaMTX Management) → 3 (Uninstall MediaMTX)
+```
+
+### Manual Uninstallation
+
+#### Remove MediaMTX
 ```bash
 sudo ./install_mediamtx.sh uninstall
 ```
 
-### Remove Audio Stream Service
+#### Remove Audio Stream Service
 ```bash
 sudo systemctl stop mediamtx-audio
 sudo systemctl disable mediamtx-audio
@@ -527,17 +809,18 @@ sudo rm /etc/systemd/system/mediamtx-audio.service
 sudo systemctl daemon-reload
 ```
 
-### Remove USB Device Mappings
+#### Remove USB Device Mappings
 ```bash
 sudo rm /etc/udev/rules.d/99-usb-soundcards.rules
 sudo udevadm control --reload-rules
 ```
 
-### Clean Configuration and Logs
+#### Clean Configuration and Logs
 ```bash
 sudo rm -rf /etc/mediamtx
 sudo rm -rf /var/lib/mediamtx-ffmpeg
 sudo rm -f /var/log/mediamtx*
+sudo rm -rf /var/lib/lyrebird-wizard
 ```
 
 ## Known Limitations
@@ -546,7 +829,7 @@ sudo rm -f /var/log/mediamtx*
 - No built-in authentication or encryption for RTSP streams
 - Audio-only (no video support)
 - Limited to USB audio devices
-- No web-based management interface
+- No web-based management interface (wizard provides CLI interface)
 - Manual device mapping required for friendly names
 - No built-in stream recording functionality
 - Single-user system (no multi-tenancy)
@@ -562,10 +845,16 @@ sudo rm -f /var/log/mediamtx*
 - Prometheus metrics export
 - Stream health monitoring and alerting
 - Dynamic codec selection based on client capabilities
+- Enhanced wizard with network configuration options
 
 ## Support
 
 For issues and feature requests, please use the [GitHub issue tracker](https://github.com/tomtom215/LyreBirdAudio/issues).
+
+When reporting issues, please include:
+- Output from the wizard's diagnostics: `sudo ./lyrebird-wizard.sh` → Troubleshooting → Run Full Diagnostics
+- Your hardware configuration (device type, number of microphones)
+- Relevant log files from `/var/log/mediamtx*.log`
 
 ## License and Contributors
 
