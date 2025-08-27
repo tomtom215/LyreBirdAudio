@@ -6,10 +6,16 @@
 # This script automatically detects USB microphones and creates MediaMTX 
 # configurations for continuous 24/7 RTSP audio streams.
 #
-# Version: 1.1.0 - Production hardened release
+# Version: 1.1.2 - Fixed race condition in wrapper script startup
 # Compatible with MediaMTX v1.12.3+
 #
 # Version History:
+# v1.1.2 - Fixed race condition in wrapper script startup
+#   - Create PID file before starting wrapper to prevent immediate exit
+#   - Wrapper now properly waits for FFmpeg process
+# v1.1.1 - Fixed wrapper script execution issue
+#   - Fixed FFMPEG_PID scope issue in wrapper scripts
+#   - Properly capture and use FFmpeg process PID
 # v1.1.0 - Production hardening release
 #   - Fixed eval security issue with array-based execution
 #   - Fixed parallel processing double-wait bug
@@ -30,7 +36,7 @@
 set -euo pipefail
 
 # Constants
-readonly VERSION="1.1.0"
+readonly VERSION="1.1.2"
 readonly SCRIPT_NAME="$(basename "${BASH_SOURCE[0]}")"
 readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly CONFIG_DIR="/etc/mediamtx"
@@ -919,9 +925,12 @@ THREAD_QUEUE="${thread_queue}"
 FIFO_SIZE="${DEFAULT_FIFO_SIZE}"
 ANALYZEDURATION="${DEFAULT_ANALYZEDURATION}"
 PROBESIZE="${DEFAULT_PROBESIZE}"
+
+# Global variable for FFmpeg PID
+FFMPEG_PID=""
 WRAPPER_VARS
 
-    # Add the main wrapper logic with array-based execution
+    # Add the main wrapper logic with fixed PID handling
     cat >> "$wrapper_script" << 'WRAPPER_MAIN'
 
 touch "${FFMPEG_LOG}"
@@ -930,8 +939,8 @@ log_message() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >> "${LOG_FILE}"
 }
 
-# Build FFmpeg command array
-build_ffmpeg_cmd() {
+# Build and execute FFmpeg command
+run_ffmpeg() {
     local cmd=()
     cmd+=(ffmpeg)
     
@@ -996,9 +1005,11 @@ build_ffmpeg_cmd() {
     cmd+=(-rtsp_transport tcp)
     cmd+=("rtsp://localhost:8554/${STREAM_PATH}")
     
-    # Execute the command array directly
+    # Execute the command array directly and capture PID
     "${cmd[@]}" >> "${FFMPEG_LOG}" 2>&1 &
     FFMPEG_PID=$!
+    
+    log_message "Started FFmpeg with PID ${FFMPEG_PID}"
 }
 
 # Check if device is still available
@@ -1032,21 +1043,23 @@ while true; do
         echo "[$(date '+%Y-%m-%d %H:%M:%S')] Log rotated" > "${FFMPEG_LOG}"
     fi
     
-    # Build and execute FFmpeg command
-    log_message "Starting FFmpeg with array-based execution"
-    
     # Record start time
     START_TIME=$(date +%s)
     
-    # Execute FFmpeg using the array-based command
-    build_ffmpeg_cmd
+    # Execute FFmpeg
+    run_ffmpeg
     
     # Give FFmpeg time to initialize
     sleep 3
     
     # Wait for FFmpeg to exit
-    wait ${FFMPEG_PID}
-    exit_code=$?
+    if [[ -n "${FFMPEG_PID}" ]]; then
+        wait ${FFMPEG_PID}
+        exit_code=$?
+    else
+        log_message "Failed to start FFmpeg"
+        exit_code=1
+    fi
     
     # Calculate run time
     END_TIME=$(date +%s)
@@ -1090,11 +1103,15 @@ WRAPPER_MAIN
     
     chmod +x "$wrapper_script"
     
+    # CRITICAL FIX: Create PID file BEFORE starting wrapper to prevent race condition
+    # Create an empty PID file first
+    touch "$pid_file"
+    
     # Start wrapper
     nohup "$wrapper_script" >/dev/null 2>&1 &
     local pid=$!
     
-    # Save PID
+    # Now atomically update the PID file with the actual PID
     write_pid_atomic "$pid" "$pid_file"
     
     # Wait for startup
@@ -2198,14 +2215,9 @@ Default audio settings:
     ALSA period: 20ms
 
 New in v${VERSION}:
-    - Fixed eval security issue with array-based execution
-    - Fixed parallel processing double-wait bug
-    - Standardized error handling with configurable modes
-    - Added input validation for all commands
-    - Implemented atomic PID file operations
-    - Enhanced lock file timeout handling
-    - Improved shellcheck compliance
-    - Backward compatible with v1.0.0 configurations
+    - Fixed race condition in wrapper script startup
+    - PID file is now created before wrapper starts
+    - Prevents immediate wrapper exit issue
 
 Environment variables:
     STREAM_STARTUP_DELAY=10            Seconds to wait after starting each stream
