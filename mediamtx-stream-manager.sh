@@ -11,6 +11,7 @@
 #
 # Version History:
 # v1.1.2 - Fixed race condition in wrapper script startup & enhanced robustness
+#   - Enable TCP and UDP by default
 #   - Create PID file before starting wrapper to prevent immediate exit
 #   - Wrapper now properly waits for FFmpeg process
 #   - Added parallel startup race condition mitigation
@@ -1354,7 +1355,8 @@ metricsAddress: :9998
 # RTSP Server
 rtsp: yes
 rtspAddress: :8554
-rtspTransports: [tcp]
+# Enable TCP and UDP
+rtspTransports: [tcp, udp]
 
 # Disable other protocols
 rtmp: no
