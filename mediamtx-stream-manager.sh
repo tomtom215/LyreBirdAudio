@@ -6,13 +6,16 @@
 # This script automatically detects USB microphones and creates MediaMTX 
 # configurations for continuous 24/7 RTSP audio streams.
 #
-# Version: 1.1.2 - Fixed race condition in wrapper script startup
+# Version: 1.1.2 - Enhanced with additional robustness improvements
 # Compatible with MediaMTX v1.12.3+
 #
 # Version History:
-# v1.1.2 - Fixed race condition in wrapper script startup
+# v1.1.2 - Fixed race condition in wrapper script startup & enhanced robustness
 #   - Create PID file before starting wrapper to prevent immediate exit
 #   - Wrapper now properly waits for FFmpeg process
+#   - Added parallel startup race condition mitigation
+#   - Enhanced debug output with clear success/failure indication
+#   - Added audio group validation for systemd service
 # v1.1.1 - Fixed wrapper script execution issue
 #   - Fixed FFMPEG_PID scope issue in wrapper scripts
 #   - Properly capture and use FFmpeg process PID
@@ -258,10 +261,16 @@ setup_directories() {
     
     chmod 755 "${FFMPEG_PID_DIR}"
     
-    touch "${LOG_FILE}"
-    touch "${MEDIAMTX_LOG}"
-    chmod 666 "${MEDIAMTX_LOG}"
-    chmod 644 "${LOG_FILE}"
+    # Enhanced: Handle potential ownership issues
+    if [[ ! -f "${LOG_FILE}" ]]; then
+        touch "${LOG_FILE}"
+        chmod 644 "${LOG_FILE}"
+    fi
+    
+    if [[ ! -f "${MEDIAMTX_LOG}" ]]; then
+        touch "${MEDIAMTX_LOG}"
+        chmod 666 "${MEDIAMTX_LOG}"
+    fi
 }
 
 # Detect if we're in a restart scenario
@@ -818,7 +827,7 @@ get_ffmpeg_pid_file() {
     echo "${FFMPEG_PID_DIR}/${stream_path}.pid"
 }
 
-# Start FFmpeg stream
+# Start FFmpeg stream with enhanced race condition check
 start_ffmpeg_stream() {
     local device_name="$1"
     local card_num="$2"
@@ -829,10 +838,10 @@ start_ffmpeg_stream() {
     
     # Check if already running
     if [[ -f "$pid_file" ]]; then
-        local pid
-        pid="$(read_pid_safe "$pid_file")"
-        if kill -0 "$pid" 2>/dev/null; then
-            log DEBUG "FFmpeg for $stream_path already running (PID: $pid)"
+        local existing_pid
+        existing_pid="$(read_pid_safe "$pid_file")"
+        if kill -0 "$existing_pid" 2>/dev/null; then
+            log DEBUG "FFmpeg for $stream_path already running (PID: $existing_pid)"
             return 0
         fi
     fi
@@ -1113,6 +1122,39 @@ WRAPPER_MAIN
     
     # Now atomically update the PID file with the actual PID
     write_pid_atomic "$pid" "$pid_file"
+    
+    # Enhanced: Check for race condition in parallel startup
+    if [[ "${PARALLEL_STREAM_START:-false}" == "true" ]]; then
+        # Brief pause to allow other processes to write their PID files
+        sleep 0.1
+        
+        # Check if another process created a PID file with the same stream path
+        # This handles the edge case where generate_stream_path() returns the same name
+        local stored_pid
+        stored_pid="$(read_pid_safe "$pid_file")"
+        
+        if [[ -n "$stored_pid" ]] && [[ "$stored_pid" != "$pid" ]]; then
+            # Race condition detected - another process claimed this stream path
+            log WARN "Race condition detected for $stream_path, regenerating path"
+            
+            # Kill our wrapper process
+            kill "$pid" 2>/dev/null || true
+            
+            # Generate a new unique path
+            stream_path="$(generate_stream_path "$device_name" "$card_num")"
+            pid_file="$(get_ffmpeg_pid_file "$stream_path")"
+            
+            # Update wrapper script with new stream path
+            sed -i "s|STREAM_PATH=\".*\"|STREAM_PATH=\"${stream_path}\"|" "$wrapper_script"
+            sed -i "s|PID_FILE=\".*\"|PID_FILE=\"${pid_file}\"|" "$wrapper_script"
+            
+            # Restart with new stream path
+            touch "$pid_file"
+            nohup "$wrapper_script" >/dev/null 2>&1 &
+            pid=$!
+            write_pid_atomic "$pid" "$pid_file"
+        fi
+    fi
     
     # Wait for startup
     sleep "${STREAM_STARTUP_DELAY}"
@@ -1900,7 +1942,7 @@ test_streams() {
     echo "  curl http://localhost:9997/v3/paths/list | jq"
 }
 
-# Debug streams
+# Debug streams with enhanced output
 debug_streams() {
     echo -e "${CYAN}=== Debugging Audio Streams ===${NC}"
     echo
@@ -1972,7 +2014,7 @@ debug_streams() {
         echo
     done
     
-    # Test stream with verbose output
+    # Enhanced: Test stream with clear success/failure indication
     echo "Testing stream connectivity..."
     if [[ ${#running_streams[@]} -gt 0 ]]; then
         # Get first running stream
@@ -1983,7 +2025,23 @@ debug_streams() {
         done
         
         echo "Test command: ffmpeg -loglevel verbose -i rtsp://localhost:8554/${test_stream} -t 2 -f null -"
-        timeout 5 ffmpeg -loglevel verbose -i "rtsp://localhost:8554/${test_stream}" -t 2 -f null - 2>&1 | tail -20
+        
+        # Capture exit code and provide clear feedback
+        local test_output
+        local test_exit_code
+        test_output=$(timeout 5 ffmpeg -loglevel verbose -i "rtsp://localhost:8554/${test_stream}" -t 2 -f null - 2>&1 | tail -20)
+        test_exit_code=$?
+        
+        echo "$test_output"
+        echo
+        
+        if [[ $test_exit_code -eq 0 ]]; then
+            echo -e "${GREEN}✔ Stream connectivity test PASSED${NC}"
+        elif [[ $test_exit_code -eq 124 ]]; then
+            echo -e "${YELLOW}⚠ Stream connectivity test TIMEOUT (stream may still be working)${NC}"
+        else
+            echo -e "${RED}✗ Stream connectivity test FAILED (exit code: $test_exit_code)${NC}"
+        fi
     fi
 }
 
@@ -2081,9 +2139,15 @@ monitor_streams() {
     done
 }
 
-# Create systemd service
+# Create systemd service with audio group check
 create_systemd_service() {
     local service_file="/etc/systemd/system/mediamtx-audio.service"
+    
+    # Enhanced: Check if audio group exists
+    if ! getent group audio >/dev/null 2>&1; then
+        log WARN "Audio group doesn't exist. The service may fail to start."
+        log WARN "Create the group with: sudo groupadd audio"
+    fi
     
     cat > "$service_file" << EOF
 [Unit]
@@ -2156,6 +2220,7 @@ EOF
     echo "  - Enhanced cleanup of stale processes"
     echo "  - Automatic detection of restart conditions"
     echo "  - Device testing disabled by default for stability"
+    echo "  - Parallel startup race condition protection"
 }
 
 # Validate command input
@@ -2183,7 +2248,7 @@ MediaMTX Audio Stream Manager v${VERSION}
 Part of LyreBirdAudio - RTSP Audio Streaming Suite
 
 Automatically configures MediaMTX for continuous 24/7 RTSP audio streaming
-from USB audio devices with enhanced service restart handling.
+from USB audio devices with enhanced service restart handling and robustness.
 
 Usage: ${SCRIPT_NAME} [COMMAND]
 
@@ -2194,7 +2259,7 @@ Commands:
     status      Show current status
     config      Show device configuration
     test        Show stream test commands
-    debug       Debug stream issues
+    debug       Debug stream issues (enhanced output)
     monitor     Live monitor streams (Ctrl+C to exit)
     install     Create systemd service
     help        Show this help
@@ -2214,10 +2279,12 @@ Default audio settings:
     ALSA buffer: 100ms
     ALSA period: 20ms
 
-New in v${VERSION}:
+Enhancements in v${VERSION}:
     - Fixed race condition in wrapper script startup
-    - PID file is now created before wrapper starts
-    - Prevents immediate wrapper exit issue
+    - Added parallel startup race condition mitigation
+    - Enhanced debug output with clear success/failure indication
+    - Added audio group validation for systemd service
+    - Improved file ownership handling
 
 Environment variables:
     STREAM_STARTUP_DELAY=10            Seconds to wait after starting each stream
