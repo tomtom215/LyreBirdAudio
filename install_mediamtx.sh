@@ -1,27 +1,22 @@
 #!/usr/bin/env bash
 #
 # MediaMTX Installation Manager - Production-Ready Install/Update/Uninstall
-# Version: 1.0.0
+# Version: 1.1.0
 # Part of LyreBirdAudio - RTSP Audio Streaming Suite
 # https://github.com/tomtom215/LyreBirdAudio
 #
 # This script provides a robust, secure, and configurable installation manager
 # for MediaMTX with comprehensive error handling and validation.
 #
-# Enhancements in v5.2.0:
-#   - Intelligent detection of management mode during updates
-#   - Proper stop/start based on management mode (systemd/stream-manager/manual)
-#   - Stream manager integration with automatic stream preservation
-#   - Enhanced installation guidance for audio streaming setups
-#
-# Enhancements in v5.1.0:
-#   - Enhanced status detection for processes managed by stream manager
-#   - Better real-time scheduling detection
-#   - Active stream enumeration with names
-#   - Improved health checks with multiple API endpoint testing
-#   - Smart detection of management mode (systemd vs stream manager)
-#   - Process uptime display
-#   - Last error preview in health check
+# Security Enhancements in v1.1.0:
+#   - Eliminated eval-based rollback system for security
+#   - Replaced source-based config loading with safe parser
+#   - Implemented atomic lock acquisition with flock
+#   - Required mktemp for secure temporary directories
+#   - Added comprehensive input validation
+#   - Fixed variable initialization order
+#   - Improved version comparison logic
+#   - Modularized complex functions
 #
 # Usage: ./mediamtx-installer.sh [OPTIONS] COMMAND
 #
@@ -65,7 +60,7 @@ set -o errtrace
 set -o functrace
 
 # Script metadata
-readonly SCRIPT_VERSION="1.0.0"
+readonly SCRIPT_VERSION="1.1.0"
 readonly SCRIPT_NAME="$(basename "${BASH_SOURCE[0]}")"
 readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 readonly SCRIPT_PID="$$"
@@ -109,54 +104,139 @@ TEMP_BASE="${TMPDIR:-/tmp}"
 TEMP_DIR=""
 LOG_FILE=""
 LOCK_FILE="/var/lock/mediamtx-installer.lock"
+LOCK_FD=""
 
 # GitHub API configuration
 readonly GITHUB_API_BASE="https://api.github.com"
 readonly GITHUB_API_TIMEOUT=30
 readonly USER_AGENT="MediaMTX-Installer/${SCRIPT_VERSION}"
 
-# Color codes (disabled in quiet mode or if not terminal)
-if [[ -t 1 ]] && [[ "${QUIET_MODE}" != "true" ]]; then
-    readonly RED='\033[0;31m'
-    readonly GREEN='\033[0;32m'
-    readonly YELLOW='\033[1;33m'
-    readonly BLUE='\033[0;34m'
-    readonly MAGENTA='\033[0;35m'
-    readonly CYAN='\033[0;36m'
-    readonly BOLD='\033[1m'
-    readonly NC='\033[0m'
-else
-    readonly RED=''
-    readonly GREEN=''
-    readonly YELLOW=''
-    readonly BLUE=''
-    readonly MAGENTA=''
-    readonly CYAN=''
-    readonly BOLD=''
-    readonly NC=''
-fi
+# Color codes (will be set after argument parsing)
+RED=''
+GREEN=''
+YELLOW=''
+BLUE=''
+MAGENTA=''
+CYAN=''
+BOLD=''
+NC=''
 
 # Arrays for cleanup tracking
 declare -a CLEANUP_FILES=()
 declare -a CLEANUP_DIRS=()
+
+# Rollback registry - safer than eval
+declare -A ROLLBACK_REGISTRY=(
+    ["mv"]="rollback_mv"
+    ["rm"]="rollback_rm"
+    ["systemctl"]="rollback_systemctl"
+    ["userdel"]="rollback_userdel"
+)
+
+# Rollback action queue
 declare -a ROLLBACK_ACTIONS=()
+
+# Download command (set in check_requirements)
+DOWNLOAD_CMD=""
+
+# Release information (set by get_release_info)
+RELEASE_VERSION=""
+RELEASE_FILE=""
+
+# Platform information (set by detect_platform)
+PLATFORM_OS=""
+PLATFORM_ARCH=""
+PLATFORM_DISTRO=""
+PLATFORM_VERSION=""
+
+# ============================================================================
+# Rollback Functions (Security Hardened)
+# ============================================================================
+
+rollback_mv() {
+    local src="$1"
+    local dst="$2"
+    mv "${src}" "${dst}" 2>/dev/null || true
+}
+
+rollback_rm() {
+    rm -f "$@" 2>/dev/null || true
+}
+
+rollback_systemctl() {
+    systemctl "$@" 2>/dev/null || true
+}
+
+rollback_userdel() {
+    userdel "$@" 2>/dev/null || true
+}
+
+# Safe rollback execution without eval
+execute_rollback() {
+    local action="$1"
+    local cmd="${action%% *}"
+    local args="${action#* }"
+    
+    if [[ -n "${ROLLBACK_REGISTRY[$cmd]:-}" ]]; then
+        # Split args safely
+        IFS=' ' read -ra arg_array <<< "${args}"
+        "${ROLLBACK_REGISTRY[$cmd]}" "${arg_array[@]}"
+    else
+        log_error "Unknown rollback command: ${cmd}"
+    fi
+}
+
+# Add rollback action
+add_rollback() {
+    local cmd="$1"
+    shift
+    local args="$*"
+    
+    if [[ -n "${ROLLBACK_REGISTRY[$cmd]:-}" ]]; then
+        ROLLBACK_ACTIONS+=("${cmd} ${args}")
+    else
+        log_warn "Invalid rollback command: ${cmd}"
+    fi
+}
 
 # ============================================================================
 # Utility Functions
 # ============================================================================
 
+# Initialize runtime variables after argument parsing
+initialize_runtime_vars() {
+    # Set color codes based on terminal and quiet mode
+    if [[ -t 1 ]] && [[ "${QUIET_MODE}" != "true" ]]; then
+        RED='\033[0;31m'
+        GREEN='\033[0;32m'
+        YELLOW='\033[1;33m'
+        BLUE='\033[0;34m'
+        MAGENTA='\033[0;35m'
+        CYAN='\033[0;36m'
+        BOLD='\033[1m'
+        NC='\033[0m'
+    else
+        RED=''
+        GREEN=''
+        YELLOW=''
+        BLUE=''
+        MAGENTA=''
+        CYAN=''
+        BOLD=''
+        NC=''
+    fi
+}
+
 # Enhanced error handler with stack trace
 error_handler() {
-    local line_no=$1
-    local bash_lineno=$2
-    local last_command=$3
-    local code=$4
-    local func_stack=()
+    local code=$1
+    local line_no=$2
+    local bash_command=$3
     
     if [[ "${code}" -ne 0 ]]; then
         log_error "Command failed with exit code ${code}"
-        log_error "Failed command: ${last_command}"
-        log_error "Line ${line_no} in function ${FUNCNAME[1]}"
+        log_error "Failed command: ${bash_command}"
+        log_error "Line ${line_no} in function ${FUNCNAME[1]:-main}"
         
         if [[ "${VERBOSE_MODE}" == "true" ]]; then
             log_debug "Stack trace:"
@@ -167,26 +247,20 @@ error_handler() {
     fi
 }
 
-trap 'error_handler ${LINENO} ${BASH_LINENO} "${BASH_COMMAND}" $?' ERR
+trap 'error_handler $? ${LINENO} "${BASH_COMMAND}"' ERR
 
 # Comprehensive cleanup handler
 cleanup() {
     local exit_code=$?
     
-    # Remove lock file
-    if [[ -f "${LOCK_FILE}" ]] && [[ -f "${LOCK_FILE}.pid" ]]; then
-        local lock_pid
-        lock_pid=$(cat "${LOCK_FILE}.pid" 2>/dev/null || echo "0")
-        if [[ "${lock_pid}" == "${SCRIPT_PID}" ]]; then
-            rm -f "${LOCK_FILE}" "${LOCK_FILE}.pid" 2>/dev/null || true
-        fi
-    fi
+    # Release lock if held
+    release_lock
     
     # Execute rollback actions if failed
     if [[ ${exit_code} -ne 0 ]] && [[ ${#ROLLBACK_ACTIONS[@]} -gt 0 ]]; then
         log_warn "Executing rollback actions..."
         for action in "${ROLLBACK_ACTIONS[@]}"; do
-            eval "${action}" 2>/dev/null || true
+            execute_rollback "${action}"
         done
     fi
     
@@ -221,25 +295,25 @@ trap cleanup EXIT INT TERM
 log_debug() {
     [[ "${VERBOSE_MODE}" == "true" ]] || return 0
     local msg="[$(date '+%Y-%m-%d %H:%M:%S')] [DEBUG] $*"
-    echo "${msg}" >> "${LOG_FILE}" 2>/dev/null || true
+    [[ -n "${LOG_FILE}" ]] && [[ -f "${LOG_FILE}" ]] && echo "${msg}" >> "${LOG_FILE}" 2>/dev/null || true
     [[ "${QUIET_MODE}" != "true" ]] && echo -e "${BLUE}[DEBUG]${NC} $*" >&2
 }
 
 log_info() {
     local msg="[$(date '+%Y-%m-%d %H:%M:%S')] [INFO] $*"
-    echo "${msg}" >> "${LOG_FILE}" 2>/dev/null || true
+    [[ -n "${LOG_FILE}" ]] && [[ -f "${LOG_FILE}" ]] && echo "${msg}" >> "${LOG_FILE}" 2>/dev/null || true
     [[ "${QUIET_MODE}" != "true" ]] && echo -e "${GREEN}[INFO]${NC} $*"
 }
 
 log_warn() {
     local msg="[$(date '+%Y-%m-%d %H:%M:%S')] [WARN] $*"
-    echo "${msg}" >> "${LOG_FILE}" 2>/dev/null || true
+    [[ -n "${LOG_FILE}" ]] && [[ -f "${LOG_FILE}" ]] && echo "${msg}" >> "${LOG_FILE}" 2>/dev/null || true
     echo -e "${YELLOW}[WARN]${NC} $*" >&2
 }
 
 log_error() {
     local msg="[$(date '+%Y-%m-%d %H:%M:%S')] [ERROR] $*"
-    echo "${msg}" >> "${LOG_FILE}" 2>/dev/null || true
+    [[ -n "${LOG_FILE}" ]] && [[ -f "${LOG_FILE}" ]] && echo "${msg}" >> "${LOG_FILE}" 2>/dev/null || true
     echo -e "${RED}[ERROR]${NC} $*" >&2
 }
 
@@ -264,8 +338,152 @@ show_progress() {
 }
 
 # ============================================================================
+# Security Functions
+# ============================================================================
+
+# Atomic lock acquisition with flock
+acquire_lock() {
+    local timeout="${1:-30}"
+    
+    # Open lock file descriptor
+    exec 200>"${LOCK_FILE}"
+    LOCK_FD=200
+    
+    log_debug "Attempting to acquire lock (timeout: ${timeout}s)..."
+    
+    if timeout "${timeout}" bash -c "flock -x 200" 2>/dev/null; then
+        echo "${SCRIPT_PID}" > "${LOCK_FILE}.pid"
+        log_debug "Lock acquired (PID: ${SCRIPT_PID})"
+        return 0
+    else
+        fatal "Failed to acquire lock after ${timeout} seconds" 1
+    fi
+}
+
+# Release lock
+release_lock() {
+    if [[ -n "${LOCK_FD}" ]]; then
+        flock -u "${LOCK_FD}" 2>/dev/null || true
+        exec 200>&- 2>/dev/null || true
+        rm -f "${LOCK_FILE}.pid" 2>/dev/null || true
+        LOCK_FD=""
+        log_debug "Lock released"
+    fi
+}
+
+# Create secure temporary directory
+create_temp_dir() {
+    # Require mktemp for security
+    if ! command -v mktemp &>/dev/null; then
+        fatal "mktemp is required but not found. Please install coreutils." 4
+    fi
+    
+    TEMP_DIR=$(mktemp -d "${TEMP_BASE}/mediamtx-installer-XXXXXX")
+    
+    if [[ ! -d "${TEMP_DIR}" ]]; then
+        fatal "Failed to create temporary directory" 1
+    fi
+    
+    # Create log file in temp directory
+    LOG_FILE="${TEMP_DIR}/install.log"
+    touch "${LOG_FILE}"
+    chmod 600 "${LOG_FILE}"
+    
+    CLEANUP_DIRS+=("${TEMP_DIR}")
+    log_debug "Created temporary directory: ${TEMP_DIR}"
+}
+
+# Safe configuration loading without source/eval
+load_config() {
+    [[ -z "${CONFIG_FILE}" || ! -f "${CONFIG_FILE}" ]] && return 0
+    
+    log_debug "Loading configuration from: ${CONFIG_FILE}"
+    
+    # Parse as key=value pairs, NOT as shell script
+    while IFS='=' read -r key value || [[ -n "${key}" ]]; do
+        # Skip comments and empty lines
+        [[ -z "${key}" || "${key}" == \#* ]] && continue
+        
+        # Trim whitespace
+        key=$(echo "${key}" | xargs)
+        value=$(echo "${value}" | xargs)
+        
+        # Remove quotes
+        value="${value#\"}"
+        value="${value%\"}"
+        value="${value#\'}"
+        value="${value%\'}"
+        
+        # Whitelist allowed configuration keys and validate values
+        case "${key}" in
+            INSTALL_PREFIX)
+                if [[ "${value}" == /* ]]; then
+                    INSTALL_PREFIX="${value}"
+                    INSTALL_DIR="${INSTALL_PREFIX}/bin"
+                else
+                    log_warn "Invalid INSTALL_PREFIX in config (must be absolute path): ${value}"
+                fi
+                ;;
+            CONFIG_DIR)
+                if [[ "${value}" == /* ]]; then
+                    CONFIG_DIR="${value}"
+                else
+                    log_warn "Invalid CONFIG_DIR in config (must be absolute path): ${value}"
+                fi
+                ;;
+            SERVICE_USER)
+                if [[ "${value}" =~ ^[a-z_][a-z0-9_-]*$ ]]; then
+                    SERVICE_USER="${value}"
+                else
+                    log_warn "Invalid SERVICE_USER in config: ${value}"
+                fi
+                ;;
+            SERVICE_GROUP)
+                if [[ "${value}" =~ ^[a-z_][a-z0-9_-]*$ ]]; then
+                    SERVICE_GROUP="${value}"
+                else
+                    log_warn "Invalid SERVICE_GROUP in config: ${value}"
+                fi
+                ;;
+            *)
+                log_warn "Ignoring unknown config key: ${key}"
+                ;;
+        esac
+    done < "${CONFIG_FILE}"
+}
+
+# ============================================================================
 # Validation Functions
 # ============================================================================
+
+# Validate input parameters
+validate_input() {
+    # Validate installation prefix
+    if [[ "${INSTALL_PREFIX}" != /* ]]; then
+        fatal "Installation prefix must be an absolute path" 10
+    fi
+    
+    if [[ "${INSTALL_PREFIX}" == *..* ]]; then
+        fatal "Installation prefix cannot contain .." 10
+    fi
+    
+    # Validate version if specified
+    if [[ -n "${TARGET_VERSION}" ]]; then
+        if ! validate_version "${TARGET_VERSION}"; then
+            fatal "Invalid version format: ${TARGET_VERSION}" 10
+        fi
+    fi
+    
+    # Validate config file if specified
+    if [[ -n "${CONFIG_FILE}" ]]; then
+        if [[ ! -f "${CONFIG_FILE}" ]]; then
+            fatal "Config file not found: ${CONFIG_FILE}" 9
+        fi
+        if [[ ! -r "${CONFIG_FILE}" ]]; then
+            fatal "Config file not readable: ${CONFIG_FILE}" 9
+        fi
+    fi
+}
 
 # Validate required commands with version checking
 check_requirements() {
@@ -277,6 +495,8 @@ check_requirements() {
         ["bash"]="4.0"
         ["curl"]="7.0"
         ["tar"]="1.20"
+        ["mktemp"]=""
+        ["flock"]=""
     )
     
     # Optional but recommended commands
@@ -335,9 +555,9 @@ check_requirements() {
     
     # Check for download command preference
     if command -v curl &>/dev/null; then
-        readonly DOWNLOAD_CMD="curl"
+        DOWNLOAD_CMD="curl"
     elif command -v wget &>/dev/null; then
-        readonly DOWNLOAD_CMD="wget"
+        DOWNLOAD_CMD="wget"
     else
         fatal "Neither curl nor wget found" 4
     fi
@@ -345,27 +565,42 @@ check_requirements() {
     log_debug "Using ${DOWNLOAD_CMD} for downloads"
 }
 
-# Version comparison (returns 0 if v1 >= v2)
+# Complete version comparison
 version_compare() {
-    local v1="$1"
-    local v2="$2"
+    local v1="${1#v}"  # Remove v prefix if present
+    local v2="${2#v}"
     
-    # Convert versions to comparable format
-    local v1_major="${v1%%.*}"
-    local v1_minor="${v1#*.}"
-    v1_minor="${v1_minor%%.*}"
-    
-    local v2_major="${v2%%.*}"
-    local v2_minor="${v2#*.}"
-    v2_minor="${v2_minor%%.*}"
-    
-    if [[ ${v1_major} -gt ${v2_major} ]]; then
-        return 0
-    elif [[ ${v1_major} -eq ${v2_major} ]] && [[ ${v1_minor} -ge ${v2_minor} ]]; then
-        return 0
-    else
-        return 1
+    # Use sort -V if available (most reliable)
+    if command -v sort &>/dev/null && sort --help 2>&1 | grep -q -- '-V'; then
+        if [[ "$(printf '%s\n' "${v2}" "${v1}" | sort -V | head -n1)" == "${v2}" ]]; then
+            return 0  # v1 >= v2
+        else
+            return 1
+        fi
     fi
+    
+    # Fallback to manual comparison
+    local IFS=.
+    local -a v1_parts=($v1)
+    local -a v2_parts=($v2)
+    
+    # Compare major, minor, and patch
+    for i in {0..2}; do
+        local p1="${v1_parts[$i]:-0}"
+        local p2="${v2_parts[$i]:-0}"
+        
+        # Remove non-numeric suffixes for comparison
+        p1="${p1%%-*}"
+        p2="${p2%%-*}"
+        
+        if [[ ${p1} -gt ${p2} ]]; then
+            return 0
+        elif [[ ${p1} -lt ${p2} ]]; then
+            return 1
+        fi
+    done
+    
+    return 0  # Equal
 }
 
 # Validate URL format
@@ -390,65 +625,6 @@ validate_version() {
         return 1
     fi
     return 0
-}
-
-# ============================================================================
-# Security Functions
-# ============================================================================
-
-# Acquire lock with timeout
-acquire_lock() {
-    local timeout="${1:-30}"
-    local elapsed=0
-    
-    while [[ ${elapsed} -lt ${timeout} ]]; do
-        if mkdir "${LOCK_FILE}.d" 2>/dev/null; then
-            echo "${SCRIPT_PID}" > "${LOCK_FILE}.pid"
-            log_debug "Lock acquired (PID: ${SCRIPT_PID})"
-            return 0
-        fi
-        
-        # Check if lock holder is still running
-        if [[ -f "${LOCK_FILE}.pid" ]]; then
-            local lock_pid
-            lock_pid=$(cat "${LOCK_FILE}.pid" 2>/dev/null || echo "0")
-            if ! kill -0 "${lock_pid}" 2>/dev/null; then
-                log_warn "Removing stale lock (PID: ${lock_pid})"
-                rm -rf "${LOCK_FILE}.d" "${LOCK_FILE}.pid" 2>/dev/null || true
-                continue
-            fi
-        fi
-        
-        sleep 1
-        ((elapsed++))
-    done
-    
-    fatal "Failed to acquire lock after ${timeout} seconds" 1
-}
-
-# Create secure temporary directory
-create_temp_dir() {
-    local template="${TEMP_BASE}/mediamtx-installer-XXXXXX"
-    
-    if command -v mktemp &>/dev/null; then
-        TEMP_DIR=$(mktemp -d "${template}")
-    else
-        # Fallback for systems without mktemp
-        TEMP_DIR="${TEMP_BASE}/mediamtx-installer-${SCRIPT_PID}-$(date +%s)"
-        mkdir -m 700 "${TEMP_DIR}"
-    fi
-    
-    if [[ ! -d "${TEMP_DIR}" ]]; then
-        fatal "Failed to create temporary directory" 1
-    fi
-    
-    # Create log file in temp directory
-    LOG_FILE="${TEMP_DIR}/install.log"
-    touch "${LOG_FILE}"
-    chmod 600 "${LOG_FILE}"
-    
-    CLEANUP_DIRS+=("${TEMP_DIR}")
-    log_debug "Created temporary directory: ${TEMP_DIR}"
 }
 
 # Validate file checksum
@@ -524,7 +700,6 @@ verify_gpg_signature() {
     fi
     
     # Import MediaMTX public key (would need to be provided)
-    # This is a placeholder - actual implementation would need the real key
     local key_url="https://github.com/${DEFAULT_GITHUB_REPO}/releases/download/signing-key.asc"
     local key_file="${TEMP_DIR}/signing-key.asc"
     
@@ -558,6 +733,7 @@ detect_platform() {
             os="linux"
             # Detect distribution
             if [[ -f /etc/os-release ]]; then
+                # shellcheck source=/dev/null
                 source /etc/os-release
                 distro="${ID:-unknown}"
                 version="${VERSION_ID:-unknown}"
@@ -608,10 +784,10 @@ detect_platform() {
     esac
     
     # Export platform information
-    readonly PLATFORM_OS="${os}"
-    readonly PLATFORM_ARCH="${arch}"
-    readonly PLATFORM_DISTRO="${distro}"
-    readonly PLATFORM_VERSION="${version}"
+    PLATFORM_OS="${os}"
+    PLATFORM_ARCH="${arch}"
+    PLATFORM_DISTRO="${distro}"
+    PLATFORM_VERSION="${version}"
     
     log_debug "Platform: ${PLATFORM_OS}/${PLATFORM_ARCH} (${PLATFORM_DISTRO} ${PLATFORM_VERSION})"
 }
@@ -762,10 +938,97 @@ get_release_info() {
         fatal "Invalid version format in release: ${tag_name}" 10
     fi
     
-    readonly RELEASE_VERSION="${tag_name}"
-    readonly RELEASE_FILE="${release_file}"
+    RELEASE_VERSION="${tag_name}"
+    RELEASE_FILE="${release_file}"
     
     log_info "Found release: ${RELEASE_VERSION}"
+}
+
+# ============================================================================
+# Common Detection Functions (Extracted for Reuse)
+# ============================================================================
+
+# Centralized process detection
+detect_mediamtx_process() {
+    local pids=()
+    
+    if command -v pgrep &>/dev/null; then
+        mapfile -t pids < <(pgrep -x "mediamtx" 2>/dev/null || true)
+        
+        # If that's too restrictive, check the full path
+        if [[ ${#pids[@]} -eq 0 ]]; then
+            local all_pids
+            mapfile -t all_pids < <(pgrep -f "${INSTALL_DIR}/mediamtx" 2>/dev/null || true)
+            for pid in "${all_pids[@]}"; do
+                [[ -z "${pid}" ]] && continue
+                # Skip our own process
+                if [[ "${pid}" != "$$" ]] && [[ "${pid}" != "$PPID" ]]; then
+                    # Check if it's actually the mediamtx binary
+                    if [[ -d "/proc/${pid}" ]]; then
+                        local exe_path
+                        exe_path=$(readlink -f "/proc/${pid}/exe" 2>/dev/null || echo "")
+                        if [[ "${exe_path}" == *"/mediamtx" ]]; then
+                            pids+=("${pid}")
+                        fi
+                    fi
+                fi
+            done
+        fi
+    fi
+    
+    printf "%s\n" "${pids[@]}"
+}
+
+# Centralized management mode detection
+detect_management_mode() {
+    if command -v systemctl &>/dev/null && systemctl is-active --quiet mediamtx 2>/dev/null; then
+        echo "systemd"
+    elif [[ -d "/var/lib/mediamtx-ffmpeg" ]] && pgrep -f "ffmpeg.*rtsp://localhost" &>/dev/null; then
+        echo "stream-manager"
+    elif pgrep -x "mediamtx" &>/dev/null; then
+        echo "manual"
+    else
+        echo "none"
+    fi
+}
+
+# Get active stream names from stream manager
+get_active_streams() {
+    local streams=()
+    
+    if [[ -d "/var/lib/mediamtx-ffmpeg" ]]; then
+        for pid_file in /var/lib/mediamtx-ffmpeg/*.pid; do
+            if [[ -f "${pid_file}" ]]; then
+                local stream_name
+                stream_name=$(basename "${pid_file}" .pid)
+                local stream_pid
+                stream_pid=$(cat "${pid_file}" 2>/dev/null || echo "0")
+                if kill -0 "${stream_pid}" 2>/dev/null; then
+                    streams+=("${stream_name}")
+                fi
+            fi
+        done
+    fi
+    
+    printf "%s\n" "${streams[@]}"
+}
+
+# Find stream manager script
+find_stream_manager() {
+    local locations=(
+        "./mediamtx-stream-manager.sh"
+        "${SCRIPT_DIR}/mediamtx-stream-manager.sh"
+        "/usr/local/bin/mediamtx-stream-manager.sh"
+    )
+    
+    for location in "${locations[@]}"; do
+        if [[ -f "${location}" ]] && [[ -x "${location}" ]]; then
+            echo "${location}"
+            return 0
+        fi
+    done
+    
+    return 1
 }
 
 # ============================================================================
@@ -786,7 +1049,7 @@ build_asset_url() {
         # Check version for naming convention
         local major minor patch
         IFS='.' read -r major minor patch <<< "${version}"
-        local version_num=$((major * 10000 + minor * 100 + patch))
+        local version_num=$((major * 10000 + minor * 100 + ${patch%%-*}))
         
         if [[ ${version_num} -lt 11201 ]]; then  # v1.12.1
             arch_suffix="arm64v8"
@@ -890,7 +1153,7 @@ create_config() {
         local backup="${config_file}.backup.$(date +%Y%m%d-%H%M%S)"
         cp "${config_file}" "${backup}"
         log_info "Existing config backed up to: ${backup}"
-        ROLLBACK_ACTIONS+=("mv '${backup}' '${config_file}'")
+        add_rollback "mv" "${backup}" "${config_file}"
     fi
     
     # Create minimal working configuration
@@ -980,7 +1243,7 @@ create_service() {
     if [[ -f "${service_file}" ]]; then
         local backup="${service_file}.backup.$(date +%Y%m%d-%H%M%S)"
         cp "${service_file}" "${backup}"
-        ROLLBACK_ACTIONS+=("mv '${backup}' '${service_file}'")
+        add_rollback "mv" "${backup}" "${service_file}"
     fi
     
     # Create service file
@@ -1098,10 +1361,10 @@ create_user() {
     chown "${SERVICE_USER}:${SERVICE_GROUP}" /var/lib/mediamtx
     chmod 755 /var/lib/mediamtx
     
-    ROLLBACK_ACTIONS+=("userdel '${SERVICE_USER}' 2>/dev/null || true")
+    add_rollback "userdel" "${SERVICE_USER}"
 }
 
-# Install MediaMTX (Enhanced with stream manager detection)
+# Install MediaMTX
 install_mediamtx() {
     log_info "Installing MediaMTX..."
     
@@ -1127,7 +1390,7 @@ install_mediamtx() {
     # Install binary
     log_info "Installing binary..."
     install -m 755 "${TEMP_DIR}/mediamtx" "${INSTALL_DIR}/"
-    ROLLBACK_ACTIONS+=("rm -f '${INSTALL_DIR}/mediamtx'")
+    add_rollback "rm" "${INSTALL_DIR}/mediamtx"
     
     # Create user
     create_user
@@ -1147,70 +1410,11 @@ install_mediamtx() {
     
     log_info "MediaMTX ${RELEASE_VERSION} installed successfully!"
     
-    # ============================================================================
-    # CHECK FOR STREAM MANAGER AND PROVIDE APPROPRIATE GUIDANCE
-    # ============================================================================
-    local stream_manager_found=false
-    local stream_manager_path=""
-    
-    # Look for stream manager script
-    if [[ -f "./mediamtx-stream-manager.sh" ]]; then
-        stream_manager_found=true
-        stream_manager_path="./mediamtx-stream-manager.sh"
-    elif [[ -f "${SCRIPT_DIR}/mediamtx-stream-manager.sh" ]]; then
-        stream_manager_found=true
-        stream_manager_path="${SCRIPT_DIR}/mediamtx-stream-manager.sh"
-    fi
-    
-    # Check for audio streaming configuration
-    local audio_streaming_setup=false
-    if [[ -f "/etc/mediamtx/audio-devices.conf" ]] || [[ -d "/var/lib/mediamtx-ffmpeg" ]]; then
-        audio_streaming_setup=true
-    fi
-    
-    echo ""
-    if [[ "${stream_manager_found}" == "true" ]] || [[ "${audio_streaming_setup}" == "true" ]]; then
-        echo "================================"
-        echo "Audio Streaming Setup Detected!"
-        echo "================================"
-        echo ""
-        echo "It appears you have an audio streaming setup with MediaMTX."
-        echo "You can manage MediaMTX using EITHER:"
-        echo ""
-        echo "Option 1: Stream Manager (Recommended for audio streaming)"
-        if [[ -n "${stream_manager_path}" ]]; then
-            echo "  sudo ${stream_manager_path} start"
-            echo "  sudo ${stream_manager_path} status"
-        else
-            echo "  sudo ./mediamtx-stream-manager.sh start"
-            echo "  sudo ./mediamtx-stream-manager.sh status"
-        fi
-        echo ""
-        echo "Option 2: Systemd Service (Standard management)"
-        echo "  sudo systemctl start mediamtx"
-        echo "  sudo systemctl enable mediamtx  # Auto-start at boot"
-        echo "  sudo systemctl status mediamtx"
-        echo ""
-        echo "Note: Use only ONE management method at a time!"
-    else
-        # Standard output for non-audio-streaming setups
-        if command -v systemctl &>/dev/null && [[ -f "${SERVICE_DIR}/${SERVICE_NAME}" ]]; then
-            echo ""
-            echo "To start MediaMTX:"
-            echo "  sudo systemctl start mediamtx"
-            echo "  sudo systemctl enable mediamtx  # Auto-start at boot"
-            echo ""
-            echo "To check status:"
-            echo "  sudo systemctl status mediamtx"
-        else
-            echo ""
-            echo "To start MediaMTX manually:"
-            echo "  ${INSTALL_DIR}/mediamtx ${CONFIG_DIR}/${CONFIG_NAME}"
-        fi
-    fi
+    # Show appropriate guidance
+    show_post_install_guidance
 }
 
-# Update MediaMTX (Enhanced with management mode detection)
+# Update MediaMTX
 update_mediamtx() {
     log_info "Updating MediaMTX..."
     
@@ -1240,129 +1444,25 @@ update_mediamtx() {
         return 0
     fi
     
-    # ============================================================================
-    # DETECT MANAGEMENT MODE BEFORE STOPPING
-    # ============================================================================
-    local management_mode="none"
+    # Detect management mode
+    local management_mode
+    management_mode=$(detect_management_mode)
     local was_running=false
-    local stream_manager_script=""
+    [[ "${management_mode}" != "none" ]] && was_running=true
+    
     local active_streams=()
-    
-    # Check if running under systemd
-    if command -v systemctl &>/dev/null && systemctl is-active --quiet mediamtx; then
-        management_mode="systemd"
-        was_running=true
-        log_info "Detected: MediaMTX running under systemd"
-    # Check if running under stream manager
-    elif command -v pgrep &>/dev/null && pgrep -x "mediamtx" &>/dev/null; then
-        # Check for stream manager indicators
-        if [[ -d "/var/lib/mediamtx-ffmpeg" ]]; then
-            # Count active FFmpeg streams
-            local ffmpeg_count
-            ffmpeg_count=$(pgrep -c -f "ffmpeg.*rtsp://localhost" 2>/dev/null || echo "0")
-            
-            if [[ ${ffmpeg_count} -gt 0 ]]; then
-                management_mode="stream-manager"
-                was_running=true
-                
-                # Collect active stream names
-                if [[ -d "/var/lib/mediamtx-ffmpeg" ]]; then
-                    for pid_file in /var/lib/mediamtx-ffmpeg/*.pid; do
-                        if [[ -f "${pid_file}" ]]; then
-                            local stream_name
-                            stream_name=$(basename "${pid_file}" .pid)
-                            local stream_pid
-                            stream_pid=$(cat "${pid_file}" 2>/dev/null || echo "0")
-                            if kill -0 "${stream_pid}" 2>/dev/null; then
-                                active_streams+=("${stream_name}")
-                            fi
-                        fi
-                    done
-                fi
-                
-                log_info "Detected: MediaMTX running under stream manager with ${#active_streams[@]} active streams"
-                
-                # Try to find the stream manager script
-                if [[ -f "./mediamtx-stream-manager.sh" ]]; then
-                    stream_manager_script="./mediamtx-stream-manager.sh"
-                elif [[ -f "${SCRIPT_DIR}/mediamtx-stream-manager.sh" ]]; then
-                    stream_manager_script="${SCRIPT_DIR}/mediamtx-stream-manager.sh"
-                elif [[ -f "/usr/local/bin/mediamtx-stream-manager.sh" ]]; then
-                    stream_manager_script="/usr/local/bin/mediamtx-stream-manager.sh"
-                else
-                    log_warn "Stream manager script not found in common locations"
-                fi
-            fi
-        # Check for audio configuration (another stream manager indicator)
-        elif [[ -f "/etc/mediamtx/audio-devices.conf" ]]; then
-            management_mode="stream-manager"
-            was_running=true
-            log_info "Detected: MediaMTX likely managed by stream manager (audio config present)"
-        else
-            # MediaMTX running but not managed
-            management_mode="manual"
-            was_running=true
-            log_info "Detected: MediaMTX running manually/unmanaged"
-        fi
+    if [[ "${management_mode}" == "stream-manager" ]]; then
+        mapfile -t active_streams < <(get_active_streams)
+        log_info "Detected ${#active_streams[@]} active streams"
     fi
     
-    # ============================================================================
-    # STOP MEDIAMTX BASED ON MANAGEMENT MODE
-    # ============================================================================
-    if [[ "${was_running}" == "true" ]]; then
-        case "${management_mode}" in
-            systemd)
-                log_info "Stopping MediaMTX service (systemd)..."
-                systemctl stop mediamtx
-                ROLLBACK_ACTIONS+=("systemctl start mediamtx 2>/dev/null || true")
-                ;;
-            
-            stream-manager)
-                if [[ -n "${stream_manager_script}" ]] && [[ -x "${stream_manager_script}" ]]; then
-                    log_info "Stopping MediaMTX and streams via stream manager..."
-                    "${stream_manager_script}" stop || {
-                        log_warn "Stream manager stop failed, falling back to manual stop"
-                        # Fallback: stop FFmpeg streams manually
-                        pkill -f "ffmpeg.*rtsp://localhost" 2>/dev/null || true
-                        sleep 1
-                        pkill mediamtx 2>/dev/null || true
-                    }
-                    ROLLBACK_ACTIONS+=("'${stream_manager_script}' start 2>/dev/null || true")
-                else
-                    log_info "Stopping MediaMTX and FFmpeg streams manually..."
-                    # Stop FFmpeg streams first
-                    pkill -f "ffmpeg.*rtsp://localhost" 2>/dev/null || true
-                    sleep 1
-                    # Then stop MediaMTX
-                    pkill mediamtx 2>/dev/null || true
-                fi
-                ;;
-            
-            manual)
-                log_info "Stopping manually-run MediaMTX..."
-                pkill mediamtx 2>/dev/null || true
-                ;;
-        esac
-        
-        # Wait for processes to stop
-        sleep 2
-        
-        # Verify stopped
-        if pgrep -x "mediamtx" &>/dev/null; then
-            log_warn "MediaMTX still running, forcing stop..."
-            pkill -9 mediamtx 2>/dev/null || true
-            sleep 1
-        fi
-    fi
-    
-    # ============================================================================
-    # PERFORM UPDATE
-    # ============================================================================
+    # Stop MediaMTX
+    stop_mediamtx "${management_mode}"
     
     # Backup current binary
     local backup="${INSTALL_DIR}/mediamtx.backup.$(date +%Y%m%d-%H%M%S)"
     cp "${INSTALL_DIR}/mediamtx" "${backup}"
-    ROLLBACK_ACTIONS+=("mv '${backup}' '${INSTALL_DIR}/mediamtx'")
+    add_rollback "mv" "${backup}" "${INSTALL_DIR}/mediamtx"
     log_info "Current binary backed up to: ${backup}"
     
     # Download new version
@@ -1371,67 +1471,96 @@ update_mediamtx() {
     # Install new binary
     install -m 755 "${TEMP_DIR}/mediamtx" "${INSTALL_DIR}/"
     
-    # ============================================================================
-    # RESTART BASED ON ORIGINAL MANAGEMENT MODE
-    # ============================================================================
+    # Restart if was running
     if [[ "${was_running}" == "true" ]]; then
-        case "${management_mode}" in
-            systemd)
-                log_info "Starting MediaMTX service (systemd)..."
-                systemctl start mediamtx
-                ;;
-            
-            stream-manager)
-                if [[ -n "${stream_manager_script}" ]] && [[ -x "${stream_manager_script}" ]]; then
-                    log_info "Starting MediaMTX and streams via stream manager..."
-                    "${stream_manager_script}" start || {
-                        log_error "Failed to start via stream manager"
-                        log_info "Please manually start with: sudo ${stream_manager_script} start"
-                    }
-                    
-                    # Show which streams were restarted
-                    if [[ ${#active_streams[@]} -gt 0 ]]; then
-                        log_info "Restarted streams: ${active_streams[*]}"
-                    fi
-                else
-                    log_warn "Stream manager script not found"
-                    log_info "Please manually restart MediaMTX with your stream manager"
-                    log_info "Typical command: sudo ./mediamtx-stream-manager.sh start"
-                fi
-                ;;
-            
-            manual)
-                log_info "MediaMTX was running manually"
-                log_info "Please restart it manually with your preferred method"
-                ;;
-            
-            none)
-                log_info "MediaMTX was not running before update"
-                ;;
-        esac
-    else
-        log_info "MediaMTX was not running before update"
+        start_mediamtx "${management_mode}"
+        
+        if [[ ${#active_streams[@]} -gt 0 ]]; then
+            log_info "Restarted streams: ${active_streams[*]}"
+        fi
     fi
     
     log_info "MediaMTX updated to ${RELEASE_VERSION} successfully!"
     
-    # ============================================================================
-    # POST-UPDATE RECOMMENDATIONS
-    # ============================================================================
-    if [[ "${management_mode}" == "stream-manager" ]]; then
-        echo ""
-        echo "Stream Manager Detected - Quick Commands:"
-        echo "  • Check status: sudo ${stream_manager_script:-./mediamtx-stream-manager.sh} status"
-        echo "  • View logs: tail -f /var/lib/mediamtx-ffmpeg/*.log"
-        if [[ ${#active_streams[@]} -gt 0 ]]; then
-            echo "  • Active streams before update: ${active_streams[*]}"
-        fi
-    elif [[ "${management_mode}" == "systemd" ]]; then
-        echo ""
-        echo "Systemd Management - Quick Commands:"
-        echo "  • Check status: sudo systemctl status mediamtx"
-        echo "  • View logs: sudo journalctl -u mediamtx -f"
+    # Show post-update recommendations
+    show_post_update_guidance "${management_mode}"
+}
+
+# Stop MediaMTX based on management mode
+stop_mediamtx() {
+    local mode="$1"
+    
+    case "${mode}" in
+        systemd)
+            log_info "Stopping MediaMTX service (systemd)..."
+            systemctl stop mediamtx
+            add_rollback "systemctl" "start" "mediamtx"
+            ;;
+        
+        stream-manager)
+            local stream_manager
+            if stream_manager=$(find_stream_manager); then
+                log_info "Stopping MediaMTX via stream manager..."
+                "${stream_manager}" stop || {
+                    log_warn "Stream manager stop failed, falling back to manual stop"
+                    pkill -f "ffmpeg.*rtsp://localhost" 2>/dev/null || true
+                    sleep 1
+                    pkill mediamtx 2>/dev/null || true
+                }
+            else
+                log_info "Stopping MediaMTX and FFmpeg streams manually..."
+                pkill -f "ffmpeg.*rtsp://localhost" 2>/dev/null || true
+                sleep 1
+                pkill mediamtx 2>/dev/null || true
+            fi
+            ;;
+        
+        manual)
+            log_info "Stopping manually-run MediaMTX..."
+            pkill mediamtx 2>/dev/null || true
+            ;;
+    esac
+    
+    # Wait for processes to stop
+    sleep 2
+    
+    # Verify stopped
+    if pgrep -x "mediamtx" &>/dev/null; then
+        log_warn "MediaMTX still running, forcing stop..."
+        pkill -9 mediamtx 2>/dev/null || true
+        sleep 1
     fi
+}
+
+# Start MediaMTX based on management mode
+start_mediamtx() {
+    local mode="$1"
+    
+    case "${mode}" in
+        systemd)
+            log_info "Starting MediaMTX service (systemd)..."
+            systemctl start mediamtx
+            ;;
+        
+        stream-manager)
+            local stream_manager
+            if stream_manager=$(find_stream_manager); then
+                log_info "Starting MediaMTX via stream manager..."
+                "${stream_manager}" start || {
+                    log_error "Failed to start via stream manager"
+                    log_info "Please manually start with: sudo ${stream_manager} start"
+                }
+            else
+                log_warn "Stream manager script not found"
+                log_info "Please manually restart MediaMTX with your stream manager"
+            fi
+            ;;
+        
+        manual)
+            log_info "MediaMTX was running manually"
+            log_info "Please restart it manually with your preferred method"
+            ;;
+    esac
 }
 
 # Uninstall MediaMTX
@@ -1482,307 +1611,92 @@ uninstall_mediamtx() {
     log_info "MediaMTX uninstalled successfully!"
 }
 
-# Show status with enhanced process detection
-show_status() {
+# ============================================================================
+# Status Functions (Modularized)
+# ============================================================================
+
+# Show status header
+show_status_header() {
     echo -e "${BOLD}MediaMTX Installation Status${NC}"
     echo "================================"
-    
-    # Installation status
+}
+
+# Show installation status
+show_installation_status() {
     if [[ -f "${INSTALL_DIR}/mediamtx" ]]; then
         echo -e "Installation: ${GREEN}✓ Installed${NC}"
         echo "Location: ${INSTALL_DIR}/mediamtx"
         
-        # Version
-        local installed_version="unknown"
+        local version="unknown"
         if "${INSTALL_DIR}/mediamtx" --version &>/dev/null; then
-            installed_version=$("${INSTALL_DIR}/mediamtx" --version 2>&1 | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' | head -1)
-            echo "Version: ${installed_version}"
-        else
-            echo "Version: ${installed_version}"
+            version=$("${INSTALL_DIR}/mediamtx" --version 2>&1 | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' | head -1)
         fi
+        echo "Version: ${version}"
         
-        # File info
         local file_size
         file_size=$(stat -c%s "${INSTALL_DIR}/mediamtx" 2>/dev/null || stat -f%z "${INSTALL_DIR}/mediamtx" 2>/dev/null || echo "unknown")
         echo "Binary size: ${file_size} bytes"
     else
         echo -e "Installation: ${RED}✗ Not installed${NC}"
     fi
-    
+}
+
+# Show configuration status
+show_configuration_status() {
     echo ""
     
-    # Configuration
     if [[ -f "${CONFIG_DIR}/${CONFIG_NAME}" ]]; then
         echo -e "Configuration: ${GREEN}✓ Present${NC}"
         echo "Config file: ${CONFIG_DIR}/${CONFIG_NAME}"
     else
         echo -e "Configuration: ${YELLOW}⚠ Missing${NC}"
     fi
-    
+}
+
+# Show process status
+show_process_status() {
     echo ""
     
-    # Enhanced service and process detection
-    local process_running=false
-    local systemd_running=false
-    local process_pids=()
-    local systemd_pid=""
+    local management_mode
+    management_mode=$(detect_management_mode)
     
-    # Check for actual MediaMTX binary processes only (not scripts or this status command)
-    if command -v pgrep &>/dev/null; then
-        # Look specifically for the mediamtx binary, excluding scripts and this status check
-        mapfile -t process_pids < <(pgrep -x "mediamtx" 2>/dev/null || true)
-        
-        # If that's too restrictive, look for the full path but exclude shell scripts
-        if [[ ${#process_pids[@]} -eq 0 ]]; then
-            local all_pids
-            mapfile -t all_pids < <(pgrep -f "${INSTALL_DIR}/mediamtx" 2>/dev/null || true)
-            for pid in "${all_pids[@]}"; do
-                # Skip empty PIDs
-                [[ -z "${pid}" ]] && continue
-                # Skip if this is our own process or parent process
-                if [[ "${pid}" != "$$" ]] && [[ "${pid}" != "$PPID" ]]; then
-                    # Check if it's actually the mediamtx binary, not a script
-                    if [[ -d "/proc/${pid}" ]]; then
-                        local exe_path
-                        exe_path=$(readlink -f "/proc/${pid}/exe" 2>/dev/null || echo "")
-                        if [[ "${exe_path}" == *"/mediamtx" ]] || [[ "${exe_path}" == "${INSTALL_DIR}/mediamtx" ]]; then
-                            process_pids+=("${pid}")
-                        fi
-                    fi
-                fi
-            done
-        fi
-        
-        if [[ ${#process_pids[@]} -gt 0 ]]; then
-            process_running=true
-        fi
-    else
-        # Fallback to ps if pgrep not available
-        local mediamtx_procs
-        mediamtx_procs=$(ps aux | grep -v grep | grep -E "^[^ ]+ +[0-9]+ .* ${INSTALL_DIR}/mediamtx" | grep -v "bash" | grep -v "${SCRIPT_NAME}" || echo "")
-        if [[ -n "${mediamtx_procs}" ]]; then
-            process_running=true
-            process_pids=($(echo "${mediamtx_procs}" | awk '{print $2}'))
-        fi
-    fi
-    
-    # Check systemd service status
     local systemd_configured=false
     if command -v systemctl &>/dev/null && [[ -f "${SERVICE_DIR}/${SERVICE_NAME}" ]]; then
         systemd_configured=true
-        if systemctl is-active --quiet mediamtx; then
-            systemd_running=true
-            systemd_pid=$(systemctl show mediamtx --property MainPID --value 2>/dev/null || echo "")
-        fi
-    fi
-    
-    # Report service configuration status
-    if [[ "${systemd_configured}" == "true" ]]; then
         echo -e "Service: ${GREEN}✓ Configured${NC}"
     else
         echo -e "Service: ${YELLOW}⚠ Not configured${NC}"
     fi
     
-    # Analyze and report process status
-    if [[ "${process_running}" == "true" ]] && [[ "${systemd_running}" == "false" ]]; then
-        # MediaMTX running outside systemd
-        echo -e "Status: ${YELLOW}⚠ Running outside systemd${NC}"
-        echo ""
-        echo "Process Details:"
+    case "${management_mode}" in
+        systemd)
+            echo -e "Status: ${GREEN}● Running (systemd)${NC}"
+            local pid
+            pid=$(systemctl show mediamtx --property MainPID --value 2>/dev/null || echo "")
+            [[ -n "${pid}" ]] && [[ "${pid}" != "0" ]] && echo "PID: ${pid}"
+            ;;
         
-        # Only show details for the main MediaMTX process(es)
-        for pid in "${process_pids[@]}"; do
-            if [[ -n "${pid}" ]] && kill -0 "${pid}" 2>/dev/null; then
-                echo "  PID: ${pid}"
-                
-                # Get process details
-                if command -v ps &>/dev/null; then
-                    # Get command line
-                    local cmd_line
-                    cmd_line=$(ps -p "${pid}" -o args= 2>/dev/null || echo "unknown")
-                    # Truncate very long command lines
-                    if [[ ${#cmd_line} -gt 80 ]]; then
-                        cmd_line="${cmd_line:0:77}..."
-                    fi
-                    echo "  Command: ${cmd_line}"
-                    
-                    # Get parent process
-                    local parent_pid
-                    parent_pid=$(ps -o ppid= -p "${pid}" 2>/dev/null | tr -d ' ' || echo "")
-                    if [[ -n "${parent_pid}" ]] && [[ "${parent_pid}" != "1" ]]; then
-                        local parent_cmd
-                        parent_cmd=$(ps -p "${parent_pid}" -o comm= 2>/dev/null || echo "unknown")
-                        echo "  Started by: ${parent_cmd} (PID: ${parent_pid})"
-                    elif [[ "${parent_pid}" == "1" ]]; then
-                        echo "  Started by: init/systemd at boot"
-                    fi
-                    
-                    # Check scheduling class - YOUR SYSTEM SHOWS IT IN CLS COLUMN!
-                    local scheduling_class
-                    scheduling_class=$(ps -p "${pid}" -o cls= 2>/dev/null | tr -d ' ' || echo "")
-                    if [[ "${scheduling_class}" == "RR" ]]; then
-                        echo "  Scheduling: Real-time (SCHED_RR)"
-                        echo -e "  ${CYAN}Note: Real-time scheduling indicates audio stream priority${NC}"
-                    elif [[ "${scheduling_class}" == "FF" ]]; then
-                        echo "  Scheduling: Real-time (SCHED_FIFO)"
-                        echo -e "  ${CYAN}Note: Real-time scheduling indicates audio stream priority${NC}"
-                    else
-                        # Show normal priority
-                        local priority
-                        priority=$(ps -p "${pid}" -o pri= 2>/dev/null | tr -d ' ' || echo "")
-                        if [[ -n "${priority}" ]]; then
-                            echo "  Priority: ${priority} (normal)"
-                        fi
-                    fi
-                    
-                    # Get CPU and memory usage
-                    local cpu_usage mem_usage
-                    cpu_usage=$(ps -p "${pid}" -o %cpu= 2>/dev/null | tr -d ' ' || echo "")
-                    mem_usage=$(ps -p "${pid}" -o %mem= 2>/dev/null | tr -d ' ' || echo "")
-                    if [[ -n "${cpu_usage}" ]] && [[ -n "${mem_usage}" ]]; then
-                        echo "  Resources: CPU ${cpu_usage}%, MEM ${mem_usage}%"
-                    fi
-                    
-                    # Get uptime - THIS WORKS ON YOUR SYSTEM!
-                    local etime
-                    etime=$(ps -p "${pid}" -o etime= 2>/dev/null | tr -d ' ' || echo "")
-                    if [[ -n "${etime}" ]]; then
-                        echo "  Uptime: ${etime}"
-                    fi
-                fi
-                
-                # Only show details for first MediaMTX process
-                break
-            fi
-        done
-        
-        echo ""
-        
-        # Check for FFmpeg streams and stream manager files
-        local ffmpeg_count=0
-        if command -v pgrep &>/dev/null; then
-            ffmpeg_count=$(pgrep -c -f "ffmpeg.*rtsp://localhost" 2>/dev/null || echo "0")
-        fi
-        
-        # Check for managed streams
-        local managed_by_stream_manager=false
-        local active_stream_names=()
-        
-        if [[ -d "/var/lib/mediamtx-ffmpeg" ]]; then
-            for pid_file in /var/lib/mediamtx-ffmpeg/*.pid; do
-                if [[ -f "${pid_file}" ]]; then
-                    local stream_name
-                    stream_name=$(basename "${pid_file}" .pid)
-                    local stream_pid
-                    stream_pid=$(cat "${pid_file}" 2>/dev/null || echo "0")
-                    if kill -0 "${stream_pid}" 2>/dev/null; then
-                        active_stream_names+=("${stream_name}")
-                        managed_by_stream_manager=true
-                    fi
-                fi
-            done
-        fi
-        
-        # Check for audio config
-        if [[ -f "/etc/mediamtx/audio-devices.conf" ]]; then
-            managed_by_stream_manager=true
-        fi
-        
-        # Display stream information
-        if [[ "${ffmpeg_count}" -gt 0 ]] || [[ ${#active_stream_names[@]} -gt 0 ]]; then
-            echo -e "${CYAN}Active Streams:${NC}"
-            
-            if [[ "${ffmpeg_count}" -gt 0 ]]; then
-                echo "  FFmpeg processes: ${ffmpeg_count}"
-            fi
-            
-            if [[ ${#active_stream_names[@]} -gt 0 ]]; then
-                echo "  Managed streams: ${#active_stream_names[@]}"
-                echo "  Stream names:"
-                for stream in "${active_stream_names[@]}"; do
-                    echo "    • ${stream}"
+        stream-manager)
+            echo -e "Status: ${YELLOW}⚠ Running (stream manager)${NC}"
+            local active_streams=()
+            mapfile -t active_streams < <(get_active_streams)
+            if [[ ${#active_streams[@]} -gt 0 ]]; then
+                echo "Active streams: ${#active_streams[@]}"
+                for stream in "${active_streams[@]}"; do
+                    echo "  • ${stream}"
                 done
             fi
-            echo ""
-        fi
+            ;;
         
-        # Show management status
-        if [[ "${managed_by_stream_manager}" == "true" ]]; then
-            echo -e "${GREEN}Management: Controlled by MediaMTX Audio Stream Manager${NC}"
-            echo "This is the expected configuration for your audio streaming setup."
-            echo ""
-            echo "Stream Manager Commands:"
-            echo "  • Check status: sudo ./mediamtx-stream-manager.sh status"
-            echo "  • Restart: sudo ./mediamtx-stream-manager.sh restart"
-            echo "  • View logs: tail -f /var/lib/mediamtx-ffmpeg/*.log"
-        else
-            echo -e "${YELLOW}Warning: MediaMTX is running but not managed by systemd${NC}"
-            echo ""
-            echo "This could mean:"
-            echo "  • Started manually from command line"
-            echo "  • Started at boot via other mechanism"
-            echo "  • Managed by a custom script"
-            echo ""
-            echo "To switch to systemd management:"
-            echo "  1. Stop current instance: sudo pkill mediamtx"
-            echo "  2. Start via systemd: sudo systemctl start mediamtx"
-            echo "  3. Enable at boot: sudo systemctl enable mediamtx"
-        fi
+        manual)
+            echo -e "Status: ${YELLOW}⚠ Running (manual)${NC}"
+            ;;
         
-    elif [[ "${systemd_running}" == "true" ]]; then
-        # MediaMTX running under systemd
-        echo -e "Status: ${GREEN}● Running (systemd)${NC}"
-        
-        if [[ -n "${systemd_pid}" ]] && [[ "${systemd_pid}" != "0" ]]; then
-            echo "PID: ${systemd_pid}"
-            
-            # Get systemd service details
-            if command -v systemctl &>/dev/null; then
-                # Uptime
-                local active_since
-                active_since=$(systemctl show mediamtx --property ActiveEnterTimestamp --value 2>/dev/null || echo "")
-                if [[ -n "${active_since}" ]] && [[ "${active_since}" != "n/a" ]]; then
-                    echo "Started: ${active_since}"
-                    
-                    # Calculate uptime if possible
-                    if command -v date &>/dev/null; then
-                        local start_epoch
-                        start_epoch=$(date -d "${active_since}" +%s 2>/dev/null || echo "")
-                        if [[ -n "${start_epoch}" ]]; then
-                            local now_epoch
-                            now_epoch=$(date +%s)
-                            local uptime_seconds=$((now_epoch - start_epoch))
-                            local days=$((uptime_seconds / 86400))
-                            local hours=$(((uptime_seconds % 86400) / 3600))
-                            local minutes=$(((uptime_seconds % 3600) / 60))
-                            echo "Uptime: ${days}d ${hours}h ${minutes}m"
-                        fi
-                    fi
-                fi
-                
-                # Memory usage
-                local memory
-                memory=$(systemctl show mediamtx --property MemoryCurrent --value 2>/dev/null || echo "")
-                if [[ -n "${memory}" ]] && [[ "${memory}" != "[not set]" ]]; then
-                    local memory_mb=$((memory / 1024 / 1024))
-                    echo "Memory: ${memory_mb} MB"
-                fi
-                
-                # Task count
-                local tasks
-                tasks=$(systemctl show mediamtx --property TasksCurrent --value 2>/dev/null || echo "")
-                if [[ -n "${tasks}" ]] && [[ "${tasks}" != "[not set]" ]]; then
-                    echo "Tasks: ${tasks}"
-                fi
-            fi
-        fi
-        
-    elif [[ "${process_running}" == "false" ]]; then
-        # Not running at all
-        echo -e "Status: ${RED}○ Not running${NC}"
-    fi
+        none)
+            echo -e "Status: ${RED}○ Not running${NC}"
+            ;;
+    esac
     
-    # Check if service is enabled for auto-start
     if [[ "${systemd_configured}" == "true" ]]; then
         if systemctl is-enabled --quiet mediamtx 2>/dev/null; then
             echo -e "Auto-start: ${GREEN}Enabled${NC}"
@@ -1790,52 +1704,19 @@ show_status() {
             echo -e "Auto-start: ${YELLOW}Disabled${NC}"
         fi
     fi
-    
+}
+
+# Show port status
+show_port_status() {
     echo ""
-    
-    # Check for port conflicts
     echo "Port Status:"
     
-    # Check if we should use default ports or detect from config
-    local rtsp_port="${DEFAULT_RTSP_PORT}"
-    local api_port="${DEFAULT_API_PORT}"
+    local ports=("${DEFAULT_RTSP_PORT}" "${DEFAULT_API_PORT}" "${DEFAULT_METRICS_PORT}")
+    local labels=("RTSP" "API" "Metrics")
     
-    # Try to detect actual ports from config if available
-    if [[ -f "${CONFIG_DIR}/${CONFIG_NAME}" ]]; then
-        local config_rtsp_port
-        local config_api_port
-        config_rtsp_port=$(grep -E "^rtspAddress:" "${CONFIG_DIR}/${CONFIG_NAME}" 2>/dev/null | sed 's/.*:\([0-9]*\)$/\1/' || echo "")
-        config_api_port=$(grep -E "^apiAddress:" "${CONFIG_DIR}/${CONFIG_NAME}" 2>/dev/null | sed 's/.*:\([0-9]*\)$/\1/' || echo "")
-        
-        [[ -n "${config_rtsp_port}" ]] && rtsp_port="${config_rtsp_port}"
-        [[ -n "${config_api_port}" ]] && api_port="${config_api_port}"
-    fi
-    
-    # Special case: Check common alternate ports if MediaMTX is running
-    if [[ "${process_running}" == "true" ]] || [[ "${systemd_running}" == "true" ]]; then
-        # Check if MediaMTX is actually listening on different ports
-        if command -v lsof &>/dev/null; then
-            # Check port 8554 (MediaMTX default RTSP)
-            if lsof -i :8554 -sTCP:LISTEN 2>/dev/null | grep -q mediamtx; then
-                rtsp_port="8554"
-            # Check port 18554 (installer default)  
-            elif lsof -i :18554 -sTCP:LISTEN 2>/dev/null | grep -q mediamtx; then
-                rtsp_port="18554"
-            fi
-            
-            # Check for API port
-            if lsof -i :9997 -sTCP:LISTEN 2>/dev/null | grep -q mediamtx; then
-                api_port="9997"
-            fi
-        fi
-    fi
-    
-    local ports_to_check=("${rtsp_port}" "${api_port}" "${DEFAULT_METRICS_PORT}")
-    local port_labels=("RTSP" "API" "Metrics")
-    
-    for i in "${!ports_to_check[@]}"; do
-        local port="${ports_to_check[$i]}"
-        local label="${port_labels[$i]}"
+    for i in "${!ports[@]}"; do
+        local port="${ports[$i]}"
+        local label="${labels[$i]}"
         
         if command -v lsof &>/dev/null; then
             local port_user
@@ -1849,30 +1730,30 @@ show_status() {
             else
                 echo -e "  ${label} (${port}): ${YELLOW}○ Not in use${NC}"
             fi
-        elif command -v netstat &>/dev/null; then
-            if netstat -tln 2>/dev/null | grep -q ":${port} "; then
-                echo -e "  ${label} (${port}): ${GREEN}✓ In use${NC}"
-            else
-                echo -e "  ${label} (${port}): ${YELLOW}○ Not in use${NC}"
-            fi
         fi
     done
-    
+}
+
+# Show update check
+show_update_check() {
     echo ""
-    
-    # Check for updates
     echo "Checking for updates..."
+    
     local temp_status_dir="/tmp/mediamtx-status-$$"
     mkdir -p "${temp_status_dir}"
+    local saved_temp_dir="${TEMP_DIR}"
     TEMP_DIR="${temp_status_dir}"
     
     if get_release_info "latest" 2>/dev/null; then
         echo "Latest version: ${RELEASE_VERSION}"
         
+        local installed_version="unknown"
+        if [[ -f "${INSTALL_DIR}/mediamtx" ]] && "${INSTALL_DIR}/mediamtx" --version &>/dev/null; then
+            installed_version=$("${INSTALL_DIR}/mediamtx" --version 2>&1 | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+        fi
+        
         if [[ "${installed_version}" != "unknown" ]] && [[ "${installed_version}" != "${RELEASE_VERSION}" ]]; then
             echo -e "${YELLOW}Update available! Run '${SCRIPT_NAME} update' to upgrade${NC}"
-            echo "  Current: ${installed_version}"
-            echo "  Latest:  ${RELEASE_VERSION}"
         elif [[ "${installed_version}" == "${RELEASE_VERSION}" ]]; then
             echo -e "${GREEN}You are running the latest version${NC}"
         fi
@@ -1880,124 +1761,89 @@ show_status() {
         echo "Could not check for updates"
     fi
     
-    # Cleanup temp dir
     rm -rf "${temp_status_dir}" 2>/dev/null || true
+    TEMP_DIR="${saved_temp_dir}"
+}
+
+# Show health check
+show_health_check() {
+    local management_mode
+    management_mode=$(detect_management_mode)
     
-    echo ""
-    
-    # Quick health check if running
-    if [[ "${process_running}" == "true" ]] || [[ "${systemd_running}" == "true" ]]; then
-        echo "Quick Health Check:"
-        
-        # Determine API port to use
-        local api_port_to_check="${DEFAULT_API_PORT}"
-        if [[ -f "${CONFIG_DIR}/${CONFIG_NAME}" ]]; then
-            local config_api_port
-            config_api_port=$(grep -E "^apiAddress:" "${CONFIG_DIR}/${CONFIG_NAME}" 2>/dev/null | sed 's/.*:\([0-9]*\)$/\1/' || echo "")
-            [[ -n "${config_api_port}" ]] && api_port_to_check="${config_api_port}"
-        fi
-        
-        # Check if API is responding
-        if command -v curl &>/dev/null; then
-            # Try multiple API endpoints for better detection
-            local api_working=false
-            
-            # Try v3 paths endpoint first (most specific)
-            if curl -s -f -m 2 "http://localhost:${api_port_to_check}/v3/paths/list" &>/dev/null; then
-                echo -e "  API: ${GREEN}✓ Responding (v3 API)${NC}"
-                api_working=true
-            # Try v2 paths endpoint (older versions)
-            elif curl -s -f -m 2 "http://localhost:${api_port_to_check}/v2/paths/list" &>/dev/null; then
-                echo -e "  API: ${GREEN}✓ Responding (v2 API)${NC}"
-                api_working=true
-            # Try root endpoint as fallback
-            elif curl -s -f -m 2 "http://localhost:${api_port_to_check}/" &>/dev/null; then
-                echo -e "  API: ${GREEN}✓ Responding (root endpoint)${NC}"
-                api_working=true
-            else
-                echo -e "  API: ${RED}✗ Not responding on port ${api_port_to_check}${NC}"
-                # Suggest checking if using non-standard ports
-                if [[ "${api_port_to_check}" != "9997" ]]; then
-                    echo "       Note: Using non-standard API port ${api_port_to_check}"
-                fi
-            fi
-            
-            # If API is working, try to get stream count
-            if [[ "${api_working}" == "true" ]]; then
-                local stream_count
-                stream_count=$(curl -s "http://localhost:${api_port_to_check}/v3/paths/list" 2>/dev/null | grep -o '"name"' | wc -l || echo "0")
-                if [[ "${stream_count}" -gt 0 ]]; then
-                    echo "  Active paths in API: ${stream_count}"
-                fi
-            fi
-        fi
-        
-        # Check log file for recent errors
-        local log_file="/var/log/mediamtx.log"
-        if [[ -f "${log_file}" ]] && command -v tail &>/dev/null; then
-            local recent_errors
-            recent_errors=$(tail -100 "${log_file}" 2>/dev/null | grep -c -i "error" || echo "0")
-            # Ensure we have a valid number - strip all non-digits
-            recent_errors="${recent_errors//[^0-9]/}"
-            # Default to 0 if empty
-            [[ -z "${recent_errors}" ]] && recent_errors="0"
-            
-            if [[ "${recent_errors}" -gt 0 ]] 2>/dev/null; then
-                echo -e "  Recent errors: ${YELLOW}${recent_errors} error(s) in last 100 log lines${NC}"
-                
-                # Show last error for context
-                local last_error
-                last_error=$(tail -100 "${log_file}" 2>/dev/null | grep -i "error" | tail -1 | cut -c1-80 || echo "")
-                if [[ -n "${last_error}" ]]; then
-                    echo "  Last error: ${last_error}..."
-                fi
-            else
-                echo -e "  Recent errors: ${GREEN}None${NC}"
-            fi
-        else
-            echo "  Log file: Not found or inaccessible"
-        fi
+    if [[ "${management_mode}" == "none" ]]; then
+        return
     fi
     
-    # Summary and recommendations
+    echo ""
+    echo "Quick Health Check:"
+    
+    if command -v curl &>/dev/null; then
+        local api_working=false
+        
+        if curl -s -f -m 2 "http://localhost:${DEFAULT_API_PORT}/v3/paths/list" &>/dev/null; then
+            echo -e "  API: ${GREEN}✓ Responding${NC}"
+            api_working=true
+        elif curl -s -f -m 2 "http://localhost:${DEFAULT_API_PORT}/" &>/dev/null; then
+            echo -e "  API: ${GREEN}✓ Responding${NC}"
+            api_working=true
+        else
+            echo -e "  API: ${RED}✗ Not responding${NC}"
+        fi
+    fi
+}
+
+# Show status summary
+show_status_summary() {
     echo ""
     echo "================================"
     
-    # Check if managed by stream manager (using the flag set earlier)
-    local is_stream_managed=false
-    if [[ -d "/var/lib/mediamtx-ffmpeg" ]] && [[ -f "/etc/mediamtx/audio-devices.conf" ]]; then
-        is_stream_managed=true
-    fi
+    local management_mode
+    management_mode=$(detect_management_mode)
     
-    if [[ "${process_running}" == "true" ]] && [[ "${systemd_running}" == "false" ]]; then
-        if [[ "${is_stream_managed}" == "true" ]]; then
+    case "${management_mode}" in
+        systemd)
+            echo -e "${GREEN}Summary: MediaMTX is properly managed by systemd${NC}"
+            echo ""
+            echo "Quick Commands:"
+            echo "  • View logs: sudo journalctl -u mediamtx -f"
+            echo "  • Restart: sudo systemctl restart mediamtx"
+            ;;
+        
+        stream-manager)
             echo -e "${GREEN}Summary: MediaMTX is running under Audio Stream Manager control${NC}"
-            echo "This is the correct configuration for your audio streaming setup."
             echo ""
             echo "Quick Commands:"
             echo "  • Check streams: sudo ./mediamtx-stream-manager.sh status"
-            echo "  • Restart streams: sudo ./mediamtx-stream-manager.sh restart"
-            echo "  • View stream logs: tail -f /var/lib/mediamtx-ffmpeg/*.log"
-        else
-            echo -e "${YELLOW}Summary: MediaMTX is running but not under systemd control${NC}"
-            echo "Consider using either systemd or mediamtx-stream-manager.sh for management."
-        fi
-    elif [[ "${systemd_running}" == "true" ]]; then
-        echo -e "${GREEN}Summary: MediaMTX is properly managed by systemd${NC}"
-        echo ""
-        echo "Quick Commands:"
-        echo "  • View logs: sudo journalctl -u mediamtx -f"
-        echo "  • Restart: sudo systemctl restart mediamtx"
-    elif [[ "${process_running}" == "false" ]]; then
-        echo -e "${RED}Summary: MediaMTX is not running${NC}"
-        if [[ -f "${INSTALL_DIR}/mediamtx" ]]; then
-            echo ""
-            echo "To start MediaMTX:"
-            echo "  • With systemd: sudo systemctl start mediamtx"
-            echo "  • With stream manager: sudo ./mediamtx-stream-manager.sh start"
-            echo "  • Manually: ${INSTALL_DIR}/mediamtx ${CONFIG_DIR}/${CONFIG_NAME}"
-        fi
-    fi
+            echo "  • Restart: sudo ./mediamtx-stream-manager.sh restart"
+            ;;
+        
+        manual)
+            echo -e "${YELLOW}Summary: MediaMTX is running but not managed${NC}"
+            echo "Consider using systemd or stream-manager for management."
+            ;;
+        
+        none)
+            echo -e "${RED}Summary: MediaMTX is not running${NC}"
+            if [[ -f "${INSTALL_DIR}/mediamtx" ]]; then
+                echo ""
+                echo "To start MediaMTX:"
+                echo "  • With systemd: sudo systemctl start mediamtx"
+                echo "  • Manually: ${INSTALL_DIR}/mediamtx ${CONFIG_DIR}/${CONFIG_NAME}"
+            fi
+            ;;
+    esac
+}
+
+# Main status function
+show_status() {
+    show_status_header
+    show_installation_status
+    show_configuration_status
+    show_process_status
+    show_port_status
+    show_update_check
+    show_health_check
+    show_status_summary
 }
 
 # Verify installation integrity
@@ -2010,13 +1856,13 @@ verify_installation() {
     # Check binary
     if [[ ! -f "${INSTALL_DIR}/mediamtx" ]]; then
         log_error "Binary not found: ${INSTALL_DIR}/mediamtx"
-        ((errors++))
+        errors=$((errors + 1))
     elif [[ ! -x "${INSTALL_DIR}/mediamtx" ]]; then
         log_error "Binary not executable: ${INSTALL_DIR}/mediamtx"
-        ((errors++))
+        errors=$((errors + 1))
     elif ! "${INSTALL_DIR}/mediamtx" --version &>/dev/null; then
         log_error "Binary verification failed"
-        ((errors++))
+        errors=$((errors + 1))
     else
         log_info "Binary: OK"
     fi
@@ -2024,7 +1870,7 @@ verify_installation() {
     # Check configuration
     if [[ ! -f "${CONFIG_DIR}/${CONFIG_NAME}" ]]; then
         log_warn "Configuration not found: ${CONFIG_DIR}/${CONFIG_NAME}"
-        ((warnings++))
+        warnings=$((warnings + 1))
     else
         log_info "Configuration: OK"
     fi
@@ -2033,10 +1879,10 @@ verify_installation() {
     if command -v systemctl &>/dev/null; then
         if [[ ! -f "${SERVICE_DIR}/${SERVICE_NAME}" ]]; then
             log_warn "Service not configured"
-            ((warnings++))
+            warnings=$((warnings + 1))
         elif ! systemctl is-enabled mediamtx &>/dev/null; then
             log_warn "Service not enabled"
-            ((warnings++))
+            warnings=$((warnings + 1))
         else
             log_info "Service: OK"
         fi
@@ -2045,83 +1891,9 @@ verify_installation() {
     # Check user
     if ! id "${SERVICE_USER}" &>/dev/null; then
         log_warn "Service user not found: ${SERVICE_USER}"
-        ((warnings++))
+        warnings=$((warnings + 1))
     else
         log_info "Service user: OK"
-    fi
-    
-    # Check for running processes
-    local process_pids=()
-    if command -v pgrep &>/dev/null; then
-        # Look specifically for the mediamtx binary
-        mapfile -t process_pids < <(pgrep -x "mediamtx" 2>/dev/null || true)
-        
-        # If that's too restrictive, check the full path
-        if [[ ${#process_pids[@]} -eq 0 ]]; then
-            local all_pids
-            mapfile -t all_pids < <(pgrep -f "${INSTALL_DIR}/mediamtx" 2>/dev/null || true)
-            for pid in "${all_pids[@]}"; do
-                # Skip empty PIDs
-                [[ -z "${pid}" ]] && continue
-                # Check if it's actually the mediamtx binary
-                if [[ -d "/proc/${pid}" ]]; then
-                    local exe_path
-                    exe_path=$(readlink -f "/proc/${pid}/exe" 2>/dev/null || echo "")
-                    if [[ "${exe_path}" == *"/mediamtx" ]]; then
-                        process_pids+=("${pid}")
-                    fi
-                fi
-            done
-        fi
-    fi
-    
-    if [[ ${#process_pids[@]} -gt 0 ]]; then
-        local systemd_running=false
-        if command -v systemctl &>/dev/null && systemctl is-active --quiet mediamtx; then
-            systemd_running=true
-        fi
-        
-        if [[ "${systemd_running}" == "false" ]]; then
-            log_warn "MediaMTX is running outside of systemd control (PID: ${process_pids[0]})"
-            ((warnings++))
-        else
-            log_info "Process: Running under systemd"
-        fi
-    else
-        log_info "Process: Not running"
-    fi
-    
-    # Check port availability
-    local port_conflicts=false
-    
-    # Try to detect actual ports from config
-    local rtsp_port="${DEFAULT_RTSP_PORT}"
-    local api_port="${DEFAULT_API_PORT}"
-    
-    if [[ -f "${CONFIG_DIR}/${CONFIG_NAME}" ]]; then
-        local config_rtsp_port
-        local config_api_port
-        config_rtsp_port=$(grep -E "^rtspAddress:" "${CONFIG_DIR}/${CONFIG_NAME}" 2>/dev/null | sed 's/.*:\([0-9]*\)$/\1/' || echo "")
-        config_api_port=$(grep -E "^apiAddress:" "${CONFIG_DIR}/${CONFIG_NAME}" 2>/dev/null | sed 's/.*:\([0-9]*\)$/\1/' || echo "")
-        
-        [[ -n "${config_rtsp_port}" ]] && rtsp_port="${config_rtsp_port}"
-        [[ -n "${config_api_port}" ]] && api_port="${config_api_port}"
-    fi
-    
-    for port in "${rtsp_port}" "${api_port}" "${DEFAULT_METRICS_PORT}"; do
-        if command -v lsof &>/dev/null; then
-            local port_user
-            port_user=$(lsof -i ":${port}" -sTCP:LISTEN 2>/dev/null | tail -n1 | awk '{print $1}' || echo "")
-            if [[ -n "${port_user}" ]] && [[ "${port_user}" != "mediamtx" ]]; then
-                log_warn "Port ${port} is in use by: ${port_user}"
-                port_conflicts=true
-                ((warnings++))
-            fi
-        fi
-    done
-    
-    if [[ "${port_conflicts}" == "false" ]]; then
-        log_info "Ports: Available or in use by MediaMTX"
     fi
     
     # Summary
@@ -2139,6 +1911,70 @@ verify_installation() {
 }
 
 # ============================================================================
+# Guidance Functions
+# ============================================================================
+
+# Show post-install guidance
+show_post_install_guidance() {
+    local stream_manager
+    stream_manager=$(find_stream_manager 2>/dev/null || echo "")
+    
+    echo ""
+    if [[ -n "${stream_manager}" ]] || [[ -f "/etc/mediamtx/audio-devices.conf" ]]; then
+        echo "================================"
+        echo "Audio Streaming Setup Detected!"
+        echo "================================"
+        echo ""
+        echo "You can manage MediaMTX using EITHER:"
+        echo ""
+        echo "Option 1: Stream Manager (Recommended for audio streaming)"
+        echo "  sudo ${stream_manager:-./mediamtx-stream-manager.sh} start"
+        echo "  sudo ${stream_manager:-./mediamtx-stream-manager.sh} status"
+        echo ""
+        echo "Option 2: Systemd Service (Standard management)"
+        echo "  sudo systemctl start mediamtx"
+        echo "  sudo systemctl enable mediamtx"
+        echo ""
+        echo "Note: Use only ONE management method at a time!"
+    else
+        if command -v systemctl &>/dev/null && [[ -f "${SERVICE_DIR}/${SERVICE_NAME}" ]]; then
+            echo ""
+            echo "To start MediaMTX:"
+            echo "  sudo systemctl start mediamtx"
+            echo "  sudo systemctl enable mediamtx  # Auto-start at boot"
+            echo ""
+            echo "To check status:"
+            echo "  sudo systemctl status mediamtx"
+        else
+            echo ""
+            echo "To start MediaMTX manually:"
+            echo "  ${INSTALL_DIR}/mediamtx ${CONFIG_DIR}/${CONFIG_NAME}"
+        fi
+    fi
+}
+
+# Show post-update guidance
+show_post_update_guidance() {
+    local mode="${1:-none}"
+    
+    case "${mode}" in
+        stream-manager)
+            echo ""
+            echo "Stream Manager Detected - Quick Commands:"
+            echo "  • Check status: sudo ./mediamtx-stream-manager.sh status"
+            echo "  • View logs: tail -f /var/lib/mediamtx-ffmpeg/*.log"
+            ;;
+        
+        systemd)
+            echo ""
+            echo "Systemd Management - Quick Commands:"
+            echo "  • Check status: sudo systemctl status mediamtx"
+            echo "  • View logs: sudo journalctl -u mediamtx -f"
+            ;;
+    esac
+}
+
+# ============================================================================
 # Help and Usage
 # ============================================================================
 
@@ -2149,8 +1985,8 @@ ${BOLD}MediaMTX Installation Manager v${SCRIPT_VERSION}${NC}
 Production-ready installer for MediaMTX media server with comprehensive
 error handling, validation, and security features.
 
-Enhanced with intelligent management mode detection for seamless updates
-of MediaMTX instances managed by systemd, stream-manager, or running manually.
+Security hardened with safe configuration loading, atomic locks, and
+secure temporary directory creation.
 
 ${BOLD}USAGE:${NC}
     ${SCRIPT_NAME} [OPTIONS] COMMAND
@@ -2200,9 +2036,6 @@ ${BOLD}EXAMPLES:${NC}
     # Custom installation prefix
     sudo ${SCRIPT_NAME} -p /opt/mediamtx install
 
-    # Force reinstall
-    sudo ${SCRIPT_NAME} -f install
-
 ${BOLD}FILES:${NC}
     Binary:       ${INSTALL_DIR}/mediamtx
     Config:       ${CONFIG_DIR}/${CONFIG_NAME}
@@ -2218,22 +2051,13 @@ ${BOLD}SERVICE MANAGEMENT:${NC}
     Disable:      sudo systemctl disable mediamtx
     Logs:         sudo journalctl -u mediamtx -f
 
-${BOLD}ENHANCED FEATURES IN v5.2.0:${NC}
-    - Automatic detection of management mode during updates
-    - Preserves stream manager configuration and active streams
-    - Intelligent stop/start based on current management
-    - Stream manager integration for audio streaming setups
-    - Real-time scheduling detection for audio applications
-    - Comprehensive health checks with multiple API endpoints
-
-${BOLD}NOTES:${NC}
-    - Requires root/sudo for installation
-    - Automatically handles ARM64 naming variations
-    - Creates secure systemd service with hardening
-    - Supports configuration backup and rollback
-    - Enhanced detection for stream-manager controlled instances
-    - Shows active audio streams when managed by stream manager
-    - Detects real-time scheduling for audio applications
+${BOLD}SECURITY ENHANCEMENTS IN v1.1.0:${NC}
+    - Eliminated eval-based rollback system
+    - Safe configuration parsing without source/eval
+    - Atomic lock acquisition with flock
+    - Secure temporary directories with mktemp
+    - Comprehensive input validation
+    - Complete version comparison logic
 
 ${BOLD}SUPPORT:${NC}
     GitHub: https://github.com/${DEFAULT_GITHUB_REPO}
@@ -2308,7 +2132,7 @@ parse_arguments() {
     done
     
     # Set command
-    readonly COMMAND="${args[0]:-}"
+    COMMAND="${args[0]:-}"
     
     # Validate command
     case "${COMMAND}" in
@@ -2324,25 +2148,22 @@ parse_arguments() {
     esac
 }
 
-# Load configuration file
-load_config() {
-    if [[ -n "${CONFIG_FILE}" ]] && [[ -f "${CONFIG_FILE}" ]]; then
-        log_debug "Loading configuration from: ${CONFIG_FILE}"
-        # shellcheck source=/dev/null
-        source "${CONFIG_FILE}"
-    fi
-}
-
 # Main function
 main() {
     # Parse arguments first
     parse_arguments "$@"
     
+    # Initialize runtime variables after parsing
+    initialize_runtime_vars
+    
     # Create temp directory early for logging
     create_temp_dir
     
-    # Load configuration
+    # Load configuration safely
     load_config
+    
+    # Validate input parameters
+    validate_input
     
     # Check if help command
     if [[ "${COMMAND}" == "help" ]]; then
