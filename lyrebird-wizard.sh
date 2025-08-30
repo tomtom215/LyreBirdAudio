@@ -6,7 +6,7 @@
 # This wizard provides a comprehensive interface for managing all aspects
 # of the LyreBirdAudio system by orchestrating the existing scripts.
 #
-# Version: 1.0.0
+# Version: 1.1.0
 # Requirements: bash 4.0+, existing LyreBirdAudio scripts
 
 # Check bash version
@@ -21,10 +21,22 @@ set -u
 set -o pipefail
 
 # Script metadata
-readonly WIZARD_VERSION="1.0.0"
+readonly WIZARD_VERSION="1.1.0"
 readonly WIZARD_NAME="$(basename "${BASH_SOURCE[0]}")"
-readonly WIZARD_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 readonly WIZARD_PID="$$"
+
+# Safe directory initialization with error handling
+get_script_dir() {
+    local source_dir
+    source_dir="$(dirname "${BASH_SOURCE[0]}")"
+    if cd "${source_dir}" 2>/dev/null; then
+        pwd -P
+    else
+        echo "Error: Cannot determine script directory" >&2
+        exit 1
+    fi
+}
+readonly WIZARD_DIR="$(get_script_dir)"
 
 # State files
 readonly STATE_DIR="/var/lib/lyrebird-wizard"
@@ -90,9 +102,6 @@ CLEANUP_DONE=false
 
 # Dry run mode
 DRY_RUN_MODE=false
-
-# Monitor mode flag - when true, don't exit on SIGINT
-MONITOR_MODE=false
 
 # ============================================================================
 # Core Functions
@@ -185,22 +194,26 @@ check_terminal() {
     fi
 }
 
+# Enhanced network connectivity check with multiple endpoints
 check_network_connectivity() {
     log_message DEBUG "Checking network connectivity..."
     
-    # Try to ping a reliable host
-    if command -v ping &>/dev/null; then
-        if ping -c 1 -W 2 8.8.8.8 &>/dev/null || ping -c 1 -W 2 1.1.1.1 &>/dev/null; then
-            return 0
-        fi
-    fi
+    local endpoints=("8.8.8.8" "1.1.1.1" "github.com")
     
-    # Try curl as fallback
-    if command -v curl &>/dev/null; then
-        if curl -s --connect-timeout 2 --max-time 5 https://github.com &>/dev/null; then
+    for endpoint in "${endpoints[@]}"; do
+        # Try multiple methods
+        if command -v ping &>/dev/null && ping -c 1 -W 2 "${endpoint}" &>/dev/null; then
             return 0
         fi
-    fi
+        
+        if command -v curl &>/dev/null && curl -s --connect-timeout 2 "https://${endpoint}" &>/dev/null; then
+            return 0
+        fi
+        
+        if command -v nc &>/dev/null && nc -z -w2 "${endpoint}" 443 &>/dev/null 2>&1; then
+            return 0
+        fi
+    done
     
     log_message WARN "Network connectivity check failed"
     return 1
@@ -318,8 +331,6 @@ validate_scripts() {
     if ! "${STREAM_MANAGER}" help >/dev/null 2>&1; then
         log_message WARN "Stream manager may have issues, some functions may not work"
     fi
-    
-    # USB mapper doesn't have a help command, so we skip testing it
 }
 
 setup_directories() {
@@ -333,33 +344,37 @@ setup_directories() {
     done
 }
 
-# Atomic state file operations with flock
+# Improved atomic state file operations with better concurrency handling
 save_state() {
     local key="$1"
     local value="$2"
     
     [[ -d "${STATE_DIR}" ]] || mkdir -p "${STATE_DIR}" 2>/dev/null || return 1
     
-    # Use flock if available for atomic operations
+    # Use atomic write with temp file
+    local temp_file="${STATE_FILE}.tmp.$$"
+    local lock_file="${STATE_FILE}.lock"
+    
     if command -v flock &>/dev/null; then
         (
-            flock -x 200 || return 1
-            local temp_file="${STATE_FILE}.tmp.$$"
+            flock -x 200 || exit 1
             
+            # Read existing state
             if [[ -f "${STATE_FILE}" ]]; then
                 grep -v "^${key}=" "${STATE_FILE}" > "${temp_file}" 2>/dev/null || true
             fi
             
+            # Add new value
             echo "${key}=${value}" >> "${temp_file}"
-            mv -f "${temp_file}" "${STATE_FILE}" 2>/dev/null || {
+            
+            # Atomic move
+            mv -f "${temp_file}" "${STATE_FILE}" || {
                 rm -f "${temp_file}"
-                return 1
+                exit 1
             }
-        ) 200>"${STATE_FILE}.lock"
+        ) 200>"${lock_file}"
     else
         # Fallback without flock
-        local temp_file="${STATE_FILE}.tmp.$$"
-        
         if [[ -f "${STATE_FILE}" ]]; then
             grep -v "^${key}=" "${STATE_FILE}" > "${temp_file}" 2>/dev/null || true
         fi
@@ -385,49 +400,27 @@ load_state() {
     fi
 }
 
-# Enhanced PID validation - fixed to check wrapper scripts properly
+# Simplified and more reliable PID validation
 validate_pid() {
     local pid="$1"
     local expected_name="${2:-}"
     
-    if [[ -z "${pid}" ]] || [[ "${pid}" == "0" ]]; then
-        return 1
-    fi
+    [[ -z "${pid}" ]] || [[ "${pid}" == "0" ]] && return 1
     
+    # Basic check if process exists
     if ! kill -0 "${pid}" 2>/dev/null; then
         return 1
     fi
     
-    # If no expected name provided, just check if process exists
-    if [[ -z "${expected_name}" ]]; then
-        return 0
-    fi
-    
-    # For wrapper scripts, check if it's a bash script running our wrapper
-    local proc_cmd
-    proc_cmd=$(ps -p "${pid}" -o args= 2>/dev/null || echo "")
-    
-    # Check if it's running a bash script or if it has ffmpeg as a child
-    if [[ "${proc_cmd}" == *"bash"* ]] || [[ "${proc_cmd}" == *"sh"* ]]; then
-        # It's a wrapper script, check for child ffmpeg processes
-        if pgrep -P "${pid}" -f "ffmpeg" >/dev/null 2>&1; then
-            return 0
-        fi
-        # Or check if the script file exists and is our wrapper
-        if [[ "${proc_cmd}" == *"/var/lib/mediamtx-ffmpeg/"* ]]; then
+    # If checking wrapper scripts, look for child processes
+    if [[ -n "${expected_name}" ]] && [[ "${expected_name}" == "wrapper" ]]; then
+        # Check for ffmpeg children
+        if pgrep -P "${pid}" >/dev/null 2>&1; then
             return 0
         fi
     fi
     
-    # Direct process name check
-    local proc_name
-    proc_name=$(ps -p "${pid}" -o comm= 2>/dev/null || echo "")
-    
-    if [[ "${proc_name}" == *"${expected_name}"* ]]; then
-        return 0
-    fi
-    
-    return 1
+    return 0
 }
 
 # Enhanced error recovery
@@ -462,6 +455,7 @@ handle_script_error() {
     esac
 }
 
+# Improved monitor mode handling
 execute_external_script() {
     local script="$1"
     shift
@@ -474,28 +468,23 @@ execute_external_script() {
         return 0
     fi
     
-    # Special handling for monitor command
+    # Special handling for monitor command with improved cleanup
     if [[ "${args[0]:-}" == "monitor" ]]; then
-        echo "Starting stream monitor (Press 'q' then Enter to return to menu)..."
+        echo "Starting stream monitor (Press Ctrl+C to return to menu)..."
         echo
         
-        # Run monitor in background and capture its PID
+        # Use trap to handle cleanup
+        local monitor_pid
+        trap 'kill "${monitor_pid}" 2>/dev/null || true; return 0' INT
+        
         "${script}" "${args[@]}" &
-        local monitor_pid=$!
+        monitor_pid=$!
         
-        # Wait for user to press 'q'
-        while true; do
-            read -n 1 -s key
-            if [[ "${key}" == "q" ]] || [[ "${key}" == "Q" ]]; then
-                # Kill the monitor process
-                kill "${monitor_pid}" 2>/dev/null || true
-                wait "${monitor_pid}" 2>/dev/null || true
-                echo
-                echo "Returning to menu..."
-                break
-            fi
-        done
+        wait "${monitor_pid}" 2>/dev/null || true
+        trap - INT
         
+        echo
+        echo "Returning to menu..."
         return 0
     fi
     
@@ -553,7 +542,7 @@ execute_external_script() {
 }
 
 # ============================================================================
-# System Detection (Enhanced)
+# System Detection (Enhanced with fixes)
 # ============================================================================
 
 # Portable disk space check
@@ -561,31 +550,36 @@ check_disk_space() {
     local path="$1"
     local min_mb="${2:-100}"
     
-    local available
-    # More portable df parsing using POSIX output
-    available=$(df -P "${path}" 2>/dev/null | awk 'NR==2 {print $4}')
+    # Use portable df with explicit block size
+    local available_kb
+    available_kb=$(df -k "${path}" 2>/dev/null | awk 'NR==2 {print $4}')
     
-    # Handle both KB and 1K-blocks output
-    if [[ -n "${available}" ]]; then
-        local available_mb=$((available / 1024))
-        if [[ ${available_mb} -lt ${min_mb} ]]; then
-            return 1
-        fi
+    if [[ -n "${available_kb}" ]] && [[ "${available_kb}" =~ ^[0-9]+$ ]]; then
+        local available_mb=$((available_kb / 1024))
+        [[ ${available_mb} -ge ${min_mb} ]]
+    else
+        # If we can't determine, assume sufficient space
+        return 0
     fi
-    return 0
 }
 
+# Fixed USB device detection with corrected regex
 detect_usb_audio_devices() {
     USB_DEVICES_COUNT=0
     USB_DEVICES_NAMES=()
     
-    # Parse /proc/asound/cards directly for better accuracy
+    # Parse /proc/asound/cards with fixed regex pattern
     if [[ -f "/proc/asound/cards" ]]; then
         while IFS= read -r line; do
-            if [[ "${line}" =~ ^\ *([0-9]+)\ \[([^\]]+)\]:.*-\ (.+)$ ]]; then
+            # Fixed regex pattern - properly matches card format
+            if [[ "${line}" =~ ^[[:space:]]*([0-9]+)[[:space:]]+\[([^]]+)\]:.*-[[:space:]]+(.+)$ ]]; then
                 local card_num="${BASH_REMATCH[1]}"
                 local card_id="${BASH_REMATCH[2]}"
                 local card_desc="${BASH_REMATCH[3]}"
+                
+                # Trim whitespace from card_id
+                card_id="${card_id#"${card_id%%[![:space:]]*}"}"
+                card_id="${card_id%"${card_id##*[![:space:]]}"}"
                 
                 # Check if it's a USB device
                 if [[ -f "/proc/asound/card${card_num}/usbid" ]]; then
@@ -1433,10 +1427,15 @@ menu_devices() {
                 if [[ -f "/proc/asound/cards" ]]; then
                     local card_num=0
                     while IFS= read -r line; do
-                        if [[ "${line}" =~ ^\ *([0-9]+)\ \[([^\]]+)\]:.*-\ (.+)$ ]]; then
+                        # Use the fixed regex pattern
+                        if [[ "${line}" =~ ^[[:space:]]*([0-9]+)[[:space:]]+\[([^]]+)\]:.*-[[:space:]]+(.+)$ ]]; then
                             card_num="${BASH_REMATCH[1]}"
                             local card_id="${BASH_REMATCH[2]}"
                             local card_desc="${BASH_REMATCH[3]}"
+                            
+                            # Trim whitespace
+                            card_id="${card_id#"${card_id%%[![:space:]]*}"}"
+                            card_id="${card_id%"${card_id##*[![:space:]]}"}"
                             
                             # Check if USB
                             if [[ -f "/proc/asound/card${card_num}/usbid" ]]; then
@@ -1526,6 +1525,24 @@ menu_devices() {
     done
 }
 
+# Enhanced environment variable parsing helper
+parse_systemd_environment() {
+    local service="$1"
+    local env_output
+    env_output=$(systemctl show "${service}" --property=Environment 2>/dev/null)
+    
+    if [[ "${env_output}" =~ ^Environment=(.*)$ ]]; then
+        local env_string="${BASH_REMATCH[1]}"
+        # Parse with proper quote handling
+        local -a env_array
+        eval "env_array=(${env_string})"
+        
+        for var in "${env_array[@]}"; do
+            echo "${var}"
+        done
+    fi
+}
+
 menu_config() {
     while true; do
         detect_system_state
@@ -1574,27 +1591,10 @@ menu_config() {
                 echo -e "${BOLD}Current Environment Variables:${NC}"
                 echo
                 
-                # Better parsing that handles quotes and spaces
+                # Use the helper function for better parsing
                 if systemctl is-active --quiet mediamtx-audio 2>/dev/null; then
                     echo "Active Service Environment:"
-                    local env_output
-                    env_output=$(systemctl show mediamtx-audio --property=Environment 2>/dev/null)
-                    
-                    if [[ "${env_output}" =~ ^Environment=(.+)$ ]]; then
-                        # Parse the environment string properly
-                        local IFS=' '
-                        local env_array
-                        read -ra env_array <<< "${BASH_REMATCH[1]}"
-                        
-                        for var in "${env_array[@]}"; do
-                            # Remove surrounding quotes if present
-                            var="${var%\"}"
-                            var="${var#\"}"
-                            [[ -n "${var}" ]] && echo "  ${var}"
-                        done
-                    else
-                        echo "  No custom environment variables set"
-                    fi
+                    parse_systemd_environment "mediamtx-audio" | sed 's/^/  /'
                     echo
                 fi
                 
@@ -1688,22 +1688,7 @@ EOF
                             # Reuse option 4 logic
                             if systemctl is-active --quiet mediamtx-audio 2>/dev/null; then
                                 echo "Current Active Environment:"
-                                local env_output
-                                env_output=$(systemctl show mediamtx-audio --property=Environment 2>/dev/null)
-                                
-                                if [[ "${env_output}" =~ ^Environment=(.+)$ ]]; then
-                                    local IFS=' '
-                                    local env_array
-                                    read -ra env_array <<< "${BASH_REMATCH[1]}"
-                                    
-                                    for var in "${env_array[@]}"; do
-                                        var="${var%\"}"
-                                        var="${var#\"}"
-                                        [[ -n "${var}" ]] && echo "  ${var}"
-                                    done
-                                else
-                                    echo "  No custom environment variables"
-                                fi
+                                parse_systemd_environment "mediamtx-audio" | sed 's/^/  /'
                             else
                                 echo "Service not running"
                             fi
@@ -1885,10 +1870,10 @@ menu_troubleshoot() {
                 echo -e "${BOLD}Testing Audio Devices:${NC}"
                 echo
                 
-                # Parse /proc/asound/cards directly for accurate info
+                # Parse /proc/asound/cards with fixed regex
                 if [[ -f "/proc/asound/cards" ]]; then
                     while IFS= read -r line; do
-                        if [[ "${line}" =~ ^\ *([0-9]+)\ \[([^\]]+)\]:.*-\ (.+)$ ]]; then
+                        if [[ "${line}" =~ ^[[:space:]]*([0-9]+)[[:space:]]+\[([^]]+)\]:.*-[[:space:]]+(.+)$ ]]; then
                             local card_num="${BASH_REMATCH[1]}"
                             local card_id="${BASH_REMATCH[2]}"
                             local card_desc="${BASH_REMATCH[3]}"
@@ -1951,9 +1936,9 @@ menu_troubleshoot() {
                     
                     # Disk space
                     if ! check_disk_space "/var/log" 100; then
-                        local available
-                        available=$(df -P "/var/log" 2>/dev/null | awk 'NR==2 {print $4}')
-                        local space_mb=$((available / 1024))
+                        local available_kb
+                        available_kb=$(df -k "/var/log" 2>/dev/null | awk 'NR==2 {print $4}')
+                        local space_mb=$((available_kb / 1024))
                         echo -e "  ${RED}✗${NC} Low disk space: ${space_mb}MB available in /var/log"
                     fi
                     
@@ -2054,7 +2039,7 @@ menu_main() {
             local unmapped_count=0
             if [[ -f "/proc/asound/cards" ]]; then
                 while IFS= read -r line; do
-                    if [[ "${line}" =~ ^\ *([0-9]+)\ \[([^\]]+)\]: ]]; then
+                    if [[ "${line}" =~ ^[[:space:]]*([0-9]+)[[:space:]]+\[([^]]+)\]: ]]; then
                         local card_id="${BASH_REMATCH[2]}"
                         local card_num="${BASH_REMATCH[1]}"
                         if [[ -f "/proc/asound/card${card_num}/usbid" ]]; then
