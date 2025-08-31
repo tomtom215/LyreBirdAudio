@@ -1,15 +1,25 @@
 #!/bin/bash
-# mediamtx-audio-stream-manager.sh - Automatic MediaMTX audio stream configuration
+# mediamtx-stream-manager.sh - Automatic MediaMTX audio stream configuration
 # Part of LyreBirdAudio - RTSP Audio Streaming Suite
 # https://github.com/tomtom215/LyreBirdAudio
 #
 # This script automatically detects USB microphones and creates MediaMTX 
 # configurations for continuous 24/7 RTSP audio streams.
 #
-# Version: 1.1.2 - Enhanced with additional robustness improvements
+# Version: 1.1.4 - Fixed stream path collision race condition
 # Compatible with MediaMTX v1.12.3+
 #
 # Version History:
+# v1.1.4 - Fixed stream path collision race condition
+#   - Added flock-based mutual exclusion for stream paths
+#   - Prevents "conflicting publisher" errors in MediaMTX
+#   - Wrappers now exit cleanly if another owns the stream
+#   - Eliminates unnecessary restart cycles from path collisions
+# v1.1.3 - Fixed critical FFmpeg PID handling in wrapper script
+#   - Fixed race condition where FFmpeg could exit before PID capture
+#   - Improved process monitoring with polling instead of just wait
+#   - Added immediate verification of FFmpeg process startup
+#   - Better exit code capture and error detection
 # v1.1.2 - Fixed race condition in wrapper script startup & enhanced robustness
 #   - Enable TCP and UDP by default
 #   - Create PID file before starting wrapper to prevent immediate exit
@@ -35,12 +45,12 @@
 # - USB audio devices
 # - ffmpeg installed for audio encoding
 #
-# Usage: ./mediamtx-audio-stream-manager.sh [start|stop|restart|status|config|help]
+# Usage: ./mediamtx-stream-manager.sh [start|stop|restart|status|config|help]
 
 set -euo pipefail
 
 # Constants
-readonly VERSION="1.1.2"
+readonly VERSION="1.1.4"
 readonly SCRIPT_NAME="$(basename "${BASH_SOURCE[0]}")"
 readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly CONFIG_DIR="/etc/mediamtx"
@@ -49,7 +59,7 @@ readonly DEVICE_CONFIG_FILE="${CONFIG_DIR}/audio-devices.conf"
 readonly PID_FILE="/var/run/mediamtx-audio.pid"
 readonly FFMPEG_PID_DIR="/var/lib/mediamtx-ffmpeg"
 readonly LOCK_FILE="/var/run/mediamtx-audio.lock"
-readonly LOG_FILE="/var/log/mediamtx-audio-manager.log"
+readonly LOG_FILE="/var/log/mediamtx-stream-manager.log"
 readonly MEDIAMTX_LOG="/var/log/mediamtx.log"
 readonly MEDIAMTX_BIN="/usr/local/bin/mediamtx"
 readonly TEMP_CONFIG="/tmp/mediamtx-audio-$$.yml"
@@ -940,10 +950,13 @@ PROBESIZE="${DEFAULT_PROBESIZE}"
 FFMPEG_PID=""
 WRAPPER_VARS
 
-    # Add the main wrapper logic with fixed PID handling
+    # Add the main wrapper logic with FIXED PID handling and STREAM LOCK
     cat >> "$wrapper_script" << 'WRAPPER_MAIN'
 
 touch "${FFMPEG_LOG}"
+
+# Stream lock file for mutual exclusion
+STREAM_LOCK="${FFMPEG_PID_DIR}/${STREAM_PATH}.lock"
 
 log_message() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >> "${LOG_FILE}"
@@ -1019,7 +1032,15 @@ run_ffmpeg() {
     "${cmd[@]}" >> "${FFMPEG_LOG}" 2>&1 &
     FFMPEG_PID=$!
     
+    # CRITICAL FIX: Verify FFmpeg started successfully
+    if [[ -z "$FFMPEG_PID" ]] || ! kill -0 "$FFMPEG_PID" 2>/dev/null; then
+        log_message "ERROR: FFmpeg failed to start or exited immediately"
+        FFMPEG_PID=""
+        return 1
+    fi
+    
     log_message "Started FFmpeg with PID ${FFMPEG_PID}"
+    return 0
 }
 
 # Check if device is still available
@@ -1056,20 +1077,44 @@ while true; do
     # Record start time
     START_TIME=$(date +%s)
     
-    # Execute FFmpeg
-    run_ffmpeg
+    # CRITICAL FIX: Acquire exclusive lock before starting FFmpeg
+    # This prevents multiple wrappers from starting FFmpeg for the same stream
+    exec 200>"${STREAM_LOCK}"
+    if ! flock -n 200; then
+        log_message "Another wrapper already owns stream ${STREAM_PATH}, exiting cleanly"
+        rm -f "${PID_FILE}"
+        exit 0  # Exit cleanly - this is not an error
+    fi
+    
+    log_message "Acquired exclusive lock for stream ${STREAM_PATH}"
+    
+    # Execute FFmpeg (lock is held via fd 200)
+    if ! run_ffmpeg; then
+        log_message "Failed to start FFmpeg, waiting before retry"
+        # Release lock before sleeping
+        exec 200>&-
+        sleep 30
+        continue
+    fi
     
     # Give FFmpeg time to initialize
     sleep 3
     
-    # Wait for FFmpeg to exit
+    # CRITICAL FIX: Use polling approach instead of just wait
+    # This is more robust for detecting process exit
+    exit_code=0
+    while [[ -n "${FFMPEG_PID}" ]] && kill -0 "$FFMPEG_PID" 2>/dev/null; do
+        sleep 1
+    done
+    
+    # Capture actual exit code after process has died
     if [[ -n "${FFMPEG_PID}" ]]; then
-        wait ${FFMPEG_PID}
+        wait "$FFMPEG_PID" 2>/dev/null
         exit_code=$?
-    else
-        log_message "Failed to start FFmpeg"
-        exit_code=1
     fi
+    
+    # Release the lock (close fd 200)
+    exec 200>&-
     
     # Calculate run time
     END_TIME=$(date +%s)
@@ -2153,7 +2198,7 @@ create_systemd_service() {
     
     cat > "$service_file" << EOF
 [Unit]
-Description=MediaMTX Audio Stream Manager
+Description=Mediamtx Stream Manager
 After=network.target sound.target
 Wants=sound.target
 
@@ -2246,11 +2291,11 @@ validate_command() {
 # Show help
 show_help() {
     cat << EOF
-MediaMTX Audio Stream Manager v${VERSION}
+Mediamtx Stream Manager v${VERSION}
 Part of LyreBirdAudio - RTSP Audio Streaming Suite
 
 Automatically configures MediaMTX for continuous 24/7 RTSP audio streaming
-from USB audio devices with enhanced service restart handling and robustness.
+from USB audio devices with fixed critical race conditions.
 
 Usage: ${SCRIPT_NAME} [COMMAND]
 
@@ -2282,11 +2327,11 @@ Default audio settings:
     ALSA period: 20ms
 
 Enhancements in v${VERSION}:
-    - Fixed race condition in wrapper script startup
-    - Added parallel startup race condition mitigation
-    - Enhanced debug output with clear success/failure indication
-    - Added audio group validation for systemd service
-    - Improved file ownership handling
+    - Fixed stream path collision race condition with flock
+    - Prevents "conflicting publisher" errors in MediaMTX
+    - Wrappers exit cleanly if another owns the stream
+    - Eliminates unnecessary restart cycles from collisions
+    - Maintains all v1.1.3 process monitoring improvements
 
 Environment variables:
     STREAM_STARTUP_DELAY=10            Seconds to wait after starting each stream
@@ -2310,6 +2355,7 @@ Common issues:
     - Stale processes: Enhanced cleanup on start
     - Ugly stream names: Run usb-audio-mapper.sh
     - Format errors: Script defaults to plughw for compatibility
+    - Silent failures: Fixed with improved PID handling
 
 EOF
 }
