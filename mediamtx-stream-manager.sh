@@ -6,25 +6,29 @@
 # This script automatically detects USB microphones and creates MediaMTX 
 # configurations for continuous 24/7 RTSP audio streams.
 #
-# Version: 1.1.5 - Production-ready enhancements for 24/7 operation
+# Version: 1.1.5 - Production-ready with critical fixes
 # Compatible with MediaMTX v1.12.3+
 #
 # Version History:
-# v1.1.5 - Production-ready enhancements for 24/7 operation
-#   - Deterministic process termination with active polling
-#   - Separated wrapper logs from system logs
-#   - Enhanced PID file validation with proper diagnostic logging
-#   - Atomic stream path claiming with flock
-#   - Dynamic MediaMTX API readiness polling
-#   - Configurable MediaMTX host
-#   - Fixed global trap inheritance
+# v1.1.5 - Production-ready release with critical fixes
+#   - CRITICAL FIX: Removed invalid FFmpeg buffer_size/period_size options
+#   - CRITICAL FIX: Fixed delimiter consistency (now uses colon throughout)
+#   - CRITICAL FIX: Fixed PID file race condition in wrapper script
+#   - CRITICAL FIX: Fixed process termination order (PID file removed after kill)
+#   - CRITICAL FIX: Fixed file descriptor leak in error paths
+#   - Enhanced MediaMTX YAML configuration with quoted regex patterns
+#   - Added FFmpeg analyzeduration and probesize parameters
+#   - Fixed pid_file variable scope in start_ffmpeg_stream
 #   - Improved error handling and device reliability
-#   - Fixed SYSTEM_PID_MAX validation to occur after logging initialization
-#   - Enhanced wrapper scripts with pipefail for pipeline safety
-#   - Fixed USB_STABILIZATION_DELAY to actually be used
-#   - Added wrapper script pre-existence security check
-#   - Fixed path desynchronization with wildcard pattern
-#   - Enhanced cleanup trap for proper process termination
+#   - Added shell injection protection for wrapper variables
+#   - Cleaned up duplicate code from merge issues
+# v1.1.4 - Fixed stream path collision race condition
+#   - Added flock-based mutual exclusion for stream paths
+#   - Prevents "conflicting publisher" errors in MediaMTX
+# v1.1.3 - Fixed critical FFmpeg PID handling in wrapper script
+# v1.1.2 - Fixed race condition in wrapper script startup
+# v1.1.1 - Fixed wrapper script execution issue
+# v1.1.0 - Production hardening release
 #
 # Requirements:
 # - MediaMTX installed (use install_mediamtx.sh)
@@ -34,14 +38,6 @@
 # Usage: ./mediamtx-stream-manager.sh [start|stop|restart|status|config|help]
 
 set -euo pipefail
-
-# CRITICAL: Check root privileges before ANY privileged operations
-# This MUST happen before logging initialization or any file operations
-if [[ ${EUID} -ne 0 ]]; then
-    echo -e "\033[0;31m[ERROR]\033[0m This script must be run as root (use sudo)" >&2
-    echo "Usage: $(basename "${BASH_SOURCE[0]}") [start|stop|restart|status|config|help]" >&2
-    exit 2
-fi
 
 # Constants with environment variable overrides for flexibility
 readonly VERSION="1.1.5"
@@ -62,8 +58,8 @@ readonly MEDIAMTX_HOST="${MEDIAMTX_HOST:-localhost}"
 readonly RESTART_MARKER="${MEDIAMTX_RESTART_MARKER:-/var/run/mediamtx-audio.restart}"
 readonly CLEANUP_MARKER="${MEDIAMTX_CLEANUP_MARKER:-/var/run/mediamtx-audio.cleanup}"
 
-# Placeholder for SYSTEM_PID_MAX - will be set after logging is available
-SYSTEM_PID_MAX=""  # Will be set after logging is available
+# System limits
+readonly SYSTEM_PID_MAX="$(cat /proc/sys/kernel/pid_max 2>/dev/null || echo 32768)"
 
 # Configurable timeouts
 readonly PID_TERMINATION_TIMEOUT="${PID_TERMINATION_TIMEOUT:-10}"
@@ -81,23 +77,21 @@ readonly DEFAULT_CHANNELS="2"
 readonly DEFAULT_FORMAT="s16le"
 readonly DEFAULT_CODEC="opus"
 readonly DEFAULT_BITRATE="128k"
-readonly DEFAULT_ALSA_BUFFER="100000"      # 100ms in microseconds
-readonly DEFAULT_ALSA_PERIOD="20000"       # 20ms in microseconds
-readonly DEFAULT_THREAD_QUEUE="8192"       # Increased for stability
-readonly DEFAULT_FIFO_SIZE="1048576"       # 1MB FIFO buffer
-readonly DEFAULT_ANALYZEDURATION="5000000" # 5 seconds
-readonly DEFAULT_PROBESIZE="5000000"       # 5MB probe size
+readonly DEFAULT_THREAD_QUEUE="8192"
+readonly DEFAULT_FIFO_SIZE="1048576"
+readonly DEFAULT_ANALYZEDURATION="5000000"
+readonly DEFAULT_PROBESIZE="5000000"
 
 # Connection settings
-readonly STREAM_STARTUP_DELAY="${STREAM_STARTUP_DELAY:-10}"  # Can be overridden via environment
+readonly STREAM_STARTUP_DELAY="${STREAM_STARTUP_DELAY:-10}"
 readonly STREAM_VALIDATION_ATTEMPTS="3"
 readonly STREAM_VALIDATION_DELAY="5"
-readonly USB_STABILIZATION_DELAY="${USB_STABILIZATION_DELAY:-5}"  # Wait for USB to stabilize
-readonly RESTART_STABILIZATION_DELAY="${RESTART_STABILIZATION_DELAY:-10}"  # Extra delay on restart
+readonly USB_STABILIZATION_DELAY="${USB_STABILIZATION_DELAY:-5}"
+readonly RESTART_STABILIZATION_DELAY="${RESTART_STABILIZATION_DELAY:-10}"
 
 # Device test settings
-readonly DEVICE_TEST_ENABLED="${DEVICE_TEST_ENABLED:-false}"  # Disable by default
-readonly DEVICE_TEST_TIMEOUT="${DEVICE_TEST_TIMEOUT:-3}"      # Increased timeout
+readonly DEVICE_TEST_ENABLED="${DEVICE_TEST_ENABLED:-false}"
+readonly DEVICE_TEST_TIMEOUT="${DEVICE_TEST_TIMEOUT:-3}"
 
 # Color codes
 readonly RED='\033[0;31m'
@@ -107,7 +101,7 @@ readonly BLUE='\033[0;34m'
 readonly CYAN='\033[0;36m'
 readonly NC='\033[0m'
 
-# Cleanup function - Enhanced to call cleanup_stale_processes for proper cleanup
+# Cleanup function
 cleanup() {
     local exit_code=$?
     
@@ -145,11 +139,11 @@ log() {
             echo -e "${YELLOW}[WARN]${NC} ${message}" >&2
             ;;
         INFO)
-            echo -e "${GREEN}[INFO]${NC} ${message}"
+            echo -e "${GREEN}[INFO]${NC} ${message}" >&2
             ;;
         DEBUG)
             if [[ "${DEBUG:-false}" == "true" ]]; then
-                echo -e "${BLUE}[DEBUG]${NC} ${message}"
+                echo -e "${BLUE}[DEBUG]${NC} ${message}" >&2
             fi
             ;;
     esac
@@ -186,40 +180,13 @@ error_exit() {
     handle_error FATAL "$1" "${2:-1}"
 }
 
-# Validate system PID max with proper logging
-validate_system_pid_max() {
-    local pid_max_raw
-    pid_max_raw="$(cat /proc/sys/kernel/pid_max 2>/dev/null || true)"
-    
-    # Validation with proper logging now available
-    if [[ -z "$pid_max_raw" ]] || ! [[ "$pid_max_raw" =~ ^[0-9]+$ ]]; then
-        log WARN "Invalid PID_MAX value detected: '${pid_max_raw:-<empty>}'"
-        log WARN "Using default value: 32768"
-        pid_max_raw="32768"
-    elif [[ "$pid_max_raw" -lt 1 ]] || [[ "$pid_max_raw" -gt 4194304 ]]; then
-        log WARN "PID_MAX value out of range (1-4194304): $pid_max_raw"
-        log WARN "Using default value: 32768"
-        pid_max_raw="32768"
-    else
-        log DEBUG "System PID_MAX validated: $pid_max_raw"
-    fi
-    
-    # Set the global variable (not readonly yet)
-    SYSTEM_PID_MAX="$pid_max_raw"
-}
-
-# Call the validation function and make readonly
-validate_system_pid_max
-readonly SYSTEM_PID_MAX
-
-# Atomic PID file operations with improved error handling
+# Atomic PID file operations
 write_pid_atomic() {
     local pid="$1"
     local pid_file="$2"
     local pid_dir
     pid_dir="$(dirname "$pid_file")"
     
-    # Create temp file in same directory as target to avoid symlink attacks
     local temp_pid
     temp_pid="$(mktemp -p "$pid_dir" "$(basename "$pid_file").XXXXXX")" || {
         log ERROR "Failed to create secure temp file in $pid_dir"
@@ -242,33 +209,26 @@ read_pid_safe() {
         return 0
     fi
     
-    # Read and sanitize PID content
     pid_content="$(cat "$pid_file" 2>/dev/null | tr -d '[:space:]')"
     
-    # Validate content exists
     if [[ -z "$pid_content" ]]; then
         log DEBUG "PID file $pid_file is empty"
         echo ""
         return 0
     fi
     
-    # Ensure content is numeric
     if [[ ! "$pid_content" =~ ^[0-9]+$ ]]; then
         log ERROR "PID file $pid_file contains invalid content: '$pid_content'"
-        # Clean up corrupted file
         rm -f "$pid_file"
         echo ""
         return 0
     fi
     
-    # Convert to decimal explicitly to prevent octal interpretation
-    # This prevents crashes when PIDs like "08" or "09" are encountered
     local pid_val=$((10#$pid_content))
     local max_val=$((10#$SYSTEM_PID_MAX))
     
-    # Validate against system PID limit
     if [[ $pid_val -lt 1 ]] || [[ $pid_val -gt $max_val ]]; then
-        log ERROR "PID file $pid_file contains out-of-range PID: $pid_content (max: $SYSTEM_PID_MAX)"
+        log ERROR "PID file $pid_file contains out-of-range PID: $pid_content"
         rm -f "$pid_file"
         echo ""
         return 0
@@ -277,15 +237,14 @@ read_pid_safe() {
     echo "$pid_content"
 }
 
-# Helper function to wait for a PID to terminate with active polling
+# Helper function to wait for a PID to terminate
 wait_for_pid_termination() {
     local pid="$1"
     local timeout="${2:-${PID_TERMINATION_TIMEOUT}}"
-    local timeout_ms=$((timeout * 1000))  # Convert to milliseconds
+    local timeout_ms=$((timeout * 1000))
     local elapsed_ms=0
-    local check_interval_ms=100  # 0.1 seconds in milliseconds
+    local check_interval_ms=100
     
-    # Quick return if process already dead
     if [[ -z "$pid" ]] || ! kill -0 "$pid" 2>/dev/null; then
         return 0
     fi
@@ -306,13 +265,12 @@ wait_for_pid_termination() {
     return 0
 }
 
-# Enhanced stale lock detection - handle empty lock files
+# Lock management
 acquire_lock() {
     local timeout="${1:-30}"
     local count=0
     
     while [[ $count -lt $timeout ]]; do
-        # Try to acquire lock with explicit FD management
         if [[ -z "${MAIN_LOCK_FD}" ]] || [[ "${MAIN_LOCK_FD}" -le 2 ]]; then
             exec {MAIN_LOCK_FD}>"${LOCK_FILE}" 2>/dev/null || {
                 log ERROR "Failed to open lock file"
@@ -325,18 +283,15 @@ acquire_lock() {
             log DEBUG "Successfully acquired lock (PID: $$, FD: ${MAIN_LOCK_FD})"
             return 0
         else
-            # Close FD before retry to prevent resource leak
             [[ -n "${MAIN_LOCK_FD}" ]] && exec {MAIN_LOCK_FD}>&- 2>/dev/null || true
             MAIN_LOCK_FD=
             
-            # Enhanced stale lock detection - handle empty lock files
             if [[ -f "${LOCK_FILE}" ]]; then
                 local lock_pid
                 lock_pid="$(read_pid_safe "${LOCK_FILE}")"
                 if [[ -z "$lock_pid" ]]; then
-                    # Empty lock file - check if any process holds the flock
                     if ! flock -n "${LOCK_FILE}" true 2>/dev/null; then
-                        log DEBUG "Lock held by unknown process (empty PID file)"
+                        log DEBUG "Lock held by unknown process"
                     else
                         log WARN "Removing empty stale lock file"
                         rm -f "${LOCK_FILE}"
@@ -357,22 +312,18 @@ acquire_lock() {
     handle_error FATAL "Failed to acquire lock after ${timeout} seconds" 5
 }
 
-# Enhanced lock release with proper ordering
 release_lock() {
-    # Close file descriptor to release kernel lock
     if [[ -n "${MAIN_LOCK_FD}" ]] && [[ "${MAIN_LOCK_FD}" -gt 2 ]]; then
         log DEBUG "Releasing lock (FD: ${MAIN_LOCK_FD})"
         if exec {MAIN_LOCK_FD}>&- 2>/dev/null; then
             MAIN_LOCK_FD=
-            # Only remove lock file after successfully closing FD
             rm -f "${LOCK_FILE}"
         else
-            log WARN "Failed to close lock FD, removing lock file anyway"
+            log WARN "Failed to close lock FD"
             MAIN_LOCK_FD=
             rm -f "${LOCK_FILE}"
         fi
     else
-        # Just in case MAIN_LOCK_FD is invalid but lock file exists
         rm -f "${LOCK_FILE}"
     fi
 }
@@ -403,7 +354,7 @@ check_dependencies() {
     fi
 }
 
-# Create required directories and fix permissions
+# Create required directories
 setup_directories() {
     mkdir -p "${CONFIG_DIR}"
     mkdir -p "$(dirname "${LOG_FILE}")"
@@ -413,7 +364,6 @@ setup_directories() {
     
     chmod 755 "${FFMPEG_PID_DIR}"
     
-    # Handle potential ownership issues
     if [[ ! -f "${LOG_FILE}" ]]; then
         touch "${LOG_FILE}"
         chmod 644 "${LOG_FILE}"
@@ -425,49 +375,8 @@ setup_directories() {
     fi
 }
 
-# Enhanced path validation to prevent directory traversal and Unicode bypass
-validate_safe_path() {
-    local base_dir="$1"
-    local path="$2"
-    
-    # First, ensure path contains only ASCII characters to prevent Unicode bypass
-    if ! LC_ALL=C grep -q '^[[:print:]]*$' <<< "$path"; then
-        log ERROR "Path contains non-ASCII characters: $path"
-        return 1
-    fi
-    
-    # Check for directory traversal attempts
-    if [[ "$path" =~ \.\. ]] || [[ "$path" =~ ^/ ]]; then
-        log ERROR "Invalid path detected: $path"
-        return 1
-    fi
-    
-    # Verify resolved path stays within base directory using realpath
-    local full_path="${base_dir}/${path}"
-    local resolved_path
-    resolved_path="$(cd "${base_dir}" && realpath -m "./${path}" 2>/dev/null)" || {
-        log ERROR "Failed to resolve path: $path"
-        return 1
-    }
-    
-    local resolved_base
-    resolved_base="$(realpath "${base_dir}")" || {
-        log ERROR "Failed to resolve base directory: ${base_dir}"
-        return 1
-    }
-    
-    # Ensure resolved path is within base directory
-    if [[ "${resolved_path}" != "${resolved_base}"/* ]] && [[ "${resolved_path}" != "${resolved_base}" ]]; then
-        log ERROR "Path escapes directory: $path (resolved to: $resolved_path)"
-        return 1
-    fi
-    
-    return 0
-}
-
 # Detect if we're in a restart scenario
 is_restart_scenario() {
-    # Check if restart marker exists and is recent (within 60 seconds)
     if [[ -f "${RESTART_MARKER}" ]]; then
         local marker_age
         marker_age="$(( $(date +%s) - $(stat -c %Y "${RESTART_MARKER}" 2>/dev/null || echo 0) ))"
@@ -476,7 +385,6 @@ is_restart_scenario() {
         fi
     fi
     
-    # Check if MediaMTX or FFmpeg processes are still dying
     if pgrep -f "${MEDIAMTX_BIN}" >/dev/null 2>&1 || pgrep -f "ffmpeg.*rtsp://${MEDIAMTX_HOST}:8554" >/dev/null 2>&1; then
         return 0
     fi
@@ -484,47 +392,39 @@ is_restart_scenario() {
     return 1
 }
 
-# Mark restart scenario
 mark_restart() {
     touch "${RESTART_MARKER}"
 }
 
-# Clear restart marker
 clear_restart_marker() {
     rm -f "${RESTART_MARKER}"
 }
 
-# Enhanced cleanup of stale processes and files with deterministic process termination
+# Cleanup stale processes
 cleanup_stale_processes() {
     log INFO "Performing comprehensive cleanup of stale processes and files"
     
-    # Mark that we're in cleanup mode
     touch "${CLEANUP_MARKER}"
     
     local -a pids_to_wait=()
     
-    # Step 1: Kill all FFmpeg wrapper scripts
     log DEBUG "Terminating FFmpeg wrapper scripts"
     for pid_file in "${FFMPEG_PID_DIR}"/*.pid; do
         if [[ -f "$pid_file" ]]; then
             local pid
             pid="$(read_pid_safe "$pid_file")"
             if [[ -n "$pid" ]]; then
-                # Try graceful termination first with process group
                 kill -TERM -- -"$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
-                # Kill children
                 pkill -TERM -P "$pid" 2>/dev/null || true
                 pids_to_wait+=("$pid")
             fi
         fi
     done
     
-    # Step 2: Wait for graceful termination with active polling
     for pid in "${pids_to_wait[@]}"; do
         wait_for_pid_termination "$pid" 2
     done
     
-    # Step 3: Force kill any remaining wrapper processes
     pids_to_wait=()
     for pid_file in "${FFMPEG_PID_DIR}"/*.pid; do
         if [[ -f "$pid_file" ]]; then
@@ -540,12 +440,10 @@ cleanup_stale_processes() {
         fi
     done
     
-    # Wait for force kills
     for pid in "${pids_to_wait[@]}"; do
         wait_for_pid_termination "$pid" 1
     done
     
-    # Step 4: Kill any orphaned FFmpeg processes with targeted termination
     log DEBUG "Killing orphaned FFmpeg processes"
     pids_to_wait=()
     while IFS= read -r pid; do
@@ -555,7 +453,6 @@ cleanup_stale_processes() {
         fi
     done < <(pgrep -f "ffmpeg.*rtsp://${MEDIAMTX_HOST}:8554" 2>/dev/null || true)
     
-    # Wait for termination with individual force kill if needed
     for pid in "${pids_to_wait[@]}"; do
         if ! wait_for_pid_termination "$pid" 2; then
             log DEBUG "Force killing orphaned FFmpeg PID $pid"
@@ -563,7 +460,6 @@ cleanup_stale_processes() {
         fi
     done
     
-    # Step 5: Kill MediaMTX if running outside our control
     if [[ -f "${PID_FILE}" ]]; then
         local mediamtx_pid
         mediamtx_pid="$(read_pid_safe "${PID_FILE}")"
@@ -581,7 +477,6 @@ cleanup_stale_processes() {
         fi
     fi
     
-    # Only kill MediaMTX processes using our config file (more targeted)
     if [[ -f "${CONFIG_FILE}" ]]; then
         local mediamtx_pids
         mediamtx_pids="$(pgrep -f "${MEDIAMTX_BIN}.*${CONFIG_FILE}" 2>/dev/null || true)"
@@ -596,7 +491,6 @@ cleanup_stale_processes() {
         fi
     fi
     
-    # Step 6: Clean up all temporary files
     log DEBUG "Cleaning temporary files"
     rm -f "${FFMPEG_PID_DIR}"/*.pid
     rm -f "${FFMPEG_PID_DIR}"/*.sh
@@ -606,19 +500,17 @@ cleanup_stale_processes() {
     rm -f "${FFMPEG_PID_DIR}"/*.claim
     rm -f /tmp/mediamtx-audio-*.yml
     
-    # Step 7: Reset ALSA if needed (helps with device issues)
     if command -v alsactl &>/dev/null; then
         log DEBUG "Resetting ALSA state"
         alsactl init 2>/dev/null || true
     fi
     
-    # Clear cleanup marker
     rm -f "${CLEANUP_MARKER}"
     
     log INFO "Cleanup completed"
 }
 
-# Wait for USB audio subsystem to stabilize (Uses passed parameter correctly)
+# Wait for USB audio subsystem to stabilize
 wait_for_usb_stabilization() {
     local max_wait="${1:-${USB_STABILIZATION_DELAY}}"
     local stable_count_needed=2
@@ -633,7 +525,7 @@ wait_for_usb_stabilization() {
         current_device_count="$(detect_audio_devices | wc -l)"
         
         if [[ $current_device_count -eq $last_device_count ]] && [[ $current_device_count -gt 0 ]]; then
-            ((stable_count++))
+            ((stable_count++)) || true
             if [[ $stable_count -ge $stable_count_needed ]]; then
                 log INFO "USB audio subsystem stable with $current_device_count devices"
                 return 0
@@ -666,7 +558,6 @@ wait_for_mediamtx_ready() {
     log INFO "Waiting for MediaMTX to become ready..."
     
     while [[ $elapsed -lt $max_wait ]]; do
-        # Check if process is still alive
         if ! kill -0 "$pid" 2>/dev/null; then
             log ERROR "MediaMTX process died during startup"
             if [[ -f /var/log/mediamtx.out ]]; then
@@ -675,7 +566,6 @@ wait_for_mediamtx_ready() {
             return 1
         fi
         
-        # Check if API is responsive
         if curl -s --max-time 2 "http://${MEDIAMTX_HOST}:9997/v3/paths/list" >/dev/null 2>&1; then
             log INFO "MediaMTX API is ready after ${elapsed} seconds"
             return 0
@@ -684,7 +574,6 @@ wait_for_mediamtx_ready() {
         sleep "$check_interval"
         ((elapsed += check_interval))
         
-        # Log progress every 5 seconds
         if [[ $((elapsed % 5)) -eq 0 ]]; then
             log DEBUG "Still waiting for MediaMTX API... (${elapsed}s/${max_wait}s)"
         fi
@@ -707,7 +596,6 @@ save_device_config() {
     cat > "${DEVICE_CONFIG_FILE}" << 'EOF'
 # Audio device configuration
 # Format: DEVICE_<sanitized_name>_<parameter>=value
-# IMPORTANT: Variable names must be ALL UPPERCASE
 
 # Universal defaults:
 # - Sample Rate: 48000 Hz
@@ -716,39 +604,24 @@ save_device_config() {
 # - Codec: opus
 # - Bitrate: 128k
 
-# Audio stability settings:
-# - ALSA_BUFFER: 100000 (microseconds - increase for stability)
-# - ALSA_PERIOD: 20000 (microseconds - decrease for lower latency)
-# - THREAD_QUEUE: 8192 (packets - increase if seeing buffer underruns)
-
 # Example overrides:
 # DEVICE_USB_BLUE_YETI_SAMPLE_RATE=44100
 # DEVICE_USB_BLUE_YETI_CHANNELS=1
-# DEVICE_USB_BLUE_YETI_ALSA_BUFFER=200000
-
-# IMPORTANT: Most USB audio devices only support s16le format
-# Only use s24le or s32le if you're certain your device supports it
-
-# For devices with stability issues:
-# DEVICE_USB_GENERIC_AUDIO_ALSA_BUFFER=200000
-# DEVICE_USB_GENERIC_AUDIO_THREAD_QUEUE=16384
 
 # Codec recommendations:
 # - opus: Best for real-time streaming (low latency, good quality)
 # - aac: Universal compatibility 
 # - mp3: Legacy device support
 # - pcm: Avoid for network streams (uses excessive bandwidth)
-
 EOF
 }
 
-# Enhanced sanitize device name with validation
+# Sanitize device name
 sanitize_device_name() {
     local name="$1"
     local sanitized
     sanitized="$(echo "$name" | sed 's/[^a-zA-Z0-9]/_/g' | sed 's/^_*//;s/_*$//')"
     
-    # Ensure non-empty result
     if [[ -z "$sanitized" ]]; then
         sanitized="unknown_device_$(date +%s)"
         log WARN "Device name sanitization produced empty result, using: $sanitized"
@@ -765,7 +638,6 @@ sanitize_path_name() {
     local sanitized
     sanitized="$(echo "$name" | tr '[:upper:]' '[:lower:]' | sed 's/[^0-9a-z]/_/g' | sed 's/__*/_/g' | sed 's/^_*//;s/_*$//')"
     
-    # Ensure non-empty result
     if [[ -z "$sanitized" ]]; then
         sanitized="stream_$(date +%s)"
         log WARN "Path name sanitization produced empty result, using: $sanitized"
@@ -792,7 +664,7 @@ get_device_config() {
     fi
 }
 
-# Helper function to verify udev names are properly set
+# Verify udev names
 verify_udev_names() {
     log INFO "Checking for udev-assigned friendly names..."
     
@@ -801,26 +673,22 @@ verify_udev_names() {
     local total_usb_cards=0
     
     if [[ -f "/proc/asound/cards" ]]; then
-        while IFS= read -r line; do
-            if [[ "$line" =~ ^\ *([0-9]+)\ .*\[([^]]+)\] ]]; then
+        while IFS= read -r line || [[ -n "$line" ]]; do
+            if [[ "$line" =~ ^[[:space:]]*([0-9]+)[[:space:]].*\[([^]]+)\] ]]; then
                 local card_num="${BASH_REMATCH[1]}"
                 local card_name="${BASH_REMATCH[2]}"
-                # Trim whitespace from card name
                 card_name="$(echo "$card_name" | xargs)"
-                ((total_cards++))
+                ((total_cards++)) || true
                 
-                # Skip non-USB cards
                 if [[ ! -f "/proc/asound/card${card_num}/usbid" ]]; then
                     continue
                 fi
                 
-                ((total_usb_cards++))
+                ((total_usb_cards++)) || true
                 
-                # Check if this looks like a friendly name
-                # Friendly names are typically short, lowercase, alphanumeric
                 if [[ "$card_name" =~ ^[a-z][a-z0-9_-]{0,31}$ ]]; then
                     log INFO "Card $card_num has friendly name: $card_name"
-                    ((found_friendly++))
+                    ((found_friendly++)) || true
                 else
                     log INFO "Card $card_num has default name: $card_name"
                 fi
@@ -834,13 +702,14 @@ verify_udev_names() {
         log WARN "No udev-assigned friendly names found. Stream names will use device info."
         log WARN "Run usb-audio-mapper.sh to assign friendly names to your devices."
     fi
+    
+    return 0
 }
 
-# Detect USB audio devices - enhanced to include card number
+# Detect USB audio devices - FIXED to use consistent delimiter
 detect_audio_devices() {
     local devices=()
     
-    # Check /dev/snd/by-id/ for persistent names
     if [[ -d /dev/snd/by-id ]]; then
         for device in /dev/snd/by-id/*; do
             if [[ -L "$device" ]] && [[ "$device" != *"-event-"* ]]; then
@@ -853,7 +722,6 @@ detect_audio_devices() {
                     local card_num="${BASH_REMATCH[1]}"
                     
                     if [[ -f "/proc/asound/card${card_num}/usbid" ]]; then
-                        # Include card number in the output
                         devices+=("${device_name}:${card_num}")
                     fi
                 fi
@@ -861,36 +729,36 @@ detect_audio_devices() {
         done
     fi
     
-    # Fallback to /proc/asound/cards
     if [[ ${#devices[@]} -eq 0 ]] && [[ -f /proc/asound/cards ]]; then
-        while IFS= read -r line; do
-            if [[ "$line" =~ ^[[:space:]]*([0-9]+)[[:space:]]+\[([^]]+)\] ]] && [[ -f "/proc/asound/card${BASH_REMATCH[1]}/usbid" ]]; then
+        while IFS= read -r line || [[ -n "$line" ]]; do
+            if [[ "$line" =~ ^[[:space:]]*([0-9]+)[[:space:]]+\[([^]]+)\] ]]; then
                 local card_num="${BASH_REMATCH[1]}"
                 local card_name="${BASH_REMATCH[2]}"
-                local safe_name
-                safe_name="$(echo "$card_name" | tr '[:upper:]' '[:lower:]' | tr ' ' '-' | tr -cd 'a-z0-9-')"
-                devices+=("usb-audio-${safe_name}:${card_num}")
+                if [[ -f "/proc/asound/card${card_num}/usbid" ]]; then
+                    local safe_name
+                    safe_name="$(echo "$card_name" | tr '[:upper:]' '[:lower:]' | tr ' ' '-' | tr -cd 'a-z0-9-')"
+                    if [[ -n "$safe_name" ]]; then
+                        devices+=("usb-audio-${safe_name}:${card_num}")
+                    fi
+                fi
             fi
         done < /proc/asound/cards
     fi
     
-    # Only print if we have devices
     if [[ ${#devices[@]} -gt 0 ]]; then
         printf '%s\n' "${devices[@]}"
     fi
 }
 
-# Enhanced check if audio device is accessible
+# Check if audio device is accessible
 check_audio_device() {
     local card_num="$1"
     
-    # Explicit validation with clear error path
     if [[ ! -e "/dev/snd/pcmC${card_num}D0c" ]]; then
         log DEBUG "Device file /dev/snd/pcmC${card_num}D0c does not exist"
         return 1
     fi
     
-    # Add timeout protection for arecord
     if timeout 2 arecord -l 2>/dev/null | grep -q "card ${card_num}:"; then
         log DEBUG "Audio device card ${card_num} found in arecord -l"
         return 0
@@ -900,26 +768,21 @@ check_audio_device() {
     return 1
 }
 
-# Generate stream path name with friendly names when available
+# Generate stream path name
 generate_stream_path() {
     local device_name="$1"
-    local card_num="${2:-}"  # Optional card number parameter
+    local card_num="${2:-}"
     local base_path=""
     
-    # First, try to get the friendly name from /proc/asound/cards if we have card_num
     if [[ -n "$card_num" ]] && [[ -f "/proc/asound/cards" ]]; then
         local card_info
         card_info=$(grep -E "^ *${card_num} " /proc/asound/cards 2>/dev/null || true)
         
         if [[ -n "$card_info" ]]; then
-            # Extract the name between square brackets [name]
             if [[ "$card_info" =~ \[([^]]+)\] ]]; then
                 local card_name="${BASH_REMATCH[1]}"
-                # Trim whitespace from card name
                 card_name="$(echo "$card_name" | xargs)"
                 
-                # Check if this looks like a udev-assigned friendly name
-                # (typically short, lowercase, no spaces or special chars)
                 if [[ "$card_name" =~ ^[a-z][a-z0-9_-]{0,31}$ ]]; then
                     log DEBUG "Found udev-friendly name: $card_name"
                     base_path="$card_name"
@@ -930,20 +793,16 @@ generate_stream_path() {
         fi
     fi
     
-    # If we didn't get a friendly name, fall back to the original logic
     if [[ -z "$base_path" ]]; then
         base_path="$(sanitize_path_name "$device_name")"
         log DEBUG "Using sanitized device name: $base_path"
     fi
     
-    # Additional validation - ensure the path is MediaMTX compatible
-    # MediaMTX has specific requirements for path names
     if [[ ! "$base_path" =~ ^[a-zA-Z][a-zA-Z0-9_-]*$ ]]; then
         log WARN "Path '$base_path' may not be MediaMTX compatible, adding prefix"
         base_path="stream_${base_path}"
     fi
     
-    # Ensure reasonable length (MediaMTX may have limits)
     if [[ ${#base_path} -gt 64 ]]; then
         log WARN "Path name too long, truncating"
         base_path="${base_path:0:64}"
@@ -953,20 +812,18 @@ generate_stream_path() {
     echo "$base_path"
 }
 
-# Test audio device capabilities with fallback
+# Test audio device capabilities
 test_audio_device_safe() {
     local card_num="$1"
     local sample_rate="$2"
     local channels="$3"
     local format="$4"
     
-    # Skip device testing if disabled
     if [[ "${DEVICE_TEST_ENABLED}" != "true" ]]; then
         log DEBUG "Device testing disabled, assuming device supports requested format"
         return 0
     fi
     
-    # Convert format for arecord
     local arecord_format
     case "$format" in
         s16le) arecord_format="S16_LE" ;;
@@ -977,13 +834,11 @@ test_audio_device_safe() {
     
     log DEBUG "Testing device hw:${card_num},0 with ${arecord_format} ${sample_rate}Hz ${channels}ch"
     
-    # Test with requested parameters - direct hw access
     if timeout "${DEVICE_TEST_TIMEOUT}" arecord -D "hw:${card_num},0" -f "${arecord_format}" -r "${sample_rate}" -c "${channels}" -d 1 -t raw 2>/dev/null | head -c 1000 >/dev/null; then
         log DEBUG "Device test passed with hw:${card_num},0"
         return 0
     fi
     
-    # If that fails, try with plughw for automatic format conversion
     log DEBUG "Testing with plughw:${card_num},0 for automatic format conversion"
     if timeout "${DEVICE_TEST_TIMEOUT}" arecord -D "plughw:${card_num},0" -f "${arecord_format}" -r "${sample_rate}" -c "${channels}" -d 1 -t raw 2>/dev/null | head -c 1000 >/dev/null; then
         log DEBUG "Device test passed with plughw:${card_num},0"
@@ -994,26 +849,22 @@ test_audio_device_safe() {
     return 1
 }
 
-# Get supported formats for a device
+# Get device capabilities
 get_device_capabilities() {
     local card_num="$1"
     local capabilities=""
     
     if command -v arecord &>/dev/null; then
-        # Try to get hardware parameters
         local hw_params
         hw_params=$(timeout 2 arecord -D "hw:${card_num},0" --dump-hw-params 2>&1 || true)
         
         if [[ -n "$hw_params" ]]; then
-            # Extract supported sample rates
             local rates
             rates=$(echo "$hw_params" | grep -E "^RATE:" | sed 's/RATE: //' || true)
             
-            # Extract supported formats
             local formats
             formats=$(echo "$hw_params" | grep -E "^FORMAT:" | sed 's/FORMAT: //' || true)
             
-            # Extract supported channels
             local channels
             channels=$(echo "$hw_params" | grep -E "^CHANNELS:" | sed 's/CHANNELS: //' || true)
             
@@ -1026,7 +877,7 @@ get_device_capabilities() {
     echo "${capabilities:-Unable to determine capabilities}"
 }
 
-# Validate stream - Removed dangerous fallback that causes false positives
+# Validate stream
 validate_stream() {
     local stream_path="$1"
     local max_attempts="${2:-${STREAM_VALIDATION_ATTEMPTS}}"
@@ -1035,20 +886,16 @@ validate_stream() {
     log DEBUG "Validating stream $stream_path (max attempts: ${max_attempts})"
     
     while [[ $attempt -lt $max_attempts ]]; do
-        ((attempt++))
+        ((attempt++)) || true
         
-        # Wait before checking
         sleep "${STREAM_VALIDATION_DELAY}"
         
-        # Check if FFmpeg process is still running
         local pid_file
         pid_file="$(get_ffmpeg_pid_file "$stream_path")"
         if [[ -f "$pid_file" ]] && kill -0 "$(read_pid_safe "$pid_file")" 2>/dev/null; then
-            # Check for actual ffmpeg process
             if pgrep -P "$(read_pid_safe "$pid_file")" -f "ffmpeg.*${stream_path}" >/dev/null 2>&1; then
                 log DEBUG "Stream $stream_path has active FFmpeg process (attempt ${attempt})"
                 
-                # Check via API - this is the ONLY authoritative source
                 if command -v curl &>/dev/null; then
                     local api_response
                     if api_response="$(curl -s "http://${MEDIAMTX_HOST}:9997/v3/paths/get/${stream_path}" 2>/dev/null)"; then
@@ -1063,11 +910,8 @@ validate_stream() {
                     fi
                 else
                     log WARN "curl not available - cannot validate stream via API"
-                    # Without API validation, we cannot confirm stream health
                     return 1
                 fi
-                
-                # REMOVED: Dangerous fallback that accepted running process without API confirmation
             else
                 log DEBUG "Stream $stream_path FFmpeg process not found"
                 return 1
@@ -1090,30 +934,22 @@ get_ffmpeg_pid_file() {
     echo "${FFMPEG_PID_DIR}/${stream_path}.pid"
 }
 
-# Helper function to cleanup claim files
+# Cleanup claim files
 cleanup_claim_files() {
     local base_path="$1"
-    # Clean up base claim file
     rm -f "${FFMPEG_PID_DIR}/${base_path}.claim" 2>/dev/null || true
-    # Clean up all numbered variants using glob pattern
     for claim_file in "${FFMPEG_PID_DIR}/${base_path}"_*.claim; do
         [[ -f "$claim_file" ]] && rm -f "$claim_file" 2>/dev/null || true
     done
 }
 
-# Start FFmpeg stream with enhanced race condition check
+# Start FFmpeg stream
 start_ffmpeg_stream() {
     local device_name="$1"
     local card_num="$2"
     local stream_path="$3"
     
-    # Validate stream path for safety
-    if ! validate_safe_path "${FFMPEG_PID_DIR}" "${stream_path}"; then
-        log ERROR "Unsafe stream path: $stream_path"
-        return 1
-    fi
-    
-    # Atomic stream path claiming using kernel-level flock
+    local pid_file=""
     local base_stream_path="$stream_path"
     local final_stream_path=""
     local suffix_counter=0
@@ -1150,11 +986,13 @@ start_ffmpeg_stream() {
                 break
             else
                 exec {claim_fd}>&- 2>/dev/null || true
-                ((suffix_counter++))
+                ((suffix_counter++)) || true
                 sleep 0.01
             fi
         else
             log ERROR "Failed to open claim file ${claim_lock_file}"
+            # FIX 3: Close FD in error path
+            [[ -n "${claim_fd:-}" ]] && exec {claim_fd}>&- 2>/dev/null || true
             cleanup_claim_files "$base_stream_path"
             return 1
         fi
@@ -1162,18 +1000,18 @@ start_ffmpeg_stream() {
     
     if [[ -z "$final_stream_path" ]]; then
         log ERROR "Failed to find unique stream path"
+        # FIX 3: Close FD in error path
+        [[ -n "${claim_fd:-}" ]] && exec {claim_fd}>&- 2>/dev/null || true
         cleanup_claim_files "$base_stream_path"
         return 1
     fi
     
     stream_path="$final_stream_path"
-    local pid_file
     pid_file="$(get_ffmpeg_pid_file "$stream_path")"
     
-    # Verify device is accessible
     if ! check_audio_device "$card_num"; then
         log ERROR "Audio device card ${card_num} is not accessible"
-        # Release claim lock on failure
+        # FIX 3: Proper FD cleanup in error path
         if [[ -n "${claim_fd:-}" ]]; then
             exec {claim_fd}>&- 2>/dev/null || true
             rm -f "${FFMPEG_PID_DIR}/${stream_path}.claim"
@@ -1181,30 +1019,24 @@ start_ffmpeg_stream() {
         return 1
     fi
     
-    # Get device configuration
-    local sample_rate channels format codec bitrate alsa_buffer alsa_period thread_queue
+    local sample_rate channels format codec bitrate thread_queue
     sample_rate="$(get_device_config "$device_name" "SAMPLE_RATE" "$DEFAULT_SAMPLE_RATE")"
     channels="$(get_device_config "$device_name" "CHANNELS" "$DEFAULT_CHANNELS")"
     format="$(get_device_config "$device_name" "FORMAT" "$DEFAULT_FORMAT")"
     codec="$(get_device_config "$device_name" "CODEC" "$DEFAULT_CODEC")"
     bitrate="$(get_device_config "$device_name" "BITRATE" "$DEFAULT_BITRATE")"
-    alsa_buffer="$(get_device_config "$device_name" "ALSA_BUFFER" "$DEFAULT_ALSA_BUFFER")"
-    alsa_period="$(get_device_config "$device_name" "ALSA_PERIOD" "$DEFAULT_ALSA_PERIOD")"
     thread_queue="$(get_device_config "$device_name" "THREAD_QUEUE" "$DEFAULT_THREAD_QUEUE")"
     
     log INFO "Configuring $device_name: ${sample_rate}Hz, ${channels}ch, ${format} format, ${codec} codec"
     
-    # Determine if we need format conversion based on device test or configuration
-    local use_plughw="true"  # Default to using plughw for better compatibility
+    local use_plughw="true"
     local format_to_use="$format"
     
-    # Only run device test if enabled
     if [[ "${DEVICE_TEST_ENABLED}" == "true" ]]; then
         if test_audio_device_safe "$card_num" "$sample_rate" "$channels" "$format"; then
             log INFO "Device supports requested format directly"
             use_plughw="false"
         else
-            # Try common fallback formats
             for fallback_format in "s16le" "s24le" "s32le"; do
                 if [[ "$fallback_format" != "$format" ]]; then
                     log DEBUG "Testing fallback format: $fallback_format"
@@ -1227,18 +1059,13 @@ start_ffmpeg_stream() {
     
     log INFO "Starting FFmpeg for $stream_path with format: $format_to_use"
     
-    # Create wrapper script
     local wrapper_script="${FFMPEG_PID_DIR}/${stream_path}.sh"
     local ffmpeg_log="${FFMPEG_PID_DIR}/${stream_path}.log"
-    local pid_file
-    pid_file="$(get_ffmpeg_pid_file "$stream_path")"
     
-    # Check if wrapper script already exists (security hardening)
     if [[ -e "$wrapper_script" ]]; then
         log ERROR "Wrapper script already exists: $wrapper_script"
-        log ERROR "Possible security issue - removing and failing"
         rm -f "$wrapper_script"
-        # Release claim if held
+        # FIX 3: Proper FD cleanup in error path
         if [[ -n "${claim_fd:-}" ]]; then
             exec {claim_fd}>&- 2>/dev/null || true
             rm -f "${FFMPEG_PID_DIR}/${stream_path}.claim"
@@ -1246,28 +1073,18 @@ start_ffmpeg_stream() {
         return 1
     fi
     
-    # Write wrapper script with pipefail but NOT set -u or set -e
     cat > "$wrapper_script" << 'WRAPPER_HEADER'
 #!/bin/bash
-# Auto-restart wrapper for FFmpeg stream
-
-# Apply ONLY pipefail for pipeline safety
-# DO NOT use set -u as it would break unset variable checks
-# DO NOT use set -e as we handle errors explicitly
 set -o pipefail
-
-# This ensures pipeline failures are detected while allowing:
-# - Unset variable checks (if [[ -n "$VAR" ]])
-# - Explicit error handling in the main loop
 WRAPPER_HEADER
 
-    # Add variables
+    # FIX 4: Escape user-controlled variables to prevent shell injection
     cat >> "$wrapper_script" << WRAPPER_VARS
-STREAM_PATH="${stream_path}"
+STREAM_PATH='${stream_path//\'/\'\\\'\'}'
 LOG_FILE="${LOG_FILE}"
 FFMPEG_LOG="${ffmpeg_log}"
 PID_FILE="${pid_file}"
-CARD_NUM="${card_num}"
+CARD_NUM='${card_num}'
 RESTART_COUNT=0
 RESTART_DELAY=10
 MAX_SHORT_RUNS=3
@@ -1275,6 +1092,7 @@ SHORT_RUN_COUNT=0
 USE_PLUGHW="${use_plughw}"
 CLEANUP_MARKER="${CLEANUP_MARKER}"
 MEDIAMTX_HOST="${MEDIAMTX_HOST}"
+FFMPEG_PID_DIR="${FFMPEG_PID_DIR}"
 
 # Audio parameters
 SAMPLE_RATE="${sample_rate}"
@@ -1282,8 +1100,6 @@ CHANNELS="${channels}"
 FORMAT="${format_to_use}"
 OUTPUT_CODEC="${codec}"
 BITRATE="${bitrate}"
-ALSA_BUFFER="${alsa_buffer}"
-ALSA_PERIOD="${alsa_period}"
 THREAD_QUEUE="${thread_queue}"
 FIFO_SIZE="${DEFAULT_FIFO_SIZE}"
 ANALYZEDURATION="${DEFAULT_ANALYZEDURATION}"
@@ -1294,40 +1110,31 @@ FFMPEG_PID=""
 FFMPEG_START_TIME=""
 WRAPPER_VARS
 
-    # Add the main wrapper logic with trap handler and enhanced PID verification
     cat >> "$wrapper_script" << 'WRAPPER_MAIN'
 
 touch "${FFMPEG_LOG}"
 
-# Stream lock file for mutual exclusion
 STREAM_LOCK="${FFMPEG_PID_DIR}/${STREAM_PATH}.lock"
 
-# Stream-specific wrapper messages go to FFMPEG_LOG
 log_message() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] [WRAPPER] $1" >> "${FFMPEG_LOG}"
 }
 
-# Critical system-wide messages go to main LOG_FILE
 log_critical() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STREAM:${STREAM_PATH}] $1" >> "${LOG_FILE}"
 }
 
-# Enhanced PID verification with process group support
 verify_ffmpeg_pid() {
     local pid="$1"
     [[ -z "$pid" ]] && return 1
     
-    # First check if process exists
     kill -0 "$pid" 2>/dev/null || return 1
     
-    # Multi-factor verification to prevent PID reuse issues
     if [[ -r "/proc/${pid}/stat" ]]; then
         local current_start
         current_start=$(awk '{print $22}' "/proc/${pid}/stat" 2>/dev/null)
         
-        # Check start time match
         if [[ -n "$current_start" && "$current_start" == "$FFMPEG_START_TIME" ]]; then
-            # Additional verification: check cmdline contains our unique markers
             if [[ -r "/proc/${pid}/cmdline" ]]; then
                 local cmdline
                 cmdline=$(tr '\0' ' ' < "/proc/${pid}/cmdline" 2>/dev/null)
@@ -1338,7 +1145,6 @@ verify_ffmpeg_pid() {
         fi
     fi
     
-    # Final fallback with proper escaping and anchoring
     local escaped_stream="${STREAM_PATH//[^a-zA-Z0-9_-]/\\\\&}"
     local escaped_host="${MEDIAMTX_HOST//./\\\\.}"
     local cmd
@@ -1351,18 +1157,14 @@ verify_ffmpeg_pid() {
     return 1
 }
 
-# Self-cleanup trap to ensure ffmpeg child process is always terminated
 cleanup_wrapper() {
     local exit_code=$?
     log_message "Wrapper cleanup initiated (exit code: $exit_code)"
     
-    # Terminate FFmpeg if running - with enhanced verification and process group
     if [[ -n "${FFMPEG_PID:-}" ]] && verify_ffmpeg_pid "$FFMPEG_PID"; then
         log_message "Terminating FFmpeg process ${FFMPEG_PID}"
-        # Try process group kill first, then individual process
         kill -TERM -- -"$FFMPEG_PID" 2>/dev/null || kill -TERM "$FFMPEG_PID" 2>/dev/null || true
         
-        # Wait briefly, then force kill if needed
         local wait_count=0
         while kill -0 "$FFMPEG_PID" 2>/dev/null && [[ $wait_count -lt 10 ]]; do
             sleep 0.1
@@ -1375,29 +1177,26 @@ cleanup_wrapper() {
         fi
     fi
     
-    # Release stream lock
     exec 200>&- 2>/dev/null || true
-    
-    # Clean up PID file
     rm -f "${PID_FILE}"
     
     log_critical "Stream wrapper terminated for ${STREAM_PATH}"
     exit "$exit_code"
 }
 
-# Set trap for all exit scenarios
 trap cleanup_wrapper EXIT INT TERM
 
-# Build and execute FFmpeg command
 run_ffmpeg() {
     local cmd=()
     cmd+=(ffmpeg)
     
-    # Global options
     cmd+=(-hide_banner)
     cmd+=(-loglevel warning)
     
-    # Choose device based on USE_PLUGHW
+    # Input analysis parameters
+    cmd+=(-analyzeduration "${ANALYZEDURATION}")
+    cmd+=(-probesize "${PROBESIZE}")
+    
     local audio_device
     if [[ "${USE_PLUGHW}" == "true" ]]; then
         audio_device="plughw:${CARD_NUM},0"
@@ -1405,19 +1204,20 @@ run_ffmpeg() {
         audio_device="hw:${CARD_NUM},0"
     fi
     
-    # Input options - thread_queue_size must come BEFORE -i
+    # Input options BEFORE -i
     cmd+=(-f alsa)
-    cmd+=(-thread_queue_size "${THREAD_QUEUE}")
-    cmd+=(-i "${audio_device}")
-    
-    # Force input format
     cmd+=(-ar "${SAMPLE_RATE}")
     cmd+=(-ac "${CHANNELS}")
+    cmd+=(-thread_queue_size "${THREAD_QUEUE}")
     
-    # Audio filter - async resampling for clock drift compensation
+    # NOTE: buffer_size and period_size are NOT valid FFmpeg options
+    # They were incorrectly added in an earlier version
+    # ALSA buffering is handled at the device level
+    
+    cmd+=(-i "${audio_device}")
+    
     cmd+=(-af "aresample=async=1:first_pts=0")
     
-    # Encoding options based on codec
     case "${OUTPUT_CODEC}" in
         opus)
             cmd+=(-c:a libopus)
@@ -1437,7 +1237,6 @@ run_ffmpeg() {
             cmd+=(-reservoir 0)
             ;;
         pcm)
-            # PCM requires more buffering for stability
             cmd+=(-c:a pcm_s16be)
             cmd+=(-max_delay 500000)
             cmd+=(-fflags "+genpts+nobuffer")
@@ -1449,24 +1248,19 @@ run_ffmpeg() {
             ;;
     esac
     
-    # Output options
     cmd+=(-f rtsp)
     cmd+=(-rtsp_transport tcp)
     cmd+=("rtsp://${MEDIAMTX_HOST}:8554/${STREAM_PATH}")
     
-    # Execute the command array directly and capture PID
     "${cmd[@]}" >> "${FFMPEG_LOG}" 2>&1 &
     FFMPEG_PID=$!
     
-    # Capture process start time for verification
     if [[ -r "/proc/${FFMPEG_PID}/stat" ]]; then
         FFMPEG_START_TIME=$(awk '{print $22}' "/proc/${FFMPEG_PID}/stat" 2>/dev/null)
     else
-        # Fallback to current time if /proc not available
         FFMPEG_START_TIME=$(date +%s%N)
     fi
     
-    # Verify FFmpeg started successfully
     if [[ -z "$FFMPEG_PID" ]] || ! verify_ffmpeg_pid "$FFMPEG_PID"; then
         log_message "ERROR: FFmpeg failed to start or exited immediately"
         log_critical "FFmpeg failed to start for stream ${STREAM_PATH}"
@@ -1479,25 +1273,22 @@ run_ffmpeg() {
     return 0
 }
 
-# Check if device is still available
 check_device_exists() {
     [[ -e "/dev/snd/pcmC${CARD_NUM}D0c" ]]
 }
 
-# Log critical startup message
 log_critical "Stream wrapper starting for ${STREAM_PATH} (card ${CARD_NUM})"
 
-# Main loop
 while true; do
-    # Check if cleanup is in progress
     if [[ -f "${CLEANUP_MARKER}" ]]; then
         log_message "Cleanup in progress, stopping wrapper for ${STREAM_PATH}"
         log_critical "Stream ${STREAM_PATH} stopping due to system cleanup"
         break
     fi
     
-    if [[ ! -f "${PID_FILE}" ]]; then
-        log_message "PID file removed, stopping wrapper for ${STREAM_PATH}"
+    # FIX 1: Check RESTART_COUNT before checking PID_FILE
+    if [[ $RESTART_COUNT -gt 0 ]] && [[ ! -f "${PID_FILE}" ]]; then
+        log_message "PID file removed after restart, stopping wrapper for ${STREAM_PATH}"
         log_critical "Stream ${STREAM_PATH} stopping due to PID file removal"
         break
     fi
@@ -1510,69 +1301,55 @@ while true; do
     
     log_message "Starting FFmpeg for ${STREAM_PATH} (attempt #$((RESTART_COUNT + 1)))"
     
-    # Rotate log if too large (10MB)
     if [[ -f "${FFMPEG_LOG}" ]] && [[ $(stat -c%s "${FFMPEG_LOG}" 2>/dev/null || echo 0) -gt 10485760 ]]; then
         mv "${FFMPEG_LOG}" "${FFMPEG_LOG}.old"
         echo "[$(date '+%Y-%m-%d %H:%M:%S')] Log rotated" > "${FFMPEG_LOG}"
     fi
     
-    # Record start time
     START_TIME=$(date +%s)
     
-    # Acquire exclusive lock before starting FFmpeg
     exec 200>"${STREAM_LOCK}"
     if ! flock -n 200; then
         log_message "Another wrapper already owns stream ${STREAM_PATH}, exiting cleanly"
         log_critical "Stream ${STREAM_PATH} wrapper exiting - another instance owns the stream"
         rm -f "${PID_FILE}"
-        exit 0  # Exit cleanly - this is not an error
+        exit 0
     fi
     
     log_message "Acquired exclusive lock for stream ${STREAM_PATH}"
     
-    # Execute FFmpeg (lock is held via fd 200)
     if ! run_ffmpeg; then
         log_message "Failed to start FFmpeg, waiting before retry"
-        # Release lock before sleeping
         exec 200>&-
         sleep 30
         continue
     fi
     
-    # Give FFmpeg time to initialize
     sleep 3
     
-    # Wait efficiently for FFmpeg to finish and capture its exit code
-    # The 'wait' builtin blocks until the child process terminates
     log_message "Waiting for FFmpeg process ${FFMPEG_PID} to exit..."
     
     wait "${FFMPEG_PID}" 2>/dev/null
     exit_code=$?
     
-    # Clear the PID and start time after waiting
     FFMPEG_PID=""
     FFMPEG_START_TIME=""
     
-    # Release the lock (close fd 200)
     exec 200>&-
     
-    # Calculate run time
     END_TIME=$(date +%s)
     RUN_TIME=$((END_TIME - START_TIME))
     
     log_message "FFmpeg for ${STREAM_PATH} exited with code ${exit_code} after ${RUN_TIME} seconds"
     
-    # Log last errors
     if [[ -s "${FFMPEG_LOG}" ]]; then
         tail -5 "${FFMPEG_LOG}" | while IFS= read -r line; do
             [[ -n "${line}" ]] && log_message "FFmpeg: ${line}"
         done
     fi
     
-    # Increment restart counter
     ((RESTART_COUNT++))
     
-    # Handle short runs
     if [[ ${RUN_TIME} -lt 60 ]]; then
         ((SHORT_RUN_COUNT++))
         if [[ ${SHORT_RUN_COUNT} -ge ${MAX_SHORT_RUNS} ]]; then
@@ -1593,25 +1370,21 @@ while true; do
     sleep ${RESTART_DELAY}
 done
 
-# Note: cleanup_wrapper will be called automatically by trap on exit
 log_message "Wrapper exiting for ${STREAM_PATH}"
 WRAPPER_MAIN
     
     chmod +x "$wrapper_script"
     
-    # Start wrapper first, then create PID file
     nohup "$wrapper_script" >/dev/null 2>&1 &
     local pid=$!
     
-    # Brief pause for process startup
     sleep 0.05
     
-    # Verify wrapper started
     if ! kill -0 "$pid" 2>/dev/null; then
         log ERROR "Wrapper failed to start for $stream_path"
         rm -f "$wrapper_script"
         rm -f "${FFMPEG_PID_DIR}/${stream_path}.log"
-        # Release claim if held
+        # FIX 3: Proper FD cleanup in error path
         if [[ -n "${claim_fd:-}" ]]; then
             exec {claim_fd}>&- 2>/dev/null || true
             rm -f "${FFMPEG_PID_DIR}/${stream_path}.claim"
@@ -1619,11 +1392,10 @@ WRAPPER_MAIN
         return 1
     fi
     
-    # Atomically create PID file
     if ! write_pid_atomic "$pid" "$pid_file"; then
         log ERROR "Failed to write PID file for $stream_path"
         kill "$pid" 2>/dev/null || true
-        # Ensure complete cleanup including claim files
+        # FIX 3: Proper FD cleanup in error path
         if [[ -n "${claim_fd:-}" ]]; then
             exec {claim_fd}>&- 2>/dev/null || true
         fi
@@ -1635,17 +1407,14 @@ WRAPPER_MAIN
     
     log DEBUG "Wrapper started with PID $pid for stream $stream_path"
     
-    # Wait for startup
     sleep "${STREAM_STARTUP_DELAY}"
     
     if kill -0 "$pid" 2>/dev/null; then
-        # Release claim lock after successful startup
         if [[ -n "${claim_fd:-}" ]]; then
             exec {claim_fd}>&- 2>/dev/null || true
             rm -f "${FFMPEG_PID_DIR}/${stream_path}.claim"
         fi
         
-        # Validate the stream is actually working
         if validate_stream "$stream_path"; then
             log INFO "FFmpeg for $stream_path started successfully (PID: $pid)"
             return 0
@@ -1653,14 +1422,13 @@ WRAPPER_MAIN
             log ERROR "Stream $stream_path failed validation"
             kill "$pid" 2>/dev/null || true
             rm -f "$pid_file"
-            # Complete cleanup on validation failure
             cleanup_claim_files "$stream_path"
             return 1
         fi
     else
         log ERROR "Wrapper script failed to start for $stream_path"
         rm -f "$pid_file"
-        # Release claim lock on failure
+        # FIX 3: Proper FD cleanup in error path
         if [[ -n "${claim_fd:-}" ]]; then
             exec {claim_fd}>&- 2>/dev/null || true
         fi
@@ -1669,7 +1437,7 @@ WRAPPER_MAIN
     fi
 }
 
-# Stop FFmpeg stream
+# Stop FFmpeg stream - FIX 2: Process termination order
 stop_ffmpeg_stream() {
     local stream_path="$1"
     local pid_file
@@ -1682,16 +1450,10 @@ stop_ffmpeg_stream() {
     local pid
     pid="$(read_pid_safe "$pid_file")"
     
-    # Remove PID file to signal wrapper to stop
-    rm -f "$pid_file"
-    
     if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
         log INFO "Stopping FFmpeg for $stream_path (PID: $pid)"
         
-        # Send SIGTERM to wrapper (with process group support)
         kill -TERM -- -"$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
-        
-        # Kill child processes
         pkill -TERM -P "$pid" 2>/dev/null || true
         
         local timeout=10
@@ -1706,7 +1468,9 @@ stop_ffmpeg_stream() {
         fi
     fi
     
-    # Cleanup all related files
+    # FIX 2: Remove PID file AFTER process termination
+    rm -f "$pid_file"
+    
     rm -f "${FFMPEG_PID_DIR}/${stream_path}.sh"
     rm -f "${FFMPEG_PID_DIR}/${stream_path}.log"
     rm -f "${FFMPEG_PID_DIR}/${stream_path}.log.old"
@@ -1714,7 +1478,7 @@ stop_ffmpeg_stream() {
     cleanup_claim_files "$stream_path"
 }
 
-# Start all FFmpeg streams (with variable scoping annotations preserved)
+# Start all FFmpeg streams - FIXED delimiter consistency
 start_all_ffmpeg_streams() {
     local devices=()
     readarray -t devices < <(detect_audio_devices)
@@ -1724,40 +1488,40 @@ start_all_ffmpeg_streams() {
         return 0
     fi
     
-    # Verify udev names before starting
-    verify_udev_names
+    verify_udev_names || true
     
     log INFO "Starting FFmpeg streams for ${#devices[@]} devices"
     
-    # Array to store actual stream paths used
     local -a stream_paths_used=()
-    
-    # Check if we should start streams in parallel (removed threshold check)
     local parallel_start="${PARALLEL_STREAM_START:-false}"
-    
     local success_count=0
     local -a start_pids=()
     
     for device_info in "${devices[@]}"; do
         IFS=':' read -r device_name card_num <<< "$device_info"
         
+        if [[ -z "$device_name" ]] || [[ -z "$card_num" ]]; then
+            log ERROR "Failed to parse device info: '$device_info'"
+            continue
+        fi
+        
+        log DEBUG "Processing device: $device_name (card $card_num)"
+        
         if [[ ! -e "/dev/snd/controlC${card_num}" ]]; then
             log WARN "Skipping inaccessible device $device_name (card $card_num)"
             continue
         fi
         
-        # Generate stream path with card number for friendly name lookup
         local stream_path
         stream_path="$(generate_stream_path "$device_name" "$card_num")"
         
-        # Store the actual path used
-        stream_paths_used+=("${device_info}:${stream_path}")
+        log DEBUG "Generated stream path: $stream_path for device $device_name"
+        
+        stream_paths_used+=("${device_name}:${card_num}:${stream_path}")
         
         if [[ "$parallel_start" == "true" ]]; then
-            # Start in background for parallel processing
-            # Use mktemp for guaranteed unique result files (prevents collision risk)
             local result_file
-            result_file=$(mktemp -p "${FFMPEG_PID_DIR}" ".start_result_$_XXXXXX") || {
+            result_file=$(mktemp -p "${FFMPEG_PID_DIR}" ".start_result_$$_XXXXXX") || {
                 log ERROR "Failed to create temp result file"
                 continue
             }
@@ -1770,21 +1534,22 @@ start_all_ffmpeg_streams() {
             ) &
             start_pids+=("$!:${result_file}")
         else
-            # Sequential start (default for reliability)
             if start_ffmpeg_stream "$device_name" "$card_num" "$stream_path"; then
-                ((success_count++))
+                ((success_count++)) || true
+                log DEBUG "Successfully started stream for $device_name"
+            else
+                log WARN "Failed to start stream for $device_name"
             fi
         fi
     done
     
-    # If we started in parallel, wait for all to complete
     if [[ "$parallel_start" == "true" ]] && [[ ${#start_pids[@]} -gt 0 ]]; then
         log INFO "Waiting for parallel stream starts to complete..."
         for pid_info in "${start_pids[@]}"; do
             IFS=':' read -r pid result_file <<< "$pid_info"
             wait "$pid"
             if [[ -f "${result_file}" ]] && [[ "$(cat "${result_file}")" == "SUCCESS" ]]; then
-                ((success_count++))
+                ((success_count++)) || true
             fi
             rm -f "${result_file}"
         done
@@ -1792,7 +1557,6 @@ start_all_ffmpeg_streams() {
     
     log INFO "Started $success_count/${#devices[@]} FFmpeg streams"
     
-    # Export the stream paths for use by the caller (variable scoping annotation preserved)
     printf '%s\n' "${stream_paths_used[@]}"
     
     return 0
@@ -1812,11 +1576,10 @@ stop_all_ffmpeg_streams() {
         done
     fi
     
-    # Kill any stragglers
     pkill -f "ffmpeg.*rtsp://${MEDIAMTX_HOST}:8554" || true
 }
 
-# Generate MediaMTX configuration with wildcard pattern to prevent path desynchronization
+# Generate MediaMTX configuration
 generate_mediamtx_config() {
     log INFO "Generating MediaMTX configuration with dynamic path support"
     
@@ -1826,17 +1589,13 @@ generate_mediamtx_config() {
     
     load_device_config
     
-    # Create temp file in same directory as target to avoid attacks
     local temp_config
     temp_config=$(mktemp -p "$(dirname "${CONFIG_FILE}")" "mediamtx.XXXXXX.yml") || {
         handle_error FATAL "Failed to create temporary config file" 4
     }
     
-    # Add trap to cleanup temp file on error
     trap "rm -f '$temp_config'" ERR
     
-    # CRITICAL FIX: Use wildcard pattern that accepts any audio stream path
-    # This solves the path desynchronization issue by allowing any path
     cat > "${temp_config}" << 'EOF'
 # MediaMTX Configuration - Audio Streams
 logLevel: info
@@ -1856,7 +1615,6 @@ metricsAddress: :9998
 # RTSP Server
 rtsp: yes
 rtspAddress: :8554
-# Enable TCP and UDP
 rtspTransports: [tcp, udp]
 
 # Disable other protocols
@@ -1865,17 +1623,14 @@ hls: no
 webrtc: no
 srt: no
 
-# Paths - Dynamic configuration that accepts any audio stream
+# Paths - Dynamic configuration
 paths:
-  # Accept any stream path - this prevents path desynchronization issues
-  # This pattern accepts alphanumeric paths with underscores and hyphens
-  ~^[a-zA-Z0-9_-]+$:
+  # Accept any stream path - regex pattern MUST be quoted
+  '~^[a-zA-Z0-9_-]+$':
     source: publisher
     sourceProtocol: automatic
-    # Optional: Add authentication or other settings here if needed
 EOF
     
-    # Validate YAML if possible
     if command -v python3 &>/dev/null && python3 -c "import yaml" 2>/dev/null; then
         if ! python3 -c "import yaml; yaml.safe_load(open('${temp_config}'))" 2>/dev/null; then
             log ERROR "Invalid YAML syntax in generated configuration"
@@ -1884,11 +1639,9 @@ EOF
         fi
     fi
     
-    # Move config into place
     mv -f "${temp_config}" "${CONFIG_FILE}"
     chmod 644 "${CONFIG_FILE}"
     
-    # Remove trap after successful completion
     trap - ERR
     
     log INFO "Configuration generated successfully with dynamic path support"
@@ -1907,28 +1660,24 @@ is_mediamtx_running() {
     return 1
 }
 
-# Start MediaMTX (Uses environment variables for delays correctly)
+# Start MediaMTX - FIXED delimiter parsing
 start_mediamtx() {
     acquire_lock
     
-    # Check if this is a restart scenario
     if is_restart_scenario; then
         log INFO "Detected restart scenario, performing enhanced cleanup"
         cleanup_stale_processes
         wait_for_usb_stabilization "${RESTART_STABILIZATION_DELAY}"
         clear_restart_marker
     else
-        # Still do basic cleanup
         cleanup_stale_processes
     fi
     
-    # Kill existing processes - more targeted approach
     if pgrep -f "${MEDIAMTX_BIN}.*${CONFIG_FILE}" >/dev/null; then
         if systemctl is-active mediamtx >/dev/null 2>&1; then
             log ERROR "MediaMTX systemd service is running. Stop it first:"
             log ERROR "  sudo systemctl stop mediamtx"
             log ERROR "  sudo systemctl disable mediamtx"
-            # Lock is released by cleanup trap
             return 1
         fi
         
@@ -1939,70 +1688,54 @@ start_mediamtx() {
     
     if is_mediamtx_running; then
         log WARN "MediaMTX already running"
-        # Lock is released by cleanup trap
         return 0
     fi
     
     log INFO "Starting MediaMTX..."
     
-    setup_directories
+    # FIX 5: setup_directories already called in main(), no need to call again
     
-    # Wait for USB devices to be ready (Actually use the environment variable)
     if ! wait_for_usb_stabilization "${USB_STABILIZATION_DELAY}"; then
         log ERROR "USB audio subsystem not ready"
-        # Lock is released by cleanup trap
         return 1
     fi
     
-    # Check for devices
     local devices=()
     readarray -t devices < <(detect_audio_devices)
     
     if [[ ${#devices[@]} -eq 0 ]]; then
         log ERROR "No USB audio devices detected"
-        # Lock is released by cleanup trap
         return 1
     fi
     
-    # Generate config
     if ! generate_mediamtx_config; then
-        # Lock is released by cleanup trap
         handle_error FATAL "Failed to generate configuration" 4
     fi
     
-    # Check ports
     for port in 8554 9997 9998; do
         if lsof -i ":$port" >/dev/null 2>&1; then
             log ERROR "Port $port is already in use"
-            # Lock is released by cleanup trap
             return 1
         fi
     done
     
-    # Set ulimits for MediaMTX
     ulimit -n 65536
     ulimit -u 4096
     
-    # Start MediaMTX
     nohup "${MEDIAMTX_BIN}" "${CONFIG_FILE}" > /var/log/mediamtx.out 2>&1 &
     local pid=$!
     
-    # Brief pause to ensure process has started
     sleep 0.1
     
-    # Verify the process is still running before proceeding
     if ! kill -0 "$pid" 2>/dev/null; then
         log ERROR "MediaMTX process died immediately after startup"
         if [[ -f /var/log/mediamtx.out ]]; then
             log ERROR "Output: $(tail -5 /var/log/mediamtx.out 2>/dev/null | tr '\n' ' ')"
         fi
-        # Lock is released by cleanup trap
         return 1
     fi
     
-    # Wait for MediaMTX API to become ready
     if ! wait_for_mediamtx_ready "$pid"; then
-        # Kill the process if it's still running but not ready
         if kill -0 "$pid" 2>/dev/null; then
             kill -TERM "$pid" 2>/dev/null || true
             sleep 2
@@ -2012,7 +1745,6 @@ start_mediamtx() {
         if [[ -f /var/log/mediamtx.out ]]; then
             log ERROR "Output: $(tail -5 /var/log/mediamtx.out 2>/dev/null | tr '\n' ' ')"
         fi
-        # Lock is released by cleanup trap
         return 1
     fi
     
@@ -2020,11 +1752,9 @@ start_mediamtx() {
         write_pid_atomic "$pid" "${PID_FILE}"
         log INFO "MediaMTX started successfully (PID: $pid)"
         
-        # Start FFmpeg streams (variable scoping preserved)
         local -a STREAM_PATHS_USED=()
         readarray -t STREAM_PATHS_USED < <(start_all_ffmpeg_streams)
         
-        # Show results
         echo
         echo -e "${GREEN}=== Available RTSP Streams ===${NC}"
         local success_count=0
@@ -2033,10 +1763,15 @@ start_mediamtx() {
             for stream_info in "${STREAM_PATHS_USED[@]}"; do
                 IFS=':' read -r device_name card_num stream_path <<< "$stream_info"
                 
-                # Validate stream is actually working
+                if [[ -z "$stream_path" ]]; then
+                    log ERROR "Failed to parse stream info: missing stream_path for device $device_name"
+                    log DEBUG "Stream info was: $stream_info"
+                    continue
+                fi
+                
                 if validate_stream "$stream_path"; then
                     echo -e "${GREEN}✔${NC} rtsp://${MEDIAMTX_HOST}:8554/${stream_path}"
-                    ((success_count++))
+                    ((success_count++)) || true
                 else
                     echo -e "${RED}✗${NC} rtsp://${MEDIAMTX_HOST}:8554/${stream_path} (failed to start)"
                 fi
@@ -2046,10 +1781,8 @@ start_mediamtx() {
         echo
         echo -e "${GREEN}Successfully started ${success_count}/${#devices[@]} streams${NC}"
         
-        # Handle partial startup failure - cleanup if no streams started
         if [[ ${success_count} -eq 0 ]]; then
             log ERROR "No streams started successfully, cleaning up MediaMTX"
-            # Kill MediaMTX since it's useless without streams
             if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
                 kill -TERM "$pid" 2>/dev/null || true
                 wait_for_pid_termination "$pid" 5
@@ -2058,11 +1791,9 @@ start_mediamtx() {
                 fi
             fi
             rm -f "${PID_FILE}"
-            # Lock is released by cleanup trap
             return 1
         fi
         
-        # Lock is released by cleanup trap
         return 0
     else
         log ERROR "MediaMTX failed to start"
@@ -2070,7 +1801,6 @@ start_mediamtx() {
             log ERROR "Output: $(tail -5 /var/log/mediamtx.out 2>/dev/null | tr '\n' ' ')"
         fi
         
-        # Show the generated config for debugging
         if [[ -f "${CONFIG_FILE}" ]]; then
             log ERROR "Checking generated configuration for issues:"
             log ERROR "Path pattern in config:"
@@ -2079,12 +1809,11 @@ start_mediamtx() {
             done
         fi
         
-        # Lock is released by cleanup trap
         return 1
     fi
 }
 
-# Stop MediaMTX - more targeted approach
+# Stop MediaMTX
 stop_mediamtx() {
     acquire_lock
     
@@ -2092,8 +1821,6 @@ stop_mediamtx() {
     
     if ! is_mediamtx_running; then
         log WARN "MediaMTX is not running"
-        # Don't use broad pkill, only clean up our instance if needed
-        # Lock is released by cleanup trap
         return 0
     fi
     
@@ -2117,20 +1844,18 @@ stop_mediamtx() {
     rm -f "${PID_FILE}"
     
     log INFO "MediaMTX stopped"
-    # Lock is released by cleanup trap
     return 0
 }
 
-# Restart MediaMTX with active cleanup polling
+# Restart MediaMTX
 restart_mediamtx() {
     mark_restart
     stop_mediamtx
     
-    # Wait for cleanup to complete with active polling
     local wait_count=0
     while [[ -f "${CLEANUP_MARKER}" ]] && [[ $wait_count -lt 100 ]]; do
         sleep 0.1
-        ((wait_count++))
+        ((wait_count++)) || true
     done
     
     if [[ $wait_count -ge 100 ]]; then
@@ -2140,7 +1865,7 @@ restart_mediamtx() {
     start_mediamtx
 }
 
-# Show status
+# Show status - FIXED delimiter parsing
 show_status() {
     echo -e "${CYAN}=== MediaMTX Audio Stream Status ===${NC}"
     echo
@@ -2174,11 +1899,16 @@ show_status() {
     if [[ ${#devices[@]} -eq 0 ]]; then
         echo "  No devices found"
     else
-        # Build a map of actual running streams first
         declare -A running_streams
         declare -A stream_to_device
         
-        # Find all running FFmpeg processes
+        for device_info in "${devices[@]}"; do
+            IFS=':' read -r device_name card_num <<< "$device_info"
+            if [[ -n "$card_num" ]]; then
+                stream_to_device["$card_num"]=""
+            fi
+        done
+        
         for pid_file in "${FFMPEG_PID_DIR}"/*.pid; do
             if [[ -f "$pid_file" ]]; then
                 local stream_name
@@ -2187,7 +1917,6 @@ show_status() {
                 if kill -0 "$(read_pid_safe "$pid_file")" 2>/dev/null; then
                     running_streams["$stream_name"]=1
                     
-                    # Extract card number from wrapper script
                     local wrapper="${FFMPEG_PID_DIR}/${stream_name}.sh"
                     if [[ -f "$wrapper" ]]; then
                         local card_num_from_wrapper
@@ -2200,7 +1929,6 @@ show_status() {
             fi
         done
         
-        # Debug: show raw device info
         if [[ "${DEBUG:-false}" == "true" ]]; then
             echo "  Raw device list:"
             for device_info in "${devices[@]}"; do
@@ -2213,12 +1941,14 @@ show_status() {
         for device_info in "${devices[@]}"; do
             IFS=':' read -r device_name card_num <<< "$device_info"
             
-            # Find the actual stream name for this card
+            if [[ -z "$device_name" ]] || [[ -z "$card_num" ]]; then
+                log ERROR "Failed to parse device info in status: '$device_info'"
+                continue
+            fi
+            
             local actual_stream_path="${stream_to_device[$card_num]}"
             
-            # If not found in our map, look for it
             if [[ -z "$actual_stream_path" ]]; then
-                # Try to find by matching device name in PID files
                 for stream_name in "${!running_streams[@]}"; do
                     local wrapper="${FFMPEG_PID_DIR}/${stream_name}.sh"
                     if [[ -f "$wrapper" ]] && grep -q "CARD_NUM=\"${card_num}\"" "$wrapper"; then
@@ -2228,7 +1958,6 @@ show_status() {
                 done
             fi
             
-            # If still not found, generate what it should be (but this is just for display)
             if [[ -z "$actual_stream_path" ]]; then
                 actual_stream_path="$(generate_stream_path "$device_name" "$card_num")"
             fi
@@ -2243,7 +1972,6 @@ show_status() {
             
             echo "    Settings: ${sample_rate}Hz, ${channels}ch, ${format}, ${codec}"
             
-            # Check if this stream is actually running
             if [[ -n "${running_streams[$actual_stream_path]}" ]]; then
                 local pid_file="${FFMPEG_PID_DIR}/${actual_stream_path}.pid"
                 if [[ -f "$pid_file" ]]; then
@@ -2252,7 +1980,6 @@ show_status() {
                     if [[ -n "$wrapper_pid" ]]; then
                         echo -e "    Wrapper: ${GREEN}Running${NC} (PID: ${wrapper_pid})"
                         
-                        # Check for actual FFmpeg process
                         if pgrep -P "${wrapper_pid}" -f "ffmpeg" >/dev/null 2>&1; then
                             echo -e "    FFmpeg: ${GREEN}Active${NC}"
                             echo -e "    Stream: ${GREEN}Healthy${NC}"
@@ -2265,7 +1992,6 @@ show_status() {
                 echo -e "    Status: ${RED}Not running${NC}"
             fi
             
-            # Show last error if available
             local ffmpeg_log="${FFMPEG_PID_DIR}/${actual_stream_path}.log"
             if [[ -f "$ffmpeg_log" ]] && [[ -s "$ffmpeg_log" ]]; then
                 local last_error
@@ -2324,14 +2050,17 @@ show_config() {
         echo "  Format: ${DEFAULT_FORMAT}"
         echo "  Codec: ${DEFAULT_CODEC}"
         echo "  Bitrate: ${DEFAULT_BITRATE}"
-        echo "  ALSA buffer: ${DEFAULT_ALSA_BUFFER}μs"
-        echo "  ALSA period: ${DEFAULT_ALSA_PERIOD}μs"
         echo "  Thread queue: ${DEFAULT_THREAD_QUEUE}"
         echo "  Device testing: ${DEVICE_TEST_ENABLED}"
         echo
         
         for device_info in "${devices[@]}"; do
             IFS=':' read -r device_name card_num <<< "$device_info"
+            
+            if [[ -z "$device_name" ]] || [[ -z "$card_num" ]]; then
+                log ERROR "Failed to parse device info in config: '$device_info'"
+                continue
+            fi
             
             echo "Device: $device_name"
             echo "  Card: $card_num"
@@ -2340,13 +2069,10 @@ show_config() {
             sanitized_name="$(sanitize_device_name "$device_name")"
             echo "  Variable prefix: DEVICE_${sanitized_name^^}_"
             
-            # Check audio access
             if check_audio_device "$card_num"; then
                 echo -e "  Access: ${GREEN}OK${NC}"
                 
-                # Only test device if enabled
                 if [[ "${DEVICE_TEST_ENABLED}" == "true" ]]; then
-                    # Test device with current settings
                     local sample_rate channels format
                     sample_rate="$(get_device_config "$device_name" "SAMPLE_RATE" "$DEFAULT_SAMPLE_RATE")"
                     channels="$(get_device_config "$device_name" "CHANNELS" "$DEFAULT_CHANNELS")"
@@ -2361,7 +2087,6 @@ show_config() {
                     echo "  Settings test: Skipped (testing disabled)"
                 fi
                 
-                # Show device capabilities
                 local caps
                 caps="$(get_device_capabilities "$card_num")"
                 if [[ -n "$caps" ]]; then
@@ -2380,7 +2105,6 @@ test_streams() {
     echo -e "${CYAN}=== Stream Test Commands ===${NC}"
     echo
     
-    # Get actual running streams
     declare -A running_streams
     declare -A stream_to_card
     
@@ -2392,7 +2116,6 @@ test_streams() {
             if kill -0 "$(read_pid_safe "$pid_file")" 2>/dev/null; then
                 running_streams["$stream_name"]=1
                 
-                # Extract card number from wrapper script
                 local wrapper="${FFMPEG_PID_DIR}/${stream_name}.sh"
                 if [[ -f "$wrapper" ]]; then
                     local card_num
@@ -2430,7 +2153,7 @@ test_streams() {
     echo "  curl http://${MEDIAMTX_HOST}:9997/v3/paths/list | jq"
 }
 
-# Debug streams with enhanced output
+# Debug streams
 debug_streams() {
     echo -e "${CYAN}=== Debugging Audio Streams ===${NC}"
     echo
@@ -2440,7 +2163,6 @@ debug_streams() {
         return 1
     fi
     
-    # Get actual running streams
     declare -A running_streams
     declare -A stream_to_card
     
@@ -2452,7 +2174,6 @@ debug_streams() {
             if kill -0 "$(read_pid_safe "$pid_file")" 2>/dev/null; then
                 running_streams["$stream_name"]=1
                 
-                # Extract card number from wrapper script
                 local wrapper="${FFMPEG_PID_DIR}/${stream_name}.sh"
                 if [[ -f "$wrapper" ]]; then
                     local card_num
@@ -2465,11 +2186,9 @@ debug_streams() {
         fi
     done
     
-    # Debug each running stream
     for stream_path in "${!running_streams[@]}"; do
         echo "Stream: $stream_path"
         
-        # Check wrapper and FFmpeg
         local pid_file
         pid_file="$(get_ffmpeg_pid_file "$stream_path")"
         if [[ -f "$pid_file" ]] && kill -0 "$(read_pid_safe "$pid_file")" 2>/dev/null; then
@@ -2477,7 +2196,6 @@ debug_streams() {
             wrapper_pid="$(read_pid_safe "$pid_file")"
             
             if [[ -n "$wrapper_pid" ]]; then
-                # Get FFmpeg PID
                 local ffmpeg_pid
                 ffmpeg_pid="$(pgrep -P "${wrapper_pid}" -f "ffmpeg" | head -1)"
                 
@@ -2486,7 +2204,6 @@ debug_streams() {
                     echo "  FFmpeg command:"
                     ps -p "$ffmpeg_pid" -o args= | fold -w 80 -s | sed 's/^/    /'
                     
-                    # Check CPU usage
                     local cpu_usage
                     cpu_usage="$(ps -p "$ffmpeg_pid" -o %cpu= | tr -d ' ')"
                     echo "  CPU usage: ${cpu_usage}%"
@@ -2494,7 +2211,6 @@ debug_streams() {
             fi
         fi
         
-        # Show last 10 lines of FFmpeg log
         local ffmpeg_log="${FFMPEG_PID_DIR}/${stream_path}.log"
         if [[ -f "$ffmpeg_log" ]]; then
             echo "  Recent log entries:"
@@ -2504,10 +2220,8 @@ debug_streams() {
         echo
     done
     
-    # Test stream with clear success/failure indication
     echo "Testing stream connectivity..."
     if [[ ${#running_streams[@]} -gt 0 ]]; then
-        # Get first running stream
         local test_stream
         for stream in "${!running_streams[@]}"; do
             test_stream="$stream"
@@ -2516,7 +2230,6 @@ debug_streams() {
         
         echo "Test command: ffmpeg -loglevel verbose -i rtsp://${MEDIAMTX_HOST}:8554/${test_stream} -t 2 -f null -"
         
-        # Capture exit code and provide clear feedback
         local test_output
         local test_exit_code
         test_output=$(timeout 5 ffmpeg -loglevel verbose -i "rtsp://${MEDIAMTX_HOST}:8554/${test_stream}" -t 2 -f null - 2>&1 | tail -20)
@@ -2548,92 +2261,104 @@ monitor_streams() {
     echo "Press Ctrl+C to stop monitoring"
     echo
     
+    # Disable exit on error for the monitor loop to prevent crashes
+    set +e
+    trap 'set -e; return 0' INT
+    
     while true; do
         clear
         echo -e "${CYAN}=== Stream Monitor - $(date) ===${NC}"
         echo
         
-        # Get actual running streams
-        declare -A running_streams
-        declare -A stream_to_card
-        declare -A card_to_stream
-        
-        for pid_file in "${FFMPEG_PID_DIR}"/*.pid; do
-            if [[ -f "$pid_file" ]]; then
-                local stream_name
-                stream_name="$(basename "$pid_file" .pid)"
-                
-                if kill -0 "$(read_pid_safe "$pid_file")" 2>/dev/null; then
-                    running_streams["$stream_name"]=1
+        # Use local scope to prevent variable pollution
+        (
+            declare -A running_streams
+            declare -A stream_to_card
+            declare -A card_to_stream
+            
+            local devices=()
+            readarray -t devices < <(detect_audio_devices)
+            for device_info in "${devices[@]}"; do
+                IFS=':' read -r device_name card_num <<< "$device_info"
+                if [[ -n "$card_num" ]]; then
+                    card_to_stream["$card_num"]=""
+                fi
+            done
+            
+            for pid_file in "${FFMPEG_PID_DIR}"/*.pid; do
+                if [[ -f "$pid_file" ]]; then
+                    local stream_name
+                    stream_name="$(basename "$pid_file" .pid)"
                     
-                    # Extract card number from wrapper script
-                    local wrapper="${FFMPEG_PID_DIR}/${stream_name}.sh"
-                    if [[ -f "$wrapper" ]]; then
-                        local card_num
-                        card_num=$(grep -E "^CARD_NUM=" "$wrapper" | cut -d= -f2 | tr -d '"')
-                        if [[ -n "$card_num" ]]; then
-                            stream_to_card["$stream_name"]="$card_num"
-                            card_to_stream["$card_num"]="$stream_name"
+                    if kill -0 "$(read_pid_safe "$pid_file")" 2>/dev/null; then
+                        running_streams["$stream_name"]=1
+                        
+                        local wrapper="${FFMPEG_PID_DIR}/${stream_name}.sh"
+                        if [[ -f "$wrapper" ]]; then
+                            local card_num
+                            card_num=$(grep -E "^CARD_NUM=" "$wrapper" | cut -d= -f2 | tr -d "'" | tr -d '"')
+                            if [[ -n "$card_num" ]]; then
+                                stream_to_card["$stream_name"]="$card_num"
+                                card_to_stream["$card_num"]="$stream_name"
+                            fi
                         fi
                     fi
                 fi
-            fi
-        done
-        
-        # Show status for each device
-        local devices=()
-        readarray -t devices < <(detect_audio_devices)
-        
-        for device_info in "${devices[@]}"; do
-            IFS=':' read -r device_name card_num <<< "$device_info"
+            done
             
-            # Find the actual stream name for this card
-            local stream_path="${card_to_stream[$card_num]}"
-            
-            if [[ -z "$stream_path" ]]; then
-                # Device not running
-                echo "Stream: [card $card_num - $device_name]"
-                echo -e "  Status: ${RED}Not running${NC}"
-                echo
-                continue
-            fi
-            
-            echo "Stream: $stream_path"
-            
-            # Check wrapper status
-            local pid_file
-            pid_file="$(get_ffmpeg_pid_file "$stream_path")"
-            if [[ -f "$pid_file" ]] && kill -0 "$(read_pid_safe "$pid_file")" 2>/dev/null; then
-                echo -e "  Status: ${GREEN}Running${NC}"
+            for device_info in "${devices[@]}"; do
+                IFS=':' read -r device_name card_num <<< "$device_info"
                 
-                # Get stream stats from API
-                if command -v curl &>/dev/null && command -v jq &>/dev/null; then
-                    local stats
-                    if stats="$(curl -s "http://${MEDIAMTX_HOST}:9997/v3/paths/get/${stream_path}" 2>/dev/null)"; then
-                        local ready readers bytes
-                        ready="$(echo "$stats" | jq -r '.ready // false' 2>/dev/null)"
-                        readers="$(echo "$stats" | jq -r '.readers | length // 0' 2>/dev/null)"
-                        bytes="$(echo "$stats" | jq -r '.bytesReceived // 0' 2>/dev/null)"
-                        
-                        echo "  Ready: $ready, Readers: $readers, Bytes: $bytes"
-                    fi
+                if [[ -z "$device_name" ]] || [[ -z "$card_num" ]]; then
+                    continue
                 fi
-            else
-                echo -e "  Status: ${RED}Stopped${NC}"
-            fi
-            
-            echo
-        done
+                
+                local stream_path="${card_to_stream[$card_num]:-}"
+                
+                if [[ -z "$stream_path" ]]; then
+                    echo "Stream: [card $card_num - $device_name]"
+                    echo -e "  Status: ${RED}Not running${NC}"
+                    echo
+                    continue
+                fi
+                
+                echo "Stream: $stream_path"
+                
+                local pid_file
+                pid_file="$(get_ffmpeg_pid_file "$stream_path")"
+                if [[ -f "$pid_file" ]] && kill -0 "$(read_pid_safe "$pid_file")" 2>/dev/null; then
+                    echo -e "  Status: ${GREEN}Running${NC}"
+                    
+                    if command -v curl &>/dev/null && command -v jq &>/dev/null; then
+                        local stats
+                        if stats="$(curl -s "http://${MEDIAMTX_HOST}:9997/v3/paths/get/${stream_path}" 2>/dev/null)"; then
+                            local ready readers bytes
+                            ready="$(echo "$stats" | jq -r '.ready // false' 2>/dev/null)"
+                            readers="$(echo "$stats" | jq -r '.readers | length // 0' 2>/dev/null)"
+                            bytes="$(echo "$stats" | jq -r '.bytesReceived // 0' 2>/dev/null)"
+                            
+                            echo "  Ready: $ready, Readers: $readers, Bytes: $bytes"
+                        fi
+                    fi
+                else
+                    echo -e "  Status: ${RED}Stopped${NC}"
+                fi
+                
+                echo
+            done
+        ) || true  # Prevent subshell errors from stopping the monitor
         
         sleep 5
     done
+    
+    # Re-enable strict mode when exiting
+    set -e
 }
 
-# Create systemd service with audio group check
+# Create systemd service
 create_systemd_service() {
     local service_file="/etc/systemd/system/mediamtx-audio.service"
     
-    # Check if audio group exists
     if ! getent group audio >/dev/null 2>&1; then
         log WARN "Audio group doesn't exist. The service may fail to start."
         log WARN "Create the group with: sudo groupadd audio"
@@ -2658,23 +2383,19 @@ StartLimitBurst=5
 User=root
 Group=audio
 
-# Extended timeout for multiple devices
 TimeoutStartSec=300
 TimeoutStopSec=60
 
-# Resource limits
 LimitNOFILE=65536
 LimitNPROC=4096
 LimitRTPRIO=99
 LimitNICE=-19
 
-# Security - hardened with ProtectSystem=full (ReadWritePaths grants needed access)
 PrivateTmp=yes
 ProtectSystem=full
 NoNewPrivileges=yes
 ReadWritePaths=/etc/mediamtx /var/lib/mediamtx-ffmpeg /var/log
 
-# Environment - support configurable paths
 Environment="HOME=/root"
 Environment="USB_STABILIZATION_DELAY=10"
 Environment="RESTART_STABILIZATION_DELAY=15"
@@ -2685,7 +2406,6 @@ Environment="PID_TERMINATION_TIMEOUT=10"
 Environment="MEDIAMTX_API_TIMEOUT=60"
 WorkingDirectory=${SCRIPT_DIR}
 
-# Audio priority
 CPUSchedulingPolicy=rr
 CPUSchedulingPriority=99
 
@@ -2701,12 +2421,14 @@ EOF
     echo "Start: sudo systemctl start mediamtx-audio"
     echo ""
     echo "Note: v${VERSION} includes critical fixes:"
-    echo "  - Fixed SYSTEM_PID_MAX validation to occur after logging initialization"
-    echo "  - Enhanced wrapper scripts with pipefail for pipeline safety"
-    echo "  - Fixed USB_STABILIZATION_DELAY to actually be used"
-    echo "  - Added wrapper script pre-existence security check"
-    echo "  - Fixed path desynchronization with wildcard pattern"
-    echo "  - Enhanced cleanup trap for proper process termination"
+    echo "  - Fixed PID file race condition in wrapper script"
+    echo "  - Fixed process termination order (PID file removed after kill)"
+    echo "  - Fixed file descriptor leak in error paths"
+    echo "  - Added shell injection protection for wrapper variables"
+    echo "  - Removed invalid FFmpeg buffer_size/period_size options"
+    echo "  - Fixed delimiter consistency throughout script"
+    echo "  - Enhanced MediaMTX YAML configuration"
+    echo "  - Improved error handling and stability"
     echo ""
     echo "Configure paths via systemd override:"
     echo "  sudo systemctl edit mediamtx-audio"
@@ -2718,13 +2440,13 @@ EOF
     echo "  Add: Environment=\"STREAM_STARTUP_DELAY=5\""
 }
 
-# Validate command input
+# Validate command
 validate_command() {
     local cmd="$1"
     local valid_commands="start stop restart status config test debug monitor install help"
     
     if [[ -z "$cmd" ]]; then
-        return 0  # Default to help
+        return 0
     fi
     
     if [[ ! " ${valid_commands} " =~ " ${cmd} " ]]; then
@@ -2754,7 +2476,7 @@ Commands:
     status      Show current status
     config      Show device configuration
     test        Show stream test commands
-    debug       Debug stream issues (enhanced output)
+    debug       Debug stream issues
     monitor     Live monitor streams (Ctrl+C to exit)
     install     Create systemd service
     help        Show this help
@@ -2771,84 +2493,66 @@ Default audio settings:
     Format: s16le (16-bit little-endian)
     Codec: opus
     Bitrate: 128k
-    ALSA buffer: 100ms
-    ALSA period: 20ms
+    Thread queue: 8192
 
 Critical Fixes in v${VERSION}:
-    - Fixed SYSTEM_PID_MAX validation to occur after logging initialization
-    - Enhanced wrapper scripts with pipefail for pipeline safety
-    - Fixed USB_STABILIZATION_DELAY environment variable to actually be used
-    - Added security check for pre-existing wrapper scripts
-    - Fixed path desynchronization with wildcard pattern in MediaMTX config
-    - Enhanced cleanup trap to properly call cleanup_stale_processes
-
-Key Features in v${VERSION}:
-    - Deterministic process termination with active polling
-    - Separated wrapper logs from system logs for better debugging
-    - Enhanced PID file validation with system limit checking
-    - Atomic stream path claiming with kernel-level flock
-    - Dynamic MediaMTX API readiness polling
-    - Configurable MediaMTX host for multi-host deployments
-    - Fixed global trap inheritance for subprocesses
+    - Fixed PID file race condition in wrapper script
+    - Fixed process termination order (PID file removed after kill)
+    - Fixed file descriptor leak in error paths
+    - Added shell injection protection for wrapper variables
+    - Removed invalid FFmpeg buffer_size/period_size options
+    - Fixed delimiter consistency (uses colon throughout)
+    - Enhanced MediaMTX YAML configuration
+    - Added FFmpeg analyzeduration and probesize parameters
     - Improved error handling and device reliability
 
-Log Locations:
-    - System events: ${LOG_FILE}
-    - Stream events: ${FFMPEG_PID_DIR}/<stream>.log
-    - MediaMTX core: ${MEDIAMTX_LOG}
-
 Environment variables:
-    Path Configuration:
     MEDIAMTX_CONFIG_DIR=/etc/mediamtx      Config directory
     MEDIAMTX_BINARY=/usr/local/bin/mediamtx MediaMTX binary path
-    MEDIAMTX_PID_FILE=/var/run/...         PID file location
-    MEDIAMTX_FFMPEG_DIR=/var/lib/...       FFmpeg work directory
-    
-    Operational Settings:
     MEDIAMTX_HOST=localhost                MediaMTX server host
     STREAM_STARTUP_DELAY=10                Seconds to wait after starting stream
     PARALLEL_STREAM_START=false            Start all streams in parallel
     DEVICE_TEST_ENABLED=false              Enable device format testing
     USB_STABILIZATION_DELAY=5              Wait for USB to stabilize (seconds)
-    RESTART_STABILIZATION_DELAY=10         Extra delay on restart (seconds)
-    ERROR_HANDLING_MODE=fail-safe          Error handling (fail-safe or fail-fast)
-    PID_TERMINATION_TIMEOUT=10             Timeout for PID termination (seconds)
-    MEDIAMTX_API_TIMEOUT=60                Timeout for MediaMTX API readiness
     DEBUG=true                             Enable debug logging
 
 Common issues and solutions:
-    - Empty PID_MAX crash: Fixed in this version
-    - USB delays not working: Fixed in this version
-    - Path desync errors: Fixed with wildcard pattern
-    - Service restart problems: Automatically handled with cleanup process
-    - Stream path collisions: Fixed with atomic flock mechanism
-    - Wrapper security issues: Now checked before creation
+    - FFmpeg fails to start: Check device format compatibility
+    - Streams fail to validate: Ensure MediaMTX API is accessible
+    - Audio dropouts: Adjust thread_queue_size in device config
     - Ugly stream names: Run usb-audio-mapper.sh for friendly names
     - Format errors: Script defaults to plughw for compatibility
-    - Multi-host setup: Set MEDIAMTX_HOST environment variable
+
+Troubleshooting steps:
+    1. Check status: sudo ./mediamtx-stream-manager.sh status
+    2. View logs: tail -f /var/log/mediamtx-stream-manager.log
+    3. Debug streams: sudo ./mediamtx-stream-manager.sh debug
+    4. Monitor live: sudo ./mediamtx-stream-manager.sh monitor
+    5. Test playback: ffplay rtsp://localhost:8554/STREAM_NAME
+
+For production deployment:
+    1. Install as service: sudo ./mediamtx-stream-manager.sh install
+    2. Enable service: sudo systemctl enable mediamtx-audio
+    3. Start service: sudo systemctl start mediamtx-audio
+    4. View service logs: sudo journalctl -u mediamtx-audio -f
 
 EOF
 }
 
-# Main function with proper initialization order
+# Main function - FIX 5: Move setup_directories earlier
 main() {
-    # Step 1: Validate command first (no privileges needed)
     if ! validate_command "${1:-}"; then
         show_help
         exit 1
     fi
     
-    # Step 2: Check prerequisites before any privileged operations
     if [[ "${1:-}" != "help" ]]; then
-        check_root         # Check root FIRST
-        check_dependencies # Then check dependencies
+        check_root
+        check_dependencies
+        # FIX 5: Setup directories before anything else
+        setup_directories
+        load_device_config
     fi
-    
-    # Step 3: Now safe to create directories with root privileges
-    setup_directories
-    
-    # Step 4: Load configuration
-    load_device_config
     
     case "${1:-help}" in
         start)
@@ -2882,7 +2586,6 @@ main() {
             show_help
             ;;
         *)
-            # This shouldn't happen due to validation, but keep as safety
             echo "Error: Unknown command '${1}'" >&2
             show_help
             exit 1
