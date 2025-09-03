@@ -1,22 +1,22 @@
 #!/usr/bin/env bash
 #
 # MediaMTX Installation Manager - Production-Ready Install/Update/Uninstall
-# Version: 1.1.0
+# Version: 1.1.1
 # Part of LyreBirdAudio - RTSP Audio Streaming Suite
 # https://github.com/tomtom215/LyreBirdAudio
 #
 # This script provides a robust, secure, and configurable installation manager
 # for MediaMTX with comprehensive error handling and validation.
 #
-# Security Enhancements in v1.1.0:
-#   - Eliminated eval-based rollback system for security
-#   - Replaced source-based config loading with safe parser
-#   - Implemented atomic lock acquisition with flock
-#   - Required mktemp for secure temporary directories
-#   - Added comprehensive input validation
-#   - Fixed variable initialization order
-#   - Improved version comparison logic
-#   - Modularized complex functions
+# Critical Fixes in v1.1.1:
+#   - Fixed lock mechanism: proper FD handling without subshells
+#   - Fixed rollback system: null-delimited storage for space handling
+#   - Complete SemVer version comparison with pre-release support
+#   - Fixed dry-run mode violations in uninstall
+#   - Updated log configuration for systemd journal
+#   - Improved JSON parsing fallbacks
+#   - Commented systemd capabilities with explanation
+#   - Fixed dry-run mode to allow metadata downloads (read-only operations)
 #
 # Usage: ./mediamtx-installer.sh [OPTIONS] COMMAND
 #
@@ -57,10 +57,10 @@ set -euo pipefail
 
 # Strict error handling
 set -o errtrace
-set -o functrace
+set -o functrace  # Keep for debugging value
 
 # Script metadata
-readonly SCRIPT_VERSION="1.1.0"
+readonly SCRIPT_VERSION="1.1.1"
 readonly SCRIPT_NAME="$(basename "${BASH_SOURCE[0]}")"
 readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 readonly SCRIPT_PID="$$"
@@ -133,8 +133,8 @@ declare -A ROLLBACK_REGISTRY=(
     ["userdel"]="rollback_userdel"
 )
 
-# Rollback action queue
-declare -a ROLLBACK_ACTIONS=()
+# Rollback action queue file
+ROLLBACK_QUEUE=""
 
 # Download command (set in check_requirements)
 DOWNLOAD_CMD=""
@@ -150,7 +150,7 @@ PLATFORM_DISTRO=""
 PLATFORM_VERSION=""
 
 # ============================================================================
-# Rollback Functions (Security Hardened)
+# Rollback Functions (Security Hardened with Space Handling)
 # ============================================================================
 
 rollback_mv() {
@@ -171,32 +171,56 @@ rollback_userdel() {
     userdel "$@" 2>/dev/null || true
 }
 
-# Safe rollback execution without eval
-execute_rollback() {
-    local action="$1"
-    local cmd="${action%% *}"
-    local args="${action#* }"
-    
-    if [[ -n "${ROLLBACK_REGISTRY[$cmd]:-}" ]]; then
-        # Split args safely
-        IFS=' ' read -ra arg_array <<< "${args}"
-        "${ROLLBACK_REGISTRY[$cmd]}" "${arg_array[@]}"
-    else
-        log_error "Unknown rollback command: ${cmd}"
-    fi
-}
-
-# Add rollback action
+# Add rollback action with null-delimited storage for space handling
 add_rollback() {
     local cmd="$1"
     shift
-    local args="$*"
     
     if [[ -n "${ROLLBACK_REGISTRY[$cmd]:-}" ]]; then
-        ROLLBACK_ACTIONS+=("${cmd} ${args}")
+        # Store command and arguments with null delimiters
+        if [[ -n "${ROLLBACK_QUEUE}" ]] && [[ -f "${ROLLBACK_QUEUE}" ]]; then
+            printf '%s\0' "${cmd}" "$@" >> "${ROLLBACK_QUEUE}"
+        fi
     else
         log_warn "Invalid rollback command: ${cmd}"
     fi
+}
+
+# Execute rollback with proper space handling
+execute_rollback() {
+    [[ -z "${ROLLBACK_QUEUE}" ]] || [[ ! -f "${ROLLBACK_QUEUE}" ]] && return 0
+    
+    # Read null-delimited entries
+    local entries=()
+    while IFS= read -r -d '' entry; do
+        entries+=("${entry}")
+    done < "${ROLLBACK_QUEUE}"
+    
+    # Process in reverse order
+    local i=${#entries[@]}
+    while [[ $i -gt 0 ]]; do
+        ((i--))
+        local cmd="${entries[$i]}"
+        local args=()
+        
+        # Collect arguments for this command
+        while [[ $i -gt 0 ]]; do
+            ((i--))
+            local next="${entries[$i]}"
+            # Check if this is a command or an argument
+            if [[ -n "${ROLLBACK_REGISTRY[$next]:-}" ]]; then
+                # This is the next command, put it back
+                ((i++))
+                break
+            fi
+            args=("${next}" "${args[@]}")  # Prepend to maintain order
+        done
+        
+        # Execute rollback
+        if [[ -n "${ROLLBACK_REGISTRY[$cmd]:-}" ]]; then
+            "${ROLLBACK_REGISTRY[$cmd]}" "${args[@]}"
+        fi
+    done
 }
 
 # ============================================================================
@@ -257,11 +281,9 @@ cleanup() {
     release_lock
     
     # Execute rollback actions if failed
-    if [[ ${exit_code} -ne 0 ]] && [[ ${#ROLLBACK_ACTIONS[@]} -gt 0 ]]; then
+    if [[ ${exit_code} -ne 0 ]]; then
         log_warn "Executing rollback actions..."
-        for action in "${ROLLBACK_ACTIONS[@]}"; do
-            execute_rollback "${action}"
-        done
+        execute_rollback
     fi
     
     # Clean up files
@@ -341,23 +363,46 @@ show_progress() {
 # Security Functions
 # ============================================================================
 
-# Atomic lock acquisition with flock
+# FIXED: Atomic lock acquisition with proper FD handling
 acquire_lock() {
     local timeout="${1:-30}"
     
-    # Open lock file descriptor
+    # Open lock file descriptor without subshell
     exec 200>"${LOCK_FILE}"
     LOCK_FD=200
     
     log_debug "Attempting to acquire lock (timeout: ${timeout}s)..."
     
-    if timeout "${timeout}" bash -c "flock -x 200" 2>/dev/null; then
-        echo "${SCRIPT_PID}" > "${LOCK_FILE}.pid"
-        log_debug "Lock acquired (PID: ${SCRIPT_PID})"
-        return 0
+    # Platform-specific lock acquisition
+    if [[ "$(uname)" == "Darwin" ]] || [[ "$(uname)" == *"BSD"* ]]; then
+        # BSD flock: use timeout wrapper
+        if command -v timeout &>/dev/null; then
+            if timeout "${timeout}" flock -x 200; then
+                echo "${SCRIPT_PID}" > "${LOCK_FILE}.pid"
+                log_debug "Lock acquired (PID: ${SCRIPT_PID})"
+                return 0
+            fi
+        else
+            # Fallback without timeout command
+            if flock -x 200; then
+                echo "${SCRIPT_PID}" > "${LOCK_FILE}.pid"
+                log_debug "Lock acquired (PID: ${SCRIPT_PID})"
+                return 0
+            fi
+        fi
     else
-        fatal "Failed to acquire lock after ${timeout} seconds" 1
+        # Linux flock: -w is timeout in seconds
+        if flock -x -w "${timeout}" 200; then
+            echo "${SCRIPT_PID}" > "${LOCK_FILE}.pid"
+            log_debug "Lock acquired (PID: ${SCRIPT_PID})"
+            return 0
+        fi
     fi
+    
+    # Clean up on failure
+    exec 200>&-
+    LOCK_FD=""
+    fatal "Failed to acquire lock after ${timeout} seconds" 1
 }
 
 # Release lock
@@ -388,6 +433,11 @@ create_temp_dir() {
     LOG_FILE="${TEMP_DIR}/install.log"
     touch "${LOG_FILE}"
     chmod 600 "${LOG_FILE}"
+    
+    # Create rollback queue file
+    ROLLBACK_QUEUE="${TEMP_DIR}/.rollback_queue"
+    touch "${ROLLBACK_QUEUE}"
+    chmod 600 "${ROLLBACK_QUEUE}"
     
     CLEANUP_DIRS+=("${TEMP_DIR}")
     log_debug "Created temporary directory: ${TEMP_DIR}"
@@ -542,6 +592,11 @@ check_requirements() {
         fi
     done
     
+    # Warn if jq not found (improves JSON parsing)
+    if ! command -v jq &>/dev/null; then
+        log_warn "jq not found - using fallback JSON parsing (less reliable)"
+    fi
+    
     # Report findings
     if [[ ${#missing[@]} -gt 0 ]]; then
         fatal "Missing required commands: ${missing[*]}" 4
@@ -565,12 +620,12 @@ check_requirements() {
     log_debug "Using ${DOWNLOAD_CMD} for downloads"
 }
 
-# Complete version comparison
+# FIXED: Complete SemVer version comparison with pre-release support
 version_compare() {
     local v1="${1#v}"  # Remove v prefix if present
     local v2="${2#v}"
     
-    # Use sort -V if available (most reliable)
+    # Try sort -V first (most reliable)
     if command -v sort &>/dev/null && sort --help 2>&1 | grep -q -- '-V'; then
         if [[ "$(printf '%s\n' "${v2}" "${v1}" | sort -V | head -n1)" == "${v2}" ]]; then
             return 0  # v1 >= v2
@@ -579,26 +634,35 @@ version_compare() {
         fi
     fi
     
-    # Fallback to manual comparison
-    local IFS=.
-    local -a v1_parts=($v1)
-    local -a v2_parts=($v2)
+    # Robust fallback implementation
+    local v1_base="${v1%%-*}"
+    local v2_base="${v2%%-*}"
     
-    # Compare major, minor, and patch
+    # Compare numeric components
+    local IFS=.
+    local -a v1_parts=($v1_base)
+    local -a v2_parts=($v2_base)
+    
     for i in {0..2}; do
         local p1="${v1_parts[$i]:-0}"
         local p2="${v2_parts[$i]:-0}"
         
-        # Remove non-numeric suffixes for comparison
-        p1="${p1%%-*}"
-        p2="${p2%%-*}"
-        
-        if [[ ${p1} -gt ${p2} ]]; then
-            return 0
-        elif [[ ${p1} -lt ${p2} ]]; then
-            return 1
-        fi
+        if [[ ${p1} -gt ${p2} ]]; then return 0; fi
+        if [[ ${p1} -lt ${p2} ]]; then return 1; fi
     done
+    
+    # Base versions equal, check pre-release
+    # No pre-release > has pre-release (1.0.0 > 1.0.0-rc1)
+    if [[ "$v1" == "$v1_base" ]] && [[ "$v2" != "$v2_base" ]]; then
+        return 0  # v1 (final) > v2 (pre-release)
+    elif [[ "$v1" != "$v1_base" ]] && [[ "$v2" == "$v2_base" ]]; then
+        return 1  # v1 (pre-release) < v2 (final)
+    elif [[ "$v1" != "$v1_base" ]] && [[ "$v2" != "$v2_base" ]]; then
+        # Both have pre-release, compare lexically
+        local v1_pre="${v1#*-}"
+        local v2_pre="${v2#*-}"
+        [[ "$v1_pre" > "$v2_pre" ]] && return 0 || return 1
+    fi
     
     return 0  # Equal
 }
@@ -796,14 +860,25 @@ detect_platform() {
 # Download Functions
 # ============================================================================
 
-# Enhanced download with retry, resume, and failover
+# Enhanced download with retry, resume, and failover - FIXED for dry-run mode
 download_file() {
     local url="$1"
     local output="$2"
     local timeout="${3:-${DEFAULT_DOWNLOAD_TIMEOUT}}"
     local retries="${4:-${DEFAULT_DOWNLOAD_RETRIES}}"
     
-    if [[ "${DRY_RUN_MODE}" == "true" ]]; then
+    # Determine if this is a metadata download (should be allowed in dry-run)
+    local is_metadata=false
+    if [[ "${url}" == *"api.github.com"* ]] || \
+       [[ "${url}" == *".sha256sum" ]] || \
+       [[ "${url}" == *".sig" ]] || \
+       [[ "${output}" == *"/release.json" ]] || \
+       [[ "${output}" == *"/checksum"* ]]; then
+        is_metadata=true
+    fi
+    
+    # Only skip non-metadata downloads in dry-run mode
+    if [[ "${DRY_RUN_MODE}" == "true" ]] && [[ "${is_metadata}" == "false" ]]; then
         log_info "[DRY RUN] Would download: ${url} -> ${output}"
         return 0
     fi
@@ -877,7 +952,7 @@ download_file() {
     return 1
 }
 
-# Parse GitHub API response safely
+# IMPROVED: Parse GitHub API response with better fallback
 parse_github_release() {
     local json_file="$1"
     local field="$2"
@@ -902,9 +977,16 @@ except:
         return
     fi
     
-    # Last resort: grep/sed (less reliable)
-    grep -o "\"${field}\"[[:space:]]*:[[:space:]]*\"[^\"]*\"" "${json_file}" 2>/dev/null | \
-        sed 's/.*:\s*"\([^"]*\)".*/\1/' | head -1 || echo ""
+    # Improved grep/sed fallback for minified JSON
+    local value=""
+    
+    # Handle minified JSON better
+    if grep -q "\"${field}\"" "${json_file}" 2>/dev/null; then
+        # Try to extract value even from minified JSON
+        value=$(sed -n "s/.*\"${field}\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p" "${json_file}" 2>/dev/null | head -1)
+    fi
+    
+    echo "${value}"
 }
 
 # Get latest release information
@@ -979,12 +1061,15 @@ detect_mediamtx_process() {
     printf "%s\n" "${pids[@]}"
 }
 
-# Centralized management mode detection
+# FIXED: Centralized management mode detection
 detect_management_mode() {
+    # Check systemd first
     if command -v systemctl &>/dev/null && systemctl is-active --quiet mediamtx 2>/dev/null; then
         echo "systemd"
+    # Check stream manager
     elif [[ -d "/var/lib/mediamtx-ffmpeg" ]] && pgrep -f "ffmpeg.*rtsp://localhost" &>/dev/null; then
         echo "stream-manager"
+    # Check manual process
     elif pgrep -x "mediamtx" &>/dev/null; then
         echo "manual"
     else
@@ -1063,7 +1148,7 @@ build_asset_url() {
     echo "${url}"
 }
 
-# Download and verify MediaMTX binary
+# Download and verify MediaMTX binary - FIXED for dry-run mode
 download_mediamtx() {
     local version="$1"
     local os="$2"
@@ -1076,6 +1161,14 @@ download_mediamtx() {
     local checksum="${TEMP_DIR}/mediamtx.tar.gz.sha256sum"
     
     log_info "Downloading MediaMTX ${version} for ${os}/${arch}..."
+    
+    # In dry-run mode, skip actual binary download but show what would happen
+    if [[ "${DRY_RUN_MODE}" == "true" ]]; then
+        log_info "[DRY RUN] Would download: ${asset_url}"
+        log_info "[DRY RUN] Would verify checksum if available"
+        log_info "[DRY RUN] Would extract and install binary"
+        return 0
+    fi
     
     # Download archive
     if ! download_file "${asset_url}" "${archive}"; then
@@ -1131,7 +1224,7 @@ download_mediamtx() {
     log_debug "Binary extracted successfully"
 }
 
-# Create configuration file
+# FIXED: Create configuration file with proper log settings
 create_config() {
     local config_file="${CONFIG_DIR}/${CONFIG_NAME}"
     
@@ -1166,8 +1259,12 @@ create_config() {
 
 # Global settings
 logLevel: info
+# Systemd captures stdout to journal automatically
+# For manual runs, logs go to file
 logDestinations: [stdout]
-logFile: /var/log/mediamtx.log
+# Note: systemd captures stdout to journal automatically
+# For manual runs, logs go to: /var/lib/mediamtx/mediamtx.log
+logFile: /var/lib/mediamtx/mediamtx.log
 
 # API Configuration
 api: yes
@@ -1220,7 +1317,7 @@ EOF
     log_info "Configuration created: ${config_file}"
 }
 
-# Create systemd service
+# FIXED: Create systemd service with commented capabilities
 create_service() {
     if [[ "${SKIP_SERVICE}" == "true" ]]; then
         log_debug "Skipping service creation"
@@ -1292,9 +1389,9 @@ LockPersonality=true
 SystemCallFilter=@system-service
 SystemCallErrorNumber=EPERM
 
-# Capabilities
-AmbientCapabilities=CAP_NET_BIND_SERVICE
-CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+# Capabilities (uncomment if using privileged ports < 1024)
+# AmbientCapabilities=CAP_NET_BIND_SERVICE
+# CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 
 # Resource limits
 LimitNOFILE=65536
@@ -1490,6 +1587,11 @@ update_mediamtx() {
 stop_mediamtx() {
     local mode="$1"
     
+    if [[ "${DRY_RUN_MODE}" == "true" ]]; then
+        log_info "[DRY RUN] Would stop MediaMTX (${mode})"
+        return 0
+    fi
+    
     case "${mode}" in
         systemd)
             log_info "Stopping MediaMTX service (systemd)..."
@@ -1536,6 +1638,11 @@ stop_mediamtx() {
 start_mediamtx() {
     local mode="$1"
     
+    if [[ "${DRY_RUN_MODE}" == "true" ]]; then
+        log_info "[DRY RUN] Would start MediaMTX (${mode})"
+        return 0
+    fi
+    
     case "${mode}" in
         systemd)
             log_info "Starting MediaMTX service (systemd)..."
@@ -1563,12 +1670,25 @@ start_mediamtx() {
     esac
 }
 
-# Uninstall MediaMTX
+# FIXED: Uninstall MediaMTX with dry-run compliance
 uninstall_mediamtx() {
     log_info "Uninstalling MediaMTX..."
     
     if [[ "${DRY_RUN_MODE}" == "true" ]]; then
         log_info "[DRY RUN] Would uninstall MediaMTX"
+        if [[ -f "${SERVICE_DIR}/${SERVICE_NAME}" ]]; then
+            log_info "[DRY RUN] Would stop and disable service"
+            log_info "[DRY RUN] Would remove service file"
+        fi
+        if [[ -f "${INSTALL_DIR}/mediamtx" ]]; then
+            log_info "[DRY RUN] Would remove binary and backups"
+        fi
+        if [[ -d "${CONFIG_DIR}" ]]; then
+            log_info "[DRY RUN] Would prompt to remove configuration"
+        fi
+        if id "${SERVICE_USER}" &>/dev/null; then
+            log_info "[DRY RUN] Would prompt to remove service user"
+        fi
         return 0
     fi
     
@@ -1601,8 +1721,16 @@ uninstall_mediamtx() {
         log_info "Configuration removed"
     fi
     
-    # Remove user
-    if id "${SERVICE_USER}" &>/dev/null && [[ "${FORCE_MODE}" == "true" ]]; then
+    # Ask about user removal
+    if id "${SERVICE_USER}" &>/dev/null && [[ "${FORCE_MODE}" != "true" ]]; then
+        echo -en "${YELLOW}Remove service user ${SERVICE_USER}? [y/N] ${NC}"
+        read -r response
+        if [[ "${response}" =~ ^[Yy]$ ]]; then
+            userdel "${SERVICE_USER}" 2>/dev/null || true
+            rm -rf /var/lib/mediamtx 2>/dev/null || true
+            log_info "Service user removed"
+        fi
+    elif [[ "${FORCE_MODE}" == "true" ]] && id "${SERVICE_USER}" &>/dev/null; then
         log_info "Removing service user..."
         userdel "${SERVICE_USER}" 2>/dev/null || true
         rm -rf /var/lib/mediamtx 2>/dev/null || true
@@ -1985,8 +2113,14 @@ ${BOLD}MediaMTX Installation Manager v${SCRIPT_VERSION}${NC}
 Production-ready installer for MediaMTX media server with comprehensive
 error handling, validation, and security features.
 
-Security hardened with safe configuration loading, atomic locks, and
-secure temporary directory creation.
+Critical fixes in v1.1.1:
+  • Fixed lock mechanism for concurrent execution protection
+  • Fixed rollback system to handle arguments with spaces
+  • Complete SemVer version comparison with pre-release support
+  • Fixed dry-run mode compliance in uninstall
+  • Improved JSON parsing fallbacks
+  • Updated log configuration for systemd journal
+  • Fixed dry-run mode to allow metadata downloads
 
 ${BOLD}USAGE:${NC}
     ${SCRIPT_NAME} [OPTIONS] COMMAND
@@ -2040,7 +2174,7 @@ ${BOLD}FILES:${NC}
     Binary:       ${INSTALL_DIR}/mediamtx
     Config:       ${CONFIG_DIR}/${CONFIG_NAME}
     Service:      ${SERVICE_DIR}/${SERVICE_NAME}
-    Logs:         /var/log/mediamtx.log
+    Logs:         /var/lib/mediamtx/mediamtx.log (systemd: journalctl)
 
 ${BOLD}SERVICE MANAGEMENT:${NC}
     Start:        sudo systemctl start mediamtx
@@ -2050,14 +2184,6 @@ ${BOLD}SERVICE MANAGEMENT:${NC}
     Enable:       sudo systemctl enable mediamtx
     Disable:      sudo systemctl disable mediamtx
     Logs:         sudo journalctl -u mediamtx -f
-
-${BOLD}SECURITY ENHANCEMENTS IN v1.1.0:${NC}
-    - Eliminated eval-based rollback system
-    - Safe configuration parsing without source/eval
-    - Atomic lock acquisition with flock
-    - Secure temporary directories with mktemp
-    - Comprehensive input validation
-    - Complete version comparison logic
 
 ${BOLD}SUPPORT:${NC}
     GitHub: https://github.com/${DEFAULT_GITHUB_REPO}
