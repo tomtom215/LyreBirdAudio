@@ -6,7 +6,7 @@
 # This wizard provides a comprehensive interface for managing all aspects
 # of the LyreBirdAudio system by orchestrating the existing scripts.
 #
-# Version: 1.1.0
+# Version: 1.1.1
 # Requirements: bash 4.0+, existing LyreBirdAudio scripts
 
 # Check bash version
@@ -20,8 +20,11 @@ fi
 set -u
 set -o pipefail
 
+# Set proper umask for created files and directories
+umask 0022
+
 # Script metadata
-readonly WIZARD_VERSION="1.1.0"
+readonly WIZARD_VERSION="1.1.1"
 readonly WIZARD_NAME="$(basename "${BASH_SOURCE[0]}")"
 readonly WIZARD_PID="$$"
 
@@ -102,6 +105,9 @@ CLEANUP_DONE=false
 
 # Dry run mode
 DRY_RUN_MODE=false
+
+# Global array for temp file cleanup
+declare -a TEMP_FILES_TO_CLEANUP=()
 
 # ============================================================================
 # Core Functions
@@ -223,7 +229,7 @@ check_dependencies() {
     local missing=()
     local optional_missing=()
     
-    # Required commands (added lsof, pgrep, pkill)
+    # Required commands
     local required_cmds=("bash" "grep" "sed" "awk" "systemctl" "lsusb" "arecord" "lsof" "pgrep" "pkill")
     for cmd in "${required_cmds[@]}"; do
         if ! command -v "${cmd}" &>/dev/null; then
@@ -232,7 +238,7 @@ check_dependencies() {
     done
     
     # Optional but recommended
-    local optional_cmds=("ffmpeg" "curl" "jq" "udevadm" "flock")
+    local optional_cmds=("ffmpeg" "curl" "jq" "udevadm" "flock" "mktemp")
     for cmd in "${optional_cmds[@]}"; do
         if ! command -v "${cmd}" &>/dev/null; then
             optional_missing+=("${cmd}")
@@ -339,52 +345,66 @@ setup_directories() {
         if [[ ! -d "${dir}" ]]; then
             if ! mkdir -p "${dir}" 2>/dev/null; then
                 log_message WARN "Could not create directory: ${dir}"
+            else
+                # Set proper permissions (only owner can write)
+                chmod 700 "${dir}" 2>/dev/null || true
             fi
         fi
     done
 }
 
-# Improved atomic state file operations with better concurrency handling
+# Directory-based locking for state file operations
 save_state() {
     local key="$1"
     local value="$2"
     
     [[ -d "${STATE_DIR}" ]] || mkdir -p "${STATE_DIR}" 2>/dev/null || return 1
     
-    # Use atomic write with temp file
-    local temp_file="${STATE_FILE}.tmp.$$"
-    local lock_file="${STATE_FILE}.lock"
+    # Use directory as lock
+    local lock_dir="${STATE_FILE}.lock"
+    local max_wait=5
+    local waited=0
     
-    if command -v flock &>/dev/null; then
-        (
-            flock -x 200 || exit 1
-            
-            # Read existing state
-            if [[ -f "${STATE_FILE}" ]]; then
-                grep -v "^${key}=" "${STATE_FILE}" > "${temp_file}" 2>/dev/null || true
-            fi
-            
-            # Add new value
-            echo "${key}=${value}" >> "${temp_file}"
-            
-            # Atomic move
-            mv -f "${temp_file}" "${STATE_FILE}" || {
-                rm -f "${temp_file}"
-                exit 1
-            }
-        ) 200>"${lock_file}"
-    else
-        # Fallback without flock
-        if [[ -f "${STATE_FILE}" ]]; then
-            grep -v "^${key}=" "${STATE_FILE}" > "${temp_file}" 2>/dev/null || true
+    # Try to acquire lock
+    while [[ ${waited} -lt ${max_wait} ]]; do
+        if mkdir "${lock_dir}" 2>/dev/null; then
+            # Lock acquired
+            break
         fi
-        
-        echo "${key}=${value}" >> "${temp_file}"
-        mv -f "${temp_file}" "${STATE_FILE}" 2>/dev/null || {
-            rm -f "${temp_file}"
-            return 1
-        }
+        sleep 0.2
+        waited=$((waited + 1))
+    done
+    
+    if [[ ${waited} -ge ${max_wait} ]]; then
+        log_message WARN "Could not acquire state lock"
+        return 1
     fi
+    
+    # Use atomic write with temp file
+    local temp_file
+    temp_file=$(mktemp "${STATE_FILE}.XXXXXX" 2>/dev/null) || {
+        rmdir "${lock_dir}" 2>/dev/null
+        return 1
+    }
+    
+    # Read existing state
+    if [[ -f "${STATE_FILE}" ]]; then
+        grep -v "^${key}=" "${STATE_FILE}" > "${temp_file}" 2>/dev/null || true
+    fi
+    
+    # Add new value
+    echo "${key}=${value}" >> "${temp_file}"
+    
+    # Atomic move
+    mv -f "${temp_file}" "${STATE_FILE}" || {
+        rm -f "${temp_file}"
+        rmdir "${lock_dir}" 2>/dev/null
+        return 1
+    }
+    
+    # Release lock
+    rmdir "${lock_dir}" 2>/dev/null
+    return 0
 }
 
 load_state() {
@@ -455,13 +475,21 @@ handle_script_error() {
     esac
 }
 
-# Improved monitor mode handling
+# Improved execute function with proper retry handling
 execute_external_script() {
     local script="$1"
     shift
+    local retry_count=0
+    
+    # Check if this is a retry call (last argument is a number preceded by __retry__)
+    if [[ "${!#}" =~ ^__retry__([0-9]+)$ ]]; then
+        retry_count="${BASH_REMATCH[1]}"
+        set -- "${@:1:$#-1}"  # Remove retry marker from args
+    fi
+    
     local args=("$@")
     
-    log_message DEBUG "Executing: ${script} ${args[*]}"
+    log_message DEBUG "Executing: ${script} ${args[*]} (retry: ${retry_count})"
     
     if [[ "${DRY_RUN_MODE}" == "true" ]]; then
         echo "[DRY RUN] Would execute: ${script} ${args[*]}"
@@ -475,22 +503,36 @@ execute_external_script() {
         
         # Use trap to handle cleanup
         local monitor_pid
-        trap 'kill "${monitor_pid}" 2>/dev/null || true; return 0' INT
+        local original_trap
+        original_trap=$(trap -p INT)
+        
+        trap 'kill "${monitor_pid}" 2>/dev/null || true; '"${original_trap}"'; return 0' INT
         
         "${script}" "${args[@]}" &
         monitor_pid=$!
         
         wait "${monitor_pid}" 2>/dev/null || true
-        trap - INT
+        eval "${original_trap}" 2>/dev/null || trap - INT
         
         echo
         echo "Returning to menu..."
         return 0
     fi
     
-    # Create a temp file for capturing output
-    local temp_output="/tmp/wizard-exec-${WIZARD_PID}-$$.out"
-    local temp_error="/tmp/wizard-exec-${WIZARD_PID}-$$.err"
+    # Create temp files for capturing output
+    local temp_output temp_error
+    temp_output=$(mktemp "/tmp/wizard-exec-${WIZARD_PID}-XXXXXX.out") || {
+        log_message ERROR "Failed to create temp file"
+        return 1
+    }
+    temp_error=$(mktemp "/tmp/wizard-exec-${WIZARD_PID}-XXXXXX.err") || {
+        rm -f "${temp_output}"
+        log_message ERROR "Failed to create temp file"
+        return 1
+    }
+    
+    # Add to global cleanup array
+    TEMP_FILES_TO_CLEANUP+=("${temp_output}" "${temp_error}")
     
     # Execute the script and capture output
     local exit_code=0
@@ -528,7 +570,11 @@ execute_external_script() {
         
         case ${recovery} in
             1) # Retry
-                execute_external_script "${script}" "${args[@]}"
+                if [[ ${retry_count} -ge 3 ]]; then
+                    log_message ERROR "Maximum retries (3) reached"
+                    return ${exit_code}
+                fi
+                execute_external_script "${script}" "${args[@]}" "__retry__$((retry_count + 1))"
                 return $?
                 ;;
             3) # Return to menu
@@ -620,7 +666,7 @@ detect_usb_audio_devices() {
     log_message DEBUG "Found ${USB_DEVICES_COUNT} USB audio devices: ${USB_DEVICES_NAMES[*]}"
 }
 
-# Fixed stream detection to properly handle wrapper scripts
+# Fixed stream detection with more precise bash check
 detect_active_streams() {
     ACTIVE_STREAMS_COUNT=0
     ACTIVE_STREAM_NAMES=()
@@ -647,8 +693,9 @@ detect_active_streams() {
                             # Check if it's a wrapper script (might be starting up)
                             local proc_cmd
                             proc_cmd=$(ps -p "${pid}" -o args= 2>/dev/null || echo "")
+                            # More precise pattern to avoid false positives
                             if [[ "${proc_cmd}" == *"/var/lib/mediamtx-ffmpeg/${stream_name}.sh"* ]] || 
-                               [[ "${proc_cmd}" == *"bash"* ]]; then
+                               [[ "${proc_cmd}" =~ ^(/bin/)?bash[[:space:]].*/${stream_name}\.sh ]]; then
                                 is_active=true
                             fi
                         fi
@@ -906,8 +953,25 @@ display_error() {
 # Backup and Restore Functions
 # ============================================================================
 
+# Sanitize backup names to prevent path traversal
+sanitize_backup_name() {
+    local name="$1"
+    # Remove path separators and other dangerous characters
+    name="${name//\//_}"
+    name="${name//\\/_}"
+    name="${name//../_}"
+    name="${name//~/_}"
+    # Limit length
+    if [[ ${#name} -gt 50 ]]; then
+        name="${name:0:50}"
+    fi
+    echo "${name}"
+}
+
 create_backup() {
-    local backup_name="${1:-backup-$(date +%Y%m%d-%H%M%S)}"
+    local raw_name="${1:-backup-$(date +%Y%m%d-%H%M%S)}"
+    local backup_name
+    backup_name=$(sanitize_backup_name "${raw_name}")
     local backup_path="${BACKUP_DIR}/${backup_name}"
     
     log_message INFO "Creating backup: ${backup_name}"
@@ -988,7 +1052,9 @@ list_backups() {
 }
 
 restore_backup() {
-    local backup_name="$1"
+    local raw_name="$1"
+    local backup_name
+    backup_name=$(sanitize_backup_name "${raw_name}")
     local backup_path="${BACKUP_DIR}/${backup_name}"
     
     if [[ ! -d "${backup_path}" ]]; then
@@ -1021,7 +1087,7 @@ restore_backup() {
         systemctl stop mediamtx 2>/dev/null || true
     fi
     
-    # Restore files
+    # Restore files with flexible service name detection
     local restored=0
     for file in "${backup_path}"/*; do
         if [[ -f "${file}" ]] && [[ "$(basename "${file}")" != "metadata.txt" ]]; then
@@ -1039,8 +1105,16 @@ restore_backup() {
                 99-usb-soundcards.rules)
                     target="${UDEV_RULES}"
                     ;;
-                mediamtx-audio.service)
-                    target="${SYSTEMD_SERVICE}"
+                *.service)
+                    # Flexible service file handling
+                    if [[ "${basename}" == "mediamtx-audio.service" ]]; then
+                        target="${SYSTEMD_SERVICE}"
+                    elif [[ "${basename}" == "mediamtx.service" ]]; then
+                        target="/etc/systemd/system/mediamtx.service"
+                    else
+                        log_message WARN "Unknown service file: ${basename}"
+                        continue
+                    fi
                     ;;
                 *)
                     continue
@@ -1525,22 +1599,14 @@ menu_devices() {
     done
 }
 
-# Enhanced environment variable parsing helper
+# Enhanced environment variable parsing using systemctl --value
 parse_systemd_environment() {
     local service="$1"
-    local env_output
-    env_output=$(systemctl show "${service}" --property=Environment 2>/dev/null)
-    
-    if [[ "${env_output}" =~ ^Environment=(.*)$ ]]; then
-        local env_string="${BASH_REMATCH[1]}"
-        # Parse with proper quote handling
-        local -a env_array
-        eval "env_array=(${env_string})"
-        
-        for var in "${env_array[@]}"; do
-            echo "${var}"
+    # Use systemctl's --value flag to get clean output
+    systemctl show "${service}" --property=Environment --value 2>/dev/null | \
+        while IFS= read -r var; do
+            [[ -n "$var" ]] && echo "$var"
         done
-    fi
 }
 
 menu_config() {
@@ -1955,15 +2021,24 @@ menu_troubleshoot() {
                     
                     # Environment variables
                     if [[ "${STREAM_MANAGER_INSTALLED}" == "true" ]] && systemctl is-active --quiet mediamtx-audio 2>/dev/null; then
-                        local env_vars
-                        env_vars=$(systemctl show mediamtx-audio --property=Environment 2>/dev/null | sed 's/^Environment=//' || echo "")
+                        local has_usb_delay=false
+                        local has_device_test=false
                         
-                        if [[ "${env_vars}" != *"USB_STABILIZATION_DELAY"* ]]; then
+                        while IFS= read -r env_var; do
+                            if [[ "${env_var}" == *"USB_STABILIZATION_DELAY"* ]]; then
+                                has_usb_delay=true
+                            fi
+                            if [[ "${env_var}" == *"DEVICE_TEST_ENABLED=false"* ]]; then
+                                has_device_test=true
+                            fi
+                        done < <(parse_systemd_environment "mediamtx-audio")
+                        
+                        if [[ "${has_usb_delay}" != "true" ]]; then
                             echo -e "  ${YELLOW}⚠${NC} Missing USB_STABILIZATION_DELAY environment variable"
                             echo "     Recommended: USB_STABILIZATION_DELAY=10"
                         fi
                         
-                        if [[ "${env_vars}" != *"DEVICE_TEST_ENABLED=false"* ]]; then
+                        if [[ "${has_device_test}" != "true" ]]; then
                             echo -e "  ${YELLOW}⚠${NC} Device testing not disabled"
                             echo "     Recommended: DEVICE_TEST_ENABLED=false"
                         fi
@@ -2107,11 +2182,16 @@ cleanup() {
     fi
     CLEANUP_DONE=true
     
-    # Clean up any temp files from execute_external_script
+    # Clean up temp files from global array
+    for temp_file in "${TEMP_FILES_TO_CLEANUP[@]}"; do
+        rm -f "${temp_file}" 2>/dev/null || true
+    done
+    
+    # Clean up any other temp files with our PID
     rm -f /tmp/wizard-exec-${WIZARD_PID}-*.{out,err} 2>/dev/null || true
     
-    # Clean up state lock file
-    rm -f "${STATE_FILE}.lock" 2>/dev/null || true
+    # Clean up state lock directory
+    rmdir "${STATE_FILE}.lock" 2>/dev/null || true
     
     # Log exit
     log_message INFO "Wizard cleanup completed (exit code: ${exit_code})"
