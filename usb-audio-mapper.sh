@@ -7,9 +7,9 @@
 # consistent names across reboots, with symlinks for easy access.
 #
 # Version: 1.2.1
-# Changes: Fixed syntax errors and production-ready improvements
-#          - Fixed incomplete if-else blocks
-#          - Removed duplicate function definitions
+# Changes: Fixed v1.0.0 backwards compatibility
+#          - Removed serial number suffixes from port paths for udev rules
+#          - Maintained all production-ready improvements
 #          - Enhanced error handling and validation
 #          - Added comprehensive exception handling
 
@@ -212,7 +212,8 @@ is_valid_usb_path() {
     fi
 }
 
-# Function to get USB physical port path for a device
+# Function to get USB physical port path for a device (v1.0.0 logic - FIXED)
+# Returns clean port path for v1.0.0 compatibility (no serial suffix)
 get_usb_physical_port() {
     local bus_num="${1:-}"
     local dev_num="${2:-}"
@@ -229,98 +230,58 @@ get_usb_physical_port() {
     local base_port_path=""
     local serial=""
     local product_name=""
-    local sysfs_path=""
-    local devpath=""
     
-    # Try different sysfs path formats to find the device
-    for path_format in "/sys/bus/usb/devices/${bus_num}-${dev_num}" \
-                       "/sys/bus/usb/devices/${bus_num}-${bus_num}.${dev_num}"; do
-        if [ -d "$path_format" ]; then
-            sysfs_path="$path_format"
-            break
+    debug "Looking for device with bus=$bus_num dev=$dev_num"
+    
+    # Method 1: Search through ALL USB devices in sysfs to find the correct one
+    # This avoids the incorrect path guessing that causes Device 5 to match the hub
+    local devices_dir="/sys/bus/usb/devices"
+    local found_device=""
+    
+    for device in "$devices_dir"/*; do
+        [ ! -d "$device" ] && continue
+        
+        # Only check directories with USB port naming pattern
+        local basename
+        basename=$(basename "$device")
+        [[ "$basename" =~ ^[0-9]+-[0-9]+(\.[0-9]+)*$ ]] || continue
+        
+        # Check if this device has the bus/dev numbers we're looking for
+        if [ -f "$device/busnum" ] && [ -f "$device/devnum" ]; then
+            local check_bus
+            local check_dev
+            check_bus=$(cat "$device/busnum" 2>/dev/null) || continue
+            check_dev=$(cat "$device/devnum" 2>/dev/null) || continue
+            
+            check_bus=$(safe_base10 "$check_bus") || continue
+            check_dev=$(safe_base10 "$check_dev") || continue
+            
+            if [ "$check_bus" = "$bus_num" ] && [ "$check_dev" = "$dev_num" ]; then
+                found_device="$device"
+                base_port_path="$basename"
+                debug "Found correct device at: $found_device"
+                debug "Port path from sysfs: $base_port_path"
+                
+                # Get serial number (for logging only, not used in port path)
+                if [ -f "$device/serial" ]; then
+                    serial=$(cat "$device/serial" 2>/dev/null | tr -d '[:space:]') || true
+                    debug "Found serial: ${serial:-none}"
+                fi
+                
+                # Get product name
+                if [ -f "$device/product" ]; then
+                    product_name=$(cat "$device/product" 2>/dev/null | tr -d '[:space:]') || true
+                    debug "Found product: ${product_name:-none}"
+                fi
+                
+                break
+            fi
         fi
     done
     
-    # If not found, search more broadly
-    if [ -z "$sysfs_path" ]; then
-        # Look for devices matching our bus/device numbers
-        local possible_paths
-        possible_paths=$(find /sys/bus/usb/devices -maxdepth 1 -type d -name "*-*" 2>/dev/null) || true
-        
-        while IFS= read -r path; do
-            [ -z "$path" ] && continue
-            if [ -f "$path/busnum" ] && [ -f "$path/devnum" ]; then
-                local check_bus
-                local check_dev
-                check_bus=$(cat "$path/busnum" 2>/dev/null) || continue
-                check_dev=$(cat "$path/devnum" 2>/dev/null) || continue
-                
-                check_bus=$(safe_base10 "$check_bus") || continue
-                check_dev=$(safe_base10 "$check_dev") || continue
-                
-                if [ "$check_bus" = "$bus_num" ] && [ "$check_dev" = "$dev_num" ]; then
-                    sysfs_path="$path"
-                    debug "Found device at: $sysfs_path"
-                    break
-                fi
-            fi
-        done <<< "$possible_paths"
-    fi
-    
-    debug "Using sysfs path: ${sysfs_path:-not found}"
-    
-    # Extract device information from sysfs
-    if [ -n "$sysfs_path" ] && [ -d "$sysfs_path" ]; then
-        # Get the actual USB port path from the sysfs path itself
-        local sysfs_basename
-        sysfs_basename=$(basename "$sysfs_path")
-        
-        # The basename usually contains the port path (e.g., "1-5.4.3")
-        if [[ "$sysfs_basename" =~ ^[0-9]+-[0-9]+(\.[0-9]+)*$ ]]; then
-            devpath="$sysfs_basename"
-            base_port_path="$devpath"
-            debug "Using sysfs basename as port path: $devpath"
-        fi
-        
-        # Also try to get it from devpath file
-        if [ -z "$devpath" ] && [ -f "$sysfs_path/devpath" ]; then
-            devpath=$(cat "$sysfs_path/devpath" 2>/dev/null) || true
-            if [ -n "$devpath" ]; then
-                # Extract just the port part
-                if [[ "$devpath" =~ /([0-9]+-[0-9]+(\.[0-9]+)*)$ ]]; then
-                    base_port_path="${BASH_REMATCH[1]}"
-                else
-                    base_port_path="$devpath"
-                fi
-                debug "Found devpath: $devpath -> $base_port_path"
-            fi
-        fi
-        
-        # Get serial number
-        if [ -f "$sysfs_path/serial" ]; then
-            serial=$(cat "$sysfs_path/serial" 2>/dev/null | tr -d '[:space:]') || true
-            debug "Found serial: ${serial:-none}"
-        fi
-        
-        # Get product name  
-        if [ -f "$sysfs_path/product" ]; then
-            product_name=$(cat "$sysfs_path/product" 2>/dev/null | tr -d '[:space:]') || true
-            debug "Found product: ${product_name:-none}"
-        fi
-        
-        # Get vendor and product IDs for additional uniqueness
-        local vendor_id=""
-        local product_id=""
-        if [ -f "$sysfs_path/idVendor" ]; then
-            vendor_id=$(cat "$sysfs_path/idVendor" 2>/dev/null) || true
-        fi
-        if [ -f "$sysfs_path/idProduct" ]; then
-            product_id=$(cat "$sysfs_path/idProduct" 2>/dev/null) || true
-        fi
-    fi
-    
-    # Fallback to udevadm if we still don't have a port path
+    # Method 2: Use udevadm as fallback if sysfs search didn't work
     if [ -z "$base_port_path" ]; then
+        debug "Sysfs search failed, trying udevadm method"
         local bus_num_padded
         local dev_num_padded
         bus_num_padded=$(printf "%03d" "$bus_num")
@@ -337,54 +298,43 @@ get_usb_physical_port() {
                 devpath_from_udev=$(printf '%s' "$udevadm_props" | grep "^DEVPATH=" | head -n1 | cut -d= -f2) || true
                 
                 if [ -n "$devpath_from_udev" ]; then
-                    if [[ "$devpath_from_udev" =~ /([0-9]+-[0-9]+(\.[0-9]+)*)$ ]]; then
-                        base_port_path="${BASH_REMATCH[1]}"
-                        debug "Extracted port from udevadm DEVPATH: $base_port_path"
+                    debug "Processing udevadm DEVPATH: $devpath_from_udev"
+                    
+                    # Extract the LAST USB port pattern (most specific)
+                    base_port_path=$(echo "$devpath_from_udev" | grep -oE '[0-9]+-[0-9]+(\.[0-9]+)*' | tail -n1)
+                    
+                    if [ -n "$base_port_path" ]; then
+                        debug "Extracted port from udevadm: $base_port_path"
+                    else
+                        debug "No USB port pattern found in DEVPATH"
                     fi
                 fi
                 
-                # Get serial if not already found
+                # Get serial if not already found (for logging only)
                 if [ -z "$serial" ]; then
                     local id_serial_short
                     id_serial_short=$(printf '%s' "$udevadm_props" | grep "^ID_SERIAL_SHORT=" | head -n1 | cut -d= -f2) || true
                     if [ -n "$id_serial_short" ]; then
                         serial="$id_serial_short"
-                    else
-                        serial=$(printf '%s' "$udevadm_props" | grep "^ID_SERIAL=" | head -n1 | cut -d= -f2) || true
+                        debug "Found serial from udevadm: ${serial:-none}"
                     fi
                 fi
             fi
         fi
     fi
     
-    # Build the final unique identifier
-    local final_port_path=""
-    
-    # Use the base port path if we have it (this represents the physical USB port)
+    # Build the final port path
     if [ -n "$base_port_path" ]; then
-        final_port_path="$base_port_path"
+        # Return clean port path (v1.0.0 compatible - no serial suffix)
+        printf '%s' "$base_port_path"
+        return 0
     else
         # Fallback: create synthetic port identifier
-        final_port_path="bus${bus_num}-dev${dev_num}"
+        local fallback="bus${bus_num}-dev${dev_num}"
+        debug "Using fallback port identifier: $fallback"
+        printf '%s' "$fallback"
+        return 0
     fi
-    
-    # For devices with serial numbers, append serial for guaranteed uniqueness
-    if [ -n "$serial" ] && [ "$serial" != "0" ]; then
-        # Use first 8 chars of serial
-        local serial_fragment
-        if [ ${#serial} -gt 8 ]; then
-            serial_fragment="${serial:0:8}"
-        else
-            serial_fragment="$serial"
-        fi
-        printf '%s-sn%s' "$final_port_path" "$serial_fragment"
-    else
-        # For devices without serial numbers, the port path alone should be unique
-        # since each physical port can only have one device
-        printf '%s' "$final_port_path"
-    fi
-    
-    return 0
 }
 
 # Function to get platform path for ID_PATH rule
