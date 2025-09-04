@@ -6,10 +6,21 @@
 # This script automatically detects USB microphones and creates MediaMTX 
 # configurations for continuous 24/7 RTSP audio streams.
 #
-# Version: 1.1.5 - Production Release
+# Version: 1.1.7 - Fixed Pattern-Based Configuration
 # Compatible with MediaMTX v1.12.3+
 #
 # Version History:
+# v1.1.7 - CRITICAL FIX for pattern-based configuration
+#   - Fixed broken pattern restoration logic that caused syntax errors
+#   - Implemented numbered pattern approach (DEVICE_PATTERN_1="*Blue*", etc.)
+#   - Pattern matching now works correctly without variable name corruption
+#   - All pattern configs use DEVICE_PATTERN_{number}_{PARAM} format
+# v1.1.6 - Added friendly device name alias support
+#   - Device aliases for easy configuration (DEVICE_ALIAS_BLUE_YETI="*Blue*")
+#   - Pattern-based configuration support
+#   - Configuration migration helper for existing setups
+#   - Enhanced configuration validation
+#   - New commands: mapping, migrate, validate
 # v1.1.5 - Production release with enhanced security and reliability
 #   - Complete shell injection protection for all wrapper variables
 #   - Enhanced device name sanitization and validation
@@ -28,7 +39,7 @@
 # - USB audio devices
 # - ffmpeg installed for audio encoding
 #
-# Usage: ./mediamtx-stream-manager.sh [start|stop|restart|status|config|help]
+# Usage: ./mediamtx-stream-manager.sh [start|stop|restart|status|config|mapping|migrate|validate|help]
 
 # Ensure we're running with bash
 if [ -z "$BASH_VERSION" ]; then
@@ -39,7 +50,7 @@ fi
 set -euo pipefail
 
 # Constants with environment variable overrides for flexibility
-readonly VERSION="1.1.5"
+readonly VERSION="1.1.7"
 readonly SCRIPT_NAME="$(basename "${BASH_SOURCE[0]}")"
 readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -606,11 +617,57 @@ load_device_config() {
     fi
 }
 
-# Save device configuration template
+# Enhanced save device configuration with alias support and FIXED patterns
 save_device_config() {
     cat > "${DEVICE_CONFIG_FILE}" << 'EOF'
-# Audio device configuration
-# Format: DEVICE_<sanitized_name>_<parameter>=value
+# Audio device configuration with friendly name support
+# Version: 1.3.0 - Fixed Pattern Support
+#
+# =============================================================================
+# DEVICE NAME ALIASES (v1.2.0+)
+# =============================================================================
+# Map friendly names to actual device patterns for easier configuration
+# Format: DEVICE_ALIAS_<friendly_name>="pattern"
+# 
+# The pattern can be:
+#   - Exact device name: "usb-Blue_Microphones_Yeti_Stereo_Microphone_REV10_..."
+#   - Partial match: "*Blue_Microphones_Yeti*"
+#   - USB ID match: "usb-*_2d7b_0003_*"
+#
+# Examples:
+# DEVICE_ALIAS_BLUE_YETI="*Blue_Microphones_Yeti*"
+# DEVICE_ALIAS_WEBCAM="*HD_Pro_Webcam*"
+# DEVICE_ALIAS_SCARLETT="*Scarlett_Solo*"
+# DEVICE_ALIAS_RODE="*RODE_NT*"
+
+# Your device aliases:
+# DEVICE_ALIAS_MIC1="*your_device_pattern*"
+# DEVICE_ALIAS_MIC2="*another_device_pattern*"
+
+# =============================================================================
+# PATTERN-BASED CONFIGURATION (v1.3.0 - Fixed)
+# =============================================================================
+# Apply settings to devices matching specific patterns using numbered patterns
+# Format: 
+#   DEVICE_PATTERN_{number}="pattern"
+#   DEVICE_PATTERN_{number}_{PARAM}="value"
+#
+# Examples:
+# DEVICE_PATTERN_1="*Logitech*"
+# DEVICE_PATTERN_1_SAMPLE_RATE="16000"
+# DEVICE_PATTERN_1_CHANNELS="1"
+#
+# DEVICE_PATTERN_2="*USB_Audio*"
+# DEVICE_PATTERN_2_CODEC="aac"
+# DEVICE_PATTERN_2_BITRATE="96k"
+
+# =============================================================================
+# DEVICE CONFIGURATION
+# =============================================================================
+# You can now use:
+# 1. Friendly names (if alias defined): DEVICE_BLUE_YETI_SAMPLE_RATE=44100
+# 2. Exact device names (legacy): DEVICE_USB_BLUE_MICROPHONES_YETI_..._SAMPLE_RATE=44100
+# 3. Pattern-based (numbered): DEVICE_PATTERN_1="*Blue*" + DEVICE_PATTERN_1_SAMPLE_RATE=44100
 
 # Universal defaults:
 # - Sample Rate: 48000 Hz
@@ -619,15 +676,23 @@ save_device_config() {
 # - Codec: opus
 # - Bitrate: 128k
 
-# Example overrides:
-# DEVICE_USB_BLUE_YETI_SAMPLE_RATE=44100
-# DEVICE_USB_BLUE_YETI_CHANNELS=1
+# Example configurations using friendly names:
+# DEVICE_BLUE_YETI_SAMPLE_RATE=44100
+# DEVICE_BLUE_YETI_CHANNELS=1
+# DEVICE_WEBCAM_CODEC=aac
+# DEVICE_SCARLETT_BITRATE=192k
 
 # Codec recommendations:
 # - opus: Best for real-time streaming (low latency, good quality)
 # - aac: Universal compatibility 
 # - mp3: Legacy device support
 # - pcm: Avoid for network streams (uses excessive bandwidth)
+
+# Priority order for configuration lookup:
+# 1. Exact device name match
+# 2. Friendly name via alias
+# 3. Numbered pattern match (DEVICE_PATTERN_1, DEVICE_PATTERN_2, etc.)
+# 4. Universal defaults
 EOF
 }
 
@@ -670,21 +735,420 @@ sanitize_path_name() {
     echo "$sanitized"
 }
 
-# Get device configuration
+# Pattern matching helper function
+match_device_pattern() {
+    local device_name="$1"
+    local pattern="$2"
+    
+    # Handle empty inputs
+    if [[ -z "$device_name" ]] || [[ -z "$pattern" ]]; then
+        return 1
+    fi
+    
+    # Convert pattern to shell pattern if needed
+    # Support both glob patterns and simple substring matching
+    case "$pattern" in
+        \**)
+            # Pattern starts with asterisk - glob pattern
+            if [[ "$device_name" == $pattern ]]; then
+                return 0
+            fi
+            ;;
+        *\**)
+            # Pattern contains asterisk - glob pattern
+            if [[ "$device_name" == $pattern ]]; then
+                return 0
+            fi
+            ;;
+        *)
+            # No asterisk - exact match
+            if [[ "$device_name" == "$pattern" ]]; then
+                return 0
+            fi
+            ;;
+    esac
+    
+    return 1
+}
+
+# Enhanced device configuration lookup with friendly name and FIXED pattern support
 get_device_config() {
     local device_name="$1"
     local param="$2"
     local default_value="$3"
     
+    # Defensive validation
+    if [[ -z "$device_name" ]] || [[ -z "$param" ]]; then
+        echo "${default_value}"
+        return 0
+    fi
+    
+    # 1. First try exact device name match (backward compatibility)
     local safe_name
     safe_name="$(sanitize_device_name "$device_name")"
-    
     local config_key="DEVICE_${safe_name^^}_${param^^}"
     
     if [[ -n "${!config_key+x}" ]]; then
+        log DEBUG "Config found via exact match: ${config_key}=${!config_key}"
         echo "${!config_key}"
+        return 0
+    fi
+    
+    # 2. Try friendly name aliases
+    local alias_pattern
+    for var_name in $(compgen -v | grep "^DEVICE_ALIAS_"); do
+        alias_pattern="${!var_name}"
+        if [[ -n "$alias_pattern" ]]; then
+            # Check if device name matches the alias pattern
+            if match_device_pattern "$device_name" "$alias_pattern"; then
+                # Extract friendly name from variable name
+                local friendly_name="${var_name#DEVICE_ALIAS_}"
+                config_key="DEVICE_${friendly_name}_${param^^}"
+                
+                if [[ -n "${!config_key+x}" ]]; then
+                    log DEBUG "Config found via alias ${friendly_name}: ${config_key}=${!config_key}"
+                    echo "${!config_key}"
+                    return 0
+                fi
+            fi
+        fi
+    done
+    
+    # 3. Try numbered pattern-based configuration (FIXED VERSION)
+    local pattern_num=1
+    local max_patterns=100  # Prevent infinite loop
+    
+    while [[ $pattern_num -le $max_patterns ]]; do
+        local pattern_var="DEVICE_PATTERN_${pattern_num}"
+        
+        # Check if this pattern number exists
+        if [[ -z "${!pattern_var+x}" ]]; then
+            # No more patterns defined
+            break
+        fi
+        
+        local pattern="${!pattern_var}"
+        
+        # Check if device matches this pattern
+        if match_device_pattern "$device_name" "$pattern"; then
+            # Look for the parameter for this pattern number
+            local param_var="DEVICE_PATTERN_${pattern_num}_${param^^}"
+            
+            if [[ -n "${!param_var+x}" ]]; then
+                log DEBUG "Config found via pattern ${pattern_num} (${pattern}): ${param_var}=${!param_var}"
+                echo "${!param_var}"
+                return 0
+            fi
+        fi
+        
+        ((pattern_num++))
+    done
+    
+    # 4. Return default value
+    echo "$default_value"
+}
+
+# List detected devices with their configuration
+show_device_mapping() {
+    echo -e "${CYAN}=== Device Configuration Mapping ===${NC}"
+    echo
+    
+    local devices=()
+    readarray -t devices < <(detect_audio_devices)
+    
+    if [[ ${#devices[@]} -eq 0 ]]; then
+        echo "No USB audio devices detected"
+        return 0
+    fi
+    
+    echo "Detected devices and their configuration keys:"
+    echo
+    
+    for device_info in "${devices[@]}"; do
+        IFS=':' read -r device_name card_num <<< "$device_info"
+        
+        if [[ -z "$device_name" ]] || [[ -z "$card_num" ]]; then
+            continue
+        fi
+        
+        echo "Device: ${device_name}"
+        echo "  Card: ${card_num}"
+        
+        # Check for alias match
+        local found_alias=""
+        for var_name in $(compgen -v | grep "^DEVICE_ALIAS_"); do
+            local alias_pattern="${!var_name}"
+            if [[ -n "$alias_pattern" ]] && match_device_pattern "$device_name" "$alias_pattern"; then
+                local friendly_name="${var_name#DEVICE_ALIAS_}"
+                found_alias="$friendly_name"
+                echo -e "  ${GREEN}✓${NC} Matched alias: ${friendly_name}"
+                echo "    Config prefix: DEVICE_${friendly_name}_"
+                break
+            fi
+        done
+        
+        # Check for pattern match (using numbered patterns)
+        local found_pattern=""
+        local pattern_num=1
+        while [[ $pattern_num -le 100 ]]; do
+            local pattern_var="DEVICE_PATTERN_${pattern_num}"
+            if [[ -n "${!pattern_var+x}" ]]; then
+                local pattern="${!pattern_var}"
+                if match_device_pattern "$device_name" "$pattern"; then
+                    found_pattern="$pattern_num"
+                    echo -e "  ${GREEN}✓${NC} Matched pattern ${pattern_num}: ${pattern}"
+                    echo "    Config prefix: DEVICE_PATTERN_${pattern_num}_"
+                    break
+                fi
+            else
+                break
+            fi
+            ((pattern_num++))
+        done
+        
+        if [[ -z "$found_alias" ]] && [[ -z "$found_pattern" ]]; then
+            local sanitized_name
+            sanitized_name="$(sanitize_device_name "$device_name")"
+            echo -e "  ${YELLOW}!${NC} No alias or pattern found"
+            echo "    Exact match prefix: DEVICE_${sanitized_name^^}_"
+            echo "    Tip: Add this to ${DEVICE_CONFIG_FILE}:"
+            echo "      DEVICE_ALIAS_MY_MIC=\"*${device_name:0:20}*\""
+            echo "      DEVICE_MY_MIC_SAMPLE_RATE=48000"
+            echo "    Or use a pattern:"
+            echo "      DEVICE_PATTERN_1=\"*${device_name:0:15}*\""
+            echo "      DEVICE_PATTERN_1_SAMPLE_RATE=48000"
+        fi
+        
+        # Show current configuration
+        local sample_rate channels codec
+        sample_rate="$(get_device_config "$device_name" "SAMPLE_RATE" "$DEFAULT_SAMPLE_RATE")"
+        channels="$(get_device_config "$device_name" "CHANNELS" "$DEFAULT_CHANNELS")"
+        codec="$(get_device_config "$device_name" "CODEC" "$DEFAULT_CODEC")"
+        
+        echo "  Current config: ${sample_rate}Hz, ${channels}ch, ${codec}"
+        echo
+    done
+}
+
+# Migration helper - convert old config to new format with aliases
+migrate_config_to_aliases() {
+    echo -e "${CYAN}=== Configuration Migration Helper ===${NC}"
+    echo
+    
+    if [[ ! -f "${DEVICE_CONFIG_FILE}" ]]; then
+        echo "No existing configuration found."
+        echo "Creating new configuration with alias support..."
+        save_device_config
+        echo "Done. Edit ${DEVICE_CONFIG_FILE} to add your device aliases."
+        return 0
+    fi
+    
+    # Backup existing config
+    local backup_file="${DEVICE_CONFIG_FILE}.$(date +%Y%m%d_%H%M%S).bak"
+    cp "${DEVICE_CONFIG_FILE}" "${backup_file}"
+    echo "Backed up existing config to: ${backup_file}"
+    echo
+    
+    # Analyze existing configuration
+    echo "Analyzing existing device configurations..."
+    local found_configs=()
+    
+    while IFS= read -r line; do
+        if [[ "$line" =~ ^DEVICE_([A-Z0-9_]+)_(SAMPLE_RATE|CHANNELS|FORMAT|CODEC|BITRATE|THREAD_QUEUE)= ]]; then
+            local device_part="${BASH_REMATCH[1]}"
+            if [[ "$device_part" != "ALIAS" ]] && [[ "$device_part" != "PATTERN" ]]; then
+                # This is an old-style exact device configuration
+                if [[ ! " ${found_configs[@]} " =~ " ${device_part} " ]]; then
+                    found_configs+=("$device_part")
+                fi
+            fi
+        fi
+    done < "${DEVICE_CONFIG_FILE}"
+    
+    if [[ ${#found_configs[@]} -eq 0 ]]; then
+        echo "No device-specific configurations found in existing file."
+        echo "Adding alias support to configuration..."
+        
+        # Prepend alias section to existing config
+        local temp_file
+        temp_file=$(mktemp)
+        cat > "$temp_file" << 'EOF'
+# =============================================================================
+# DEVICE NAME ALIASES (Added by migration)
+# =============================================================================
+# Map friendly names to device patterns for easier configuration
+# 
+# Examples based on your devices:
+EOF
+        
+        # Add suggested aliases for detected devices
+        local devices=()
+        readarray -t devices < <(detect_audio_devices)
+        local device_counter=1
+        
+        for device_info in "${devices[@]}"; do
+            IFS=':' read -r device_name card_num <<< "$device_info"
+            if [[ -n "$device_name" ]]; then
+                # Create a suggested friendly name
+                local suggested_name="MIC${device_counter}"
+                if [[ "$device_name" == *"Blue"* ]]; then
+                    suggested_name="BLUE_YETI"
+                elif [[ "$device_name" == *"Logitech"* ]]; then
+                    suggested_name="WEBCAM"
+                elif [[ "$device_name" == *"Scarlett"* ]]; then
+                    suggested_name="SCARLETT"
+                elif [[ "$device_name" == *"RODE"* ]]; then
+                    suggested_name="RODE"
+                fi
+                
+                echo "# DEVICE_ALIAS_${suggested_name}=\"*${device_name:0:25}*\"" >> "$temp_file"
+                ((device_counter++))
+            fi
+        done
+        
+        echo "" >> "$temp_file"
+        echo "# ==============================================================================" >> "$temp_file"
+        echo "" >> "$temp_file"
+        
+        # Append existing config
+        cat "${DEVICE_CONFIG_FILE}" >> "$temp_file"
+        mv "$temp_file" "${DEVICE_CONFIG_FILE}"
+        
     else
-        echo "$default_value"
+        echo "Found configurations for ${#found_configs[@]} devices:"
+        for config in "${found_configs[@]}"; do
+            echo "  - DEVICE_${config}_*"
+        done
+        echo
+        echo "Suggested aliases to add to your configuration:"
+        echo
+        
+        local alias_counter=1
+        for config in "${found_configs[@]}"; do
+            # Try to create a meaningful friendly name
+            local friendly_name="DEVICE${alias_counter}"
+            
+            # Make intelligent guesses based on common patterns
+            case "${config,,}" in
+                *blue*yeti*) friendly_name="BLUE_YETI" ;;
+                *scarlett*) friendly_name="SCARLETT" ;;
+                *logitech*) friendly_name="WEBCAM" ;;
+                *rode*) friendly_name="RODE" ;;
+                *behringer*) friendly_name="BEHRINGER" ;;
+                *) friendly_name="MIC${alias_counter}" ;;
+            esac
+            
+            echo "# For device configurations matching DEVICE_${config}_*:"
+            echo "DEVICE_ALIAS_${friendly_name}=\"*${config:0:20}*\""
+            echo
+            echo "# Then you can use:"
+            echo "# DEVICE_${friendly_name}_SAMPLE_RATE=48000"
+            echo "# Instead of: DEVICE_${config}_SAMPLE_RATE=48000"
+            echo
+            
+            ((alias_counter++))
+        done
+        
+        echo
+        echo "For pattern-based configuration (NEW - FIXED in v1.3.0), use numbered patterns:"
+        echo "# DEVICE_PATTERN_1=\"*Logitech*\""
+        echo "# DEVICE_PATTERN_1_SAMPLE_RATE=16000"
+        echo "# DEVICE_PATTERN_1_CHANNELS=1"
+        echo
+        echo "# DEVICE_PATTERN_2=\"*USB_Audio*\""
+        echo "# DEVICE_PATTERN_2_CODEC=aac"
+    fi
+    
+    echo
+    echo "Edit ${DEVICE_CONFIG_FILE} to:"
+    echo "1. Uncomment and adjust the suggested aliases"
+    echo "2. Update your device configurations to use the friendly names"
+    echo "3. Add numbered patterns for groups of devices"
+    echo "4. Run: sudo $0 mapping  # To verify the mapping"
+}
+
+# Enhanced validation for configuration
+validate_device_config() {
+    local errors=0
+    local warnings=0
+    
+    echo -e "${CYAN}=== Validating Device Configuration ===${NC}"
+    echo
+    
+    if [[ ! -f "${DEVICE_CONFIG_FILE}" ]]; then
+        echo -e "${RED}✗${NC} Configuration file not found: ${DEVICE_CONFIG_FILE}"
+        return 1
+    fi
+    
+    # Check for syntax errors
+    if ! bash -n "${DEVICE_CONFIG_FILE}" 2>/dev/null; then
+        echo -e "${RED}✗${NC} Configuration file has syntax errors"
+        ((errors++))
+    else
+        echo -e "${GREEN}✓${NC} Configuration syntax valid"
+    fi
+    
+    # Check for conflicting aliases
+    declare -A alias_patterns
+    while IFS='=' read -r key value; do
+        if [[ "$key" =~ ^DEVICE_ALIAS_([A-Z0-9_]+)$ ]]; then
+            local alias_name="${BASH_REMATCH[1]}"
+            # Remove quotes from value
+            value="${value%\"}"
+            value="${value#\"}"
+            
+            if [[ -n "${alias_patterns[$value]}" ]]; then
+                echo -e "${YELLOW}⚠${NC} Duplicate pattern '$value' for aliases: ${alias_patterns[$value]} and ${alias_name}"
+                ((warnings++))
+            else
+                alias_patterns["$value"]="$alias_name"
+            fi
+        fi
+    done < <(grep "^DEVICE_ALIAS_" "${DEVICE_CONFIG_FILE}" 2>/dev/null)
+    
+    # Check numbered pattern configuration
+    local pattern_num=1
+    while [[ $pattern_num -le 100 ]]; do
+        local pattern_var="DEVICE_PATTERN_${pattern_num}"
+        if grep -q "^${pattern_var}=" "${DEVICE_CONFIG_FILE}" 2>/dev/null; then
+            echo -e "${GREEN}✓${NC} Found pattern ${pattern_num}"
+            ((pattern_num++))
+        else
+            break
+        fi
+    done
+    
+    # Check parameter values
+    while IFS='=' read -r key value; do
+        case "$key" in
+            *_SAMPLE_RATE)
+                if ! [[ "$value" =~ ^[0-9]+$ ]] || [[ "$value" -lt 8000 ]] || [[ "$value" -gt 192000 ]]; then
+                    echo -e "${RED}✗${NC} Invalid sample rate in ${key}: ${value}"
+                    ((errors++))
+                fi
+                ;;
+            *_CHANNELS)
+                if ! [[ "$value" =~ ^[0-9]+$ ]] || [[ "$value" -lt 1 ]] || [[ "$value" -gt 32 ]]; then
+                    echo -e "${RED}✗${NC} Invalid channel count in ${key}: ${value}"
+                    ((errors++))
+                fi
+                ;;
+            *_CODEC)
+                if [[ ! "$value" =~ ^(opus|aac|mp3|pcm)$ ]]; then
+                    echo -e "${YELLOW}⚠${NC} Unknown codec in ${key}: ${value}"
+                    ((warnings++))
+                fi
+                ;;
+        esac
+    done < <(grep "^DEVICE_" "${DEVICE_CONFIG_FILE}" | grep -v "^DEVICE_ALIAS_" 2>/dev/null)
+    
+    echo
+    if [[ $errors -eq 0 ]] && [[ $warnings -eq 0 ]]; then
+        echo -e "${GREEN}Configuration validation passed!${NC}"
+        return 0
+    else
+        echo "Found $errors errors and $warnings warnings"
+        return $((errors > 0 ? 1 : 0))
     fi
 }
 
@@ -2170,6 +2634,9 @@ show_config() {
             echo
         done
     fi
+    
+    # Show device mapping at the end
+    show_device_mapping
 }
 
 # Test streams
@@ -2492,13 +2959,12 @@ EOF
     echo "Enable: sudo systemctl enable mediamtx-audio"
     echo "Start: sudo systemctl start mediamtx-audio"
     echo ""
-    echo "Note: v${VERSION} includes comprehensive security and reliability enhancements:"
-    echo "  - Complete shell injection protection"
-    echo "  - Enhanced device validation and sanitization"
-    echo "  - Atomic file operations to prevent corruption"
-    echo "  - Improved process lifecycle management with restart limits"
-    echo "  - Fixed FFmpeg parameter compatibility issues"
-    echo "  - Enhanced stream validation and monitoring"
+    echo "Note: v${VERSION} includes FIXED pattern-based configuration:"
+    echo "  - Critical fix for pattern matching (v1.1.7)"
+    echo "  - Numbered patterns (DEVICE_PATTERN_1, DEVICE_PATTERN_2, etc.)"
+    echo "  - Device aliases for easy configuration"
+    echo "  - Configuration migration helper"
+    echo "  - Enhanced validation"
     echo ""
     echo "Configure paths via systemd override:"
     echo "  sudo systemctl edit mediamtx-audio"
@@ -2513,7 +2979,7 @@ EOF
 # Validate command
 validate_command() {
     local cmd="$1"
-    local valid_commands="start stop restart status config test debug monitor install help"
+    local valid_commands="start stop restart status config mapping migrate validate test debug monitor install help"
     
     if [[ -z "$cmd" ]]; then
         return 0
@@ -2537,6 +3003,9 @@ Part of LyreBirdAudio - RTSP Audio Streaming Suite
 Automatically configures MediaMTX for continuous 24/7 RTSP audio streaming
 from USB audio devices with production-ready features and enhanced reliability.
 
+CRITICAL FIX in v1.1.7: Pattern-based configuration now works correctly.
+Use numbered patterns: DEVICE_PATTERN_1="*Blue*", DEVICE_PATTERN_1_SAMPLE_RATE=44100
+
 Usage: ${SCRIPT_NAME} [COMMAND]
 
 Commands:
@@ -2545,83 +3014,72 @@ Commands:
     restart     Restart everything
     status      Show current status
     config      Show device configuration
+    mapping     Show device to configuration mapping
+    migrate     Migrate config to use friendly aliases
+    validate    Validate device configuration
     test        Show stream test commands
-    debug       Debug stream issues
-    monitor     Live monitor streams (Ctrl+C to exit)
+    debug       Debug running streams
+    monitor     Live stream monitoring
     install     Create systemd service
-    help        Show this help
+    help        Show this help message
 
-Configuration files:
-    Device config: ${DEVICE_CONFIG_FILE}
-    MediaMTX config: ${CONFIG_FILE}
-    System log: ${LOG_FILE}
-    Stream logs: ${FFMPEG_PID_DIR}/<stream>.log
+Configuration:
+    Device aliases:      DEVICE_ALIAS_BLUE_YETI="*Blue_Microphones_Yeti*"
+    Numbered patterns:   DEVICE_PATTERN_1="*Logitech*"
+                        DEVICE_PATTERN_1_SAMPLE_RATE=16000
+    Exact device match: DEVICE_USB_BLUE_MICROPHONES_YETI_..._SAMPLE_RATE=44100
 
-Default audio settings:
-    Sample rate: 48000 Hz
-    Channels: 2 (stereo)
-    Format: s16le (16-bit little-endian)
-    Codec: opus
-    Bitrate: 128k
-    Thread queue: 8192
+Files:
+    Config:     ${DEVICE_CONFIG_FILE}
+    Log:        ${LOG_FILE}
+    PID:        ${PID_FILE}
 
-Key Features in v${VERSION}:
-    - Production-grade security with complete shell injection protection
-    - Enhanced device name sanitization and validation
-    - Atomic file operations prevent corruption
-    - Intelligent process lifecycle management with restart limits
-    - Fixed FFmpeg parameter compatibility
-    - Enhanced stream validation and monitoring
-    - Improved error handling and device reliability
+Examples:
+    # Start streaming
+    sudo ${SCRIPT_NAME} start
+    
+    # View status and stream URLs
+    sudo ${SCRIPT_NAME} status
+    
+    # Configure devices
+    sudo vi ${DEVICE_CONFIG_FILE}
+    sudo ${SCRIPT_NAME} restart
+    
+    # Debug issues
+    sudo ${SCRIPT_NAME} debug
+    
+    # Install as service
+    sudo ${SCRIPT_NAME} install
+    sudo systemctl enable mediamtx-audio
+    sudo systemctl start mediamtx-audio
 
-Environment variables:
-    MEDIAMTX_CONFIG_DIR=/etc/mediamtx      Config directory
-    MEDIAMTX_BINARY=/usr/local/bin/mediamtx MediaMTX binary path
-    MEDIAMTX_HOST=localhost                MediaMTX server host
-    STREAM_STARTUP_DELAY=10                Seconds to wait after starting stream
-    PARALLEL_STREAM_START=false            Start all streams in parallel
-    DEVICE_TEST_ENABLED=false              Enable device format testing
-    USB_STABILIZATION_DELAY=5              Wait for USB to stabilize (seconds)
-    DEBUG=true                             Enable debug logging
-
-Common issues and solutions:
-    - FFmpeg fails to start: Check device format compatibility
-    - Streams fail to validate: Ensure MediaMTX API is accessible
-    - Audio dropouts: Adjust thread_queue_size in device config
-    - Ugly stream names: Run usb-audio-mapper.sh for friendly names
-    - Format errors: Script defaults to plughw for compatibility
-
-Troubleshooting steps:
-    1. Check status: sudo ./mediamtx-stream-manager.sh status
-    2. View logs: tail -f /var/log/mediamtx-stream-manager.log
-    3. Debug streams: sudo ./mediamtx-stream-manager.sh debug
-    4. Monitor live: sudo ./mediamtx-stream-manager.sh monitor
-    5. Test playback: ffplay rtsp://localhost:8554/STREAM_NAME
-
-For production deployment:
-    1. Install as service: sudo ./mediamtx-stream-manager.sh install
-    2. Enable service: sudo systemctl enable mediamtx-audio
-    3. Start service: sudo systemctl start mediamtx-audio
-    4. View service logs: sudo journalctl -u mediamtx-audio -f
-
+For more information: https://github.com/tomtom215/LyreBirdAudio
 EOF
 }
 
-# Main function
+# Main execution
 main() {
-    if ! validate_command "${1:-}"; then
+    local command="${1:-help}"
+    
+    if ! validate_command "$command"; then
         show_help
         exit 1
     fi
     
-    if [[ "${1:-}" != "help" ]]; then
-        check_root
-        check_dependencies
-        setup_directories
-        load_device_config
-    fi
+    # Commands that don't require root
+    case "$command" in
+        help)
+            show_help
+            exit 0
+            ;;
+    esac
     
-    case "${1:-help}" in
+    # All other commands require root
+    check_root
+    check_dependencies
+    setup_directories
+    
+    case "$command" in
         start)
             start_mediamtx
             ;;
@@ -2637,6 +3095,18 @@ main() {
         config)
             show_config
             ;;
+        mapping)
+            load_device_config
+            show_device_mapping
+            ;;
+        migrate)
+            load_device_config
+            migrate_config_to_aliases
+            ;;
+        validate)
+            load_device_config
+            validate_device_config
+            ;;
         test)
             test_streams
             ;;
@@ -2649,18 +3119,13 @@ main() {
         install)
             create_systemd_service
             ;;
-        help|--help|-h|"")
-            show_help
-            ;;
         *)
-            echo "Error: Unknown command '${1}'" >&2
+            echo "Error: Unknown command: $command"
             show_help
             exit 1
             ;;
     esac
 }
 
-# Run
-if ! main "$@"; then
-    exit 1
-fi
+# Execute main function with all arguments
+main "$@"
