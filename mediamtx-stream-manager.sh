@@ -6,11 +6,11 @@
 # This script automatically detects USB microphones and creates MediaMTX 
 # configurations for continuous 24/7 RTSP audio streams.
 #
-# Version: 1.1.7 - Fixed Pattern-Based Configuration
-# Compatible with MediaMTX v1.12.3+
+# Version: 1.1.6.1 - Fixed Pattern-Based Configuration
+# Compatible with MediaMTX v1.13.0+
 #
 # Version History:
-# v1.1.7 - CRITICAL FIX for pattern-based configuration
+# v1.1.6.1 - CRITICAL FIX for pattern-based configuration
 #   - Fixed broken pattern restoration logic that caused syntax errors
 #   - Implemented numbered pattern approach (DEVICE_PATTERN_1="*Blue*", etc.)
 #   - Pattern matching now works correctly without variable name corruption
@@ -50,7 +50,7 @@ fi
 set -euo pipefail
 
 # Constants with environment variable overrides for flexibility
-readonly VERSION="1.1.7"
+readonly VERSION="1.1.6.1"
 readonly SCRIPT_NAME="$(basename "${BASH_SOURCE[0]}")"
 readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -2960,7 +2960,7 @@ EOF
     echo "Start: sudo systemctl start mediamtx-audio"
     echo ""
     echo "Note: v${VERSION} includes FIXED pattern-based configuration:"
-    echo "  - Critical fix for pattern matching (v1.1.7)"
+    echo "  - Critical fix for pattern matching (v1.1.6.1)"
     echo "  - Numbered patterns (DEVICE_PATTERN_1, DEVICE_PATTERN_2, etc.)"
     echo "  - Device aliases for easy configuration"
     echo "  - Configuration migration helper"
@@ -3003,7 +3003,7 @@ Part of LyreBirdAudio - RTSP Audio Streaming Suite
 Automatically configures MediaMTX for continuous 24/7 RTSP audio streaming
 from USB audio devices with production-ready features and enhanced reliability.
 
-CRITICAL FIX in v1.1.7: Pattern-based configuration now works correctly.
+CRITICAL FIX in v1.1.6.1: Pattern-based configuration now works correctly.
 Use numbered patterns: DEVICE_PATTERN_1="*Blue*", DEVICE_PATTERN_1_SAMPLE_RATE=44100
 
 Usage: ${SCRIPT_NAME} [COMMAND]
