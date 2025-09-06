@@ -6,7 +6,7 @@
 # This script automatically detects USB microphones and creates MediaMTX 
 # configurations for continuous 24/7 RTSP audio streams.
 #
-# Version: 1.1.5.1 - Production Release with Resouce Fix
+# Version: 1.1.5.1 - Production Release with Resource Fix
 # Compatible with MediaMTX v1.12.3+
 #
 # Version History:
@@ -1683,7 +1683,7 @@ generate_mediamtx_config() {
 logLevel: info
 
 # Timeouts
-readTimeout: 600s
+readTimeout: 30s
 writeTimeout: 600s
 
 # API
@@ -1711,8 +1711,7 @@ paths:
   '~^[a-zA-Z0-9_-]+$':
     source: publisher
     sourceProtocol: automatic
-    sourceOnDemand: no      # Prevents idle wait loops
-    readTimeout: 45s        # Cleans up disconnected publishers and prevents tight-loops
+    sourceOnDemand: no      # Prevents idle wait loops when publisher disconnects
 EOF
     
     if command -v python3 &>/dev/null && python3 -c "import yaml" 2>/dev/null; then
@@ -2496,13 +2495,14 @@ EOF
     echo "Enable: sudo systemctl enable mediamtx-audio"
     echo "Start: sudo systemctl start mediamtx-audio"
     echo ""
-    echo "Note: v${VERSION} includes comprehensive security and reliability enhancements:"
+    echo "Note: v${VERSION} includes CPU exhaustion bug fix:"
+    echo "  - Fixed high CPU usage from orphaned MediaMTX streams"
+    echo "  - Added sourceOnDemand: no to prevent idle wait loops"
+    echo "  - Set readTimeout: 30s to clean up disconnected publishers"
     echo "  - Complete shell injection protection"
     echo "  - Enhanced device validation and sanitization"
     echo "  - Atomic file operations to prevent corruption"
     echo "  - Improved process lifecycle management with restart limits"
-    echo "  - Fixed FFmpeg parameter compatibility issues"
-    echo "  - Enhanced stream validation and monitoring"
     echo ""
     echo "Configure paths via systemd override:"
     echo "  sudo systemctl edit mediamtx-audio"
@@ -2570,6 +2570,9 @@ Default audio settings:
     Thread queue: 8192
 
 Key Features in v${VERSION}:
+    - Fixed high CPU usage from orphaned MediaMTX streams
+    - sourceOnDemand: no prevents idle wait loops
+    - readTimeout: 30s cleans up disconnected publishers
     - Production-grade security with complete shell injection protection
     - Enhanced device name sanitization and validation
     - Atomic file operations prevent corruption
@@ -2589,6 +2592,7 @@ Environment variables:
     DEBUG=true                             Enable debug logging
 
 Common issues and solutions:
+    - High CPU usage: Fixed in v1.1.5.1 with proper timeout configuration
     - FFmpeg fails to start: Check device format compatibility
     - Streams fail to validate: Ensure MediaMTX API is accessible
     - Audio dropouts: Adjust thread_queue_size in device config
