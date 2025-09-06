@@ -6,10 +6,12 @@
 # This script automatically detects USB microphones and creates MediaMTX 
 # configurations for continuous 24/7 RTSP audio streams.
 #
-# Version: 1.1.5 - Production Release
+# Version: 1.1.5.1 - Production Release with Resouce Fix
 # Compatible with MediaMTX v1.12.3+
 #
 # Version History:
+# v1.1.5.1 - fix(config): Prevent mediamtx high CPU on publisher disconnect
+#   - Add sourceOnDemand: no and readTimeout: 30s to MediaMTX configuration to prevent resource leaks
 # v1.1.5 - Production release with enhanced security and reliability
 #   - Complete shell injection protection for all wrapper variables
 #   - Enhanced device name sanitization and validation
@@ -39,7 +41,7 @@ fi
 set -euo pipefail
 
 # Constants with environment variable overrides for flexibility
-readonly VERSION="1.1.5"
+readonly VERSION="1.1.5.1"
 readonly SCRIPT_NAME="$(basename "${BASH_SOURCE[0]}")"
 readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -1709,6 +1711,8 @@ paths:
   '~^[a-zA-Z0-9_-]+$':
     source: publisher
     sourceProtocol: automatic
+    sourceOnDemand: no      # Prevents idle wait loops
+    readTimeout: 45s        # Cleans up disconnected publishers and prevents tight-loops
 EOF
     
     if command -v python3 &>/dev/null && python3 -c "import yaml" 2>/dev/null; then
