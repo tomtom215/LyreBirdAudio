@@ -6,10 +6,16 @@
 # This script automatically detects USB microphones and creates MediaMTX 
 # configurations for continuous 24/7 RTSP audio streams.
 #
-# Version: 1.1.5.2 - Critical CPU Leak Fix
+# Version: 1.1.5.3 - Security and Stability Hardening
 # Compatible with MediaMTX v1.12.3+
 #
 # Version History:
+# v1.1.5.3 - fix(security/stability): Critical security and stability improvements
+#   - SECURITY: Fixed shell injection vulnerability in wrapper variable generation
+#   - STABILITY: Added process validation to read_pid_safe() preventing stale PID usage
+#   - RELIABILITY: Implemented exponential backoff with permanent failure detection
+#   - CONSISTENCY: Fixed all associative array initializations
+#   - ROBUSTNESS: Enhanced wrapper restart logic with MAX_CONSECUTIVE_FAILURES
 # v1.1.5.2 - fix(critical): Resolve CPU resource leak from writeTimeout
 #   - CRITICAL: Changed writeTimeout from 600s to 30s to prevent CPU exhaustion
 #   - Fixed bash array initialization in show_status() to prevent unintended cleanup
@@ -45,7 +51,7 @@ fi
 set -euo pipefail
 
 # Constants with environment variable overrides for flexibility
-readonly VERSION="1.1.5.2"
+readonly VERSION="1.1.5.3"
 readonly SCRIPT_NAME="$(basename "${BASH_SOURCE[0]}")"
 readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -216,7 +222,7 @@ write_pid_atomic() {
     }
 }
 
-# Enhanced PID file reading with validation
+# Enhanced PID file reading with validation and process existence check
 read_pid_safe() {
     local pid_file="$1"
     local pid_content=""
@@ -246,6 +252,14 @@ read_pid_safe() {
     
     if [[ $pid_val -lt 1 ]] || [[ $pid_val -gt $max_val ]]; then
         log ERROR "PID file $pid_file contains out-of-range PID: $pid_content"
+        rm -f "$pid_file"
+        echo ""
+        return 0
+    fi
+    
+    # CRITICAL FIX: Verify process actually exists before returning PID
+    if ! kill -0 "$pid_content" 2>/dev/null; then
+        log DEBUG "PID $pid_content from $pid_file is not running"
         rm -f "$pid_file"
         echo ""
         return 0
@@ -1141,33 +1155,40 @@ start_ffmpeg_stream() {
 set -o pipefail
 WRAPPER_HEADER
 
-    # Use escape_wrapper ONLY for truly user-controlled variables
+    # SECURITY FIX: Escape ALL variables that could contain user data or be externally influenced
     cat >> "$temp_wrapper" << WRAPPER_VARS
 STREAM_PATH='$(escape_wrapper "$stream_path")'
-LOG_FILE="${LOG_FILE}"
-FFMPEG_LOG="${ffmpeg_log}"
-PID_FILE="${pid_file}"
-CARD_NUM='${card_num}'
-RESTART_COUNT=0
-RESTART_DELAY=10
-MAX_SHORT_RUNS=3
-SHORT_RUN_COUNT=0
-USE_PLUGHW="${use_plughw}"
-CLEANUP_MARKER="${CLEANUP_MARKER}"
-MEDIAMTX_HOST="${MEDIAMTX_HOST}"
-FFMPEG_PID_DIR="${FFMPEG_PID_DIR}"
-MAX_RESTARTS=50
+LOG_FILE='$(escape_wrapper "${LOG_FILE}")'
+FFMPEG_LOG='$(escape_wrapper "${ffmpeg_log}")'
+PID_FILE='$(escape_wrapper "${pid_file}")'
+MEDIAMTX_HOST='$(escape_wrapper "${MEDIAMTX_HOST}")'
+FFMPEG_PID_DIR='$(escape_wrapper "${FFMPEG_PID_DIR}")'
+CARD_NUM='$(escape_wrapper "${card_num}")'
+USE_PLUGHW='$(escape_wrapper "${use_plughw}")'
+CLEANUP_MARKER='$(escape_wrapper "${CLEANUP_MARKER}")'
+SAMPLE_RATE='$(escape_wrapper "${sample_rate}")'
+CHANNELS='$(escape_wrapper "${channels}")'
+FORMAT='$(escape_wrapper "${format_to_use}")'
+OUTPUT_CODEC='$(escape_wrapper "${codec}")'
+BITRATE='$(escape_wrapper "${bitrate}")'
+THREAD_QUEUE='$(escape_wrapper "${thread_queue}")'
+FIFO_SIZE='$(escape_wrapper "${DEFAULT_FIFO_SIZE}")'
+ANALYZEDURATION='$(escape_wrapper "${DEFAULT_ANALYZEDURATION}")'
+PROBESIZE='$(escape_wrapper "${DEFAULT_PROBESIZE}")'
 
-# Audio parameters - these are safe internal values, no escaping needed
-SAMPLE_RATE="${sample_rate}"
-CHANNELS="${channels}"
-FORMAT="${format_to_use}"
-OUTPUT_CODEC="${codec}"
-BITRATE="${bitrate}"
-THREAD_QUEUE="${thread_queue}"
-FIFO_SIZE="${DEFAULT_FIFO_SIZE}"
-ANALYZEDURATION="${DEFAULT_ANALYZEDURATION}"
-PROBESIZE="${DEFAULT_PROBESIZE}"
+# Restart configuration
+RESTART_COUNT=0
+MAX_RESTARTS=50
+SHORT_RUN_COUNT=0
+MAX_SHORT_RUNS=3
+MAX_CONSECUTIVE_FAILURES=10
+CONSECUTIVE_FAILURES=0
+
+# Exponential backoff configuration
+BACKOFF_BASE=10
+BACKOFF_MULTIPLIER=2
+MAX_BACKOFF=3600
+RESTART_DELAY=10
 
 # Global variable for FFmpeg PID and start time
 FFMPEG_PID=""
@@ -1358,6 +1379,13 @@ while true; do
         break
     fi
     
+    # Check for permanent failure condition
+    if [[ $CONSECUTIVE_FAILURES -ge $MAX_CONSECUTIVE_FAILURES ]]; then
+        log_message "Stream permanently failed after ${MAX_CONSECUTIVE_FAILURES} consecutive attempts"
+        log_critical "Stream ${STREAM_PATH} permanently failed - too many consecutive failures"
+        break
+    fi
+    
     log_message "Starting FFmpeg for ${STREAM_PATH} (attempt #$((RESTART_COUNT + 1)))"
     
     if [[ -f "${FFMPEG_LOG}" ]] && [[ $(stat -c%s "${FFMPEG_LOG}" 2>/dev/null || echo 0) -gt 10485760 ]]; then
@@ -1379,8 +1407,17 @@ while true; do
     
     if ! run_ffmpeg; then
         log_message "Failed to start FFmpeg, waiting before retry"
+        ((CONSECUTIVE_FAILURES++))
         exec 200>&-
-        sleep 30
+        
+        # Calculate exponential backoff delay
+        RESTART_DELAY=$((BACKOFF_BASE * (BACKOFF_MULTIPLIER ** CONSECUTIVE_FAILURES)))
+        if [[ $RESTART_DELAY -gt $MAX_BACKOFF ]]; then
+            RESTART_DELAY=$MAX_BACKOFF
+        fi
+        
+        log_message "Waiting ${RESTART_DELAY}s before retry (consecutive failures: ${CONSECUTIVE_FAILURES})"
+        sleep $RESTART_DELAY
         continue
     fi
     
@@ -1418,17 +1455,26 @@ while true; do
     
     if [[ ${RUN_TIME} -lt 60 ]]; then
         ((SHORT_RUN_COUNT++))
+        ((CONSECUTIVE_FAILURES++))
+        
         if [[ ${SHORT_RUN_COUNT} -ge ${MAX_SHORT_RUNS} ]]; then
-            log_message "Too many short runs (${SHORT_RUN_COUNT}), extended delay of 300s"
-            log_critical "Stream ${STREAM_PATH} experiencing repeated failures - 300s cooldown"
-            RESTART_DELAY=300
+            # Use exponential backoff for repeated short runs
+            RESTART_DELAY=$((BACKOFF_BASE * (BACKOFF_MULTIPLIER ** CONSECUTIVE_FAILURES)))
+            if [[ $RESTART_DELAY -gt $MAX_BACKOFF ]]; then
+                RESTART_DELAY=$MAX_BACKOFF
+            fi
+            
+            log_message "Too many short runs (${SHORT_RUN_COUNT}), waiting ${RESTART_DELAY}s (exponential backoff)"
+            log_critical "Stream ${STREAM_PATH} experiencing repeated failures - ${RESTART_DELAY}s cooldown"
             SHORT_RUN_COUNT=0
         else
             RESTART_DELAY=60
             log_message "Short run detected (#${SHORT_RUN_COUNT}), waiting ${RESTART_DELAY}s"
         fi
     else
+        # Successful run, reset consecutive failure counter
         SHORT_RUN_COUNT=0
+        CONSECUTIVE_FAILURES=0
         RESTART_DELAY=10
         log_message "Normal restart, waiting ${RESTART_DELAY}s"
     fi
@@ -1985,7 +2031,7 @@ show_status() {
     if [[ ${#devices[@]} -eq 0 ]]; then
         echo "  No devices found"
     else
-        # Initialize associative arrays before use
+        # CONSISTENCY FIX: Initialize associative arrays with =()
         declare -A running_streams=()
         declare -A stream_to_device=()
         
@@ -2192,8 +2238,9 @@ test_streams() {
     echo -e "${CYAN}=== Stream Test Commands ===${NC}"
     echo
     
-    declare -A running_streams
-    declare -A stream_to_card
+    # CONSISTENCY FIX: Initialize associative arrays with =()
+    declare -A running_streams=()
+    declare -A stream_to_card=()
     
     for pid_file in "${FFMPEG_PID_DIR}"/*.pid; do
         if [[ -f "$pid_file" ]]; then
@@ -2250,8 +2297,9 @@ debug_streams() {
         return 1
     fi
     
-    declare -A running_streams
-    declare -A stream_to_card
+    # CONSISTENCY FIX: Initialize associative arrays with =()
+    declare -A running_streams=()
+    declare -A stream_to_card=()
     
     for pid_file in "${FFMPEG_PID_DIR}"/*.pid; do
         if [[ -f "$pid_file" ]]; then
@@ -2359,9 +2407,10 @@ monitor_streams() {
         
         # Use local scope to prevent variable pollution
         (
-            declare -A running_streams
-            declare -A stream_to_card
-            declare -A card_to_stream
+            # CONSISTENCY FIX: Initialize associative arrays with =()
+            declare -A running_streams=()
+            declare -A stream_to_card=()
+            declare -A card_to_stream=()
             
             local devices=()
             readarray -t devices < <(detect_audio_devices)
@@ -2507,14 +2556,16 @@ EOF
     echo "Enable: sudo systemctl enable mediamtx-audio"
     echo "Start: sudo systemctl start mediamtx-audio"
     echo ""
-    echo "Note: v${VERSION} includes CRITICAL CPU leak fix:"
-    echo "  - Fixed writeTimeout from 600s to 30s preventing CPU exhaustion"
-    echo "  - Fixed bash array initialization preventing MediaMTX termination"
-    echo "  - Added safety check in cleanup() for status command errors"
-    echo "  - Previous fixes from v1.1.5.1 still included:"
-    echo "    • sourceOnDemand: no prevents idle wait loops"
-    echo "    • readTimeout: 30s cleans up disconnected publishers"
-    echo "    • Complete shell injection protection"
+    echo "Note: v${VERSION} includes critical security and stability fixes:"
+    echo "  - SECURITY: Fixed shell injection vulnerability in wrapper variables"
+    echo "  - STABILITY: Added process validation to prevent stale PID usage"  
+    echo "  - RELIABILITY: Implemented exponential backoff with failure detection"
+    echo "  - CONSISTENCY: Fixed all associative array initializations"
+    echo ""
+    echo "Previous fixes still included:"
+    echo "  - writeTimeout: 30s prevents CPU exhaustion (v1.1.5.2)"
+    echo "  - sourceOnDemand: no prevents idle wait loops (v1.1.5.1)"
+    echo "  - readTimeout: 30s cleans up disconnected publishers"
     echo ""
     echo "Configure paths via systemd override:"
     echo "  sudo systemctl edit mediamtx-audio"
@@ -2581,17 +2632,22 @@ Default audio settings:
     Bitrate: 128k
     Thread queue: 8192
 
-CRITICAL FIX in v${VERSION}:
-    - Resolved CPU resource leak (31.6% → <5% usage)
-    - Fixed writeTimeout from 600s to 30s
-    - Fixed bash array initialization in status command
-    - Added cleanup safety check for status errors
+CRITICAL FIXES in v${VERSION}:
+    - SECURITY: Fixed shell injection vulnerability in wrapper generation
+    - STABILITY: Added process validation preventing stale PID usage
+    - RELIABILITY: Implemented exponential backoff with failure detection
+    - CONSISTENCY: Fixed all associative array initializations
+    
+Previous fixes included:
+    - Resolved CPU resource leak (writeTimeout: 30s) - v1.1.5.2
+    - Fixed bash array initialization in status command - v1.1.5.2
+    - Added sourceOnDemand: no to prevent idle loops - v1.1.5.1
+    - readTimeout: 30s cleans up disconnected publishers - v1.1.5.1
     
 Key Features:
-    - Fixed high CPU usage from orphaned MediaMTX streams
-    - sourceOnDemand: no prevents idle wait loops
-    - readTimeout: 30s cleans up disconnected publishers  
     - Production-grade security with complete shell injection protection
+    - Intelligent restart logic with exponential backoff
+    - Process validation prevents zombie and stale processes
     - Enhanced device name sanitization and validation
     - Atomic file operations prevent corruption
     - Intelligent process lifecycle management with restart limits
@@ -2611,6 +2667,9 @@ Environment variables:
 
 Common issues and solutions:
     - High CPU usage: FIXED in v1.1.5.2 with writeTimeout correction
+    - Shell injection: FIXED in v1.1.5.3 with proper escaping
+    - Stale PIDs: FIXED in v1.1.5.3 with process validation
+    - Restart loops: FIXED in v1.1.5.3 with exponential backoff
     - FFmpeg fails to start: Check device format compatibility
     - Streams fail to validate: Ensure MediaMTX API is accessible
     - Audio dropouts: Adjust thread_queue_size in device config
