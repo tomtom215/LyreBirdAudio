@@ -38,6 +38,7 @@ LyreBirdAudio provides a comprehensive solution for managing multiple USB audio 
 ### Project Motivation
 
 This project was inspired by my desire to listen to birds using some USB microphones and Mini PC's I had lying around. I had first found [cberge908](https://gist.github.com/cberge908/ab7ddc1ac46fd63bb6935cd1f4341112)'s original script for launching MediaMTX but I quickly learned there were a lot more edge cases that needed to be handled in order for it to run reliably 24x7. LyreBird Audio is my solution to those edgecases. 
+If you like this project, please "Star" the repo. If you use it in any cool or large deployments, please let me know! I'm curious to see where this project goes.
 
 ### Key Problems Solved
 
@@ -1111,64 +1112,6 @@ If issues persist:
 
 ## Performance & Optimization
 
-### System Tuning for MediaMTX
-
-#### CPU Optimization
-
-```bash
-# Set CPU governor to performance
-echo performance | sudo tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
-
-# Disable CPU frequency scaling
-sudo systemctl disable ondemand
-
-# Pin MediaMTX to specific CPUs
-sudo taskset -c 1,2 /usr/local/bin/mediamtx
-```
-
-#### Memory Optimization
-
-```bash
-# Increase system limits for MediaMTX
-sudo tee /etc/security/limits.d/mediamtx.conf << EOF
-* soft nofile 65535
-* hard nofile 65535
-* soft memlock unlimited
-* hard memlock unlimited
-EOF
-
-# Optimize kernel parameters
-sudo tee -a /etc/sysctl.conf << EOF
-# Network buffers for RTSP streaming
-net.core.rmem_max = 134217728
-net.core.wmem_max = 134217728
-net.ipv4.tcp_rmem = 4096 87380 134217728
-net.ipv4.tcp_wmem = 4096 65536 134217728
-
-# Reduce swappiness for MediaMTX
-vm.swappiness = 10
-EOF
-
-sudo sysctl -p
-```
-
-#### Network Optimization
-
-```bash
-# Optimize network stack for low latency
-sudo tee -a /etc/sysctl.conf << EOF
-# Reduce buffering for real-time streams
-net.ipv4.tcp_low_latency = 1
-net.ipv4.tcp_nodelay = 1
-net.ipv4.tcp_quickack = 1
-
-# Increase connection tracking
-net.netfilter.nf_conntrack_max = 131072
-net.nf_conntrack_max = 131072
-EOF
-
-sudo sysctl -p
-```
 
 ### MediaMTX Configuration Optimization
 
@@ -1271,36 +1214,6 @@ scrape_configs:
       - targets: ['localhost:9998']
 ```
 
-#### Custom Monitoring Script
-
-```bash
-#!/bin/bash
-# monitor-streams.sh
-
-while true; do
-  clear
-  echo "=== MediaMTX Stream Monitor ==="
-  echo "Time: $(date)"
-  echo ""
-  
-  # Get stream count
-  stream_count=$(curl -s http://localhost:9997/v3/paths/list | jq '.items | length')
-  echo "Active Streams: $stream_count"
-  echo ""
-  
-  # Get each stream's readers
-  curl -s http://localhost:9997/v3/paths/list | jq -r '.items[] | 
-    "Stream: \(.name) | Readers: \(.readers | length) | Source: \(.source.type)"'
-  
-  echo ""
-  echo "=== System Resources ==="
-  # MediaMTX process stats
-  ps aux | grep mediamtx | grep -v grep | awk '{print "CPU: "$3"% | MEM: "$4"%"}'
-  
-  sleep 5
-done
-```
-
 ### Scaling Considerations
 
 #### Multiple MediaMTX Instances
@@ -1323,10 +1236,10 @@ upstream mediamtx_servers {
 
 #### Hardware Recommendations by Scale
 
-- **1-4 Streams**: Raspberry Pi 4 (4GB RAM)
-- **5-16 Streams**: Intel NUC or equivalent (8GB RAM)
-- **17-50 Streams**: Dedicated server (16GB RAM, 4+ cores)
-- **50+ Streams**: Multiple servers with load balancing
+- **1-2 Streams**: Raspberry Pi 4 (4GB RAM)
+- **3-16 Streams**: Intel NUC or equivalent (8GB RAM)
+- **17-50 Streams**: Dedicated server (16GB RAM, 4+ cores, multiple USB cards)
+- **50+ Streams**: Multiple servers with load balancing (not tested, let me know if you get this far!)
 
 # Test device detection
 sudo ./usb-audio-mapper.sh --test
