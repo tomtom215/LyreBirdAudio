@@ -225,7 +225,7 @@ For production environments, we recommend the following installation procedure:
 
 #### Step 1: Install MediaMTX v1.15.1 (Core Streaming Engine)
 
-```bash
+```
 # Install MediaMTX v1.15.1 (tested for maximum stability)
 sudo ./install_mediamtx.sh install --version v1.15.1
 
@@ -244,7 +244,7 @@ sudo ./install_mediamtx.sh status
 
 #### Step 2: Map USB Audio Devices
 
-```bash
+```
 # List available USB audio devices
 sudo ./usb-audio-mapper.sh --list
 
@@ -264,7 +264,7 @@ sudo ./usb-audio-mapper.sh --test
 
 #### Step 3: Configure MediaMTX Audio Streaming
 
-```bash
+```
 # Configure audio devices for MediaMTX streaming
 echo "Device_1:hw:Device_1:48000:2" | sudo tee /etc/mediamtx/audio-devices.conf
 
@@ -276,31 +276,6 @@ sudo ./mediamtx-stream-manager.sh status
 
 # Test RTSP stream from MediaMTX
 ffplay rtsp://localhost:8554/Device_1
-```
-
-### Docker Installation (Alternative)
-
-For containerized deployments using MediaMTX official Docker image:
-
-```bash
-# Create configuration directory
-mkdir -p ~/mediamtx-config
-
-# Copy configuration
-cp /etc/mediamtx/mediamtx.yml ~/mediamtx-config/
-
-# Run MediaMTX v1.15.1 container
-docker run -d \
-  --name mediamtx \
-  --restart unless-stopped \
-  --network host \
-  --device /dev/snd \
-  -v ~/mediamtx-config:/etc/mediamtx \
-  -v /dev/snd:/dev/snd \
-  bluenviron/mediamtx:v1.15.1
-
-# Verify container is running
-docker logs mediamtx
 ```
 
 ## Components
@@ -317,7 +292,7 @@ Maps USB audio devices to persistent names using udev rules based on physical US
 - `create_udev_rule()` - Generates udev rules for persistent naming
 
 **Usage:**
-```bash
+```
 # Interactive device mapping
 sudo ./usb-audio-mapper.sh
 
@@ -360,7 +335,7 @@ Comprehensive MediaMTX installation and management with intelligent update capab
 3. **manual**: Direct execution for testing/debugging
 
 **Usage:**
-```bash
+```
 # Install MediaMTX v1.15.1 (recommended, tested for stability)
 sudo ./install_mediamtx.sh install --version v1.15.1
 
@@ -418,7 +393,7 @@ hw:Device_1 → ffmpeg -f alsa → rtsp://localhost:8554/Device_1 → Clients
 ```
 
 **Usage:**
-```bash
+```
 # Start MediaMTX and all audio streams
 sudo ./mediamtx-stream-manager.sh start
 
@@ -472,7 +447,7 @@ Interactive setup wizard providing guided installation of MediaMTX v1.15.1 and c
 6. Connection testing
 
 **Usage:**
-```bash
+```
 # Run interactive setup (installs MediaMTX v1.15.1)
 sudo ./lyrebird-wizard.sh
 
@@ -561,7 +536,7 @@ paths:
 
 The MediaMTX v1.15.1 API (v3) provides comprehensive control:
 
-```bash
+```
 # List all active paths/streams
 curl http://localhost:9997/v3/paths/list
 
@@ -585,7 +560,7 @@ curl http://localhost:9998/metrics
 
 FFmpeg publishes audio to MediaMTX using optimized parameters:
 
-```bash
+```
 # Basic audio streaming to MediaMTX
 ffmpeg -f alsa -i hw:Device_1 \
   -c:a aac -b:a 128k \
@@ -608,7 +583,7 @@ ffmpeg -f alsa -thread_queue_size 512 -i hw:Device_1 \
 
 Clients can access MediaMTX streams using any RTSP-compatible player:
 
-```bash
+```
 # VLC
 vlc rtsp://server:8554/Device_1
 
@@ -640,7 +615,7 @@ MediaMTX v1.15.1 performance with LyreBirdAudio (tested configuration):
 
 ### Quick Start Guide
 
-```bash
+```
 # 1. Setup complete system (installs MediaMTX v1.15.1)
 sudo ./lyrebird-wizard.sh
 
@@ -661,7 +636,7 @@ ffplay rtsp://localhost:8554/Device_1
 
 For production environments, follow this deployment checklist:
 
-```bash
+```
 # 1. System preparation
 sudo apt-get update
 sudo apt-get install -y ffmpeg alsa-utils curl
@@ -699,7 +674,7 @@ vlc rtsp://server-ip:8554/Device_1
 ### Command Reference
 
 #### MediaMTX Management
-```bash
+```
 # Installation and updates
 sudo ./install_mediamtx.sh install --version v1.15.1  # Install specific version
 sudo ./install_mediamtx.sh update                     # Update preserving streams
@@ -1216,7 +1191,7 @@ scrape_configs:
 
 ### Scaling Considerations
 
-#### Multiple MediaMTX Instances
+#### Multiple MediaMTX Instances (Untested)
 
 For large deployments, run multiple MediaMTX instances:
 
@@ -1252,10 +1227,8 @@ sudo udevadm trigger --subsystem-match=sound
 cat /proc/asound/cards
 ls -la /dev/snd/by-usb-port/
 ```
-
 #### MediaMTX Not Starting
 
-```bash
 # Check MediaMTX status
 sudo ./install_mediamtx.sh status
 
@@ -1308,7 +1281,7 @@ dmesg | grep -i usb | tail -20
 
 Enable debug output for detailed troubleshooting:
 
-```bash
+```
 # Enable debug for all scripts
 export LYREBIRD_DEBUG=1
 
