@@ -42,7 +42,9 @@ LyreBirdAudio provides a comprehensive solution for managing multiple USB audio 
 
 This project was inspired by my desire to listen to birds using some USB microphones and Mini PC's I had lying around. I had first found [cberge908](https://gist.github.com/cberge908/ab7ddc1ac46fd63bb6935cd1f4341112)'s original script for launching MediaMTX but I quickly learned there were a lot more edge cases that needed to be handled in order for it to run reliably 24x7. LyreBird Audio is my solution to those edgecases. 
 
-If you like this project, please "Star" the repo. If you use it in any cool or large deployments, please let me know! I'm curious to see where this project goes.
+**If you like this project, please "star" the repo!** 
+
+**If you use it in any cool or large deployments, please let me know! I'm curious to see where this project goes.**
 
 ### Key Problems Solved
 
