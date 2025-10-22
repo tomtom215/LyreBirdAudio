@@ -1,44 +1,41 @@
 #!/usr/bin/env bash
 #
 # MediaMTX Installation Manager - Production-Ready Install/Update/Uninstall
-# Version: 1.2.0
+# Version: 2.0.0
 # Part of LyreBirdAudio - RTSP Audio Streaming Suite
 # https://github.com/tomtom215/LyreBirdAudio
 #
 # Changelog:
+#   v2.0.0: Major rewrite with built-in --upgrade support (MediaMTX v1.15.0+), atomic binary
+#           installation with simplified rollback, enforced checksum verification (--force to skip),
+#           fixed BSD/macOS lock race conditions, improved SemVer comparison, state directory
+#           management, enhanced JSON parsing, better error handling, full shellcheck compliance
 #   v1.2.0: Fixed checksum URL to use unified checksums.sha256 file
-#   v1.1.x: Resolved shellcheck warnings, fixed readonly vars, added rollback system
 #   v1.1.0: Added stream manager integration, dry-run mode, SemVer comparison
 #
 # Usage: ./mediamtx-installer.sh [OPTIONS] COMMAND
 
 set -euo pipefail
-
-# Strict error handling
 set -o errtrace
 set -o functrace
 
-# Script metadata - CRITICAL: assign BEFORE making readonly
-SCRIPT_VERSION="1.2.0"
-readonly SCRIPT_VERSION
+# Script metadata
+readonly SCRIPT_VERSION="2.0.0"
 
+SCRIPT_NAME=""
 SCRIPT_NAME="$(basename "${BASH_SOURCE[0]}")"
 readonly SCRIPT_NAME
 
+SCRIPT_DIR=""
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 readonly SCRIPT_DIR
 
-SCRIPT_PID="$$"
-readonly SCRIPT_PID
-
-# SCRIPT_PPID kept for process tracking
-SCRIPT_PPID="$PPID"
-# shellcheck disable=SC2034
-readonly SCRIPT_PPID
+readonly SCRIPT_PID="$$"
 
 # Default configuration
 readonly DEFAULT_INSTALL_PREFIX="${MEDIAMTX_PREFIX:-/usr/local}"
 readonly DEFAULT_CONFIG_DIR="${MEDIAMTX_CONFIG_DIR:-/etc/mediamtx}"
+readonly DEFAULT_STATE_DIR="${MEDIAMTX_STATE_DIR:-/var/lib/mediamtx}"
 readonly DEFAULT_SERVICE_USER="${MEDIAMTX_USER:-mediamtx}"
 readonly DEFAULT_SERVICE_GROUP="${MEDIAMTX_GROUP:-mediamtx}"
 readonly DEFAULT_RTSP_PORT="${MEDIAMTX_RTSP_PORT:-8554}"
@@ -51,6 +48,7 @@ readonly DEFAULT_GITHUB_REPO="${MEDIAMTX_REPO:-bluenviron/mediamtx}"
 # Runtime configuration
 INSTALL_PREFIX="${DEFAULT_INSTALL_PREFIX}"
 CONFIG_DIR="${DEFAULT_CONFIG_DIR}"
+STATE_DIR="${DEFAULT_STATE_DIR}"
 SERVICE_USER="${DEFAULT_SERVICE_USER}"
 SERVICE_GROUP="${DEFAULT_SERVICE_GROUP}"
 VERBOSE_MODE=false
@@ -59,40 +57,33 @@ DRY_RUN_MODE=false
 FORCE_MODE=false
 SKIP_SERVICE=false
 SKIP_CONFIG=false
-VERIFY_GPG=false
 TARGET_VERSION=""
 CONFIG_FILE=""
 COMMAND=""
 
 # Derived paths
 INSTALL_DIR="${INSTALL_PREFIX}/bin"
-SERVICE_DIR="/etc/systemd/system"
-SERVICE_NAME="mediamtx.service"
-CONFIG_NAME="mediamtx.yml"
+readonly SERVICE_DIR="/etc/systemd/system"
+readonly SERVICE_NAME="mediamtx.service"
+readonly CONFIG_NAME="mediamtx.yml"
 
-# Temporary directory
+# Temporary directory and files
 TEMP_BASE="${TMPDIR:-/tmp}"
 TEMP_DIR=""
 LOG_FILE=""
-LOCK_FILE="/var/lock/mediamtx-installer.lock"
+readonly LOCK_FILE="/var/lock/mediamtx-installer.lock"
 LOCK_FD=""
 
 # GitHub API configuration
 readonly GITHUB_API_BASE="https://api.github.com"
 readonly GITHUB_API_TIMEOUT=30
-USER_AGENT="MediaMTX-Installer/${SCRIPT_VERSION}"
-readonly USER_AGENT
+readonly USER_AGENT="MediaMTX-Installer/${SCRIPT_VERSION}"
 
-# Color codes (set after argument parsing)
+# Color codes
 RED=''
 GREEN=''
 YELLOW=''
 BLUE=''
-# MAGENTA and CYAN for future use
-# shellcheck disable=SC2034
-MAGENTA=''
-# shellcheck disable=SC2034
-CYAN=''
 BOLD=''
 NC=''
 
@@ -100,95 +91,24 @@ NC=''
 declare -a CLEANUP_FILES=()
 declare -a CLEANUP_DIRS=()
 
-# Rollback registry
-declare -A ROLLBACK_REGISTRY=(
-    ["mv"]="rollback_mv"
-    ["rm"]="rollback_rm"
-    ["systemctl"]="rollback_systemctl"
-    ["userdel"]="rollback_userdel"
-)
+# Backup tracking for rollback
+BINARY_BACKUP=""
+SERVICE_BACKUP=""
+CONFIG_BACKUP=""
+STATE_DIR_CREATED=false
 
-# Rollback queue file
-ROLLBACK_QUEUE=""
-
-# Download command (set in check_requirements)
+# Download command
 DOWNLOAD_CMD=""
 
 # Release information
 RELEASE_VERSION=""
-# shellcheck disable=SC2034
-RELEASE_FILE=""
 
 # Platform information
 PLATFORM_OS=""
 PLATFORM_ARCH=""
-PLATFORM_DISTRO=""
-PLATFORM_VERSION=""
 
-# ============================================================================
-# Rollback Functions
-# ============================================================================
-
-rollback_mv() {
-    local src="$1"
-    local dst="$2"
-    mv "${src}" "${dst}" 2>/dev/null || true
-}
-
-rollback_rm() {
-    rm -f "$@" 2>/dev/null || true
-}
-
-rollback_systemctl() {
-    systemctl "$@" 2>/dev/null || true
-}
-
-rollback_userdel() {
-    userdel "$@" 2>/dev/null || true
-}
-
-add_rollback() {
-    local cmd="$1"
-    shift
-    
-    if [[ -n "${ROLLBACK_REGISTRY[$cmd]:-}" ]]; then
-        if [[ -n "${ROLLBACK_QUEUE}" ]] && [[ -f "${ROLLBACK_QUEUE}" ]]; then
-            printf '%s\0' "${cmd}" "$@" >> "${ROLLBACK_QUEUE}"
-        fi
-    else
-        log_warn "Invalid rollback command: ${cmd}"
-    fi
-}
-
-execute_rollback() {
-    [[ -z "${ROLLBACK_QUEUE}" ]] || [[ ! -f "${ROLLBACK_QUEUE}" ]] && return 0
-    
-    local entries=()
-    while IFS= read -r -d '' entry; do
-        entries+=("${entry}")
-    done < "${ROLLBACK_QUEUE}"
-    
-    local i=${#entries[@]}
-    while [[ $i -gt 0 ]]; do
-        ((i--))
-        local cmd="${entries[$i]}"
-        local args=()
-        
-        while [[ $i -gt 0 ]]; do
-            ((i--))
-            local next="${entries[$i]}"
-            if [[ -n "${ROLLBACK_REGISTRY[$next]:-}" ]]; then
-                ((i++))
-                break
-            fi
-            args=("${next}" "${args[@]}")
-        done
-        
-        if [[ -n "${ROLLBACK_REGISTRY[$cmd]:-}" ]]; then
-            "${ROLLBACK_REGISTRY[$cmd]}" "${args[@]}"
-        fi
-    done
-}
+# Minimum version for --upgrade support (MediaMTX added this in v1.15.0)
+readonly MIN_UPGRADE_VERSION="1.15.0"
 
 # ============================================================================
 # Utility Functions
@@ -200,10 +120,6 @@ initialize_runtime_vars() {
         GREEN='\033[0;32m'
         YELLOW='\033[1;33m'
         BLUE='\033[0;34m'
-        # shellcheck disable=SC2034
-        MAGENTA='\033[0;35m'
-        # shellcheck disable=SC2034
-        CYAN='\033[0;36m'
         BOLD='\033[1m'
         NC='\033[0m'
     fi
@@ -217,12 +133,17 @@ error_handler() {
     if [[ "${code}" -ne 0 ]]; then
         log_error "Command failed with exit code ${code}"
         log_error "Failed command: ${bash_command}"
-        log_error "Line ${line_no} in function ${FUNCNAME[1]:-main}"
+        local func_name="${FUNCNAME[1]:-main}"
+        [[ -z "${func_name}" ]] && func_name="main"
+        log_error "Line ${line_no} in function ${func_name}"
         
         if [[ "${VERBOSE_MODE}" == "true" ]]; then
             log_debug "Stack trace:"
+            local i
             for ((i=1; i<${#FUNCNAME[@]}; i++)); do
-                log_debug "  ${i}: ${FUNCNAME[$i]}() at line ${BASH_LINENO[$((i-1))]}"
+                local fname="${FUNCNAME[$i]:-unknown}"
+                local fline="${BASH_LINENO[$((i-1))]:-0}"
+                log_debug "  ${i}: ${fname}() at line ${fline}"
             done
         fi
     fi
@@ -235,17 +156,21 @@ cleanup() {
     
     release_lock
     
+    # Rollback on failure
     if [[ ${exit_code} -ne 0 ]]; then
-        log_warn "Executing rollback actions..."
+        log_warn "Executing rollback due to failure..."
         execute_rollback
     fi
     
+    # Clean up temporary files
+    local file
     for file in "${CLEANUP_FILES[@]}"; do
         if [[ -f "${file}" ]]; then
             rm -f "${file}" 2>/dev/null || true
         fi
     done
     
+    local dir
     for dir in "${CLEANUP_DIRS[@]}"; do
         if [[ -d "${dir}" ]]; then
             rm -rf "${dir}" 2>/dev/null || true
@@ -256,11 +181,13 @@ cleanup() {
         rm -rf "${TEMP_DIR}" 2>/dev/null || true
     fi
     
+    # Save error log
     if [[ ${exit_code} -ne 0 ]] && [[ -f "${LOG_FILE}" ]]; then
         local error_log
         error_log="/tmp/mediamtx-installer-error-$(date +%Y%m%d-%H%M%S).log"
-        cp "${LOG_FILE}" "${error_log}" 2>/dev/null || true
-        [[ "${QUIET_MODE}" != "true" ]] && echo -e "${YELLOW}Error log saved to: ${error_log}${NC}" >&2
+        if cp "${LOG_FILE}" "${error_log}" 2>/dev/null; then
+            [[ "${QUIET_MODE}" != "true" ]] && echo -e "${YELLOW}Error log saved to: ${error_log}${NC}" >&2
+        fi
     fi
     
     return ${exit_code}
@@ -270,7 +197,7 @@ trap cleanup EXIT INT TERM
 
 # Logging functions
 log_debug() {
-    [[ "${VERBOSE_MODE}" == "true" ]] || return 0
+    [[ "${VERBOSE_MODE}" != "true" ]] && return 0
     local msg
     msg="[$(date '+%Y-%m-%d %H:%M:%S')] [DEBUG] $*"
     if [[ -n "${LOG_FILE}" ]] && [[ -f "${LOG_FILE}" ]]; then
@@ -323,31 +250,30 @@ acquire_lock() {
     
     log_debug "Attempting to acquire lock (timeout: ${timeout}s)..."
     
+    # Platform-specific flock handling
     if [[ "$(uname)" == "Darwin" ]] || [[ "$(uname)" == *"BSD"* ]]; then
-        if command -v timeout &>/dev/null; then
-            if timeout "${timeout}" flock -x 200; then
-                echo "${SCRIPT_PID}" > "${LOCK_FILE}.pid"
-                log_debug "Lock acquired (PID: ${SCRIPT_PID})"
-                return 0
+        # BSD/macOS: flock doesn't support -w timeout, use manual loop
+        local elapsed=0
+        while ! flock -n -x 200 2>/dev/null; do
+            sleep 1
+            ((elapsed++))
+            if [[ ${elapsed} -ge ${timeout} ]]; then
+                exec 200>&- 2>/dev/null || true
+                LOCK_FD=""
+                fatal "Failed to acquire lock after ${timeout} seconds" 1
             fi
-        else
-            if flock -x 200; then
-                echo "${SCRIPT_PID}" > "${LOCK_FILE}.pid"
-                log_debug "Lock acquired (PID: ${SCRIPT_PID})"
-                return 0
-            fi
-        fi
+        done
     else
-        if flock -x -w "${timeout}" 200; then
-            echo "${SCRIPT_PID}" > "${LOCK_FILE}.pid"
-            log_debug "Lock acquired (PID: ${SCRIPT_PID})"
-            return 0
+        # Linux: use native timeout support
+        if ! flock -x -w "${timeout}" 200; then
+            exec 200>&-
+            LOCK_FD=""
+            fatal "Failed to acquire lock after ${timeout} seconds" 1
         fi
     fi
     
-    exec 200>&-
-    LOCK_FD=""
-    fatal "Failed to acquire lock after ${timeout} seconds" 1
+    echo "${SCRIPT_PID}" > "${LOCK_FILE}.pid"
+    log_debug "Lock acquired (PID: ${SCRIPT_PID})"
 }
 
 release_lock() {
@@ -375,29 +301,20 @@ create_temp_dir() {
     touch "${LOG_FILE}"
     chmod 600 "${LOG_FILE}"
     
-    ROLLBACK_QUEUE="${TEMP_DIR}/.rollback_queue"
-    touch "${ROLLBACK_QUEUE}"
-    chmod 600 "${ROLLBACK_QUEUE}"
-    
     CLEANUP_DIRS+=("${TEMP_DIR}")
     log_debug "Created temporary directory: ${TEMP_DIR}"
 }
 
 load_config() {
-    [[ -z "${CONFIG_FILE}" || ! -f "${CONFIG_FILE}" ]] && return 0
+    [[ -z "${CONFIG_FILE}" ]] || [[ ! -f "${CONFIG_FILE}" ]] && return 0
     
     log_debug "Loading configuration from: ${CONFIG_FILE}"
     
     while IFS='=' read -r key value || [[ -n "${key}" ]]; do
-        [[ -z "${key}" || "${key}" == \#* ]] && continue
+        [[ -z "${key}" ]] || [[ "${key}" == \#* ]] && continue
         
         key=$(echo "${key}" | xargs)
-        value=$(echo "${value}" | xargs)
-        
-        value="${value#\"}"
-        value="${value%\"}"
-        value="${value#\'}"
-        value="${value%\'}"
+        value=$(echo "${value}" | xargs | sed -e 's/^["\x27]//' -e 's/["\x27]$//')
         
         case "${key}" in
             INSTALL_PREFIX)
@@ -413,6 +330,13 @@ load_config() {
                     CONFIG_DIR="${value}"
                 else
                     log_warn "Invalid CONFIG_DIR in config: ${value}"
+                fi
+                ;;
+            STATE_DIR)
+                if [[ "${value}" == /* ]]; then
+                    STATE_DIR="${value}"
+                else
+                    log_warn "Invalid STATE_DIR in config: ${value}"
                 fi
                 ;;
             SERVICE_USER)
@@ -437,6 +361,37 @@ load_config() {
 }
 
 # ============================================================================
+# Rollback Functions
+# ============================================================================
+
+execute_rollback() {
+    # Restore binary backup (atomic)
+    if [[ -n "${BINARY_BACKUP}" ]] && [[ -f "${BINARY_BACKUP}" ]]; then
+        log_warn "Restoring binary backup..."
+        mv -f "${BINARY_BACKUP}" "${INSTALL_DIR}/mediamtx" 2>/dev/null || true
+    fi
+    
+    # Restore service backup (atomic)
+    if [[ -n "${SERVICE_BACKUP}" ]] && [[ -f "${SERVICE_BACKUP}" ]]; then
+        log_warn "Restoring service backup..."
+        mv -f "${SERVICE_BACKUP}" "${SERVICE_DIR}/${SERVICE_NAME}" 2>/dev/null || true
+        systemctl daemon-reload 2>/dev/null || true
+    fi
+    
+    # Restore config backup (atomic)
+    if [[ -n "${CONFIG_BACKUP}" ]] && [[ -f "${CONFIG_BACKUP}" ]]; then
+        log_warn "Restoring config backup..."
+        mv -f "${CONFIG_BACKUP}" "${CONFIG_DIR}/${CONFIG_NAME}" 2>/dev/null || true
+    fi
+    
+    # Remove state directory if we created it
+    if [[ "${STATE_DIR_CREATED}" == "true" ]] && [[ -d "${STATE_DIR}" ]]; then
+        log_warn "Removing state directory created during failed operation..."
+        rm -rf "${STATE_DIR}" 2>/dev/null || true
+    fi
+}
+
+# ============================================================================
 # Validation Functions
 # ============================================================================
 
@@ -449,90 +404,37 @@ validate_input() {
         fatal "Installation prefix cannot contain .." 10
     fi
     
-    if [[ -n "${TARGET_VERSION}" ]]; then
-        if ! validate_version "${TARGET_VERSION}"; then
-            fatal "Invalid version format: ${TARGET_VERSION}" 10
-        fi
+    if [[ -n "${TARGET_VERSION}" ]] && ! validate_version "${TARGET_VERSION}"; then
+        fatal "Invalid version format: ${TARGET_VERSION}" 10
     fi
     
     if [[ -n "${CONFIG_FILE}" ]]; then
-        if [[ ! -f "${CONFIG_FILE}" ]]; then
-            fatal "Config file not found: ${CONFIG_FILE}" 9
-        fi
-        if [[ ! -r "${CONFIG_FILE}" ]]; then
-            fatal "Config file not readable: ${CONFIG_FILE}" 9
-        fi
+        [[ ! -f "${CONFIG_FILE}" ]] && fatal "Config file not found: ${CONFIG_FILE}" 9
+        [[ ! -r "${CONFIG_FILE}" ]] && fatal "Config file not readable: ${CONFIG_FILE}" 9
     fi
 }
 
 check_requirements() {
     local missing=()
-    local warnings=()
     
-    # Required commands with minimum versions
-    local -A required_commands=(
-        ["bash"]="4.0"
-        ["curl"]="7.0"
-        ["tar"]="1.20"
-        ["mktemp"]=""
-        ["flock"]=""
-    )
+    # Required commands
+    local -a required=("bash" "curl" "tar" "mktemp" "flock")
     
-    # Optional commands
-    local -A optional_commands=(
-        ["jq"]="1.5"
-        ["sha256sum"]=""
-        ["systemctl"]=""
-        ["gpg"]="2.0"
-        ["lsof"]=""
-    )
-    
-    for cmd in "${!required_commands[@]}"; do
-        if ! command -v "${cmd}" &>/dev/null; then
-            missing+=("${cmd}")
-        elif [[ -n "${required_commands[$cmd]}" ]]; then
-            local version
-            case "${cmd}" in
-                bash)
-                    version="${BASH_VERSION%%.*}.${BASH_VERSION#*.}"
-                    version="${version%%.*}"
-                    ;;
-                curl)
-                    version=$(curl --version 2>/dev/null | head -1 | grep -oE '[0-9]+\.[0-9]+' | head -1)
-                    ;;
-                tar)
-                    version=$(tar --version 2>/dev/null | head -1 | grep -oE '[0-9]+\.[0-9]+' | head -1)
-                    ;;
-            esac
-            
-            if [[ -n "${version}" ]]; then
-                if ! version_compare "${version}" "${required_commands[$cmd]}"; then
-                    warnings+=("${cmd} version ${version} is below recommended ${required_commands[$cmd]}")
-                fi
-            fi
-        fi
+    local cmd
+    for cmd in "${required[@]}"; do
+        command -v "${cmd}" &>/dev/null || missing+=("${cmd}")
     done
     
-    for cmd in "${!optional_commands[@]}"; do
-        if ! command -v "${cmd}" &>/dev/null; then
-            warnings+=("Optional: ${cmd} not found")
-        fi
-    done
-    
-    if ! command -v jq &>/dev/null; then
-        log_warn "jq not found - using fallback JSON parsing"
+    # Check bash version
+    if [[ "${BASH_VERSINFO[0]}" -lt 4 ]]; then
+        fatal "Bash 4.0+ required (found ${BASH_VERSION})" 4
     fi
     
     if [[ ${#missing[@]} -gt 0 ]]; then
         fatal "Missing required commands: ${missing[*]}" 4
     fi
     
-    if [[ ${#warnings[@]} -gt 0 ]] && [[ "${VERBOSE_MODE}" == "true" ]]; then
-        for warning in "${warnings[@]}"; do
-            log_warn "${warning}"
-        done
-    fi
-    
+    # Determine download command
     if command -v curl &>/dev/null; then
         DOWNLOAD_CMD="curl"
     elif command -v wget &>/dev/null; then
@@ -542,70 +444,90 @@ check_requirements() {
     fi
     
     log_debug "Using ${DOWNLOAD_CMD} for downloads"
+    
+    # Optional but recommended
+    if ! command -v sha256sum &>/dev/null && ! command -v shasum &>/dev/null; then
+        log_warn "No SHA256 tool available - checksum verification will require --force"
+    fi
+    
+    if ! command -v jq &>/dev/null; then
+        log_warn "jq not found - using fallback JSON parsing"
+    fi
 }
 
-version_compare() {
-    local v1="${1#v}"
-    local v2="${2#v}"
-    
-    if command -v sort &>/dev/null && sort --help 2>&1 | grep -q -- '-V'; then
-        if [[ "$(printf '%s\n' "${v2}" "${v1}" | sort -V | head -n1)" == "${v2}" ]]; then
-            return 0
-        else
-            return 1
-        fi
-    fi
-    
-    local v1_base="${v1%%-*}"
-    local v2_base="${v2%%-*}"
-    
-    local IFS=.
-    local -a v1_parts
-    local -a v2_parts
-    read -r -a v1_parts <<< "$v1_base"
-    read -r -a v2_parts <<< "$v2_base"
-    
-    for i in {0..2}; do
-        local p1="${v1_parts[$i]:-0}"
-        local p2="${v2_parts[$i]:-0}"
-        
-        if [[ ${p1} -gt ${p2} ]]; then return 0; fi
-        if [[ ${p1} -lt ${p2} ]]; then return 1; fi
-    done
-    
-    # Handle pre-release versions
-    if [[ "$v1" == "$v1_base" ]] && [[ "$v2" != "$v2_base" ]]; then
-        return 0
-    elif [[ "$v1" != "$v1_base" ]] && [[ "$v2" == "$v2_base" ]]; then
-        return 1
-    elif [[ "$v1" != "$v1_base" ]] && [[ "$v2" != "$v2_base" ]]; then
-        local v1_pre="${v1#*-}"
-        local v2_pre="${v2#*-}"
-        [[ "$v1_pre" > "$v2_pre" ]] && return 0 || return 1
-    fi
-    
-    return 0
+validate_version() {
+    local version="$1"
+    local version_regex='^v?[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9\.\-]+)?(\+[a-zA-Z0-9\.\-]+)?$'
+    [[ "${version}" =~ ${version_regex} ]] && return 0 || return 1
 }
 
 validate_url() {
     local url="$1"
     local url_regex='^https?://[-A-Za-z0-9\+&@#/%?=~_|!:,.;]*[-A-Za-z0-9\+&@#/%=~_|]$'
-    
-    if [[ ! "${url}" =~ ${url_regex} ]]; then
-        log_error "Invalid URL format: ${url}"
-        return 1
-    fi
-    return 0
+    [[ "${url}" =~ ${url_regex} ]] && return 0 || return 1
 }
 
-validate_version() {
-    local version="$1"
-    local version_regex='^v?[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9\-\.]+)?$'
+version_compare() {
+    # Returns 0 if v1 >= v2, 1 otherwise
+    local v1="${1#v}"
+    local v2="${2#v}"
     
-    if [[ ! "${version}" =~ ${version_regex} ]]; then
-        log_error "Invalid version format: ${version}"
-        return 1
+    # Require sort -V for reliable SemVer comparison (handles numeric pre-releases)
+    if command -v sort &>/dev/null && sort --version 2>&1 | grep -q 'GNU\|BusyBox'; then
+        if sort --help 2>&1 | grep -q -- '-V'; then
+            [[ "$(printf '%s\n' "${v2}" "${v1}" | sort -V | head -n1)" == "${v2}" ]] && return 0 || return 1
+        fi
     fi
+    
+    # Fallback: manual comparison with normalization
+    log_debug "Using fallback version comparison"
+    
+    # Warn if pre-releases detected (may not compare correctly)
+    if [[ "${v1}" == *-* ]] || [[ "${v2}" == *-* ]]; then
+        log_warn "Pre-release versions detected - comparison may be unreliable without GNU sort -V"
+    fi
+    
+    # Extract base version and normalize to 3 parts
+    local v1_base="${v1%%-*}"
+    local v2_base="${v2%%-*}"
+    
+    # Normalize to exactly 3 parts (X.Y.Z)
+    while [[ $(tr -dc '.' <<< "${v1_base}" | wc -c) -lt 2 ]]; do
+        v1_base="${v1_base}.0"
+    done
+    while [[ $(tr -dc '.' <<< "${v2_base}" | wc -c) -lt 2 ]]; do
+        v2_base="${v2_base}.0"
+    done
+    
+    local IFS=.
+    local -a v1_parts v2_parts
+    read -r -a v1_parts <<< "${v1_base}"
+    read -r -a v2_parts <<< "${v2_base}"
+    
+    local i
+    for i in 0 1 2; do
+        local p1="${v1_parts[$i]:-0}"
+        local p2="${v2_parts[$i]:-0}"
+        
+        if [[ ${p1} -gt ${p2} ]]; then
+            return 0
+        elif [[ ${p1} -lt ${p2} ]]; then
+            return 1
+        fi
+    done
+    
+    # Equal base versions - check pre-release
+    local v1_pre="${v1#*-}"
+    local v2_pre="${v2#*-}"
+    
+    if [[ "$v1" == "$v1_pre" ]] && [[ "$v2" != "$v2_pre" ]]; then
+        return 0
+    elif [[ "$v1" != "$v1_pre" ]] && [[ "$v2" == "$v2_pre" ]]; then
+        return 1
+    elif [[ "$v1" != "$v1_pre" ]] && [[ "$v2" != "$v2_pre" ]]; then
+        [[ "$v1_pre" > "$v2_pre" ]] && return 0 || return 1
+    fi
+    
     return 0
 }
 
@@ -620,27 +542,42 @@ verify_checksum() {
     fi
     
     if [[ ! -f "${checksum_file}" ]]; then
-        log_warn "Checksum file not found: ${checksum_file}"
-        return 2
+        if [[ "${FORCE_MODE}" == "true" ]]; then
+            log_warn "Checksum file not found - skipping verification (--force enabled)"
+            return 0
+        else
+            log_error "Checksum file not found and --force not specified"
+            return 1
+        fi
     fi
     
-    # Extract checksum for our specific file from the unified checksums file
+    # Extract checksum
     local expected_checksum
-    expected_checksum=$(grep "${filename}" "${checksum_file}" 2>/dev/null | awk '{print $1}' | head -1)
+    expected_checksum=$(grep -F "${filename}" "${checksum_file}" 2>/dev/null | head -1 | awk '{print $1}')
     
-    if [[ -z "${expected_checksum}" ]]; then
-        log_error "Failed to find checksum for ${filename} in checksums file"
+    if [[ -z "${expected_checksum}" ]] || [[ ! "${expected_checksum}" =~ ^[a-f0-9]{64}$ ]]; then
+        if [[ "${FORCE_MODE}" == "true" ]]; then
+            log_warn "No valid checksum found for ${filename} - skipping verification (--force enabled)"
+            return 0
+        fi
+        log_error "Failed to find valid checksum for ${filename}"
         return 1
     fi
     
+    # Calculate actual checksum
     local actual_checksum
     if command -v sha256sum &>/dev/null; then
         actual_checksum=$(sha256sum "${file}" | awk '{print $1}')
     elif command -v shasum &>/dev/null; then
         actual_checksum=$(shasum -a 256 "${file}" | awk '{print $1}')
     else
-        log_warn "No SHA256 tool available, skipping verification"
-        return 2
+        if [[ "${FORCE_MODE}" == "true" ]]; then
+            log_warn "No SHA256 tool available - skipping verification (--force enabled)"
+            return 0
+        else
+            log_error "No SHA256 tool available and --force not specified"
+            return 1
+        fi
     fi
     
     if [[ "${expected_checksum}" != "${actual_checksum}" ]]; then
@@ -654,40 +591,6 @@ verify_checksum() {
     return 0
 }
 
-verify_gpg_signature() {
-    local file="$1"
-    local sig_file="$2"
-    
-    if [[ "${VERIFY_GPG}" != "true" ]]; then
-        return 0
-    fi
-    
-    if ! command -v gpg &>/dev/null; then
-        log_warn "GPG not available, skipping signature verification"
-        return 2
-    fi
-    
-    if [[ ! -f "${sig_file}" ]]; then
-        log_warn "Signature file not found: ${sig_file}"
-        return 2
-    fi
-    
-    local key_url="https://github.com/${DEFAULT_GITHUB_REPO}/releases/download/signing-key.asc"
-    local key_file="${TEMP_DIR}/signing-key.asc"
-    
-    if download_file "${key_url}" "${key_file}"; then
-        gpg --import "${key_file}" 2>/dev/null || true
-    fi
-    
-    if gpg --verify "${sig_file}" "${file}" 2>/dev/null; then
-        log_info "GPG signature verified successfully"
-        return 0
-    else
-        log_error "GPG signature verification failed"
-        return 1
-    fi
-}
-
 # ============================================================================
 # Platform Detection
 # ============================================================================
@@ -695,32 +598,16 @@ verify_gpg_signature() {
 detect_platform() {
     local os=""
     local arch=""
-    local distro=""
-    local version=""
     
     case "${OSTYPE}" in
         linux*)
             os="linux"
-            if [[ -f /etc/os-release ]]; then
-                # shellcheck source=/dev/null
-                source /etc/os-release
-                distro="${ID:-unknown}"
-                version="${VERSION_ID:-unknown}"
-            elif [[ -f /etc/redhat-release ]]; then
-                distro="rhel"
-            elif [[ -f /etc/debian_version ]]; then
-                distro="debian"
-            fi
             ;;
         darwin*)
             os="darwin"
-            distro="macos"
-            version=$(sw_vers -productVersion 2>/dev/null || echo "unknown")
             ;;
         freebsd*)
             os="freebsd"
-            distro="freebsd"
-            version=$(uname -r)
             ;;
         *)
             fatal "Unsupported operating system: ${OSTYPE}" 3
@@ -753,10 +640,8 @@ detect_platform() {
     
     PLATFORM_OS="${os}"
     PLATFORM_ARCH="${arch}"
-    PLATFORM_DISTRO="${distro}"
-    PLATFORM_VERSION="${version}"
     
-    log_debug "Platform: ${PLATFORM_OS}/${PLATFORM_ARCH} (${PLATFORM_DISTRO} ${PLATFORM_VERSION})"
+    log_debug "Platform: ${PLATFORM_OS}/${PLATFORM_ARCH}"
 }
 
 # ============================================================================
@@ -769,12 +654,11 @@ download_file() {
     local timeout="${3:-${DEFAULT_DOWNLOAD_TIMEOUT}}"
     local retries="${4:-${DEFAULT_DOWNLOAD_RETRIES}}"
     
+    # Allow metadata downloads in dry-run mode
     local is_metadata=false
     if [[ "${url}" == *"api.github.com"* ]] || \
        [[ "${url}" == *"checksums.sha256" ]] || \
-       [[ "${url}" == *".sig" ]] || \
-       [[ "${output}" == *"/release.json" ]] || \
-       [[ "${output}" == *"/checksum"* ]]; then
+       [[ "${output}" == *"/release.json" ]]; then
         is_metadata=true
     fi
     
@@ -787,17 +671,16 @@ download_file() {
         return 1
     fi
     
-    local attempt=0
-    local success=false
+    local output_dir
+    output_dir=$(dirname "${output}")
+    [[ -d "${output_dir}" ]] || mkdir -p "${output_dir}"
     
-    while [[ ${attempt} -lt ${retries} ]] && [[ "${success}" == "false" ]]; do
+    local attempt=0
+    while [[ ${attempt} -lt ${retries} ]]; do
         ((attempt++))
         log_debug "Download attempt ${attempt}/${retries}: ${url}"
         
-        local output_dir
-        output_dir=$(dirname "${output}")
-        [[ -d "${output_dir}" ]] || mkdir -p "${output_dir}"
-        
+        local success=false
         case "${DOWNLOAD_CMD}" in
             curl)
                 if curl -fsSL \
@@ -805,7 +688,6 @@ download_file() {
                     --max-time "${timeout}" \
                     --retry 2 \
                     --retry-delay 5 \
-                    --retry-max-time 120 \
                     -C - \
                     -H "User-Agent: ${USER_AGENT}" \
                     -o "${output}" \
@@ -827,16 +709,12 @@ download_file() {
                 ;;
         esac
         
-        if [[ "${success}" == "true" ]]; then
-            if [[ ! -s "${output}" ]]; then
-                log_error "Downloaded file is empty: ${output}"
-                rm -f "${output}"
-                success=false
-            else
-                log_debug "Download successful: ${output} ($(stat -c%s "${output}" 2>/dev/null || stat -f%z "${output}" 2>/dev/null || echo "unknown") bytes)"
-                return 0
-            fi
+        if [[ "${success}" == "true" ]] && [[ -s "${output}" ]]; then
+            log_debug "Download successful: ${output}"
+            return 0
         fi
+        
+        rm -f "${output}" 2>/dev/null || true
         
         if [[ ${attempt} -lt ${retries} ]]; then
             log_warn "Download failed, retrying in 10 seconds..."
@@ -852,30 +730,51 @@ parse_github_release() {
     local json_file="$1"
     local field="$2"
     
+    # Validate JSON file exists and is readable
+    if [[ ! -f "${json_file}" ]] || [[ ! -r "${json_file}" ]]; then
+        log_error "JSON file not found or not readable: ${json_file}"
+        return 1
+    fi
+    
+    # Basic JSON validation
+    if ! grep -q '^[[:space:]]*{' "${json_file}"; then
+        log_error "Invalid JSON format in ${json_file}"
+        return 1
+    fi
+    
+    # Try jq first
     if command -v jq &>/dev/null; then
-        jq -r ".${field} // empty" "${json_file}" 2>/dev/null || echo ""
-        return
+        local result
+        result=$(jq -r ".${field} // empty" "${json_file}" 2>/dev/null)
+        if [[ -n "${result}" ]]; then
+            echo "${result}"
+            return 0
+        fi
     fi
     
+    # Try python3
     if command -v python3 &>/dev/null; then
-        python3 -c "
-import json, sys
-try:
-    with open('${json_file}') as f:
-        data = json.load(f)
-        print(data.get('${field}', ''))
-except:
-    pass
-" 2>/dev/null || echo ""
-        return
+        local result
+        result=$(python3 -c "import sys, json; data=json.load(open('${json_file}')); print(data.get('${field}', ''))" 2>/dev/null)
+        if [[ -n "${result}" ]]; then
+            echo "${result}"
+            return 0
+        fi
     fi
     
-    local value=""
-    if grep -q "\"${field}\"" "${json_file}" 2>/dev/null; then
-        value=$(sed -n "s/.*\"${field}\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p" "${json_file}" 2>/dev/null | head -1)
+    # Fallback: basic sed parsing with pre-check
+    if ! grep -q "\"${field}\"" "${json_file}"; then
+        return 1
     fi
     
-    echo "${value}"
+    local result
+    result=$(sed -n "s/.*\"${field}\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p" "${json_file}" 2>/dev/null | head -1)
+    if [[ -n "${result}" ]]; then
+        echo "${result}"
+        return 0
+    fi
+    
+    return 1
 }
 
 get_release_info() {
@@ -907,9 +806,6 @@ get_release_info() {
     fi
     
     RELEASE_VERSION="${tag_name}"
-    # shellcheck disable=SC2034
-    RELEASE_FILE="${release_file}"
-    
     log_info "Found release: ${RELEASE_VERSION}"
 }
 
@@ -929,26 +825,6 @@ detect_management_mode() {
     fi
 }
 
-get_active_streams() {
-    local streams=()
-    
-    if [[ -d "/var/lib/mediamtx-ffmpeg" ]]; then
-        for pid_file in /var/lib/mediamtx-ffmpeg/*.pid; do
-            if [[ -f "${pid_file}" ]]; then
-                local stream_name
-                stream_name=$(basename "${pid_file}" .pid)
-                local stream_pid
-                stream_pid=$(cat "${pid_file}" 2>/dev/null || echo "0")
-                if kill -0 "${stream_pid}" 2>/dev/null; then
-                    streams+=("${stream_name}")
-                fi
-            fi
-        done
-    fi
-    
-    printf "%s\n" "${streams[@]}"
-}
-
 find_stream_manager() {
     local locations=(
         "./mediamtx-stream-manager.sh"
@@ -956,6 +832,7 @@ find_stream_manager() {
         "/usr/local/bin/mediamtx-stream-manager.sh"
     )
     
+    local location
     for location in "${locations[@]}"; do
         if [[ -f "${location}" ]] && [[ -x "${location}" ]]; then
             echo "${location}"
@@ -975,22 +852,8 @@ build_asset_url() {
     local os="$2"
     local arch="$3"
     
-    local arch_suffix="${arch}"
-    
-    if [[ "${arch}" == "arm64" ]] && [[ "${os}" == "linux" ]]; then
-        local major minor patch
-        IFS='.' read -r major minor patch <<< "${version}"
-        local version_num=$((major * 10000 + minor * 100 + ${patch%%-*}))
-        
-        if [[ ${version_num} -lt 11201 ]]; then
-            arch_suffix="arm64v8"
-        fi
-    fi
-    
-    local filename="mediamtx_v${version}_${os}_${arch_suffix}.tar.gz"
-    local url="https://github.com/${DEFAULT_GITHUB_REPO}/releases/download/v${version}/${filename}"
-    
-    echo "${url}"
+    local filename="mediamtx_v${version}_${os}_${arch}.tar.gz"
+    echo "https://github.com/${DEFAULT_GITHUB_REPO}/releases/download/v${version}/${filename}"
 }
 
 download_mediamtx() {
@@ -1000,11 +863,8 @@ download_mediamtx() {
     
     local asset_url
     asset_url=$(build_asset_url "${version}" "${os}" "${arch}")
-    
     local archive="${TEMP_DIR}/mediamtx.tar.gz"
     local checksum="${TEMP_DIR}/checksums.sha256"
-    
-    # Extract just the filename for checksum verification
     local archive_filename
     archive_filename=$(basename "${asset_url}")
     
@@ -1012,18 +872,16 @@ download_mediamtx() {
     
     if [[ "${DRY_RUN_MODE}" == "true" ]]; then
         log_info "[DRY RUN] Would download: ${asset_url}"
-        log_info "[DRY RUN] Would verify checksum if available"
-        log_info "[DRY RUN] Would extract and install binary"
+        log_info "[DRY RUN] Would verify checksum and extract"
         return 0
     fi
     
+    # Try primary architecture
     if ! download_file "${asset_url}" "${archive}"; then
+        # Fallback for ARM64 alternate naming
         if [[ "${arch}" == "arm64" ]]; then
-            log_warn "Trying alternate ARM64 naming..."
-            local alt_arch="arm64v8"
-            [[ "${asset_url}" == *"arm64v8"* ]] && alt_arch="arm64"
-            
-            asset_url=$(build_asset_url "${version}" "${os}" "${alt_arch}")
+            log_warn "Trying alternate ARM64 naming (arm64v8)..."
+            asset_url=$(build_asset_url "${version}" "${os}" "arm64v8")
             archive_filename=$(basename "${asset_url}")
             if ! download_file "${asset_url}" "${archive}"; then
                 fatal "Failed to download MediaMTX" 5
@@ -1033,24 +891,21 @@ download_mediamtx() {
         fi
     fi
     
-    # Download the unified checksums file
+    # Verify checksum (enforced by default)
     log_info "Verifying download..."
-    local checksum_url="https://github.com/${DEFAULT_GITHUB_REPO}/releases/download/${version}/checksums.sha256"
-    if download_file "${checksum_url}" "${checksum}"; then
+    local checksum_url="https://github.com/${DEFAULT_GITHUB_REPO}/releases/download/v${version}/checksums.sha256"
+    if ! download_file "${checksum_url}" "${checksum}"; then
+        if [[ "${FORCE_MODE}" != "true" ]]; then
+            fatal "Failed to download checksum file (use --force to skip verification)" 6
+        fi
+        log_warn "Checksum download failed - skipping verification (--force enabled)"
+    else
         if ! verify_checksum "${archive}" "${checksum}" "${archive_filename}"; then
             fatal "Checksum verification failed" 6
         fi
-    else
-        log_warn "Checksum file not available, skipping verification"
     fi
     
-    if [[ "${VERIFY_GPG}" == "true" ]]; then
-        local sig_file="${TEMP_DIR}/mediamtx.tar.gz.sig"
-        if download_file "${asset_url}.sig" "${sig_file}"; then
-            verify_gpg_signature "${archive}" "${sig_file}" || true
-        fi
-    fi
-    
+    # Extract
     log_info "Extracting archive..."
     if ! tar -xzf "${archive}" -C "${TEMP_DIR}"; then
         fatal "Failed to extract archive" 7
@@ -1060,11 +915,12 @@ download_mediamtx() {
         fatal "Binary not found in archive" 7
     fi
     
+    # Verify binary
     if ! "${TEMP_DIR}/mediamtx" --version &>/dev/null; then
-        log_warn "Binary version check failed"
+        log_warn "Binary version check failed - may not be compatible"
     fi
     
-    log_debug "Binary extracted successfully"
+    log_debug "Binary extracted and verified"
 }
 
 create_config() {
@@ -1082,12 +938,11 @@ create_config() {
     
     [[ -d "${CONFIG_DIR}" ]] || mkdir -p "${CONFIG_DIR}"
     
+    # Backup existing config
     if [[ -f "${config_file}" ]]; then
-        local backup
-        backup="${config_file}.backup.$(date +%Y%m%d-%H%M%S)"
-        cp "${config_file}" "${backup}"
-        log_info "Existing config backed up to: ${backup}"
-        add_rollback "mv" "${backup}" "${config_file}"
+        CONFIG_BACKUP="${config_file}.backup.$(date +%Y%m%d-%H%M%S)"
+        cp "${config_file}" "${CONFIG_BACKUP}"
+        log_info "Existing config backed up to: ${CONFIG_BACKUP}"
     fi
     
     cat > "${config_file}" << EOF
@@ -1100,7 +955,7 @@ create_config() {
 # Global settings
 logLevel: info
 logDestinations: [stdout]
-logFile: /var/lib/mediamtx/mediamtx.log
+logFile: ${STATE_DIR}/mediamtx.log
 
 # API Configuration
 api: yes
@@ -1115,8 +970,6 @@ rtsp: yes
 rtspAddress: :${DEFAULT_RTSP_PORT}
 rtspEncryption: "no"
 rtspTransports: [tcp, udp]
-rtspProtocols: [tcp, udp]
-rtspAuthMethods: [basic]
 
 # RTMP Server (disabled by default)
 rtmp: no
@@ -1134,19 +987,13 @@ webrtcAddress: :8889
 pathDefaults:
   source: publisher
   sourceOnDemand: no
-  sourceOnDemandStartTimeout: 10s
-  sourceOnDemandCloseAfter: 10s
-  record: no
 
-paths:
+paths: {}
   # Define your paths here
-  # Example:
-  # mystream:
-  #   source: rtsp://192.168.1.100:554/stream
 EOF
     
     chmod 644 "${config_file}"
-    chown root:root "${config_file}"
+    chown root:root "${config_file}" 2>/dev/null || true
     
     log_info "Configuration created: ${config_file}"
 }
@@ -1162,6 +1009,14 @@ create_service() {
         return 0
     fi
     
+    # Check systemd version for StateDirectory support
+    local systemd_version=""
+    if systemd_version=$(systemctl --version 2>/dev/null | head -1 | grep -oE '[0-9]+' | head -1); then
+        if [[ ${systemd_version} -lt 235 ]]; then
+            log_warn "systemd ${systemd_version} detected - StateDirectory may not work correctly (requires ≥235)"
+        fi
+    fi
+    
     if [[ "${DRY_RUN_MODE}" == "true" ]]; then
         log_info "[DRY RUN] Would create service: ${SERVICE_NAME}"
         return 0
@@ -1169,14 +1024,12 @@ create_service() {
     
     local service_file="${SERVICE_DIR}/${SERVICE_NAME}"
     
+    # Backup existing service
     if [[ -f "${service_file}" ]]; then
-        local backup
-        backup="${service_file}.backup.$(date +%Y%m%d-%H%M%S)"
-        cp "${service_file}" "${backup}"
-        add_rollback "mv" "${backup}" "${service_file}"
+        SERVICE_BACKUP="${service_file}.backup.$(date +%Y%m%d-%H%M%S)"
+        cp "${service_file}" "${SERVICE_BACKUP}"
     fi
     
-    # Create service with full security hardening
     cat > "${service_file}" << EOF
 [Unit]
 Description=MediaMTX Media Server
@@ -1198,8 +1051,8 @@ StartLimitInterval=60
 StartLimitBurst=3
 
 # Environment
-Environment="HOME=/var/lib/mediamtx"
-WorkingDirectory=/var/lib/mediamtx
+Environment="HOME=${STATE_DIR}"
+WorkingDirectory=${STATE_DIR}
 
 # Logging
 StandardOutput=journal
@@ -1211,30 +1064,12 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
-ProtectKernelTunables=true
-ProtectKernelModules=true
-ProtectControlGroups=true
-RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
-RestrictNamespaces=true
-RestrictRealtime=true
-RestrictSUIDSGID=true
-LockPersonality=true
-SystemCallFilter=@system-service
-SystemCallErrorNumber=EPERM
-
-# Capabilities (uncomment if using privileged ports < 1024)
-# AmbientCapabilities=CAP_NET_BIND_SERVICE
-# CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+ReadWritePaths=/var/log ${STATE_DIR}
+StateDirectory=mediamtx
+RuntimeDirectory=mediamtx
 
 # Resource limits
 LimitNOFILE=65536
-LimitNPROC=512
-
-# Directories
-ReadWritePaths=/var/log /var/lib/mediamtx
-StateDirectory=mediamtx
-LogsDirectory=mediamtx
-RuntimeDirectory=mediamtx
 
 [Install]
 WantedBy=multi-user.target
@@ -1260,31 +1095,24 @@ create_user() {
     log_info "Creating service user: ${SERVICE_USER}"
     
     if command -v useradd &>/dev/null; then
-        useradd \
-            --system \
-            --home-dir /var/lib/mediamtx \
-            --no-create-home \
-            --shell /usr/sbin/nologin \
-            --comment "MediaMTX service user" \
-            "${SERVICE_USER}"
+        useradd --system --home-dir "${STATE_DIR}" --no-create-home \
+                --shell /usr/sbin/nologin --comment "MediaMTX service user" "${SERVICE_USER}"
     elif command -v adduser &>/dev/null; then
-        adduser \
-            --system \
-            --home /var/lib/mediamtx \
-            --no-create-home \
-            --shell /usr/sbin/nologin \
-            --group \
-            "${SERVICE_USER}"
+        adduser --system --home "${STATE_DIR}" --no-create-home \
+                --shell /usr/sbin/nologin --group "${SERVICE_USER}"
     else
         log_warn "Cannot create user, no user management command found"
         return 1
     fi
     
-    mkdir -p /var/lib/mediamtx
-    chown "${SERVICE_USER}:${SERVICE_GROUP}" /var/lib/mediamtx
-    chmod 755 /var/lib/mediamtx
+    # Create and track state directory
+    if [[ ! -d "${STATE_DIR}" ]]; then
+        mkdir -p "${STATE_DIR}"
+        STATE_DIR_CREATED=true
+    fi
     
-    add_rollback "userdel" "${SERVICE_USER}"
+    chown "${SERVICE_USER}:${SERVICE_GROUP}" "${STATE_DIR}"
+    chmod 755 "${STATE_DIR}"
 }
 
 # ============================================================================
@@ -1298,6 +1126,27 @@ install_mediamtx() {
         fatal "MediaMTX is already installed. Use --force to override or 'update' command" 7
     fi
     
+    # Early writability check
+    if [[ "${DRY_RUN_MODE}" != "true" ]]; then
+        if [[ ! -d "${INSTALL_PREFIX}" ]]; then
+            if ! mkdir -p "${INSTALL_PREFIX}" 2>/dev/null; then
+                fatal "Cannot create installation prefix: ${INSTALL_PREFIX}" 8
+            fi
+        fi
+        
+        if [[ ! -w "${INSTALL_PREFIX}" ]]; then
+            fatal "Installation prefix not writable: ${INSTALL_PREFIX}" 8
+        fi
+        
+        # Test actual write access
+        local test_file="${INSTALL_PREFIX}/.write_test.$$"
+        if ! touch "${test_file}" 2>/dev/null; then
+            fatal "Cannot write to installation prefix: ${INSTALL_PREFIX}" 8
+        fi
+        rm -f "${test_file}"
+        log_debug "Write access to ${INSTALL_PREFIX} verified"
+    fi
+    
     get_release_info "${TARGET_VERSION}"
     download_mediamtx "${RELEASE_VERSION}" "${PLATFORM_OS}" "${PLATFORM_ARCH}"
     
@@ -1308,22 +1157,22 @@ install_mediamtx() {
     
     [[ -d "${INSTALL_DIR}" ]] || mkdir -p "${INSTALL_DIR}"
     
+    # Atomic binary installation with cleanup on failure
     log_info "Installing binary..."
-    install -m 755 "${TEMP_DIR}/mediamtx" "${INSTALL_DIR}/"
-    add_rollback "rm" "${INSTALL_DIR}/mediamtx"
+    local temp_binary="${INSTALL_DIR}/mediamtx.new.$$"
+    if ! install -m 755 "${TEMP_DIR}/mediamtx" "${temp_binary}"; then
+        fatal "Failed to prepare binary for installation" 7
+    fi
+    if ! mv -f "${temp_binary}" "${INSTALL_DIR}/mediamtx"; then
+        rm -f "${temp_binary}"
+        fatal "Failed to atomically install binary" 7
+    fi
     
     create_user
     create_config
     create_service
     
-    if "${INSTALL_DIR}/mediamtx" --version &>/dev/null; then
-        log_info "Installation verified successfully"
-    else
-        log_warn "Could not verify installation"
-    fi
-    
     log_info "MediaMTX ${RELEASE_VERSION} installed successfully!"
-    
     show_post_install_guidance
 }
 
@@ -1334,11 +1183,13 @@ update_mediamtx() {
         fatal "MediaMTX is not installed. Use 'install' command first" 7
     fi
     
+    # Get current version
     local current_version="unknown"
     if "${INSTALL_DIR}/mediamtx" --version &>/dev/null; then
-        current_version=$("${INSTALL_DIR}/mediamtx" --version 2>&1 | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+        current_version=$("${INSTALL_DIR}/mediamtx" --version 2>&1 | grep -oE 'v?[0-9]+\.[0-9]+\.[0-9]+' | head -1)
     fi
     
+    # Get target version
     get_release_info "${TARGET_VERSION}"
     
     if [[ "${current_version}" == "${RELEASE_VERSION}" ]] && [[ "${FORCE_MODE}" != "true" ]]; then
@@ -1353,39 +1204,74 @@ update_mediamtx() {
         return 0
     fi
     
+    # Detect management mode
     local management_mode
     management_mode=$(detect_management_mode)
     local was_running=false
     [[ "${management_mode}" != "none" ]] && was_running=true
     
-    local active_streams=()
-    if [[ "${management_mode}" == "stream-manager" ]]; then
-        mapfile -t active_streams < <(get_active_streams)
-        log_info "Detected ${#active_streams[@]} active streams"
-    fi
-    
+    # Stop MediaMTX
     stop_mediamtx "${management_mode}"
     
-    local backup
-    backup="${INSTALL_DIR}/mediamtx.backup.$(date +%Y%m%d-%H%M%S)"
-    cp "${INSTALL_DIR}/mediamtx" "${backup}"
-    add_rollback "mv" "${backup}" "${INSTALL_DIR}/mediamtx"
-    log_info "Current binary backed up to: ${backup}"
+    # Create backup
+    BINARY_BACKUP="${INSTALL_DIR}/mediamtx.backup.$(date +%Y%m%d-%H%M%S)"
+    cp "${INSTALL_DIR}/mediamtx" "${BINARY_BACKUP}"
+    log_info "Current binary backed up to: ${BINARY_BACKUP}"
     
-    download_mediamtx "${RELEASE_VERSION}" "${PLATFORM_OS}" "${PLATFORM_ARCH}"
-    
-    install -m 755 "${TEMP_DIR}/mediamtx" "${INSTALL_DIR}/"
-    
-    if [[ "${was_running}" == "true" ]]; then
-        start_mediamtx "${management_mode}"
+    # Try built-in upgrade if supported
+    local upgrade_success=false
+    if version_compare "${current_version}" "${MIN_UPGRADE_VERSION}"; then
+        log_info "Attempting built-in upgrade (--upgrade)..."
         
-        if [[ ${#active_streams[@]} -gt 0 ]]; then
-            log_info "Restarted streams: ${active_streams[*]}"
+        if "${INSTALL_DIR}/mediamtx" --upgrade 2>&1 | tee -a "${LOG_FILE}"; then
+            # Verify the upgrade actually worked
+            local new_version
+            if new_version=$("${INSTALL_DIR}/mediamtx" --version 2>&1 | grep -oE 'v?[0-9]+\.[0-9]+\.[0-9]+' | head -1); then
+                if [[ "${new_version}" != "${current_version}" ]]; then
+                    upgrade_success=true
+                    log_info "Built-in upgrade completed successfully (${current_version} → ${new_version})"
+                else
+                    log_warn "Built-in upgrade reported success but version unchanged"
+                fi
+            else
+                log_warn "Could not verify new version after upgrade"
+            fi
+        else
+            log_warn "Built-in upgrade failed, falling back to manual update"
+        fi
+    else
+        log_debug "Version ${current_version} does not support --upgrade (requires ${MIN_UPGRADE_VERSION}+), using manual update"
+    fi
+    
+    # Manual update if upgrade failed or not supported
+    if [[ "${upgrade_success}" != "true" ]]; then
+        log_info "Performing manual update..."
+        download_mediamtx "${RELEASE_VERSION}" "${PLATFORM_OS}" "${PLATFORM_ARCH}"
+        
+        # Atomic binary replacement with cleanup on failure
+        local temp_binary="${INSTALL_DIR}/mediamtx.new.$$"
+        if ! install -m 755 "${TEMP_DIR}/mediamtx" "${temp_binary}"; then
+            fatal "Failed to prepare binary for update" 7
+        fi
+        if ! mv -f "${temp_binary}" "${INSTALL_DIR}/mediamtx"; then
+            rm -f "${temp_binary}"
+            fatal "Failed to atomically update binary" 7
         fi
     fi
     
-    log_info "MediaMTX updated to ${RELEASE_VERSION} successfully!"
+    # Verify new version
+    if "${INSTALL_DIR}/mediamtx" --version &>/dev/null; then
+        local new_version
+        new_version=$("${INSTALL_DIR}/mediamtx" --version 2>&1 | grep -oE 'v?[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+        log_info "Updated to version: ${new_version}"
+    fi
     
+    # Restart if it was running
+    if [[ "${was_running}" == "true" ]]; then
+        start_mediamtx "${management_mode}"
+    fi
+    
+    log_info "MediaMTX updated successfully!"
     show_post_update_guidance "${management_mode}"
 }
 
@@ -1399,37 +1285,36 @@ stop_mediamtx() {
     
     case "${mode}" in
         systemd)
-            log_info "Stopping MediaMTX service (systemd)..."
-            systemctl stop mediamtx
-            add_rollback "systemctl" "start" "mediamtx"
+            log_info "Stopping MediaMTX service..."
+            systemctl stop mediamtx || log_warn "Failed to stop service cleanly"
             ;;
         
         stream-manager)
             local stream_manager
             if stream_manager=$(find_stream_manager); then
                 log_info "Stopping MediaMTX via stream manager..."
-                "${stream_manager}" stop || {
-                    log_warn "Stream manager stop failed, falling back to manual stop"
+                if ! "${stream_manager}" stop; then
+                    log_warn "Stream manager stop failed, using manual stop"
                     pkill -f "ffmpeg.*rtsp://localhost" 2>/dev/null || true
-                    sleep 1
                     pkill mediamtx 2>/dev/null || true
-                }
+                fi
             else
-                log_info "Stopping MediaMTX and FFmpeg streams manually..."
+                log_info "Stopping MediaMTX manually..."
                 pkill -f "ffmpeg.*rtsp://localhost" 2>/dev/null || true
-                sleep 1
                 pkill mediamtx 2>/dev/null || true
             fi
             ;;
         
-        manual)
-            log_info "Stopping manually-run MediaMTX..."
+        manual|*)
+            log_info "Stopping MediaMTX..."
             pkill mediamtx 2>/dev/null || true
             ;;
     esac
     
+    # Wait for processes to stop
     sleep 2
     
+    # Force kill if still running
     if pgrep -x "mediamtx" &>/dev/null; then
         log_warn "MediaMTX still running, forcing stop..."
         pkill -9 mediamtx 2>/dev/null || true
@@ -1447,27 +1332,24 @@ start_mediamtx() {
     
     case "${mode}" in
         systemd)
-            log_info "Starting MediaMTX service (systemd)..."
-            systemctl start mediamtx
+            log_info "Starting MediaMTX service..."
+            systemctl start mediamtx || log_error "Failed to start service"
             ;;
         
         stream-manager)
             local stream_manager
             if stream_manager=$(find_stream_manager); then
                 log_info "Starting MediaMTX via stream manager..."
-                "${stream_manager}" start || {
-                    log_error "Failed to start via stream manager"
-                    log_info "Please manually start with: sudo ${stream_manager} start"
-                }
+                if ! "${stream_manager}" start; then
+                    log_warn "Please manually start with: sudo ${stream_manager} start"
+                fi
             else
-                log_warn "Stream manager script not found"
-                log_info "Please manually restart MediaMTX with your stream manager"
+                log_warn "Please manually restart MediaMTX with your stream manager"
             fi
             ;;
         
-        manual)
-            log_info "MediaMTX was running manually"
-            log_info "Please restart it manually with your preferred method"
+        manual|*)
+            log_info "Please manually restart MediaMTX"
             ;;
     esac
 }
@@ -1480,6 +1362,7 @@ uninstall_mediamtx() {
         return 0
     fi
     
+    # Stop and remove service
     if command -v systemctl &>/dev/null && [[ -f "${SERVICE_DIR}/${SERVICE_NAME}" ]]; then
         log_info "Stopping and disabling service..."
         systemctl stop mediamtx 2>/dev/null || true
@@ -1488,36 +1371,57 @@ uninstall_mediamtx() {
         systemctl daemon-reload
     fi
     
+    # Remove binary
     if [[ -f "${INSTALL_DIR}/mediamtx" ]]; then
         log_info "Removing binary..."
         rm -f "${INSTALL_DIR}/mediamtx"
         rm -f "${INSTALL_DIR}"/mediamtx.backup.* 2>/dev/null || true
+        rm -f "${INSTALL_DIR}"/mediamtx.new.* 2>/dev/null || true
     fi
     
-    if [[ -d "${CONFIG_DIR}" ]] && [[ "${FORCE_MODE}" != "true" ]]; then
-        echo -en "${YELLOW}Remove configuration directory ${CONFIG_DIR}? [y/N] ${NC}"
-        read -r response
-        if [[ "${response}" =~ ^[Yy]$ ]]; then
+    # Remove config (with confirmation)
+    if [[ -d "${CONFIG_DIR}" ]]; then
+        if [[ "${FORCE_MODE}" == "true" ]]; then
             rm -rf "${CONFIG_DIR}"
             log_info "Configuration removed"
+        else
+            echo -en "${YELLOW}Remove configuration directory ${CONFIG_DIR}? [y/N] ${NC}"
+            read -r response
+            if [[ "${response}" =~ ^[Yy]$ ]]; then
+                rm -rf "${CONFIG_DIR}"
+                log_info "Configuration removed"
+            fi
         fi
-    elif [[ "${FORCE_MODE}" == "true" ]] && [[ -d "${CONFIG_DIR}" ]]; then
-        rm -rf "${CONFIG_DIR}"
-        log_info "Configuration removed"
     fi
     
-    if id "${SERVICE_USER}" &>/dev/null && [[ "${FORCE_MODE}" != "true" ]]; then
-        echo -en "${YELLOW}Remove service user ${SERVICE_USER}? [y/N] ${NC}"
-        read -r response
-        if [[ "${response}" =~ ^[Yy]$ ]]; then
-            userdel "${SERVICE_USER}" 2>/dev/null || true
-            rm -rf /var/lib/mediamtx 2>/dev/null || true
-            log_info "Service user removed"
+    # Remove state directory (with confirmation)
+    if [[ -d "${STATE_DIR}" ]]; then
+        if [[ "${FORCE_MODE}" == "true" ]]; then
+            rm -rf "${STATE_DIR}"
+            log_info "State directory removed"
+        else
+            echo -en "${YELLOW}Remove state directory ${STATE_DIR}? [y/N] ${NC}"
+            read -r response
+            if [[ "${response}" =~ ^[Yy]$ ]]; then
+                rm -rf "${STATE_DIR}"
+                log_info "State directory removed"
+            fi
         fi
-    elif [[ "${FORCE_MODE}" == "true" ]] && id "${SERVICE_USER}" &>/dev/null; then
-        log_info "Removing service user..."
-        userdel "${SERVICE_USER}" 2>/dev/null || true
-        rm -rf /var/lib/mediamtx 2>/dev/null || true
+    fi
+    
+    # Remove user (with confirmation)
+    if id "${SERVICE_USER}" &>/dev/null; then
+        if [[ "${FORCE_MODE}" == "true" ]]; then
+            userdel "${SERVICE_USER}" 2>/dev/null || true
+            log_info "Service user removed"
+        else
+            echo -en "${YELLOW}Remove service user ${SERVICE_USER}? [y/N] ${NC}"
+            read -r response
+            if [[ "${response}" =~ ^[Yy]$ ]]; then
+                userdel "${SERVICE_USER}" 2>/dev/null || true
+                log_info "Service user removed"
+            fi
+        fi
     fi
     
     log_info "MediaMTX uninstalled successfully!"
@@ -1531,25 +1435,21 @@ show_status() {
     echo -e "${BOLD}MediaMTX Installation Status${NC}"
     echo "================================"
     
-    # Installation status
+    # Installation
     if [[ -f "${INSTALL_DIR}/mediamtx" ]]; then
         echo -e "Installation: ${GREEN}✓ Installed${NC}"
         echo "Location: ${INSTALL_DIR}/mediamtx"
         
         local version="unknown"
         if "${INSTALL_DIR}/mediamtx" --version &>/dev/null; then
-            version=$("${INSTALL_DIR}/mediamtx" --version 2>&1 | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+            version=$("${INSTALL_DIR}/mediamtx" --version 2>&1 | grep -oE 'v?[0-9]+\.[0-9]+\.[0-9]+' | head -1)
         fi
         echo "Version: ${version}"
-        
-        local file_size
-        file_size=$(stat -c%s "${INSTALL_DIR}/mediamtx" 2>/dev/null || stat -f%z "${INSTALL_DIR}/mediamtx" 2>/dev/null || echo "unknown")
-        echo "Binary size: ${file_size} bytes"
     else
         echo -e "Installation: ${RED}✗ Not installed${NC}"
     fi
     
-    # Configuration status
+    # Configuration
     echo ""
     if [[ -f "${CONFIG_DIR}/${CONFIG_NAME}" ]]; then
         echo -e "Configuration: ${GREEN}✓ Present${NC}"
@@ -1558,7 +1458,7 @@ show_status() {
         echo -e "Configuration: ${YELLOW}⚠ Missing${NC}"
     fi
     
-    # Process status
+    # Service and process status
     echo ""
     local management_mode
     management_mode=$(detect_management_mode)
@@ -1572,20 +1472,9 @@ show_status() {
     case "${management_mode}" in
         systemd)
             echo -e "Status: ${GREEN}● Running (systemd)${NC}"
-            local pid
-            pid=$(systemctl show mediamtx --property MainPID --value 2>/dev/null || echo "")
-            [[ -n "${pid}" ]] && [[ "${pid}" != "0" ]] && echo "PID: ${pid}"
             ;;
         stream-manager)
             echo -e "Status: ${YELLOW}⚠ Running (stream manager)${NC}"
-            local active_streams=()
-            mapfile -t active_streams < <(get_active_streams)
-            if [[ ${#active_streams[@]} -gt 0 ]]; then
-                echo "Active streams: ${#active_streams[@]}"
-                for stream in "${active_streams[@]}"; do
-                    echo "  • ${stream}"
-                done
-            fi
             ;;
         manual)
             echo -e "Status: ${YELLOW}⚠ Running (manual)${NC}"
@@ -1596,120 +1485,103 @@ show_status() {
     esac
     
     # Port status
-    if command -v lsof &>/dev/null; then
+    if command -v lsof &>/dev/null || command -v ss &>/dev/null; then
         echo ""
         echo "Port Status:"
-        
         local ports=("${DEFAULT_RTSP_PORT}" "${DEFAULT_API_PORT}" "${DEFAULT_METRICS_PORT}")
         local labels=("RTSP" "API" "Metrics")
         
+        local i
         for i in "${!ports[@]}"; do
             local port="${ports[$i]}"
             local label="${labels[$i]}"
+            local port_status=""
+            local port_user=""
             
-            local port_user
-            port_user=$(lsof -i ":${port}" -sTCP:LISTEN 2>/dev/null | tail -n1 | awk '{print $1}' || echo "")
+            # Try lsof first
+            if command -v lsof &>/dev/null; then
+                port_user=$(lsof -i ":${port}" -sTCP:LISTEN 2>/dev/null | tail -n1 | awk '{print $1}' || echo "")
+            fi
+            
+            # Fallback to ss if lsof didn't find anything
+            if [[ -z "${port_user}" ]] && command -v ss &>/dev/null; then
+                port_status=$(ss -ltn "sport = :${port}" 2>/dev/null | grep -v "State" || echo "")
+            fi
+            
             if [[ -n "${port_user}" ]]; then
                 if [[ "${port_user}" == "mediamtx" ]]; then
                     echo -e "  ${label} (${port}): ${GREEN}✓ In use by MediaMTX${NC}"
                 else
-                    echo -e "  ${label} (${port}): ${YELLOW}⚠ In use by ${port_user}${NC}"
+                    echo -e "  ${label} (${port}): ${GREEN}✓ In use by ${port_user}${NC}"
                 fi
+            elif [[ -n "${port_status}" ]]; then
+                echo -e "  ${label} (${port}): ${GREEN}✓ In use${NC}"
             else
-                echo -e "  ${label} (${port}): ${YELLOW}○ Not in use${NC}"
+                if [[ "${management_mode}" == "stream-manager" ]] || [[ "${management_mode}" == "systemd" ]]; then
+                    echo -e "  ${label} (${port}): ${YELLOW}⚠ Status unknown${NC}"
+                else
+                    echo -e "  ${label} (${port}): ${YELLOW}○ Not in use${NC}"
+                fi
             fi
         done
     fi
-    
-    # Summary
-    echo ""
-    echo "================================"
-    
-    case "${management_mode}" in
-        systemd)
-            echo -e "${GREEN}Summary: MediaMTX is properly managed by systemd${NC}"
-            echo ""
-            echo "Quick Commands:"
-            echo "  • View logs: sudo journalctl -u mediamtx -f"
-            echo "  • Restart: sudo systemctl restart mediamtx"
-            ;;
-        stream-manager)
-            echo -e "${GREEN}Summary: MediaMTX is running under Stream Manager control${NC}"
-            echo ""
-            echo "Quick Commands:"
-            echo "  • Check streams: sudo ./mediamtx-stream-manager.sh status"
-            echo "  • Restart: sudo ./mediamtx-stream-manager.sh restart"
-            ;;
-        manual)
-            echo -e "${YELLOW}Summary: MediaMTX is running but not managed${NC}"
-            echo "Consider using systemd or stream-manager for management."
-            ;;
-        none)
-            echo -e "${RED}Summary: MediaMTX is not running${NC}"
-            if [[ -f "${INSTALL_DIR}/mediamtx" ]]; then
-                echo ""
-                echo "To start MediaMTX:"
-                echo "  • With systemd: sudo systemctl start mediamtx"
-                echo "  • Manually: ${INSTALL_DIR}/mediamtx ${CONFIG_DIR}/${CONFIG_NAME}"
-            fi
-            ;;
-    esac
 }
 
 verify_installation() {
     log_info "Verifying installation..."
     
     local errors=0
-    local warning_count=0
+    local warnings=0
     
+    # Check binary
     if [[ ! -f "${INSTALL_DIR}/mediamtx" ]]; then
         log_error "Binary not found: ${INSTALL_DIR}/mediamtx"
-        errors=$((errors + 1))
+        ((errors++))
     elif [[ ! -x "${INSTALL_DIR}/mediamtx" ]]; then
         log_error "Binary not executable: ${INSTALL_DIR}/mediamtx"
-        errors=$((errors + 1))
+        ((errors++))
     elif ! "${INSTALL_DIR}/mediamtx" --version &>/dev/null; then
         log_error "Binary verification failed"
-        errors=$((errors + 1))
+        ((errors++))
     else
         log_info "Binary: OK"
     fi
     
+    # Check config
     if [[ ! -f "${CONFIG_DIR}/${CONFIG_NAME}" ]]; then
         log_warn "Configuration not found: ${CONFIG_DIR}/${CONFIG_NAME}"
-        warning_count=$((warning_count + 1))
+        ((warnings++))
     else
         log_info "Configuration: OK"
     fi
     
+    # Check service
     if command -v systemctl &>/dev/null; then
         if [[ ! -f "${SERVICE_DIR}/${SERVICE_NAME}" ]]; then
             log_warn "Service not configured"
-            warning_count=$((warning_count + 1))
-        elif ! systemctl is-enabled mediamtx &>/dev/null; then
-            log_warn "Service not enabled"
-            warning_count=$((warning_count + 1))
+            ((warnings++))
         else
             log_info "Service: OK"
         fi
     fi
     
+    # Check user
     if ! id "${SERVICE_USER}" &>/dev/null; then
         log_warn "Service user not found: ${SERVICE_USER}"
-        warning_count=$((warning_count + 1))
+        ((warnings++))
     else
         log_info "Service user: OK"
     fi
     
     echo ""
-    if [[ ${errors} -eq 0 ]] && [[ ${warning_count} -eq 0 ]]; then
-        log_info "✓ Installation verified successfully - no issues found"
+    if [[ ${errors} -eq 0 ]] && [[ ${warnings} -eq 0 ]]; then
+        log_info "✓ Installation verified successfully"
         return 0
     elif [[ ${errors} -eq 0 ]]; then
-        log_warn "Installation verified with ${warning_count} warning(s)"
+        log_warn "Installation verified with ${warnings} warning(s)"
         return 0
     else
-        log_error "Installation verification failed with ${errors} error(s) and ${warning_count} warning(s)"
+        log_error "Verification failed: ${errors} error(s), ${warnings} warning(s)"
         return 1
     fi
 }
@@ -1723,34 +1595,26 @@ show_post_install_guidance() {
     stream_manager=$(find_stream_manager 2>/dev/null || echo "")
     
     echo ""
-    if [[ -n "${stream_manager}" ]] || [[ -f "/etc/mediamtx/audio-devices.conf" ]]; then
+    if [[ -n "${stream_manager}" ]]; then
         echo "================================"
         echo "Audio Streaming Setup Detected!"
         echo "================================"
         echo ""
-        echo "You can manage MediaMTX using EITHER:"
+        echo "Option 1: Stream Manager (Recommended)"
+        echo "  sudo ${stream_manager} start"
         echo ""
-        echo "Option 1: Stream Manager (Recommended for audio streaming)"
-        echo "  sudo ${stream_manager:-./mediamtx-stream-manager.sh} start"
-        echo "  sudo ${stream_manager:-./mediamtx-stream-manager.sh} status"
-        echo ""
-        echo "Option 2: Systemd Service (Standard management)"
+        echo "Option 2: Systemd Service"
         echo "  sudo systemctl start mediamtx"
         echo "  sudo systemctl enable mediamtx"
-        echo ""
-        echo "Note: Use only ONE management method at a time!"
     else
         if command -v systemctl &>/dev/null && [[ -f "${SERVICE_DIR}/${SERVICE_NAME}" ]]; then
             echo ""
             echo "To start MediaMTX:"
             echo "  sudo systemctl start mediamtx"
-            echo "  sudo systemctl enable mediamtx  # Auto-start at boot"
-            echo ""
-            echo "To check status:"
-            echo "  sudo systemctl status mediamtx"
+            echo "  sudo systemctl enable mediamtx"
         else
             echo ""
-            echo "To start MediaMTX manually:"
+            echo "To start MediaMTX:"
             echo "  ${INSTALL_DIR}/mediamtx ${CONFIG_DIR}/${CONFIG_NAME}"
         fi
     fi
@@ -1760,17 +1624,17 @@ show_post_update_guidance() {
     local mode="${1:-none}"
     
     case "${mode}" in
-        stream-manager)
-            echo ""
-            echo "Stream Manager Detected - Quick Commands:"
-            echo "  • Check status: sudo ./mediamtx-stream-manager.sh status"
-            echo "  • View logs: tail -f /var/lib/mediamtx-ffmpeg/*.log"
-            ;;
         systemd)
             echo ""
-            echo "Systemd Management - Quick Commands:"
-            echo "  • Check status: sudo systemctl status mediamtx"
-            echo "  • View logs: sudo journalctl -u mediamtx -f"
+            echo "Quick Commands:"
+            echo "  • Status: sudo systemctl status mediamtx"
+            echo "  • Logs:   sudo journalctl -u mediamtx -f"
+            ;;
+        stream-manager)
+            echo ""
+            echo "Quick Commands:"
+            echo "  • Status: sudo ./mediamtx-stream-manager.sh status"
+            echo "  • Logs:   tail -f /var/lib/mediamtx-ffmpeg/*.log"
             ;;
     esac
 }
@@ -1779,62 +1643,64 @@ show_help() {
     cat << EOF
 ${BOLD}MediaMTX Installation Manager v${SCRIPT_VERSION}${NC}
 
-Production-ready installer for MediaMTX media server with comprehensive
-error handling, validation, and security features.
+Production-ready installer for MediaMTX with built-in upgrade support.
 
 ${BOLD}USAGE:${NC}
     ${SCRIPT_NAME} [OPTIONS] COMMAND
 
 ${BOLD}COMMANDS:${NC}
     install     Install MediaMTX
-    update      Update to latest version
+    update      Update to latest version (uses built-in --upgrade when available)
     uninstall   Remove MediaMTX
     status      Show installation status
     verify      Verify installation integrity
     help        Show this help message
 
 ${BOLD}OPTIONS:${NC}
-    -c, --config FILE      Use configuration file
-    -v, --verbose         Enable verbose output
-    -q, --quiet          Suppress non-error output
-    -n, --dry-run        Show what would be done
-    -f, --force          Force operation (skip confirmations)
-    -V, --version VER    Install specific version
-    -p, --prefix DIR     Installation prefix (default: ${DEFAULT_INSTALL_PREFIX})
-    --no-service         Skip systemd service creation
-    --no-config          Skip configuration file creation
-    --verify-gpg         Verify GPG signatures
+    -c, --config FILE           Use configuration file
+    -v, --verbose              Enable verbose output
+    -q, --quiet                Suppress non-error output
+    -n, --dry-run              Show what would be done
+    -f, --force                Force operation (skip confirmations/checksums)
+    -V, --target-version VER   Install specific version
+    -p, --prefix DIR           Installation prefix (default: ${DEFAULT_INSTALL_PREFIX})
+    --version                  Show script version
+    --no-service               Skip systemd service creation
+    --no-config                Skip configuration file creation
 
 ${BOLD}EXAMPLES:${NC}
-    # Standard installation
+    # Install latest version
     sudo ${SCRIPT_NAME} install
 
+    # Update using built-in upgrade (MediaMTX v${MIN_UPGRADE_VERSION}+)
+    sudo ${SCRIPT_NAME} update
+
     # Install specific version
-    sudo ${SCRIPT_NAME} -V v1.12.0 install
+    sudo ${SCRIPT_NAME} -V v1.15.0 install
 
-    # Update with verbose output
-    sudo ${SCRIPT_NAME} -v update
+    # Dry run
+    sudo ${SCRIPT_NAME} -n update
 
-    # Dry run to see what would happen
-    sudo ${SCRIPT_NAME} -n install
-
-    # Custom installation prefix
-    sudo ${SCRIPT_NAME} -p /opt/mediamtx install
+    # Show script version
+    ${SCRIPT_NAME} --version
 
 ${BOLD}FILES:${NC}
-    Binary:       ${INSTALL_DIR}/mediamtx
-    Config:       ${CONFIG_DIR}/${CONFIG_NAME}
-    Service:      ${SERVICE_DIR}/${SERVICE_NAME}
-    Logs:         /var/lib/mediamtx/mediamtx.log (systemd: journalctl)
+    Binary:  ${INSTALL_DIR}/mediamtx
+    Config:  ${CONFIG_DIR}/${CONFIG_NAME}
+    State:   ${STATE_DIR}
+    Service: ${SERVICE_DIR}/${SERVICE_NAME}
 
-${BOLD}SERVICE MANAGEMENT:${NC}
-    Start:        sudo systemctl start mediamtx
-    Stop:         sudo systemctl stop mediamtx
-    Restart:      sudo systemctl restart mediamtx
-    Status:       sudo systemctl status mediamtx
-    Enable:       sudo systemctl enable mediamtx
-    Disable:      sudo systemctl disable mediamtx
-    Logs:         sudo journalctl -u mediamtx -f
+${BOLD}ENVIRONMENT VARIABLES:${NC}
+    MEDIAMTX_PREFIX       Installation prefix
+    MEDIAMTX_CONFIG_DIR   Configuration directory
+    MEDIAMTX_STATE_DIR    State directory
+    MEDIAMTX_USER         Service user name
+    MEDIAMTX_GROUP        Service group name
+
+${BOLD}UPDATE NOTES:${NC}
+    The update command uses MediaMTX's built-in --upgrade functionality
+    when available (v${MIN_UPGRADE_VERSION}+). This simplifies updates and ensures
+    platform compatibility. Falls back to manual update for older versions.
 
 ${BOLD}GITHUB:${NC}
     https://github.com/${DEFAULT_GITHUB_REPO}
@@ -1871,7 +1737,7 @@ parse_arguments() {
                 FORCE_MODE=true
                 shift
                 ;;
-            -V|--version)
+            -V|--target-version)
                 TARGET_VERSION="$2"
                 shift 2
                 ;;
@@ -1888,9 +1754,9 @@ parse_arguments() {
                 SKIP_CONFIG=true
                 shift
                 ;;
-            --verify-gpg)
-                VERIFY_GPG=true
-                shift
+            --version)
+                echo "${SCRIPT_NAME} version ${SCRIPT_VERSION}"
+                exit 0
                 ;;
             -h|--help)
                 show_help
@@ -1933,12 +1799,14 @@ main() {
         exit 0
     fi
     
-    if [[ "${COMMAND}" != "status" ]] && [[ "${DRY_RUN_MODE}" != "true" ]]; then
+    # Root check for destructive operations
+    if [[ "${COMMAND}" =~ ^(install|update|uninstall)$ ]] && [[ "${DRY_RUN_MODE}" != "true" ]]; then
         if [[ ${EUID} -ne 0 ]]; then
             fatal "This operation requires root privileges. Please run with sudo." 2
         fi
     fi
     
+    # Lock for install/update/uninstall
     if [[ "${COMMAND}" =~ ^(install|update|uninstall)$ ]]; then
         acquire_lock 30
     fi
