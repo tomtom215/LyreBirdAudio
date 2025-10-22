@@ -1,9 +1,8 @@
 # LyreBirdAudio
 
-**Version:** v1.1.0  
 **License:** Apache 2.0  
 **Platform:** Linux (Ubuntu/Debian/Raspberry Pi OS)  
-**Core Engine:** MediaMTX v1.15.1 (tested for maximum stability)
+**Core Engine:** MediaMTX (latest stable recommended)
 
 ## Table of Contents
 
@@ -15,7 +14,11 @@
 - [Components](#components)
 - [MediaMTX Integration](#mediamtx-integration)
 - [Usage](#usage)
+  - [Orchestrator Interface](#orchestrator-interface)
+  - [Command Reference](#command-reference)
+  - [Advanced Operations](#advanced-operations)
 - [Configuration](#configuration)
+- [Version Management](#version-management)
 - [Troubleshooting](#troubleshooting)
 - [Performance & Optimization](#performance--optimization)
 - [Version History](#version-history)
@@ -29,7 +32,7 @@ LyreBirdAudio provides a comprehensive solution for managing multiple USB audio 
 
 ### Core Technology Stack
 
-- **MediaMTX v1.15.1** - High-performance real-time media server providing RTSP/WebRTC streaming
+- **MediaMTX** - High-performance real-time media server providing RTSP/WebRTC streaming
 - **ALSA** - Linux audio subsystem for device access and control
 - **udev** - Dynamic device management for persistent naming
 - **FFmpeg** - Audio capture and encoding pipeline
@@ -38,6 +41,7 @@ LyreBirdAudio provides a comprehensive solution for managing multiple USB audio 
 ### Project Motivation
 
 This project was inspired by my desire to listen to birds using some USB microphones and Mini PC's I had lying around. I had first found [cberge908](https://gist.github.com/cberge908/ab7ddc1ac46fd63bb6935cd1f4341112)'s original script for launching MediaMTX but I quickly learned there were a lot more edge cases that needed to be handled in order for it to run reliably 24x7. LyreBird Audio is my solution to those edgecases. 
+
 If you like this project, please "Star" the repo. If you use it in any cool or large deployments, please let me know! I'm curious to see where this project goes.
 
 ### Key Problems Solved
@@ -59,7 +63,7 @@ If you like this project, please "Star" the repo. If you use it in any cool or l
 └────────────────────┬────────────────────────────────────────┘
                      │ RTSP://host:8554/DeviceName
 ┌────────────────────▼────────────────────────────────────────┐
-│                    MediaMTX v1.15.1                         │
+│                       MediaMTX                              │
 │                  (Real-time Media Server)                   │
 │  ┌──────────────────────────────────────────────────────┐   │
 │  │ • RTSP Server (port 8554)                            │   │
@@ -108,6 +112,44 @@ If you like this project, please "Star" the repo. If you use it in any cool or l
 └─────────────────────────────────────────────────────────────┘
 ```
 
+### Management Architecture
+
+LyreBirdAudio uses a modular, single-responsibility architecture where each script handles one specific domain:
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                 lyrebird-orchestrator.sh                    │
+│                 (Unified Interface)                         │
+│  • Interactive TUI for all operations                       │
+│  • Delegates to specialized scripts                         │
+│  • No duplicate business logic                              │
+│  • Consistent error handling & feedback                     │
+└─────────┬───────────────────────────────────────────────────┘
+          │
+          ├─────> install_mediamtx.sh
+          │       • MediaMTX installation & updates
+          │       • Binary management
+          │       • Service configuration
+          │       • Built-in --upgrade support
+          │
+          ├─────> mediamtx-stream-manager.sh
+          │       • FFmpeg process lifecycle
+          │       • Stream health monitoring
+          │       • Automatic recovery
+          │       • MediaMTX start/stop/restart
+          │
+          ├─────> usb-audio-mapper.sh
+          │       • USB device detection
+          │       • udev rule generation
+          │       • Persistent naming
+          │
+          └─────> lyrebird-updater.sh
+                  • Git-based version management
+                  • Safe version switching
+                  • Update checking
+                  • Rollback capabilities
+```
+
 ### Data Flow
 
 1. **Device Detection**: USB audio devices are detected via udev and mapped to persistent names
@@ -120,17 +162,18 @@ If you like this project, please "Star" the repo. If you use it in any cool or l
 
 ### Core Functionality
 
-- **MediaMTX-Powered RTSP Streaming**: Enterprise-grade real-time audio streaming using MediaMTX v1.15.1 (extensively tested for stability)
+- **MediaMTX-Powered RTSP Streaming**: Enterprise-grade real-time audio streaming
 - **Persistent USB Audio Device Naming**: Maps USB audio devices to consistent names using udev rules based on physical USB port paths
+- **Unified Orchestrator Interface**: Single interactive TUI for all system management operations
 - **Intelligent Management Detection**: Automatically detects and preserves MediaMTX service management mode (systemd/stream-manager/manual)
 - **Zero-Downtime Updates**: Stream-aware MediaMTX updates that preserve active audio streams during upgrades
 - **Comprehensive Error Handling**: Production-ready exception handling with automatic rollback capabilities
-- **Interactive Setup Wizard**: Guided configuration with MediaMTX version selection and system validation
+- **Version Management**: Git-based version control with safe switching and rollback
 
-### MediaMTX Capabilities (v1.15.1 Tested)
+### MediaMTX Capabilities
 
 - **Multi-Protocol Support**: RTSP, RTMP, HLS, WebRTC, and SRT streaming protocols
-- **Concurrent Streams**: Handles 8+ simultaneous audio device streams with minimal latency
+- **Concurrent Streams**: Handles multiple simultaneous audio device streams with minimal latency
 - **API Management**: RESTful API on port 9997 for dynamic stream control
 - **Authentication Support**: Optional stream authentication and access control
 - **Recording**: On-demand or continuous recording to disk
@@ -140,12 +183,12 @@ If you like this project, please "Star" the repo. If you use it in any cool or l
 
 ### Technical Capabilities
 
-- Supports 1-8+ simultaneous USB audio devices per system
-- Compatible with complex USB hub topologies (4+ level hierarchies tested)
-- Backwards compatible with all previous versions (v1.0.0, v1.0.1)
-- Cross-platform hash generation for embedded systems without standard utilities
+- Supports multiple simultaneous USB audio devices per system
+- Compatible with complex USB hub topologies
+- Backwards compatible with previous versions
+- Cross-platform hash generation for embedded systems
 - Safe base-10 number conversion preventing octal interpretation errors
-- Multi-endpoint API health checking across MediaMTX versions (v1.9.x through v1.15.x)
+- Multi-endpoint API health checking across MediaMTX versions
 - Automatic codec negotiation (AAC, Opus, PCM)
 - Real-time scheduling support (SCHED_FIFO/SCHED_RR) for low-latency operation
 
@@ -161,6 +204,7 @@ If you like this project, please "Star" the repo. If you use it in any cool or l
 - **Privileges**: Root or sudo access required
 - **Architecture**: x86_64, arm64, armv7 (MediaMTX provides native binaries)
 - **Network**: 100Mbps for reliable streaming (1-2Mbps per audio stream)
+- **Raspberry Pi Warning**: Due to USB bandiwdth, power and compute limitations, even the best Raspberry Pi is limited to 2 microphones max
 
 ### Recommended Requirements
 
@@ -178,6 +222,7 @@ Required packages (automatically checked during installation):
 - `curl` or `wget` - downloading MediaMTX releases
 - `tar` - MediaMTX archive extraction
 - `arecord` - ALSA utilities for audio device testing
+- `git` - version management (if using lyrebird-updater.sh)
 
 Optional packages (enhanced functionality):
 - `systemctl` - systemd service management for MediaMTX
@@ -198,73 +243,181 @@ MediaMTX default ports (configurable):
 
 ## Installation
 
-### MediaMTX Version Compatibility
+### Migrating from Non-Git Installation
 
-**Recommended:** MediaMTX v1.15.1 (extensively tested for stability)  
-**Supported:** MediaMTX v1.12.0 through v1.15.x  
-**API Versions:** Automatically detects v2/v3 API endpoints
+If you previously installed LyreBirdAudio without git (e.g., downloaded as ZIP, manual copy, or installed in a custom location), you can migrate to use the orchestrator and version management features.
+
+**Important**: The orchestrator works with any installation, but `lyrebird-updater.sh` requires a git repository.
+
+#### Option 1: Keep Current Installation (Orchestrator Only)
+
+If you don't need version management, your current installation works fine:
+
+```bash
+# Navigate to your existing installation
+cd /path/to/your/lyrebird/scripts
+
+# Make scripts executable if needed
+chmod +x *.sh
+
+# Launch orchestrator
+sudo ./lyrebird-orchestrator.sh
+```
+
+The orchestrator will work from any directory containing the LyreBirdAudio scripts.
+
+#### Option 2: Clone Repository Alongside (Recommended)
+
+Keep your working installation separate and use a git clone for updates:
+
+```bash
+# Clone to a standard location (recommended: home directory)
+git clone https://github.com/tomtom215/LyreBirdAudio.git ~/LyreBirdAudio
+
+# Your existing installation remains at its current location
+# Example: /opt/lyrebird or /usr/local/scripts/lyrebird
+
+# Use the git clone for version management
+cd ~/LyreBirdAudio
+./lyrebird-updater.sh
+
+# Copy updated scripts to your working location when needed
+sudo cp ~/LyreBirdAudio/*.sh /path/to/your/installation/
+```
+
+**What gets preserved automatically:**
+- MediaMTX configuration: `/etc/mediamtx/`
+- USB device mappings: `/etc/udev/rules.d/99-usb-soundcards.rules`
+- Stream configurations: `/etc/mediamtx/audio-devices.conf`
+- MediaMTX binary: `/usr/local/bin/mediamtx`
+- State and logs: `/var/lib/mediamtx/`, `/var/log/`
+
+These system files are independent of where you keep the scripts.
+
+#### Option 3: Convert Current Directory to Git Repository (Advanced)
+
+Only do this if you're comfortable with git and understand the risks:
+
+```bash
+# 1. BACKUP YOUR CURRENT DIRECTORY FIRST
+sudo cp -r /path/to/current/installation /path/to/backup-$(date +%Y%m%d)
+
+# 2. Navigate to current installation
+cd /path/to/current/installation
+
+# 3. Check for uncommitted changes or custom files
+ls -la
+
+# 4. Initialize git and connect to remote
+git init
+git remote add origin https://github.com/tomtom215/LyreBirdAudio.git
+git fetch origin
+
+# 5. View what will change
+git diff HEAD..origin/main
+
+# 6. IMPORTANT: Stash or commit any local changes
+git add .
+git commit -m "Local changes before sync"
+
+# 7. Reset to repository version (this will overwrite local files)
+git reset --hard origin/main
+
+# 8. Verify scripts are executable
+chmod +x *.sh
+
+# 9. Run updater
+./lyrebird-updater.sh
+```
+
+**Warnings for Option 3:**
+- This will overwrite any modified scripts in your directory
+- Custom changes will be lost unless committed first
+- Only do this if your directory contains only LyreBirdAudio scripts
+- If you have a mix of files, use Option 2 instead
+
+#### After Migration
+
+Regardless of which option you choose:
+
+1. **Verify MediaMTX is still running:**
+   ```bash
+   sudo ./mediamtx-stream-manager.sh status
+   # or
+   sudo systemctl status mediamtx
+   ```
+
+2. **Check USB device mappings:**
+   ```bash
+   ls -la /dev/snd/by-usb-port/
+   cat /etc/udev/rules.d/99-usb-soundcards.rules
+   ```
+
+3. **Test orchestrator:**
+   ```bash
+   sudo ./lyrebird-orchestrator.sh
+   ```
+
+Your audio streams and MediaMTX configuration are unaffected by where you keep the scripts.
+
+### MediaMTX Compatibility
+
+**Recommended:** Latest stable MediaMTX release  
+**Minimum:** MediaMTX v1.12.0 or later  
+**API Support:** Automatically detects and uses v2 or v3 API endpoints
 
 ### Quick Installation
 
 ```bash
 # Clone the repository
-git clone -b v1.1.0 https://github.com/tomtom215/LyreBirdAudio.git
+git clone https://github.com/tomtom215/LyreBirdAudio.git
 cd LyreBirdAudio
 
 # Make scripts executable
 chmod +x *.sh
 
-# Run the interactive setup wizard (recommended)
-# Automatically installs MediaMTX v1.15.1 and configures audio devices
-sudo ./lyrebird-wizard.sh
+# Launch the orchestrator (provides interactive setup)
+sudo ./lyrebird-orchestrator.sh
 ```
 
 ### Production Installation
 
 For production environments, we recommend the following installation procedure:
 
-#### Step 1: Install MediaMTX v1.15.1 (Core Streaming Engine)
+#### Step 1: Install MediaMTX (Core Streaming Engine)
 
-```
-# Install MediaMTX v1.15.1 (tested for maximum stability)
-sudo ./install_mediamtx.sh install --version v1.15.1
+```bash
+# Install latest MediaMTX
+sudo ./install_mediamtx.sh install
+
+# Or install a specific version
+sudo ./install_mediamtx.sh install --target-version v1.15.1
 
 # Verify MediaMTX installation and API connectivity
 sudo ./install_mediamtx.sh status
 
-# Expected output:
-# MediaMTX Status:
-#   Version: v1.15.1
-#   Binary: /usr/local/bin/mediamtx
-#   Config: /etc/mediamtx/mediamtx.yml
-#   Process: ✓ Running (PID: 12345)
-#   API: ✓ Responding (v3 API)
-#   Uptime: 0d 0h 1m
+# Expected output shows version, paths, process status, and API connectivity
 ```
 
 #### Step 2: Map USB Audio Devices
 
-```
-# List available USB audio devices
-sudo ./usb-audio-mapper.sh --list
-
-# Example output:
-# Available USB Audio Devices:
-# Card 1: USB Audio Device [C-Media Electronics Inc.]
-#   - Bus: 001, Device: 005
-#   - USB Path: 1-1.4
-#   - Current ALSA name: Generic_USB_Audio
-
-# Map devices interactively (creates udev rules)
+```bash
+# Run interactive device mapper
 sudo ./usb-audio-mapper.sh
 
-# Verify device persistence (test mode)
+# Or enable debug mode for troubleshooting
+sudo DEBUG=true ./usb-audio-mapper.sh
+
+# Test device persistence (dry-run mode)
 sudo ./usb-audio-mapper.sh --test
+
+# View help for non-interactive options
+sudo ./usb-audio-mapper.sh --help
 ```
 
 #### Step 3: Configure MediaMTX Audio Streaming
 
-```
+```bash
 # Configure audio devices for MediaMTX streaming
 echo "Device_1:hw:Device_1:48000:2" | sudo tee /etc/mediamtx/audio-devices.conf
 
@@ -280,1148 +433,911 @@ ffplay rtsp://localhost:8554/Device_1
 
 ## Components
 
-### usb-audio-mapper.sh (v1.2.1)
+### lyrebird-orchestrator.sh
 
-Maps USB audio devices to persistent names using udev rules based on physical USB port paths. This ensures MediaMTX always streams from the correct device regardless of boot order.
+**Role**: Unified interactive interface for all LyreBirdAudio operations
 
-**Key Functions:**
-- `get_usb_physical_port()` - Comprehensive sysfs device search for accurate port detection
-- `get_device_uniqueness()` - Generates unique identifiers without breaking v1.0.0 compatibility
-- `safe_base10()` - Prevents octal number interpretation errors
-- `get_portable_hash()` - Cross-platform hash generation with multiple fallbacks
-- `create_udev_rule()` - Generates udev rules for persistent naming
+The orchestrator is the primary user interface for LyreBirdAudio. It provides an interactive menu system that delegates all operations to specialized scripts without duplicating any business logic.
 
-**Usage:**
-```
-# Interactive device mapping
-sudo ./usb-audio-mapper.sh
-
-# List all USB audio devices
-sudo ./usb-audio-mapper.sh --list
-
-# Test mode (no changes made)
-sudo ./usb-audio-mapper.sh --test
-
-# Map specific device by card number
-sudo ./usb-audio-mapper.sh --card 2
-
-# Remove existing mappings
-sudo ./usb-audio-mapper.sh --remove Device_1
-
-# Show current mappings
-sudo ./usb-audio-mapper.sh --show-mappings
-```
-
-**Generated Files:**
-- `/etc/udev/rules.d/99-usb-soundcards.rules` - udev rules for persistent naming
-- `/dev/snd/by-usb-port/` - Symbolic links to actual devices
-- `/usr/local/bin/usb-audio-symlink.sh` - Helper script for symlink creation
-
-### install_mediamtx.sh (v5.2.0)
-
-Comprehensive MediaMTX installation and management with intelligent update capabilities. Handles MediaMTX binary installation, configuration, and service management.
-
-**Key Functions:**
-- `detect_management_mode()` - Identifies how MediaMTX is being managed (systemd/stream-manager/manual)
-- `update_mediamtx()` - Stream-aware update process preserving active connections
-- `download_mediamtx()` - Architecture-aware binary download from GitHub releases
-- `configure_mediamtx()` - Initial configuration with optimal audio streaming settings
-- `show_status()` - Enhanced status display with MediaMTX API health checks
-- `verify_installation()` - Multi-endpoint API health checking (v2/v3 compatibility)
-
-**MediaMTX Management Modes:**
-1. **systemd**: Full service integration with automatic startup
-2. **stream-manager**: Coordinated with audio stream manager
-3. **manual**: Direct execution for testing/debugging
+**Key Features:**
+- Interactive TUI with status dashboard
+- Consistent error handling and user feedback
+- Automatic detection of system state
+- Script version compatibility checking
+- Real-time system status display
 
 **Usage:**
+```bash
+# Launch orchestrator (interactive mode)
+sudo ./lyrebird-orchestrator.sh
 ```
-# Install MediaMTX v1.15.1 (recommended, tested for stability)
-sudo ./install_mediamtx.sh install --version v1.15.1
 
-# Install latest MediaMTX version
+### install_mediamtx.sh
+
+**Role**: MediaMTX binary installation and lifecycle management
+
+Handles all MediaMTX binary operations including installation, updates, and uninstallation.
+
+**Usage:**
+```bash
+# Install latest MediaMTX
 sudo ./install_mediamtx.sh install
 
-# Update existing MediaMTX (preserves streams)
+# Install specific version
+sudo ./install_mediamtx.sh install --target-version v1.15.1
+
+# Update to latest
 sudo ./install_mediamtx.sh update
 
-# Check MediaMTX and stream status
+# Check status
 sudo ./install_mediamtx.sh status
 
-# Enable systemd service
-sudo ./install_mediamtx.sh enable
+# Verify installation
+sudo ./install_mediamtx.sh verify
 
-# Disable systemd service
-sudo ./install_mediamtx.sh disable
-
-# Uninstall MediaMTX (preserves configs)
+# Uninstall
 sudo ./install_mediamtx.sh uninstall
-
-# Show installed MediaMTX version
-sudo ./install_mediamtx.sh version
-
-# Backup MediaMTX configuration
-sudo ./install_mediamtx.sh backup
-
-# Restore MediaMTX configuration
-sudo ./install_mediamtx.sh restore
 ```
 
-**Installation Paths:**
-- Binary: `/usr/local/bin/mediamtx`
-- Configuration: `/etc/mediamtx/mediamtx.yml`
-- Service: `/etc/systemd/system/mediamtx.service`
-- Logs: `/var/log/mediamtx.log`
-- Backups: `/etc/mediamtx/backups/`
+**Common Options:**
+- `-v, --verbose` - Enable verbose output
+- `-q, --quiet` - Suppress non-error output
+- `-n, --dry-run` - Show what would be done
+- `-f, --force` - Skip confirmations and checksum verification
+- `-V, --target-version VER` - Install specific version
 
 ### mediamtx-stream-manager.sh
 
-Manages FFmpeg audio capture processes that publish streams to MediaMTX. Provides automatic stream recovery, health monitoring, and coordinated lifecycle management.
+**Role**: FFmpeg process lifecycle and MediaMTX service management
 
-**Features:**
-- Automatic audio device discovery from mapped devices
-- FFmpeg process management with PID tracking
-- Stream health monitoring with auto-restart
-- Coordinated start/stop with MediaMTX
-- Real-time priority scheduling support (SCHED_FIFO)
-- Individual stream logging
-
-**Stream Pipeline:**
-```
-ALSA Device → FFmpeg Capture → RTSP Publish → MediaMTX → Client Access
-hw:Device_1 → ffmpeg -f alsa → rtsp://localhost:8554/Device_1 → Clients
-```
+Manages FFmpeg streaming processes and MediaMTX service operations with automatic recovery and health monitoring.
 
 **Usage:**
-```
-# Start MediaMTX and all audio streams
+```bash
+# Start MediaMTX and audio streams
 sudo ./mediamtx-stream-manager.sh start
 
-# Stop MediaMTX and all streams
+# Stop everything gracefully
 sudo ./mediamtx-stream-manager.sh stop
+
+# Force stop (immediate termination)
+sudo ./mediamtx-stream-manager.sh force-stop
 
 # Restart MediaMTX and streams
 sudo ./mediamtx-stream-manager.sh restart
 
-# Check MediaMTX and stream status
+# Check status
 sudo ./mediamtx-stream-manager.sh status
 
-# Add new audio device stream
-sudo ./mediamtx-stream-manager.sh add-device Device_1
+# Monitor resources in real-time
+sudo ./mediamtx-stream-manager.sh monitor
 
-# Remove audio device stream
-sudo ./mediamtx-stream-manager.sh remove-device Device_1
-
-# Enable real-time scheduling
-sudo ./mediamtx-stream-manager.sh enable-realtime
-
-# Show stream statistics
-sudo ./mediamtx-stream-manager.sh stats
+# Show configuration
+sudo ./mediamtx-stream-manager.sh config
 ```
 
-**Configuration Files:**
-- `/etc/mediamtx/audio-devices.conf` - Device-to-stream mappings
-- `/var/lib/mediamtx-ffmpeg/*.pid` - Process ID files
-- `/var/lib/mediamtx-ffmpeg/*.log` - Individual stream logs
+**Configuration:**
+Device configuration file: `/etc/mediamtx/audio-devices.conf`
 
-### lyrebird-wizard.sh (v1.1.1)
+Format: `StreamName:ALSADevice:SampleRate:Channels`
 
-Interactive setup wizard providing guided installation of MediaMTX v1.15.1 and complete system configuration.
+Example:
+```
+Device_1:hw:Device_1:48000:2
+Device_2:hw:Device_2:48000:2
+```
 
-**Features:**
-- System requirements validation
-- MediaMTX v1.15.1 installation with verification
-- Interactive USB audio device mapping
-- Audio stream configuration
-- Service setup selection (systemd vs stream-manager)
-- Configuration backup and restore
-- Network connectivity testing
-- MediaMTX API verification
+**Key Environment Variables:**
+- `MEDIAMTX_CONFIG_DIR` - Configuration directory (default: /etc/mediamtx)
+- `MEDIAMTX_BINARY` - MediaMTX binary path (default: /usr/local/bin/mediamtx)
+- `STREAM_STARTUP_DELAY` - Startup delay in seconds (default: 10)
 
-**Workflow:**
-1. System compatibility check
-2. MediaMTX installation (defaults to v1.15.1)
-3. USB audio device detection and mapping
-4. Stream configuration generation
-5. Service enablement
-6. Connection testing
+### usb-audio-mapper.sh
+
+**Role**: USB device detection and persistent naming via udev
+
+Maps USB audio devices to consistent names based on physical USB port paths to ensure devices maintain the same ALSA names across reboots.
 
 **Usage:**
+```bash
+# Interactive device mapping (recommended)
+sudo ./usb-audio-mapper.sh
+
+# Test device persistence (dry-run)
+sudo ./usb-audio-mapper.sh --test
+
+# Non-interactive mapping
+sudo ./usb-audio-mapper.sh --non-interactive --vendor 2e88 --product 4610 --friendly movo-x1
+
+# Enable debug output
+sudo DEBUG=true ./usb-audio-mapper.sh
+
+# Show help
+sudo ./usb-audio-mapper.sh --help
 ```
-# Run interactive setup (installs MediaMTX v1.15.1)
-sudo ./lyrebird-wizard.sh
 
-# Run with debug output
-sudo LYREBIRD_DEBUG=1 ./lyrebird-wizard.sh
+**Generated Files:**
+- udev rules: `/etc/udev/rules.d/99-usb-soundcards.rules`
+- Device symlinks: `/dev/snd/by-usb-port/Device_N`
 
-# Skip confirmation prompts
-sudo ./lyrebird-wizard.sh --yes
+### lyrebird-updater.sh
 
-# Restore from backup
-sudo ./lyrebird-wizard.sh --restore backup-20241011.tar.gz
+**Role**: Git-based version management
 
-# Validate existing installation
-sudo ./lyrebird-wizard.sh --validate
+Provides interactive version management for the LyreBirdAudio repository. **Requires a git clone of the repository.**
+
+**Usage:**
+```bash
+# Check for updates (non-interactive)
+./lyrebird-updater.sh --status
+
+# List available versions
+./lyrebird-updater.sh --list
+
+# Launch interactive version manager
+./lyrebird-updater.sh
+
+# Show version
+./lyrebird-updater.sh --version
 ```
+
+**Interactive Menu Options:**
+- Check for Updates
+- Upgrade to Latest Version
+- Switch to Specific Version
+- View Available Versions
+- Show Current Version
+
+**Requirements:**
+- Git 2.0+ must be installed
+- Must be run from within a git clone
+- Internet connection for fetching updates
 
 ## MediaMTX Integration
 
-### Overview
+### Service Management Modes
 
-MediaMTX v1.15.1 serves as the core streaming engine for LyreBirdAudio, providing enterprise-grade RTSP streaming with minimal latency and resource usage. The integration has been extensively tested for stability with multiple concurrent audio streams.
+LyreBirdAudio supports three MediaMTX management modes:
 
-### Why MediaMTX v1.15.1?
+1. **Stream Manager Mode** (Recommended for audio streaming)
+   - Managed by `mediamtx-stream-manager.sh`
+   - Automatic FFmpeg process management
+   - Stream health monitoring and recovery
+   - Start/stop/restart via stream manager commands
 
-- **Stability**: v1.15.1 has been thoroughly tested with 5+ concurrent audio streams for extended periods (14+ days)
-- **Performance**: Minimal CPU usage (~1-2% per stream on modern hardware)
-- **Compatibility**: Proven compatibility with all major RTSP clients
-- **Features**: Complete feature set including API, authentication, and recording
-- **Reliability**: Stable memory usage without leaks over weeks of continuous operation
+2. **Systemd Mode** (Recommended for general use)
+   - Managed by systemd service
+   - `systemctl start/stop/restart mediamtx`
+   - Automatic startup on boot
+   - System-level integration
 
-### MediaMTX Configuration for Audio
+3. **Manual Mode** (Advanced users)
+   - Direct binary execution
+   - Full control over process
+   - No automatic recovery
 
-Optimized configuration for audio streaming (`/etc/mediamtx/mediamtx.yml`):
+### MediaMTX Configuration
 
+Default configuration location: `/etc/mediamtx/mediamtx.yml`
+
+**Key Settings for Audio Streaming:**
 ```yaml
-# Core server settings
-rtspAddress: :8554
-protocols: [udp, tcp]
-rtpAddress: :8000
-rtcpAddress: :8001
-readTimeout: 10s
-writeTimeout: 10s
-
-# API configuration
+# API Configuration
 api: yes
 apiAddress: :9997
 
-# Logging
-logLevel: info
-logDestinations: [file]
-logFile: /var/log/mediamtx.log
+# RTSP Configuration
+rtspAddress: :8554
+rtp: yes
+rtpAddress: :8000
+rtcp: yes
+rtcpAddress: :8001
 
-# Metrics (Prometheus compatible)
-metrics: yes
-metricsAddress: :9998
-
-# Path configuration for audio streams
-pathDefaults:
-  source: publisher
-  sourceOnDemand: no
-  sourceOnDemandStartTimeout: 10s
-  sourceOnDemandCloseAfter: 10s
-  
-  # Audio-optimized settings
-  rtspTransport: udp
-  rtspAnyPort: no
-  
-  # Recording (optional)
-  record: no
-  recordPath: /var/lib/mediamtx/recordings/%path/%Y-%m-%d_%H-%M-%S.mp4
-  recordFormat: mp4
-  recordPartDuration: 1h
-  recordSegmentDuration: 1h
-  recordDeleteAfter: 24h
-
-# Individual audio device paths
+# Path Configuration for Audio Devices
 paths:
-  # Dynamically configured by stream manager
-  # Example:
-  # Device_1:
-  #   source: rtsp://localhost:8554/Device_1
-  #   sourceProtocol: tcp
+  Device_1:
+    source: publisher
+    sourceOnDemand: no
+  Device_2:
+    source: publisher
+    sourceOnDemand: no
 ```
 
-### MediaMTX API Usage
+### API Integration
 
-The MediaMTX v1.15.1 API (v3) provides comprehensive control:
+MediaMTX provides a REST API on port 9997 (default) for runtime control:
 
-```
-# List all active paths/streams
+```bash
+# Get server configuration
+curl http://localhost:9997/v3/config/global/get
+
+# List active paths (streams)
 curl http://localhost:9997/v3/paths/list
 
-# Get specific path information
+# Get path (stream) information
 curl http://localhost:9997/v3/paths/get/Device_1
 
-# Get server configuration
-curl http://localhost:9997/v3/config/get
-
-# Reload configuration
-curl -X POST http://localhost:9997/v3/config/reload
-
-# Kick a client
-curl -X POST http://localhost:9997/v3/paths/kick/Device_1/client_id
-
-# Get metrics
-curl http://localhost:9998/metrics
+# Set log level
+curl -X POST http://localhost:9997/v3/config/global/patch \
+  -H "Content-Type: application/json" \
+  -d '{"logLevel": "debug"}'
 ```
 
-### Stream Publishing to MediaMTX
+**API Versions:**
+- v3 API: MediaMTX v1.15.0+
+- v2 API: Earlier MediaMTX versions
 
-FFmpeg publishes audio to MediaMTX using optimized parameters:
-
-```
-# Basic audio streaming to MediaMTX
-ffmpeg -f alsa -i hw:Device_1 \
-  -c:a aac -b:a 128k \
-  -f rtsp rtsp://localhost:8554/Device_1
-
-# High-quality audio streaming
-ffmpeg -f alsa -ar 48000 -ac 2 -i hw:Device_1 \
-  -c:a libfdk_aac -profile:a aac_he_v2 -b:a 64k \
-  -f rtsp -rtsp_transport tcp \
-  rtsp://localhost:8554/Device_1
-
-# Low-latency audio streaming
-ffmpeg -f alsa -thread_queue_size 512 -i hw:Device_1 \
-  -c:a opus -b:a 128k -application lowdelay \
-  -f rtsp -rtsp_transport udp \
-  rtsp://localhost:8554/Device_1
-```
-
-### Client Access
-
-Clients can access MediaMTX streams using any RTSP-compatible player:
-
-```
-# VLC
-vlc rtsp://server:8554/Device_1
-
-# FFplay (low latency)
-ffplay -fflags nobuffer -rtsp_transport tcp rtsp://server:8554/Device_1
-
-# GStreamer
-gst-launch-1.0 rtspsrc location=rtsp://server:8554/Device_1 ! decodebin ! autoaudiosink
-
-# MPV
-mpv rtsp://server:8554/Device_1
-
-# OBS Studio
-# Add Media Source with URL: rtsp://server:8554/Device_1
-```
-
-### Performance Metrics
-
-MediaMTX v1.15.1 performance with LyreBirdAudio (tested configuration):
-
-- **Streams**: 5 concurrent audio streams
-- **Latency**: <200ms end-to-end (LAN)
-- **CPU Usage**: ~10% total on Intel N100
-- **Memory**: ~50MB for MediaMTX + 10MB per stream
-- **Network**: ~1Mbps per audio stream (128kbps AAC)
-- **Uptime**: 30+ days continuous operation without restart
+LyreBirdAudio automatically detects and uses the appropriate API version.
 
 ## Usage
 
-### Quick Start Guide
+### Orchestrator Interface
 
-```
-# 1. Setup complete system (installs MediaMTX v1.15.1)
-sudo ./lyrebird-wizard.sh
+The orchestrator provides the primary user interface for all operations:
 
-# 2. Verify MediaMTX is running
-sudo ./install_mediamtx.sh status
-
-# 3. List your audio devices
-sudo ./usb-audio-mapper.sh --list
-
-# 4. Start streaming
-sudo ./mediamtx-stream-manager.sh start
-
-# 5. Access stream
-ffplay rtsp://localhost:8554/Device_1
+```bash
+# Launch orchestrator
+sudo ./lyrebird-orchestrator.sh
 ```
 
-### Production Deployment
+**Main Menu Navigation:**
+- Use number keys to select menu options
+- Status dashboard shows current system state
+- Error messages displayed at bottom of screen
+- Press 0 to return to previous menu
 
-For production environments, follow this deployment checklist:
-
-```
-# 1. System preparation
-sudo apt-get update
-sudo apt-get install -y ffmpeg alsa-utils curl
-
-# 2. Install MediaMTX v1.15.1 (tested version)
-sudo ./install_mediamtx.sh install --version v1.15.1
-
-# 3. Map all audio devices
-sudo ./usb-audio-mapper.sh
-# Follow prompts to map each device
-
-# 4. Configure stream parameters
-sudo nano /etc/mediamtx/audio-devices.conf
-# Set appropriate sample rates and channels
-
-# 5. Enable systemd service
-sudo ./install_mediamtx.sh enable
-sudo systemctl start mediamtx
-
-# 6. Start stream manager
-sudo ./mediamtx-stream-manager.sh start
-
-# 7. Verify all streams active
-curl http://localhost:9997/v3/paths/list | jq
-
-# 8. Configure firewall
-sudo ufw allow 8554/tcp  # RTSP
-sudo ufw allow 8000:8001/udp  # RTP/RTCP
-sudo ufw allow 9997/tcp  # API
-
-# 9. Test from client
-vlc rtsp://server-ip:8554/Device_1
-```
+**Status Indicators:**
+- ✓ (green) - Service/component running and healthy
+- ✗ (red) - Service/component stopped or failed
+- ⚠ (yellow) - Warning or degraded state
+- ℹ (blue) - Informational message
 
 ### Command Reference
 
-#### MediaMTX Management
-```
-# Installation and updates
-sudo ./install_mediamtx.sh install --version v1.15.1  # Install specific version
-sudo ./install_mediamtx.sh update                     # Update preserving streams
-sudo ./install_mediamtx.sh uninstall                  # Remove MediaMTX
+#### MediaMTX Operations
 
-# Service control
-sudo ./install_mediamtx.sh start                      # Start MediaMTX service
-sudo ./install_mediamtx.sh stop                       # Stop MediaMTX service
-sudo ./install_mediamtx.sh restart                    # Restart MediaMTX service
-sudo ./install_mediamtx.sh enable                     # Enable on boot
-sudo ./install_mediamtx.sh disable                    # Disable on boot
-
-# Status and diagnostics
-sudo ./install_mediamtx.sh status                     # Full status with API check
-sudo ./install_mediamtx.sh version                    # Show installed version
-sudo ./install_mediamtx.sh logs                       # View MediaMTX logs
-```
-
-#### Device Management
 ```bash
-# Device discovery and mapping
-sudo ./usb-audio-mapper.sh --list                     # List all USB audio devices
-sudo ./usb-audio-mapper.sh --scan                     # Scan for new devices
-sudo ./usb-audio-mapper.sh                            # Interactive mapping
-sudo ./usb-audio-mapper.sh --card 2                   # Map specific card
-sudo ./usb-audio-mapper.sh --test                     # Test without changes
+# Installation
+sudo ./install_mediamtx.sh install                           # Install latest
+sudo ./install_mediamtx.sh install --target-version v1.XX.X  # Install specific version
 
-# Device maintenance
-sudo ./usb-audio-mapper.sh --show-mappings            # Display current mappings
-sudo ./usb-audio-mapper.sh --remove Device_1          # Remove device mapping
-sudo ./usb-audio-mapper.sh --reload                   # Reload udev rules
+# Service Control (via stream manager)
+sudo ./mediamtx-stream-manager.sh start               # Start MediaMTX + streams
+sudo ./mediamtx-stream-manager.sh stop                # Stop gracefully
+sudo ./mediamtx-stream-manager.sh restart             # Restart everything
+sudo ./mediamtx-stream-manager.sh force-stop          # Force termination
+
+# Status and Monitoring
+sudo ./install_mediamtx.sh status                     # Installation status
+sudo ./mediamtx-stream-manager.sh status              # Service status
+sudo ./mediamtx-stream-manager.sh monitor             # Real-time monitoring
+
+# Updates
+sudo ./install_mediamtx.sh update                     # Update MediaMTX
+sudo ./install_mediamtx.sh verify                     # Verify installation
+```
+
+#### USB Device Management
+
+```bash
+# Device Detection and Mapping
+sudo ./usb-audio-mapper.sh                            # Interactive mapping
+sudo ./usb-audio-mapper.sh --list                     # List devices
+sudo ./usb-audio-mapper.sh --test                     # Test persistence
+
+# View Device Configuration
+cat /etc/udev/rules.d/99-usb-soundcards.rules         # View udev rules
+ls -la /dev/snd/by-usb-port/                          # View symlinks
 ```
 
 #### Stream Management
+
 ```bash
-# Stream control
+# Stream Operations
 sudo ./mediamtx-stream-manager.sh start               # Start all streams
 sudo ./mediamtx-stream-manager.sh stop                # Stop all streams
-sudo ./mediamtx-stream-manager.sh restart             # Restart all streams
-sudo ./mediamtx-stream-manager.sh status              # Check stream status
+sudo ./mediamtx-stream-manager.sh list-streams        # List active streams
 
-# Individual stream management
-sudo ./mediamtx-stream-manager.sh add-device Device_1     # Add stream
-sudo ./mediamtx-stream-manager.sh remove-device Device_1  # Remove stream
-sudo ./mediamtx-stream-manager.sh restart-device Device_1 # Restart one stream
-
-# Monitoring
-sudo ./mediamtx-stream-manager.sh stats               # Stream statistics
-sudo ./mediamtx-stream-manager.sh logs Device_1       # View stream logs
+# Stream Testing
+ffplay rtsp://localhost:8554/Device_1                 # Test playback
+ffprobe rtsp://localhost:8554/Device_1                # Probe stream info
 ```
 
-### Accessing Streams
+#### Version Management
 
-#### Local Testing
 ```bash
-# Test with FFplay (lowest latency)
-ffplay -fflags nobuffer -flags low_delay \
-  -rtsp_transport tcp rtsp://localhost:8554/Device_1
+# Update Checking
+./lyrebird-updater.sh --status                        # Check for updates
 
-# Test with VLC
-vlc --network-caching=200 rtsp://localhost:8554/Device_1
-
-# Test with GStreamer
-gst-launch-1.0 rtspsrc location=rtsp://localhost:8554/Device_1 \
-  latency=100 ! decodebin ! autoaudiosink
+# Version Operations
+./lyrebird-updater.sh                                 # Interactive manager
+./lyrebird-updater.sh --upgrade                       # Upgrade to latest
 ```
 
-#### Network Access
+### Advanced Operations
+
+#### Manual MediaMTX Configuration
+
+For advanced users who need custom MediaMTX configuration:
+
 ```bash
-# From another machine on the network
-vlc rtsp://192.168.1.100:8554/Device_1
+# Edit MediaMTX configuration
+sudo nano /etc/mediamtx/mediamtx.yml
 
-# With authentication (if configured)
-vlc rtsp://user:pass@192.168.1.100:8554/Device_1
+# Validate configuration
+sudo /usr/local/bin/mediamtx --check /etc/mediamtx/mediamtx.yml
 
-# Multiple streams simultaneously
-vlc rtsp://192.168.1.100:8554/Device_1 \
-    rtsp://192.168.1.100:8554/Device_2 \
-    rtsp://192.168.1.100:8554/Device_3
+# Restart to apply changes
+sudo ./mediamtx-stream-manager.sh restart
 ```
 
-#### API Access
+#### Custom Stream Configuration
+
+Create custom audio device configurations:
+
 ```bash
-# List all streams
-curl http://localhost:9997/v3/paths/list | jq
+# Edit device configuration
+sudo nano /etc/mediamtx/audio-devices.conf
 
-# Get specific stream info
-curl http://localhost:9997/v3/paths/get/Device_1 | jq
+# Format: StreamName:ALSADevice:SampleRate:Channels
+# Examples:
+Device_1:hw:Device_1:48000:2        # Standard stereo at 48kHz
+Device_2:hw:Device_2:44100:1        # Mono at 44.1kHz
+HighQuality:hw:Device_3:96000:2     # High sample rate stereo
+```
 
-# Monitor active connections
-watch -n 1 'curl -s http://localhost:9997/v3/paths/list | \
-  jq ".items[] | {name, readers: .readers | length}"'
+#### Backup and Restore
 
-# Get server metrics
-curl http://localhost:9998/metrics | grep mediamtx
+```bash
+# Backup current configuration
+sudo tar -czf lyrebird-backup-$(date +%Y%m%d).tar.gz \
+  /etc/mediamtx/ \
+  /etc/udev/rules.d/99-usb-soundcards.rules \
+  /var/lib/mediamtx/
+
+# Restore from backup
+sudo tar -xzf lyrebird-backup-20250101.tar.gz -C /
+sudo udevadm control --reload-rules
+sudo udevadm trigger
+sudo ./mediamtx-stream-manager.sh restart
+```
+
+#### Debugging
+
+```bash
+# Enable debug mode for all scripts
+export DEBUG=1
+
+# View detailed logs
+sudo tail -f /var/log/mediamtx-stream-manager.log
+sudo tail -f /var/lib/mediamtx-ffmpeg/*.log
+sudo journalctl -u mediamtx -f
+
+# Check MediaMTX API
+curl -v http://localhost:9997/v3/config/global/get
+
+# Test USB device detection
+sudo DEBUG=true ./usb-audio-mapper.sh --list
 ```
 
 ## Configuration
 
-### MediaMTX Configuration
+### System Configuration Files
 
-The main configuration file is located at `/etc/mediamtx/mediamtx.yml`. Key settings:
+| File | Purpose | Format |
+|------|---------|--------|
+| `/etc/mediamtx/mediamtx.yml` | MediaMTX main configuration | YAML |
+| `/etc/mediamtx/audio-devices.conf` | Audio device mappings | Text (colon-separated) |
+| `/etc/udev/rules.d/99-usb-soundcards.rules` | USB device persistence rules | udev syntax |
+| `/etc/systemd/system/mediamtx.service` | Systemd service file | INI-style |
 
-```yaml
-# RTSP server configuration
-rtspAddress: :8554
-rtpAddress: :8000
-rtcpAddress: :8001
+### Runtime State Files
 
-# API configuration
-api: true
-apiAddress: :9997
+| File/Directory | Purpose |
+|----------------|---------|
+| `/var/run/mediamtx-audio.pid` | Stream manager PID file |
+| `/var/lib/mediamtx-ffmpeg/` | FFmpeg PID files and logs |
+| `/var/log/mediamtx-stream-manager.log` | Stream manager log |
+| `/var/log/mediamtx.out` | MediaMTX output log |
 
-# Logging
-logLevel: info
-logDestinations: [file]
-logFile: /var/log/mediamtx.log
+### Environment Variables
 
-# Path defaults
-pathDefaults:
-  source: publisher
-  sourceOnDemand: no
-```
-
-### Audio Device Configuration
-
-Audio devices are configured in `/etc/mediamtx/audio-devices.conf`:
+Stream manager behavior can be customized via environment variables:
 
 ```bash
-# Format: DEVICE_NAME:ALSA_DEVICE:SAMPLE_RATE:CHANNELS
-Device_1:hw:Device_1:48000:2
-Device_2:hw:Device_2:44100:2
-Device_3:hw:Device_3:48000:1
+# MediaMTX Configuration
+export MEDIAMTX_CONFIG_DIR=/etc/mediamtx
+export MEDIAMTX_BINARY=/usr/local/bin/mediamtx
+export MEDIAMTX_HOST=localhost
+export MEDIAMTX_API_PORT=9997
+
+# Timing Configuration
+export STREAM_STARTUP_DELAY=10
+export USB_STABILIZATION_DELAY=5
+export RESTART_STABILIZATION_DELAY=15
+
+# Resource Limits
+export MAX_CPU_WARNING=20
+export MAX_CPU_CRITICAL=40
+export MAX_FD_WARNING=500
+export MAX_FD_CRITICAL=1000
 ```
 
-### udev Rules
+### Audio Configuration
 
-USB device mapping rules are stored in `/etc/udev/rules.d/99-usb-soundcards.rules`:
+Default audio settings in `mediamtx-stream-manager.sh`:
 
 ```bash
-# Example rule structure
-SUBSYSTEM=="sound", ACTION=="add|change", KERNEL=="card[0-9]*", \
-  ATTRS{idVendor}=="0d8c", ATTRS{idProduct}=="0014", \
-  KERNELS=="1-1.4", \
-  ATTR{id}="Device_1", \
-  RUN+="/usr/local/bin/usb-audio-symlink.sh %k Device_1"
+DEFAULT_SAMPLE_RATE="48000"
+DEFAULT_CHANNELS="2"
+DEFAULT_CODEC="opus"
+DEFAULT_BITRATE="128k"
 ```
+
+Override via device configuration:
+```
+# Custom sample rate and channels
+Device_1:hw:Device_1:96000:2
+Device_2:hw:Device_2:44100:1
+```
+
+## Version Management
+
+### Update Process
+
+LyreBirdAudio uses git-based version management:
+
+1. **Check for Updates**
+   ```bash
+   ./lyrebird-updater.sh --status
+   ```
+
+2. **Upgrade to Latest**
+   ```bash
+   ./lyrebird-updater.sh --upgrade
+   ```
+   - Automatically stashes local changes
+   - Fetches latest version
+   - Switches to new version
+   - Preserves executable permissions
+
+3. **Switch to Specific Version**
+   ```bash
+   ./lyrebird-updater.sh
+   # Select "Switch to Specific Version" from menu
+   ```
 
 ## Troubleshooting
 
-### Common Issues and Solutions
+### Common Issues
 
-#### Device Remapping After Reboot (v1.0.1 Issue - FIXED in v1.1.0)
+#### MediaMTX Won't Start
 
-If upgrading from v1.0.1 where devices changed names after reboot:
+**Symptoms:** MediaMTX fails to start or exits immediately
 
+**Solutions:**
 ```bash
-# Verify udev rules (should NOT contain serial numbers in path)
+# Check for port conflicts
+sudo lsof -i :8554    # RTSP port
+sudo lsof -i :9997    # API port
+
+# Verify binary
+sudo /usr/local/bin/mediamtx --version
+
+# Check configuration syntax
+sudo /usr/local/bin/mediamtx --check /etc/mediamtx/mediamtx.yml
+
+# Review logs
+sudo journalctl -u mediamtx -n 50
+sudo tail -50 /var/log/mediamtx.out
+```
+
+#### USB Devices Not Mapped
+
+**Symptoms:** Devices don't appear in `/dev/snd/by-usb-port/`
+
+**Solutions:**
+```bash
+# Verify udev rules exist
 cat /etc/udev/rules.d/99-usb-soundcards.rules
-
-# Correct format (v1.1.0):
-# KERNELS=="1-1.4"  ✓ (no serial suffix)
-
-# Incorrect format (v1.0.1):
-# KERNELS=="1-1.4-ABC123"  ✗ (has serial suffix)
-
-# Test device detection
-sudo ./usb-audio-mapper.sh --test
 
 # Reload udev rules
 sudo udevadm control --reload-rules
-sudo udevadm trigger --subsystem-match=sound
+sudo udevadm trigger
 
-# Verify persistent naming
-ls -la /dev/snd/by-usb-port/
+# Check device detection
+sudo ./usb-audio-mapper.sh --list
+
+# Enable debug mode
+sudo DEBUG=true ./usb-audio-mapper.sh --test
 ```
 
-#### MediaMTX Not Starting
+#### Streams Not Publishing
 
-```bash
-# Check MediaMTX installation
-sudo ./install_mediamtx.sh status
+**Symptoms:** FFmpeg processes running but streams not available
 
-# If not installed, install v1.15.1
-sudo ./install_mediamtx.sh install --version v1.15.1
-
-# Check for port conflicts
-sudo lsof -i :8554  # RTSP port
-sudo lsof -i :9997  # API port
-
-# Test MediaMTX directly
-sudo /usr/local/bin/mediamtx /etc/mediamtx/mediamtx.yml
-
-# View detailed logs
-sudo journalctl -u mediamtx -f
-sudo tail -f /var/log/mediamtx.log
-
-# Check configuration syntax
-/usr/local/bin/mediamtx test /etc/mediamtx/mediamtx.yml
-```
-
-#### Audio Streams Not Publishing to MediaMTX
-
+**Solutions:**
 ```bash
 # Check stream manager status
 sudo ./mediamtx-stream-manager.sh status
 
-# Verify FFmpeg processes running
+# Verify MediaMTX is running
+curl http://localhost:9997/v3/paths/list
+
+# Check FFmpeg logs
+sudo tail -f /var/lib/mediamtx-ffmpeg/*.log
+
+# Test ALSA device directly
+arecord -D hw:Device_1 -f S16_LE -r 48000 -c 2 -d 5 test.wav
+
+# Restart streams
+sudo ./mediamtx-stream-manager.sh restart
+```
+
+#### Permission Denied Errors
+
+**Symptoms:** Scripts fail with permission errors
+
+**Solutions:**
+```bash
+# Ensure running with sudo
+sudo ./lyrebird-orchestrator.sh
+
+# Check file permissions
+ls -la /etc/mediamtx/
+ls -la /var/run/mediamtx-*
+
+# Verify user exists
+id mediamtx
+
+# Fix ownership
+sudo chown -R mediamtx:mediamtx /var/lib/mediamtx
+```
+
+#### Version Mismatch Warnings
+
+**Symptoms:** Orchestrator shows version compatibility warnings
+
+**Solutions:**
+```bash
+# Check current versions
+./install_mediamtx.sh --version
+grep "readonly VERSION=" mediamtx-stream-manager.sh
+grep "readonly VERSION=" usb-audio-mapper.sh
+
+# Update to latest
+./lyrebird-updater.sh --upgrade
+
+# If using custom branch, ensure compatibility
+cd /path/to/LyreBirdAudio
+git status
+git branch -v
+```
+
+### Performance Issues
+
+#### High CPU Usage
+
+```bash
+# Monitor resource usage
+sudo ./mediamtx-stream-manager.sh monitor
+
+# Check FFmpeg processes
 ps aux | grep ffmpeg
 
-# Check individual stream logs
-sudo tail -f /var/lib/mediamtx-ffmpeg/Device_1.log
-
-# Test audio device directly
-arecord -D hw:Device_1 -f cd -d 5 test.wav
-aplay test.wav
-
-# Test FFmpeg publishing to MediaMTX manually
-ffmpeg -f alsa -i hw:Device_1 -c:a aac -b:a 128k \
-  -f rtsp rtsp://localhost:8554/test
-
-# Verify stream in MediaMTX API
-curl http://localhost:9997/v3/paths/get/Device_1
+# Reduce bitrate or sample rate
+sudo nano /etc/mediamtx/audio-devices.conf
+# Change: Device_1:hw:Device_1:96000:2
+# To:     Device_1:hw:Device_1:48000:2
 ```
 
-#### High Latency Issues
+#### Stream Latency
 
 ```bash
-# Use UDP instead of TCP for lower latency
-# Client side:
-ffplay -rtsp_transport udp -fflags nobuffer \
-  rtsp://server:8554/Device_1
-
-# Server side - configure in audio-devices.conf:
-# Use Opus codec for lower latency
-Device_1:hw:Device_1:48000:2:opus:lowdelay
-
-# Enable real-time scheduling
-sudo ./mediamtx-stream-manager.sh enable-realtime
-
-# Check for buffer underruns
-dmesg | grep -i "xrun"
+# Reduce buffer sizes in FFmpeg (advanced)
+# Edit stream manager and adjust:
+# -thread_queue_size 8192  # Reduce from default
+# -analyzeduration 1000000 # Reduce analysis time
 ```
 
-#### MediaMTX API Not Responding
+#### Network Congestion
 
 ```bash
-# Check if MediaMTX is running
-pgrep mediamtx
+# Monitor bandwidth
+iftop -i eth0
 
-# Test different API endpoints (v1.15.1 uses v3)
-curl -v http://localhost:9997/v3/paths/list
-curl -v http://localhost:9997/v2/paths/list  # Older versions
-curl -v http://localhost:9997/                 # Root endpoint
+# Check active connections
+ss -tupn | grep 8554
 
-# Check API is enabled in config
-grep "api:" /etc/mediamtx/mediamtx.yml
-# Should show: api: yes
-
-# Restart MediaMTX
-sudo systemctl restart mediamtx
+# Limit concurrent clients in MediaMTX config
+sudo nano /etc/mediamtx/mediamtx.yml
+# Add under paths:
+#   Device_1:
+#     maxReaders: 5
 ```
 
-#### USB Device Not Detected
+### Diagnostic Commands
 
 ```bash
-# List all USB devices
-lsusb -v | grep -A 10 -i audio
+# System Health Check
+sudo ./lyrebird-orchestrator.sh    # Check status dashboard
 
-# Check device in ALSA
+# MediaMTX Health
+curl http://localhost:9997/v3/config/global/get
+curl http://localhost:9997/v3/paths/list
+
+# Stream Health
+sudo ./mediamtx-stream-manager.sh status
+sudo ./mediamtx-stream-manager.sh list-streams
+
+# Device Health
+sudo ./usb-audio-mapper.sh --list
+ls -la /dev/snd/by-usb-port/
 aplay -l
-arecord -l
 
-# Check kernel messages
-dmesg | grep -i "usb.*audio" | tail -20
-
-# Verify device in sysfs
-ls -la /sys/bus/usb/devices/*/sound/
-
-# Rescan USB bus
-sudo udevadm trigger --subsystem-match=usb
-sudo udevadm settle
-```
-
-#### Streams Dropping/Reconnecting
-
-```bash
-# Check network statistics
-netstat -s | grep -i drop
-
-# Monitor MediaMTX connections
-watch -n 1 'ss -tan | grep :8554'
-
-# Increase MediaMTX timeouts in mediamtx.yml
-readTimeout: 20s
-writeTimeout: 20s
-
-# Check system resources
-htop  # Look for CPU/memory issues
-iostat -x 1  # Check disk I/O
-
-# Review MediaMTX error logs
-grep -i error /var/log/mediamtx.log | tail -20
-```
-
-#### Permission Issues
-
-```bash
-# Fix MediaMTX permissions
-sudo chown root:root /usr/local/bin/mediamtx
-sudo chmod 755 /usr/local/bin/mediamtx
-
-# Fix configuration permissions
-sudo chown -R root:root /etc/mediamtx
-sudo chmod 644 /etc/mediamtx/mediamtx.yml
-
-# Fix log permissions
-sudo touch /var/log/mediamtx.log
-sudo chown syslog:adm /var/log/mediamtx.log
-sudo chmod 640 /var/log/mediamtx.log
-
-# Fix audio group membership
-sudo usermod -a -G audio $USER
-# Log out and back in for changes to take effect
-```
-
-### Debug Mode
-
-Enable comprehensive debugging:
-
-```bash
-# Enable debug logging for all components
-export LYREBIRD_DEBUG=1
-
-# Debug USB device mapping
-sudo LYREBIRD_DEBUG=1 ./usb-audio-mapper.sh --test
-
-# Debug MediaMTX installation
-sudo LYREBIRD_DEBUG=1 ./install_mediamtx.sh status
-
-# Debug stream manager
-sudo LYREBIRD_DEBUG=1 ./mediamtx-stream-manager.sh status
-
-# Enable MediaMTX debug logging
-# Edit /etc/mediamtx/mediamtx.yml:
-logLevel: debug
-
-# Restart to apply
-sudo systemctl restart mediamtx
-```
-
-### Log File Locations
-
-All relevant logs for troubleshooting:
-
-```bash
-# MediaMTX server logs
-/var/log/mediamtx.log              # Main server log
-/var/log/mediamtx-access.log       # Access logs (if enabled)
-
-# Stream manager logs
-/var/lib/mediamtx-ffmpeg/*.log     # Individual stream logs
-/var/log/mediamtx-audio-manager.log # Manager log
-
-# System logs
-/var/log/syslog                    # System events
-/var/log/kern.log                  # Kernel/USB events
-journalctl -u mediamtx             # systemd service logs
-
-# Installation logs
-/var/log/lyrebird-wizard.log       # Setup wizard log
-/tmp/mediamtx-install.log          # Installation log
+# Log Analysis
+sudo tail -100 /var/log/mediamtx-stream-manager.log
+sudo journalctl -u mediamtx --since "1 hour ago"
+sudo tail -50 /var/lib/mediamtx-ffmpeg/*.log
 ```
 
 ### Getting Help
 
-If issues persist:
+If you encounter issues not covered here:
 
-1. **Collect diagnostic information:**
-```bash
-# Generate diagnostic report
-(
-  echo "=== System Info ==="
-  uname -a
-  echo -e "\n=== MediaMTX Version ==="
-  /usr/local/bin/mediamtx --version
-  echo -e "\n=== USB Devices ==="
-  lsusb
-  echo -e "\n=== Audio Devices ==="
-  aplay -l
-  echo -e "\n=== Device Mappings ==="
-  cat /proc/asound/cards
-  echo -e "\n=== MediaMTX Status ==="
-  sudo ./install_mediamtx.sh status
-  echo -e "\n=== Active Streams ==="
-  curl -s http://localhost:9997/v3/paths/list | jq
-  echo -e "\n=== Recent Logs ==="
-  sudo tail -50 /var/log/mediamtx.log
-) > diagnostic_report.txt
-```
-
-2. **Check GitHub Issues:** https://github.com/tomtom215/LyreBirdAudio/issues
-
-3. **Report new issues with:**
-   - Diagnostic report
+1. Enable debug mode: `export DEBUG=1`
+2. Collect logs from:
+   - `/var/log/mediamtx-stream-manager.log`
+   - `/var/lib/mediamtx-ffmpeg/*.log`
+   - `journalctl -u mediamtx`
+3. Check system status with orchestrator
+4. Open an issue on GitHub with:
+   - LyreBirdAudio version
+   - MediaMTX version
+   - Operating system and version
+   - Complete error messages and logs
    - Steps to reproduce
-   - Expected vs actual behavior
-   - LyreBirdAudio version (v1.1.0)
-   - MediaMTX version (v1.15.1)
 
 ## Performance & Optimization
 
+### Hardware Optimization
 
-### MediaMTX Configuration Optimization
+**Recommended Hardware for Different Scales:**
 
-#### Low-Latency Configuration
+| Scale | CPU | RAM | Network | Storage | Max Devices |
+|-------|-----|-----|---------|---------|-------------|
+| Small (1-2 devices) | 1 core | 512MB | 100Mbps | 1GB | 2 |
+| Medium (3-5 devices) | 2 cores | 1GB | 1Gbps | 5GB | 5 |
+| Large (6-10 devices) | 4 cores | 2GB | 1Gbps | 10GB | 10 |
+| Enterprise (10+ devices) | 8+ cores | 4GB+ | 1Gbps | 20GB+ | 20+ |
 
-```yaml
-# /etc/mediamtx/mediamtx.yml optimized for low latency
-rtspAddress: :8554
-protocols: [udp]  # UDP only for lowest latency
-rtpAddress: :8000
-rtcpAddress: :8001
-
-# Reduce timeouts
-readTimeout: 5s
-writeTimeout: 5s
-
-# Disable unnecessary features
-metrics: no
-pprof: no
-
-pathDefaults:
-  source: publisher
-  sourceOnDemand: no
-  # Reduce buffering
-  rtspTransport: udp
-  rtspAnyPort: no
-```
-
-#### High-Throughput Configuration
-
-```yaml
-# /etc/mediamtx/mediamtx.yml optimized for many streams
-rtspAddress: :8554
-protocols: [tcp, udp]  # Both protocols
-readBufferCount: 2048  # Increase buffers
-
-# Enable connection pooling
-rtspAddress: :8554
-rtpAddress: :8000-8100  # Port range for multiple streams
-rtcpAddress: :8001-8101
-
-pathDefaults:
-  source: publisher
-  sourceOnDemand: yes  # On-demand to save resources
-  sourceOnDemandStartTimeout: 10s
-  sourceOnDemandCloseAfter: 60s
-```
-
-### Audio Quality Optimization
-
-#### Sample Rate Selection
+### Audio Quality vs Performance
 
 ```bash
-# Professional quality (studio)
-Device_Studio:hw:Device_1:96000:2  # 96kHz/24-bit
+# Low bandwidth (96 kbps per stream)
+Device_1:hw:Device_1:22050:1
 
-# Broadcast quality
-Device_Broadcast:hw:Device_2:48000:2  # 48kHz/16-bit
+# Standard quality (256 kbps per stream)
+Device_1:hw:Device_1:48000:2
 
-# Voice communication
-Device_Voice:hw:Device_3:16000:1  # 16kHz mono
-
-# Music streaming
-Device_Music:hw:Device_4:44100:2  # 44.1kHz (CD quality)
+# High quality (512 kbps per stream)
+Device_1:hw:Device_1:96000:2
 ```
 
-#### Codec Selection for Use Cases
+### MediaMTX Tuning
 
-```bash
-# Ultra-low latency (<100ms) - Use Opus
-ffmpeg -f alsa -i hw:Device_1 \
-  -c:a opus -b:a 128k -frame_duration 2.5 \
-  -application lowdelay \
-  -f rtsp rtsp://localhost:8554/Device_1
-
-# High quality music - Use AAC
-ffmpeg -f alsa -i hw:Device_1 \
-  -c:a libfdk_aac -profile:a aac_he_v2 -b:a 256k \
-  -f rtsp rtsp://localhost:8554/Device_1
-
-# Minimal bandwidth - Use Opus at low bitrate
-ffmpeg -f alsa -i hw:Device_1 \
-  -c:a opus -b:a 32k -application voip \
-  -f rtsp rtsp://localhost:8554/Device_1
-```
-
-### Monitoring and Metrics
-
-#### Prometheus Integration
+Edit `/etc/mediamtx/mediamtx.yml`:
 
 ```yaml
-# Enable metrics in mediamtx.yml
+# Performance tuning
+readTimeout: 10s
+writeTimeout: 10s
+readBufferCount: 512
+maxReaders: 50  # Limit concurrent clients
+
+# Resource optimization
+logLevel: info  # Use 'warn' in production for less I/O
 metrics: yes
 metricsAddress: :9998
 
-# Prometheus scrape config
-scrape_configs:
-  - job_name: 'mediamtx'
-    static_configs:
-      - targets: ['localhost:9998']
+# Path-specific tuning
+paths:
+  Device_1:
+    source: publisher
+    sourceOnDemand: no
+    record: no  # Disable if not needed
+    maxReaders: 10
 ```
 
-### Scaling Considerations
-
-#### Multiple MediaMTX Instances (Untested)
-
-For large deployments, run multiple MediaMTX instances:
+### System Tuning
 
 ```bash
-# Instance 1: Devices 1-4
-/usr/local/bin/mediamtx /etc/mediamtx/mediamtx1.yml
+# Increase file descriptor limits
+sudo nano /etc/security/limits.conf
+# Add:
+mediamtx soft nofile 65536
+mediamtx hard nofile 65536
 
-# Instance 2: Devices 5-8  
-/usr/local/bin/mediamtx /etc/mediamtx/mediamtx2.yml
+# Enable real-time scheduling (requires configuration)
+sudo setcap 'cap_sys_nice=eip' /usr/local/bin/mediamtx
 
-# Load balance with nginx
-upstream mediamtx_servers {
-    server 127.0.0.1:8554;
-    server 127.0.0.1:8555;
-}
+# Optimize network buffers
+sudo sysctl -w net.core.rmem_max=134217728
+sudo sysctl -w net.core.wmem_max=134217728
 ```
 
-#### Hardware Recommendations by Scale
-
-- **1-2 Streams**: Raspberry Pi 4 (4GB RAM)
-- **3-16 Streams**: Intel NUC or equivalent (8GB RAM)
-- **17-50 Streams**: Dedicated server (16GB RAM, 4+ cores, multiple USB cards)
-- **50+ Streams**: Multiple servers with load balancing (not tested, let me know if you get this far!)
-
-# Test device detection
-sudo ./usb-audio-mapper.sh --test
-
-# Reload udev rules
-sudo udevadm control --reload-rules
-sudo udevadm trigger --subsystem-match=sound
-
-# Check current device mapping
-cat /proc/asound/cards
-ls -la /dev/snd/by-usb-port/
-```
-#### MediaMTX Not Starting
-
-# Check MediaMTX status
-sudo ./install_mediamtx.sh status
-
-# View MediaMTX logs
-sudo tail -f /var/log/mediamtx.log
-
-# Test MediaMTX manually
-sudo /usr/local/bin/mediamtx /etc/mediamtx/mediamtx.yml
-
-# Check for port conflicts
-sudo lsof -i :8554
-sudo lsof -i :9997
-```
-
-#### Audio Streams Not Working
+### Monitoring
 
 ```bash
-# Check stream manager status
-sudo ./mediamtx-stream-manager.sh status
+# Real-time resource monitoring
+sudo ./mediamtx-stream-manager.sh monitor
 
-# View FFmpeg logs
-sudo tail -f /var/lib/mediamtx-ffmpeg/*.log
+# System-wide monitoring
+htop -u mediamtx
 
-# Test audio device directly
-arecord -D hw:Device_1 -f cd -d 5 test.wav
-aplay test.wav
+# Network monitoring
+iftop -i eth0 -f "port 8554"
 
-# Verify RTSP stream
-ffplay rtsp://localhost:8554/Device_1
+# Stream-specific monitoring
+ffprobe -show_streams rtsp://localhost:8554/Device_1
 ```
-
-#### USB Device Not Detected
-
-```bash
-# List all USB devices
-lsusb -t
-
-# Check USB audio devices
-aplay -l
-arecord -l
-
-# Verify device in sysfs
-ls -la /sys/bus/usb/devices/
-
-# Check kernel messages
-dmesg | grep -i usb | tail -20
-```
-
-### Debug Mode
-
-Enable debug output for detailed troubleshooting:
-
-```
-# Enable debug for all scripts
-export LYREBIRD_DEBUG=1
-
-# Run with debug output
-sudo LYREBIRD_DEBUG=1 ./usb-audio-mapper.sh --test
-sudo LYREBIRD_DEBUG=1 ./install_mediamtx.sh status
-```
-
-### Log Files
-
-Important log locations:
-
-- `/var/log/mediamtx.log` - MediaMTX server logs
-- `/var/log/lyrebird-wizard.log` - Setup wizard logs
-- `/var/log/mediamtx-audio-manager.log` - Stream manager logs
-- `/var/lib/mediamtx-ffmpeg/*.log` - Individual stream logs
-- `/var/log/syslog` or `journalctl` - System logs including udev events
 
 ## Version History
 
-### v1.1.0 (Current Release)
+### Current Architecture
 
-**MediaMTX Integration:**
-- Extensively tested with MediaMTX v1.15.1 for maximum stability
-- Added intelligent detection of MediaMTX management mode (systemd/stream-manager/manual)
-- Implemented zero-downtime MediaMTX updates preserving active streams
-- Enhanced API health checking with v2/v3 endpoint compatibility
-- Stream-aware update process with automatic rollback on failure
+**Orchestrator-Based Design:**
+- `lyrebird-orchestrator.sh` provides unified TUI interface for all operations
+- Single-responsibility principle: each component script manages one domain
+- Orchestrator delegates to specialized scripts without logic duplication
 
-**Critical Fixes:**
-- **FIXED:** USB device remapping on reboot (removed serial suffixes from port paths)
-- **FIXED:** Incorrect device detection where Device 5 matched USB hub instead of audio device
-- **FIXED:** Octal number interpretation errors with leading zeros (007 now correctly parsed as 7)
-- **FIXED:** MediaMTX updates interrupting active audio streams
-- **FIXED:** v1.0.0 backwards compatibility broken by v1.0.1 serial number changes
+**Key Components:**
+- **install_mediamtx.sh** - MediaMTX installation and lifecycle management
+- **mediamtx-stream-manager.sh** - FFmpeg processes and MediaMTX service control  
+- **usb-audio-mapper.sh** - USB device persistence via udev rules
+- **lyrebird-updater.sh** - Git-based version management
 
-**USB Audio Mapper (v1.2.1):**
-- Complete rewrite of `get_usb_physical_port()` for accurate sysfs device matching
-- Added `safe_base10()` function preventing octal interpretation
-- Implemented portable hash generation with multiple fallback methods
-- Enhanced USB path validation for broader compatibility
-- Separated port path generation from symlink uniqueness
+### Important Behavioral Changes
 
-**MediaMTX Installer (v5.2.0):**
-- Added `detect_management_mode()` function for intelligent service detection
-- Implemented stream preservation during updates (collects and restarts active streams)
-- Multi-endpoint API testing (v3/v2/root) for version compatibility
-- Enhanced status display showing active stream names and real-time scheduling
-- Added rollback actions for failed updates
-- Context-aware post-installation guidance
+**USB Device Mapping:**
+- Device mapping uses physical USB port paths (not serial numbers)
+- Ensures backwards compatibility with v1.0.0 installations
+- Device names remain consistent across reboots
 
-**Compatibility & Testing:**
-- Fully backwards compatible with v1.0.0 and v1.0.1
-- No migration required - drop-in replacement
-- Tested on Ubuntu 20.04/22.04, Debian 11/12, Raspberry Pi OS
-- Validated with 8+ concurrent audio streams for 30+ days
-- Confirmed working with MediaMTX v1.9.x through v1.15.x
+**MediaMTX Management:**
+- Automatic detection of management mode (systemd/stream-manager/manual)
+- Stream-aware updates preserve active streams during MediaMTX upgrades
+- Service control unified through stream manager (start/stop/restart)
 
-### v1.0.1
+**Version Management:**
+- Git-based updates via `lyrebird-updater.sh`
+- Requires git clone of repository (not compatible with standalone installations)
+- Automatic stashing of local changes during updates
 
-**New Components:**
-- Added `lyrebird-wizard.sh` interactive setup wizard
-- Implemented `mediamtx-stream-manager.sh` for FFmpeg process management
-- Created automated device configuration generation
+### Breaking Changes to Note
 
-**Features:**
-- Initial stream manager implementation with auto-restart
-- Basic MediaMTX service integration
-- System requirements validation
-- Configuration backup and restore functionality
+**usb-audio-mapper.sh:**
+- If upgrading from v1.0.1, devices may need remapping after update
+- Serial number suffixes removed from port paths (restores v1.0.0 compatibility)
 
-**Known Issues (Fixed in v1.1.0):**
-- Serial numbers added to USB port paths breaking v1.0.0 compatibility
-- Devices could be remapped after system reboot
-- MediaMTX updates would interrupt active streams
+**install_mediamtx.sh:**
+- Checksum verification now required by default (use --force to skip)
+- Update command uses MediaMTX's native --upgrade when available
 
-### v1.0.0
-
-**Foundation Release:**
-- Core USB audio device persistence using udev rules
-- Physical USB port path mapping inspired by cberge's concept
-- Basic MediaMTX installation script
-- Manual device mapping functionality
-
-**Components:**
-- `usb-audio-mapper.sh` - Device to port mapping
-- `install_mediamtx.sh` - MediaMTX installation
-- Basic udev rule generation
-- Symlink creation for consistent naming
-
-**Limitations (Addressed in later versions):**
-- Manual configuration required
-- No stream management
-- Basic error handling
-- Limited MediaMTX integration
+**lyrebird-wizard.sh:**
+- Deprecated in favor of lyrebird-orchestrator.sh
+- Wizard maintained for backwards compatibility but not actively developed
 
 ## Contributing
 
 Contributions are welcome! Please follow these guidelines:
 
-1. Fork the repository
-2. Create a feature branch (`git checkout -b feature/improvement`)
-3. Make your changes following these standards:
+1. **Fork the repository**
+   ```bash
+   git clone https://github.com/YOUR_USERNAME/LyreBirdAudio.git
+   cd LyreBirdAudio
+   ```
+
+2. **Create a feature branch**
+   ```bash
+   git checkout -b feature/improvement
+   ```
+
+3. **Make your changes following these standards:**
    - All scripts must pass `bash -n` syntax check
    - All scripts must pass `shellcheck` with no errors
    - Use comprehensive error handling with try/catch patterns
    - Add debug output for troubleshooting
    - Update relevant documentation
-4. Test thoroughly on target platforms
-5. Submit a pull request with detailed description
+   - Follow the single-responsibility principle
+   - Maintain backwards compatibility where possible
 
-### Code Standards
+4. **Test thoroughly on target platforms:**
+   - Ubuntu 20.04+
+   - Debian 11+
+   - Raspberry Pi OS (if applicable)
+   - Test with multiple USB devices
+   - Verify all commands and menu options
 
-All code must meet production-ready standards:
-- Zero syntax errors
-- Comprehensive exception handling
-- Detailed error messages
-- No hard-coded values unless explicitly required
-- Extensive inline documentation
-- ShellCheck compliance
+5. **Submit a pull request:**
+   - Provide clear description of changes
+   - Reference any related issues
+   - Include test results
+   - Update version history in README
 
-## Network Ports
+### Development Setup
 
-LyreBirdAudio uses the following ports (ensure firewall allows them):
-- **8554/tcp & udp**: RTSP streaming
-- **9997/tcp**: MediaMTX API
-- **9998/tcp**: Prometheus metrics (optional)
+```bash
+# Enable debug mode
+export DEBUG=1
+
+# Run shellcheck on all scripts
+for script in *.sh; do
+    echo "Checking $script..."
+    shellcheck "$script"
+done
+
+# Test syntax
+for script in *.sh; do
+    bash -n "$script" || echo "$script has syntax errors"
+done
+
+# Make scripts executable
+chmod +x *.sh
+```
+
+### Code Style Guidelines
+
+- Use 4 spaces for indentation (no tabs)
+- Maximum line length: 100 characters
+- Function names: lowercase with underscores
+- Variables: UPPERCASE for constants, lowercase for local
+- Always quote variables: `"${variable}"`
+- Use `readonly` for constants
+- Prefer `[[ ]]` over `[ ]` for tests
+- Use `local` for function-scoped variables
+- Add comments for complex logic
 
 ## Credits
 
-## Contributors
+### Original Inspiration
 
-- **Main development**: [Tom F](https://github.com/tomtom215)
-- **Original concept**: [cberge908](https://gist.github.com/cberge908/ab7ddc1ac46fd63bb6935cd1f4341112) - GitHub Gist that inspired this project
-- **MediaMTX**: [bluenviron/mediamtx](https://github.com/bluenviron/mediamtx) - The excellent RTSP server this project builds upon
+This project was inspired by [cberge908's gist](https://gist.github.com/cberge908/ab7ddc1ac46fd63bb6935cd1f4341112) which provided the foundational concept for USB audio device streaming with MediaMTX. LyreBirdAudio extends this concept into a production-ready system with comprehensive error handling, persistent device management, and professional-grade reliability.
+
+### Dependencies
+
+- **[MediaMTX](https://github.com/bluenviron/mediamtx)** - High-performance real-time media server by bluenviron
+- **[FFmpeg](https://ffmpeg.org/)** - Complete multimedia framework
+- **Linux kernel udev** - Device management
+- **ALSA Project** - Linux audio subsystem
+
+### Contributors
+
+Special thanks to all contributors who have helped improve LyreBirdAudio.
 
 ## License
 
-Apache 2.0 License - See LICENSE file for details
+Copyright 2024 LyreBirdAudio Contributors
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
 
 ---
 
-**Note**: This project is not officially affiliated with the MediaMTX project. Always review scripts before running with sudo privileges.
+**Project Links:**
+- GitHub: https://github.com/tomtom215/LyreBirdAudio
+- Issues: https://github.com/tomtom215/LyreBirdAudio/issues
+- Discussions: https://github.com/tomtom215/LyreBirdAudio/discussions
+
+**MediaMTX:**
+- GitHub: https://github.com/bluenviron/mediamtx
+- Documentation: https://github.com/bluenviron/mediamtx#documentation
