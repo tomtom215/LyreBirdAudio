@@ -6,40 +6,18 @@
 # This script provides an interactive interface for managing LyreBirdAudio versions,
 # handling git operations, and switching between releases safely.
 #
-# Version: 1.2.0 - Production Stability Release
+# Version: 1.3.0 - Self-Update Protection & UX Enhancement Release
 #
-# Major Improvements in v1.2.0:
-#
-# Stash Management & Git Operations:
-#   - Robust stash handling with commit hash tracking and multi-level fallback strategies
-#   - Protection against git configuration interference (rebase.autoStash, etc.)
-#   - Correct operation sequencing for stash restoration and permission setting
-#   - Three-phase restoration strategy: pop, apply, manual resolution with conflict reporting
-#   - Enhanced "Discard changes" option for improved user control (Y/D/N menu)
-#
-# Repository State Management:
-#   - Accurate state tracking across all git operations that modify the working tree
-#   - Empty repository handling for freshly cloned or initialized repos
-#   - Reliable version comparison without semantic version sorting bugs
-#
-# File Mode & Permission Handling:
-#   - Automatic git file mode configuration (core.fileMode=false) to prevent false modifications
-#   - Script permission management that doesn't interfere with repository status
-#   - Proper file existence validation before permission operations
-#
-# Git Configuration & Validation:
-#   - Enhanced remote branch validation via git ls-remote
-#   - Reliable default branch detection using git ls-remote --symref
-#   - Proactive permission and ownership issue detection
-#   - Comprehensive input validation with regex patterns for commit SHAs
-#
-# All fixes verified against edge cases and production scenarios
-#
-# Compatible with: LyreBirdAudio v1.0.0+
+# Key Features:
+#   - Safe self-update handling with automatic process replacement
+#   - Date-based version sorting (latest = most recently created)
+#   - Numbered selection system for easy version switching
+#   - Startup diagnostics with intelligent update recommendations
+#   - Three-phase stash restoration with conflict detection
+#   - Comprehensive error handling and user guidance
 #
 # Prerequisites:
-#   - Git 2.0+ must be installed
-#   - Bash 4.0+ required
+#   - Git 2.0+ and Bash 4.0+
 #   - Must be run from within a cloned LyreBirdAudio git repository
 #   - Internet connection required for fetching updates
 #
@@ -64,7 +42,7 @@ SCRIPT_NAME="$(basename "${BASH_SOURCE[0]}")"
 readonly SCRIPT_NAME
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly SCRIPT_DIR
-readonly VERSION="1.2.0"
+readonly VERSION="1.3.0"
 
 # Repository configuration
 readonly REPO_OWNER="tomtom215"
@@ -129,6 +107,9 @@ HAS_LOCAL_CHANGES=false
 
 # Stash tracking for backup/restore operations
 LAST_STASH_HASH=""  # Commit hash of the stash (immutable identifier)
+
+# Version selection array (populated by list_available_releases)
+AVAILABLE_VERSIONS=()  # Array of version strings for numbered selection
 
 ################################################################################
 # Logging Functions
@@ -687,20 +668,33 @@ validate_version_exists() {
     fi
 }
 
-# List available versions (tags and branches)
+# List available versions (tags and branches) with dates and numbers
 list_available_releases() {
+    # Clear the versions array
+    AVAILABLE_VERSIONS=()
+    
     echo
     echo "${BOLD}=== Available Versions ===${NC}"
     echo
     
-    # List tags (releases)
-    echo "${BOLD}Stable Releases:${NC} (sorted by release date, newest first)"
-    if git tag -l 'v*' --sort=-creatordate --format='%(creatordate:short) - %(refname:short)' | head -n 20 | grep -q .; then
-        git tag -l 'v*' --sort=-creatordate --format='%(creatordate:short) - %(refname:short)' | head -n 20 | sed 's/^/  /'
+    # List tags (releases) - sorted by creation date (newest first)
+    echo "${BOLD}Stable Releases (sorted by creation date, newest first):${NC}"
+    if git tag -l 'v*' --sort=-creatordate | head -n 20 | grep -q .; then
+        local counter=1
+        while IFS= read -r tag; do
+            local tag_date
+            tag_date=$(git log -1 --format=%ai "$tag" 2>/dev/null | cut -d' ' -f1)
+            printf "  %2d) %-12s (created: %s)\n" "$counter" "$tag" "$tag_date"
+            
+            # Store in array for selection by number
+            AVAILABLE_VERSIONS+=("$tag")
+            ((counter++))
+        done < <(git tag -l 'v*' --sort=-creatordate | head -n 20)
+        
         local tag_count
         tag_count=$(git tag -l 'v*' | wc -l)
         if [[ "$tag_count" -gt 20 ]]; then
-            echo "  ... and $((tag_count - 20)) more versions"
+            echo "      ... and $((tag_count - 20)) more versions (not shown)"
         fi
     else
         echo "  (no releases found)"
@@ -708,14 +702,17 @@ list_available_releases() {
     
     echo
     echo "${BOLD}Development Versions:${NC}"
+    local branch_counter=$((${#AVAILABLE_VERSIONS[@]} + 1))
     if git branch -r | grep -v HEAD | sed 's/origin\///' | grep -q .; then
-        git branch -r | grep -v HEAD | sed 's/origin\///' | sed 's/^/  /'
+        while IFS= read -r branch; do
+            printf "  %2d) %s\n" "$branch_counter" "$branch"
+            AVAILABLE_VERSIONS+=("$branch")
+            ((branch_counter++))
+        done < <(git branch -r | grep -v HEAD | sed 's/origin\///' | sed 's/^[[:space:]]*//')
     else
         echo "  (no development branches found)"
     fi
     echo
-    
-    log_info "To switch to a version: use Option 3 (Select Version)"
 }
 
 ################################################################################
@@ -724,27 +721,34 @@ list_available_releases() {
 
 # Set executable permissions on scripts
 # This is a convenience function and should not be critical to operation
-# Set executable permissions on scripts
 set_script_permissions() {
     log_debug "Setting executable permissions on scripts..."
     
-    local chmod_success=true
-    local script_found=false
+    local script_files=(
+        "install_mediamtx.sh"
+        "lyrebird-orchestrator.sh"
+        "lyrebird-updater.sh"
+        "mediamtx-stream-manager.sh"
+        "usb-audio-mapper.sh"
+    )
     
-    # Use a nullglob to prevent errors if no .sh files are found
-    shopt -s nullglob
-    for script in ./*.sh; do
-        script_found=true
-        if ! chmod +x "$script" 2>/dev/null; then
-            log_debug "Could not set permissions on $script (non-critical)"
-            chmod_success=false
+    local chmod_success=true
+    local missing_files=()
+    local script
+    
+    for script in "${script_files[@]}"; do
+        if [[ -f "$script" ]]; then
+            if ! chmod +x "$script" 2>/dev/null; then
+                log_debug "Could not set permissions on $script (non-critical)"
+                chmod_success=false
+            fi
+        else
+            log_debug "Script not found: $script (non-critical)"
+            missing_files+=("$script")
         fi
     done
-    shopt -u nullglob # Unset nullglob
     
-    if [[ "$script_found" == "false" ]]; then
-        log_debug "No .sh files found to set permissions on."
-    elif [[ "$chmod_success" == "true" ]]; then
+    if [[ "$chmod_success" == "true" ]]; then
         log_debug "Script permissions set successfully"
     else
         log_debug "Some permission changes failed (non-critical)"
@@ -821,6 +825,58 @@ switch_version() {
     fi
     
     log_info "Switching to version: $target_version..."
+    
+    # CRITICAL: Check if this script itself is about to be modified (self-update scenario)
+    local self_script_name
+    self_script_name="$(basename "${BASH_SOURCE[0]}")"
+    
+    if ! git diff --quiet HEAD "$target_version" -- "$self_script_name" 2>/dev/null; then
+        # The script IS changing. Handle the self-update safely.
+        log_warn "The updater script itself is being updated!"
+        log_info "The update process will restart automatically..."
+        
+        # Perform the checkout. After this, the file on disk is the NEW version.
+        local checkout_output
+        if ! checkout_output=$(git checkout "$target_version" 2>&1); then
+            log_error "Failed to checkout new version during self-update"
+            echo "$checkout_output" >&2
+            
+            # Attempt to restore stash on failure
+            if [[ -n "$LAST_STASH_HASH" ]]; then
+                log_info "Attempting to restore your changes..."
+                restore_backup_stash
+            fi
+            
+            return "$E_GENERAL"
+        fi
+        
+        # SUCCESS: The checkout worked, but this process is still running the OLD code
+        # The file on disk is now the NEW version
+        # We must replace this process with the new script
+        log_success "Switched to version: $target_version. Restarting updater..."
+        
+        # Set script permissions before restarting
+        if [[ -f "./$self_script_name" ]]; then
+            chmod +x "./$self_script_name" 2>/dev/null || true
+        fi
+        
+        sleep 2  # Give user time to read the message
+        
+        # Use exec to replace the current process with the new script
+        # Pass arguments to handle stash restoration in the new process
+        if [[ -n "$LAST_STASH_HASH" ]]; then
+            exec "./$self_script_name" --post-update-restore "$LAST_STASH_HASH"
+        else
+            exec "./$self_script_name" --post-update-complete
+        fi
+        # The exec command replaces this process and never returns
+        # This line is only reached if exec fails
+        log_error "Failed to restart updater script"
+        return "$E_GENERAL"
+    fi
+    
+    # Normal path: The script is NOT changing, proceed with standard checkout
+    log_debug "Updater script will not be modified. Proceeding with normal checkout."
     
     # Perform the checkout and capture output
     local checkout_output
@@ -917,9 +973,10 @@ switch_to_latest_stable() {
         log_warn "Could not fetch updates, using cached information"
     fi
     
-    # Get latest version tag
+    # Get latest version tag by creation date (most recently created tag)
+    # This correctly identifies the newest release regardless of version numbering
     local latest_tag
-    latest_tag="$(git tag -l 'v*' --sort=-version:refname | head -n 1)"
+    latest_tag="$(git tag -l 'v*' --sort=-creatordate | head -n 1)"
     
     if [[ -z "$latest_tag" ]]; then
         log_error "No version tags found"
@@ -935,29 +992,92 @@ switch_to_latest_stable() {
 # User Interface Functions
 ################################################################################
 
-# Show current status
+# Show current status with detailed information
 show_status() {
     # Update current state
     get_current_version
     check_local_changes
     
     echo
-    echo "${BOLD}=== Repository Status ===${NC}"
+    echo "${BOLD}=== Detailed Repository Status ===${NC}"
     echo
     
+    # Current position
     if [[ "$IS_DETACHED" == "true" ]]; then
-        echo "Status:  ${YELLOW}Viewing specific version${NC}"
-        echo "Version: ${BOLD}$CURRENT_VERSION${NC}"
+        echo "${BOLD}Current State:${NC}"
+        echo "  Status:     ${YELLOW}Detached HEAD (viewing specific version)${NC}"
+        echo "  Version:    ${BOLD}$CURRENT_VERSION${NC}"
+        
+        # Try to identify which tag or branch this commit is from
+        local tags_here
+        tags_here=$(git tag --points-at HEAD 2>/dev/null | tr '\n' ' ')
+        if [[ -n "$tags_here" ]]; then
+            echo "  Tags here:  $tags_here"
+        fi
     else
-        echo "Branch:  ${BOLD}$CURRENT_BRANCH${NC}"
-        echo "Commit:  ${BOLD}$CURRENT_VERSION${NC}"
+        echo "${BOLD}Current Branch:${NC}"
+        echo "  Branch:     ${BOLD}$CURRENT_BRANCH${NC}"
+        echo "  Commit:     ${BOLD}$CURRENT_VERSION${NC}"
+        
+        # Show if we're on a tag
+        local current_tag
+        current_tag=$(git describe --exact-match --tags HEAD 2>/dev/null || echo "")
+        if [[ -n "$current_tag" ]]; then
+            echo "  Tag:        ${GREEN}$current_tag${NC}"
+        fi
+        
+        # Show relationship to remote
+        if git show-ref --verify --quiet "refs/remotes/origin/$CURRENT_BRANCH" 2>/dev/null; then
+            local ahead behind
+            ahead=$(git rev-list --count "origin/$CURRENT_BRANCH..HEAD" 2>/dev/null || echo "0")
+            behind=$(git rev-list --count "HEAD..origin/$CURRENT_BRANCH" 2>/dev/null || echo "0")
+            
+            if [[ "$ahead" -gt 0 ]] && [[ "$behind" -gt 0 ]]; then
+                echo "  Remote:     ${YELLOW}Diverged: $ahead ahead, $behind behind origin/$CURRENT_BRANCH${NC}"
+            elif [[ "$ahead" -gt 0 ]]; then
+                echo "  Remote:     ${YELLOW}$ahead commit(s) ahead of origin/$CURRENT_BRANCH${NC}"
+            elif [[ "$behind" -gt 0 ]]; then
+                echo "  Remote:     ${YELLOW}$behind commit(s) behind origin/$CURRENT_BRANCH${NC}"
+            else
+                echo "  Remote:     ${GREEN}In sync with origin/$CURRENT_BRANCH${NC}"
+            fi
+        else
+            echo "  Remote:     ${YELLOW}No remote tracking branch${NC}"
+        fi
     fi
     
+    echo
+    echo "${BOLD}Working Directory:${NC}"
     if [[ "$HAS_LOCAL_CHANGES" == "true" ]]; then
-        echo "Changes: ${YELLOW}Modified (uncommitted changes present)${NC}"
+        echo "  Status:     ${YELLOW}Modified (uncommitted changes)${NC}"
+        echo
+        echo "  ${BOLD}Summary of changes:${NC}"
+        git status --short | head -n 10 | sed 's/^/    /'
+        
+        local change_count
+        change_count=$(git status --short | wc -l)
+        if [[ "$change_count" -gt 10 ]]; then
+            echo "    ... and $((change_count - 10)) more files"
+        fi
+        echo
+        echo "  Use Option 6 to view all changes in detail"
     else
-        echo "Changes: ${GREEN}Clean${NC}"
+        echo "  Status:     ${GREEN}Clean (no uncommitted changes)${NC}"
     fi
+    
+    echo
+    echo "${BOLD}Repository Info:${NC}"
+    local repo_remote
+    repo_remote=$(git remote get-url origin 2>/dev/null || echo "No remote configured")
+    echo "  Remote:     $repo_remote"
+    
+    local last_fetch
+    if [[ -f ".git/FETCH_HEAD" ]]; then
+        last_fetch=$(stat -c %y ".git/FETCH_HEAD" 2>/dev/null | cut -d' ' -f1,2 | cut -d'.' -f1 || echo "Unknown")
+    else
+        last_fetch="Never"
+    fi
+    echo "  Last fetch: $last_fetch"
     
     echo
 }
@@ -1021,74 +1141,40 @@ select_version_interactive() {
         log_warn "Could not fetch updates, using cached information"
     fi
     
-    echo
-    echo "${BOLD}=== Available Versions ===${NC}"
-    echo
-    
-    # Build arrays of versions
-    local -a stable_versions
-    local -a dev_versions
-    
-    # Get stable releases with dates
-    echo "${BOLD}Stable Releases:${NC} (sorted by release date, newest first)"
-    local idx=1
-    while IFS='|' read -r date version; do
-        if [[ -n "$version" ]]; then
-            stable_versions+=("$version")
-            printf "  ${CYAN}%2d${NC}) %s - %s\n" "$idx" "$date" "$version"
-            ((idx++))
-        fi
-    done < <(git tag -l 'v*' --sort=-creatordate --format='%(creatordate:short)|%(refname:short)' | head -n 20)
-    
-    if [[ ${#stable_versions[@]} -eq 0 ]]; then
-        echo "  (no releases found)"
-    fi
+    # Show available versions (also populates AVAILABLE_VERSIONS array)
+    list_available_releases
     
     echo
-    echo "${BOLD}Development Versions:${NC}"
-    local dev_start=$idx
-    while IFS= read -r branch; do
-        if [[ -n "$branch" ]]; then
-            dev_versions+=("$branch")
-            printf "  ${CYAN}%2d${NC}) %s\n" "$idx" "$branch"
-            ((idx++))
-        fi
-    done < <(git branch -r | grep -v HEAD | sed 's/origin\///' | sed 's/^[[:space:]]*//')
-    
-    if [[ ${#dev_versions[@]} -eq 0 ]]; then
-        echo "  (no development branches found)"
-    fi
-    
+    echo "You can enter:"
+    echo "  - A number from the list above (e.g., 1 for the first option)"
+    echo "  - A version name directly (e.g., v1.2.0 or main)"
+    echo "  - Press Enter to cancel and return to menu"
     echo
-    echo "${BOLD}Enter selection number, version name, or press Enter to cancel${NC}"
-    read -r -p "Selection: " selection
+    read -r -p "Your selection: " selection
     
     if [[ -z "$selection" ]]; then
-        log_info "Selection cancelled"
+        log_info "Selection cancelled - returning to menu"
         return
     fi
     
-    # Check if selection is a number
+    local target_version=""
+    
+    # Check if input is a number
     if [[ "$selection" =~ ^[0-9]+$ ]]; then
-        local total_versions=$((${#stable_versions[@]} + ${#dev_versions[@]}))
-        if [[ "$selection" -lt 1 || "$selection" -gt "$total_versions" ]]; then
-            log_error "Invalid selection: $selection (must be between 1-$total_versions)"
-            read -r -p "Press Enter to continue..."
+        # Numeric selection - map to version from array
+        local index=$((selection - 1))
+        
+        if [[ "$index" -ge 0 ]] && [[ "$index" -lt "${#AVAILABLE_VERSIONS[@]}" ]]; then
+            target_version="${AVAILABLE_VERSIONS[$index]}"
+            log_info "Selected: $target_version"
+        else
+            log_error "Invalid selection number: $selection"
+            log_info "Please choose a number between 1 and ${#AVAILABLE_VERSIONS[@]}"
             return
         fi
-        
-        # Determine if it's a stable or dev version
-        if [[ "$selection" -lt "$dev_start" ]]; then
-            # Stable release (array is 0-indexed)
-            local target_version="${stable_versions[$((selection - 1))]}"
-        else
-            # Development version
-            local dev_idx=$((selection - dev_start))
-            local target_version="${dev_versions[$dev_idx]}"
-        fi
     else
-        # User typed a version name directly
-        local target_version="$selection"
+        # Direct version string input
+        target_version="$selection"
     fi
     
     switch_version "$target_version"
@@ -1202,100 +1288,96 @@ Or choose option 5 to see your current status
 EOF
 }
 
-# Show a diagnostic summary on script startup
-show_startup_diagnostics() {
-    echo
-    echo "${BOLD}Analyzing repository state...${NC}"
-
-    # Fetch updates silently to get latest info
-    if ! git fetch --all --tags --prune >/dev/null 2>&1; then
-        log_warn "Could not fetch updates from GitHub. Status may be based on old data."
-        # Show regular status and exit function if fetch fails
-        show_status
-        read -r -p "Press Enter to continue..."
-        return
-    fi
-    log_info "Successfully checked for updates."
-
-    # Get current state information
-    get_current_version
-    check_local_changes
-    local current_head="HEAD"
-    local latest_tag
-    # Use creation date instead of version number to find truly latest release
-    latest_tag=$(git tag -l 'v*' --sort=-creatordate | head -n 1)
-    local dev_branch_ref="origin/${DEFAULT_BRANCH}"
-
-    echo
-    echo "${BOLD}--- LyreBirdAudio Status Summary ---${NC}"
-    # 1. Display Current Version and Local Changes
-    if [[ "$IS_DETACHED" == "true" ]]; then
-        printf "  %-20s ${YELLOW}%s${NC}\n" "Current Version:" "$CURRENT_VERSION"
-    else
-        printf "  %-20s ${CYAN}%s${NC} @ ${BOLD}%s${NC}\n" "Current Branch:" "$CURRENT_BRANCH" "$CURRENT_VERSION"
-    fi
-
-    if [[ "$HAS_LOCAL_CHANGES" == "true" ]]; then
-        printf "  %-20s ${YELLOW}%s${NC}\n" "Local Repository:" "You have uncommitted changes"
-    else
-        printf "  %-20s ${GREEN}%s${NC}\n" "Local Repository:" "Clean"
-    fi
-    
-    echo
-
-    # 2. Compare to Latest Stable Release
-    if [[ -n "$latest_tag" ]]; then
-        local latest_tag_commit
-        latest_tag_commit=$(git rev-parse "$latest_tag^{commit}")
-        local current_commit
-        current_commit=$(git rev-parse "$current_head")
-        
-        if [[ "$current_commit" == "$latest_tag_commit" ]]; then
-            printf "  %-20s ${GREEN}You are on the latest stable release!${NC}\n" "Stable Release:"
-        else
-            # Check if latest tag is an ancestor of current (i.e., we're ahead of latest stable)
-            if git merge-base --is-ancestor "$latest_tag_commit" "$current_head" >/dev/null 2>&1; then
-                printf "  %-20s ${GREEN}You are ahead of latest stable ${BOLD}%s${NC}\n" "Stable Release:" "$latest_tag"
-            # Check if current is an ancestor of latest tag (i.e., we're behind)
-            elif git merge-base --is-ancestor "$current_head" "$latest_tag_commit" >/dev/null 2>&1; then
-                printf "  %-20s A new stable release is available: ${BOLD}%s${NC}\n" "Stable Release:" "$latest_tag"
-            else
-                # Diverged - neither is ancestor of the other
-                printf "  %-20s Latest is ${BOLD}%s${NC}. You are on a different version line.\n" "Stable Release:" "$latest_tag"
-            fi
-        fi
-    else
-        printf "  %-20s (No stable releases found)\n" "Stable Release:"
-    fi
-
-    # 3. Compare to Development Branch
-    if git rev-parse --verify --quiet "$dev_branch_ref" >/dev/null 2>&1; then
-        local ahead_behind
-        ahead_behind=$(git rev-list --left-right --count "${dev_branch_ref}...${current_head}")
-        local behind_count ahead_count
-        behind_count=$(echo "$ahead_behind" | cut -f1)
-        ahead_count=$(echo "$ahead_behind" | cut -f2)
-
-        if [[ "$behind_count" -eq 0 && "$ahead_count" -eq 0 ]]; then
-            printf "  %-20s ${GREEN}Up-to-date with the latest development version.${NC}\n" "Development Branch:"
-        elif [[ "$behind_count" -gt 0 && "$ahead_count" -eq 0 ]]; then
-            printf "  %-20s ${YELLOW}%s commit(s) behind the latest development version.${NC}\n" "Development Branch:" "$behind_count"
-        elif [[ "$behind_count" -eq 0 && "$ahead_count" -gt 0 ]]; then
-            printf "  %-20s You have ${BOLD}%s${NC} local commit(s) not in the development branch.\n" "Development Branch:" "$ahead_count"
-        else
-            printf "  %-20s ${YELLOW}Diverged.${NC} You are ${BOLD}%s${NC} ahead and ${BOLD}%s${NC} behind.\n" "Development Branch:" "$ahead_count" "$behind_count"
-        fi
-    else
-        printf "  %-20s (Could not find remote development branch '${DEFAULT_BRANCH}')\n" "Development Branch:"
-    fi
-    echo "${BOLD}------------------------------------${NC}"
-    echo
-    read -r -p "Press Enter to view the main menu..."
-}
-
 ################################################################################
 # Main Menu
 ################################################################################
+
+# Show startup diagnostics to guide user decisions
+show_startup_diagnostics() {
+    log_debug "Displaying startup diagnostics..."
+    
+    # Get current state
+    get_current_version
+    check_local_changes
+    
+    echo
+    echo "${BOLD}═══ LyreBirdAudio Version Manager v${VERSION} ═══${NC}"
+    echo
+    
+    # Show current version info
+    if [[ "$IS_DETACHED" == "true" ]]; then
+        echo "Current Status: ${YELLOW}Viewing specific version${NC}"
+        echo "       Version: ${BOLD}$CURRENT_VERSION${NC}"
+    else
+        echo "Current Status: ${GREEN}On branch${NC} ${BOLD}$CURRENT_BRANCH${NC}"
+        echo "       Commit:  ${BOLD}$CURRENT_VERSION${NC}"
+    fi
+    
+    if [[ "$HAS_LOCAL_CHANGES" == "true" ]]; then
+        echo "       Changes: ${YELLOW}You have uncommitted local changes${NC}"
+    else
+        echo "       Changes: ${GREEN}Clean working directory${NC}"
+    fi
+    
+    echo
+    
+    # Check for available updates (quick check without full fetch)
+    log_info "Checking for available updates..."
+    
+    # Try a quick fetch (timeout after 5 seconds if slow)
+    local fetch_succeeded=false
+    if timeout 5 git fetch --all --tags --prune --quiet 2>/dev/null; then
+        fetch_succeeded=true
+    fi
+    
+    # Check for new stable releases - use date-based sorting to get most recently created tag
+    # This is the correct way to find "latest" when version numbers may not be chronological
+    local latest_tag
+    latest_tag="$(git tag -l 'v*' --sort=-creatordate 2>/dev/null | head -n 1)"
+    
+    if [[ -n "$latest_tag" ]]; then
+        # Get current version tag if we're on one
+        local current_tag
+        current_tag="$(git describe --exact-match --tags HEAD 2>/dev/null || echo "")"
+        
+        if [[ -n "$current_tag" ]] && [[ "$current_tag" == "$latest_tag" ]]; then
+            echo "Stable Release:  ${GREEN}You're on the latest stable: $latest_tag${NC}"
+        else
+            echo "Stable Release:  ${YELLOW}New version available: $latest_tag${NC}"
+            if [[ "$fetch_succeeded" == "true" ]]; then
+                echo "                 ${CYAN}Select Option 1 to update to latest stable${NC}"
+            fi
+        fi
+    else
+        echo "Stable Release:  ${YELLOW}No tagged releases found${NC}"
+    fi
+    
+    # Check for development branch updates
+    if [[ "$IS_DETACHED" == "false" ]]; then
+        local behind_count
+        behind_count=$(git rev-list --count "HEAD..origin/$CURRENT_BRANCH" 2>/dev/null || echo "0")
+        
+        if [[ "$behind_count" -gt 0 ]]; then
+            echo "Development:     ${YELLOW}You are $behind_count commit(s) behind origin/$CURRENT_BRANCH${NC}"
+            if [[ "$fetch_succeeded" == "true" ]]; then
+                echo "                 ${CYAN}Select Option 2 to update to latest development${NC}"
+            fi
+        else
+            echo "Development:     ${GREEN}Up to date with origin/$CURRENT_BRANCH${NC}"
+        fi
+    else
+        echo "Development:     ${CYAN}Not applicable (viewing specific version)${NC}"
+    fi
+    
+    if [[ "$fetch_succeeded" == "false" ]]; then
+        echo
+        log_warn "Could not fetch updates from remote (network issue or timeout)"
+        log_info "Using cached repository information"
+    fi
+    
+    echo
+    read -r -p "Press Enter to continue to menu..."
+}
 
 # Interactive main menu
 main_menu() {
@@ -1345,20 +1427,12 @@ main_menu() {
         
         case "$choice" in
             1)
-                # Switch to latest stable - fetch then switch
-                log_info "Checking for latest stable release..."
-                if ! fetch_updates; then
-                    log_warn "Could not check for updates, using cached information"
-                fi
+                # Switch to latest stable release
                 switch_to_latest_stable
                 read -r -p "Press Enter to continue..."
                 ;;
             2)
-                # Switch to development branch - fetch then switch
-                log_info "Switching to development version..."
-                if ! fetch_updates; then
-                    log_warn "Could not check for updates, using cached information"
-                fi
+                # Switch to development branch
                 switch_version "$DEFAULT_BRANCH"
                 read -r -p "Press Enter to continue..."
                 ;;
@@ -1416,7 +1490,7 @@ reset_interactive_menu() {
         log_warn "This will permanently delete all your local changes!"
         echo
         echo "Reset to which version?"
-        echo "  ${BOLD}1${NC}) Latest version on current branch"
+        echo "  ${BOLD}1${NC}) Latest remote version of current branch (origin/$CURRENT_BRANCH)"
         echo "  ${BOLD}2${NC}) Latest development version ($DEFAULT_BRANCH)"
         echo "  ${BOLD}3${NC}) Specific version (let me choose)"
         echo "  ${BOLD}C${NC}) Cancel - Don't reset"
@@ -1531,8 +1605,35 @@ main() {
     log_debug "Detected default branch: $DEFAULT_BRANCH"
     
     # Check for command line arguments
+    local post_update_flow=false
     if [[ $# -gt 0 ]]; then
         case "$1" in
+            --post-update-restore)
+                # Script was updated and needs to restore stashed changes
+                post_update_flow=true
+                if [[ -z "${2-}" ]]; then
+                    log_error "Post-update restore called without a stash hash"
+                    exit "$E_GENERAL"
+                fi
+                echo
+                log_info "Updater has been updated. Restoring your stashed changes..."
+                LAST_STASH_HASH="$2"
+                if restore_backup_stash; then
+                    log_success "Update complete and changes restored"
+                else
+                    log_warn "Update complete but changes need manual restoration"
+                fi
+                echo
+                read -r -p "Press Enter to continue to the main menu..."
+                ;;
+            --post-update-complete)
+                # Script was updated with no changes to restore
+                post_update_flow=true
+                echo
+                log_success "Updater has been updated successfully"
+                echo
+                read -r -p "Press Enter to continue to the main menu..."
+                ;;
             --version|-v)
                 echo "LyreBirdAudio Version Manager v${VERSION}"
                 echo "Requires: Git ${MIN_GIT_MAJOR}.0+, Bash ${MIN_BASH_MAJOR}.0+"
@@ -1563,8 +1664,10 @@ main() {
                 exit "$E_GENERAL"
                 ;;
         esac
-    else
-        # Show startup diagnostics if running interactively without flags
+    fi
+    
+    # Show startup diagnostics if running interactively (not in post-update flow)
+    if [[ "$post_update_flow" == "false" ]]; then
         show_startup_diagnostics
     fi
     
