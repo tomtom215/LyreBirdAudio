@@ -3,7 +3,7 @@
 # Part of LyreBirdAudio - RTSP Audio Streaming Suite
 # https://github.com/tomtom215/LyreBirdAudio
 #
-# Version: 1.4.0 - Production Hardening Release
+# Version: 1.4.1 - UI/UX Improvements & Production Hardening Release
 #
 # This script provides safe, reliable version management with:
 #   - Atomic operations with automatic rollback on failure
@@ -11,7 +11,7 @@
 #   - Lock file protection against concurrent execution
 #   - Transaction-based stash management
 #   - Progressive error recovery with user guidance
-#   - Simplified UX for non-technical users
+#   - Clear, non-technical UX for non-git-expert users
 #   - Network resilience with retries
 #
 # Prerequisites:
@@ -39,7 +39,7 @@ SCRIPT_NAME="$(basename "${BASH_SOURCE[0]}")"
 readonly SCRIPT_NAME
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly SCRIPT_DIR
-readonly VERSION="1.4.0"
+readonly VERSION="1.4.1"
 LOCKFILE="${SCRIPT_DIR}/.lyrebird-updater.lock"
 readonly LOCKFILE
 
@@ -374,7 +374,7 @@ detect_git_state() {
     
     if [[ "$HAS_LOCAL_CHANGES" == "true" ]]; then
         GIT_STATE="dirty"
-        log_debug "Git state: dirty (uncommitted changes)"
+        log_debug "Git state: dirty (local modifications)"
     else
         GIT_STATE="clean"
         log_debug "Git state: clean"
@@ -390,28 +390,28 @@ validate_clean_state() {
         merge)
             log_error "Git merge in progress"
             log_info "You must complete or abort the merge first:"
-            log_info "  To complete: git merge --continue"
-            log_info "  To abort:    git merge --abort"
+            log_info "  To continue merge:  git merge --continue"
+            log_info "  To cancel merge:    git merge --abort"
             return "$E_BAD_STATE"
             ;;
         rebase)
             log_error "Git rebase in progress"
             log_info "You must complete or abort the rebase first:"
-            log_info "  To complete: git rebase --continue"
-            log_info "  To abort:    git rebase --abort"
+            log_info "  To continue rebase: git rebase --continue"
+            log_info "  To cancel rebase:   git rebase --abort"
             return "$E_BAD_STATE"
             ;;
         cherry-pick)
             log_error "Git cherry-pick in progress"
             log_info "You must complete or abort the cherry-pick first:"
-            log_info "  To complete: git cherry-pick --continue"
-            log_info "  To abort:    git cherry-pick --abort"
+            log_info "  To continue:        git cherry-pick --continue"
+            log_info "  To cancel:          git cherry-pick --abort"
             return "$E_BAD_STATE"
             ;;
         bisect)
             log_error "Git bisect in progress"
-            log_info "You must complete the bisect first:"
-            log_info "  To finish: git bisect reset"
+            log_info "You must finish the bisect first:"
+            log_info "  To complete: git bisect reset"
             return "$E_BAD_STATE"
             ;;
         clean|dirty)
@@ -487,7 +487,7 @@ get_current_version() {
             CURRENT_VERSION="$tag_name"
         fi
         
-        log_debug "Detached HEAD at $CURRENT_VERSION"
+        log_debug "Viewing specific version: $CURRENT_VERSION"
     else
         IS_DETACHED=false
         CURRENT_BRANCH="$(git rev-parse --abbrev-ref HEAD 2>/dev/null)"
@@ -510,10 +510,10 @@ check_local_changes() {
     if ! git diff-index --quiet HEAD 2>/dev/null || \
        git ls-files --others --exclude-standard 2>/dev/null | grep -q .; then
         HAS_LOCAL_CHANGES=true
-        log_debug "Local changes detected"
+        log_debug "Local modifications detected"
     else
         HAS_LOCAL_CHANGES=false
-        log_debug "No local changes"
+        log_debug "No local modifications"
     fi
     
     return 0
@@ -537,6 +537,15 @@ confirm_action() {
     fi
     
     [[ "$response" =~ ^[Yy]$ ]]
+}
+
+# Require explicit "yes" confirmation for destructive operations
+confirm_destructive_action() {
+    local prompt="$1"
+    local response
+    
+    read -r -p "${prompt} " response
+    [[ "$response" == "yes" ]]
 }
 
 ################################################################################
@@ -579,14 +588,14 @@ transaction_stash_changes() {
     stash_message="lyrebird-tx-${TRANSACTION_STATE[operation]}-$$-$(date +%s)"
     
     if ! git stash push -u -m "$stash_message" >/dev/null 2>&1; then
-        log_error "Failed to stash changes"
+        log_error "Failed to save your changes"
         return "$E_GENERAL"
     fi
     
     # Verify stash was created and get its hash
     local stash_hash
     if ! stash_hash="$(git rev-parse 'stash@{0}' 2>/dev/null)"; then
-        log_error "Failed to get stash commit hash"
+        log_error "Failed to save your changes (couldn't verify save)"
         return "$E_GENERAL"
     fi
     
@@ -636,7 +645,7 @@ transaction_rollback() {
     
     # Restore stashed changes if any
     if [[ -n "${TRANSACTION_STATE[stash_hash]}" ]]; then
-        log_debug "Restoring stashed changes: ${TRANSACTION_STATE[stash_hash]}"
+        log_debug "Restoring saved changes: ${TRANSACTION_STATE[stash_hash]}"
         
         # Find stash ref from hash
         local stash_ref
@@ -644,14 +653,14 @@ transaction_rollback() {
         
         if [[ -n "$stash_ref" ]]; then
             if git stash pop "$stash_ref" >/dev/null 2>&1; then
-                log_success "Stashed changes restored"
+                log_success "Your changes were restored"
             else
-                log_warn "Could not restore stashed changes automatically"
+                log_warn "Could not restore your changes automatically"
                 log_info "Your changes are saved in: $stash_ref"
                 log_info "To restore: git stash pop $stash_ref"
             fi
         else
-            log_warn "Could not find stash reference"
+            log_warn "Could not find your saved changes"
         fi
     fi
     
@@ -782,7 +791,7 @@ switch_version_safe() {
     check_local_changes
     if [[ "$HAS_LOCAL_CHANGES" == "true" ]]; then
         echo
-        log_warn "You have uncommitted changes"
+        log_warn "You have local modifications"
         echo
         git status --short 2>/dev/null | head -n 15
         
@@ -806,7 +815,7 @@ switch_version_safe() {
             return "$E_GENERAL"
         fi
         
-        log_success "Changes saved temporarily"
+        log_success "Your changes have been saved and will be restored after the update"
     fi
     
     # Check if script itself will be modified (self-update)
@@ -884,7 +893,7 @@ switch_version_safe() {
         stash_ref=$(git stash list --format="%gd %H" | grep "${TRANSACTION_STATE[stash_hash]}" | cut -d' ' -f1 || echo "")
         
         if [[ -z "$stash_ref" ]]; then
-            log_warn "Could not find stashed changes"
+            log_warn "Could not find your saved changes"
             log_info "Your changes may have been lost (stash hash: ${TRANSACTION_STATE[stash_hash]})"
         else
             # Try to pop the stash
@@ -937,11 +946,19 @@ reset_to_clean_state() {
         return "$E_GENERAL"
     fi
     
-    # Final confirmation
+    # Show what will be deleted before confirmation
     echo
-    log_warn "This will PERMANENTLY delete all local changes and reset to: $target"
+    log_warn "WARNING: This action CANNOT be undone!"
     echo
-    if ! confirm_action "Are you absolutely sure?"; then
+    log_warn "The following changes will be PERMANENTLY deleted:"
+    echo
+    git status --short 2>/dev/null || echo "  (no changes)"
+    echo
+    log_warn "Reset target: $target"
+    echo
+    
+    # Require explicit "yes" confirmation
+    if ! confirm_destructive_action "Type 'yes' (case-sensitive) to confirm reset, or anything else to cancel: "; then
         log_info "Reset cancelled"
         return 0
     fi
@@ -959,7 +976,7 @@ reset_to_clean_state() {
         log_warn "Could not remove all untracked files"
     fi
     
-    log_success "Reset complete - all changes discarded"
+    log_success "Reset complete. Your changes are gone. Repository is clean."
     
     # Set script permissions
     set_script_permissions
@@ -999,11 +1016,11 @@ list_available_releases() {
     AVAILABLE_VERSIONS=()
     
     echo
-    echo "${BOLD}═══ Available Versions ═══${NC}"
+    echo "${BOLD}━━━ Available Versions ━━━${NC}"
     echo
     
     # List stable releases (tags)
-    echo "${BOLD}Stable Releases (newest first):${NC}"
+    echo "${BOLD}Stable Releases (numbered versions, tested and stable):${NC}"
     
     if git tag -l 'v*' --sort=-creatordate | head -n 20 | grep -q .; then
         local counter=1
@@ -1026,7 +1043,7 @@ list_available_releases() {
     fi
     
     echo
-    echo "${BOLD}Development Branches:${NC}"
+    echo "${BOLD}Development Branches (active development, may contain bugs):${NC}"
     
     local branch_counter=$((${#AVAILABLE_VERSIONS[@]} + 1))
     if git branch -r | grep -v HEAD | sed 's/origin\///' | sed 's/^[[:space:]]*//' | grep -q .; then
@@ -1132,13 +1149,13 @@ show_status() {
     detect_git_state
     
     echo
-    echo "${BOLD}═══ Repository Status ═══${NC}"
+    echo "${BOLD}━━━ Repository Status ━━━${NC}"
     echo
     
     # Current position
     if [[ "$IS_DETACHED" == "true" ]]; then
         echo "${BOLD}Current State:${NC}"
-        echo "  Status:     ${YELLOW}Detached HEAD (viewing specific version)${NC}"
+        echo "  Status:     ${YELLOW}Viewing a Specific Release (not on a branch)${NC}"
         echo "  Version:    ${BOLD}$CURRENT_VERSION${NC}"
         
         local tags_here
@@ -1183,10 +1200,12 @@ show_status() {
     
     case "$GIT_STATE" in
         clean)
-            echo "  Status:     ${GREEN}Clean (no changes)${NC}"
+            echo "  Status:     ${GREEN}Ready (no local modifications)${NC}"
             ;;
         dirty)
-            echo "  Status:     ${YELLOW}Modified (uncommitted changes)${NC}"
+            echo "  Status:     ${YELLOW}Has Local Modifications${NC}"
+            echo
+            echo "  File Status Legend:  M=modified  A=added  D=deleted  ?=untracked"
             echo
             git status --short | head -n 10 | sed 's/^/    /'
             
@@ -1225,18 +1244,18 @@ show_startup_diagnostics() {
     check_local_changes
     
     echo
-    echo "${BOLD}═══ LyreBirdAudio Version Manager v${VERSION} ═══${NC}"
+    echo "${BOLD}━━━ LyreBirdAudio Version Manager v${VERSION} ━━━${NC}"
     echo
     
     # Current version
     if [[ "$IS_DETACHED" == "true" ]]; then
-        echo "Current:  ${YELLOW}Viewing version ${BOLD}$CURRENT_VERSION${NC}"
+        echo "Current:  ${YELLOW}Viewing Release: ${BOLD}$CURRENT_VERSION${NC}${YELLOW} (not tracking a branch)${NC}"
     else
         echo "Current:  ${GREEN}Branch ${BOLD}$CURRENT_BRANCH${NC} @ $CURRENT_VERSION"
     fi
     
     if [[ "$HAS_LOCAL_CHANGES" == "true" ]]; then
-        echo "Changes:  ${YELLOW}You have uncommitted changes${NC}"
+        echo "Changes:  ${YELLOW}You have local modifications${NC}"
     else
         echo "Changes:  ${GREEN}Clean working directory${NC}"
     fi
@@ -1274,7 +1293,7 @@ show_startup_diagnostics() {
             echo "Stable:   ${GREEN}You're on latest: $latest_tag${NC}"
         else
             echo "Stable:   ${YELLOW}Update available: $latest_tag${NC}"
-            echo "          ${CYAN}→ Select option 1 to update${NC}"
+            echo "          ${CYAN}↑ Select option 1 to update${NC}"
         fi
     fi
     
@@ -1285,7 +1304,7 @@ show_startup_diagnostics() {
         
         if [[ "$behind" -gt 0 ]]; then
             echo "Dev:      ${YELLOW}$behind commit(s) behind origin/$CURRENT_BRANCH${NC}"
-            echo "          ${CYAN}→ Select option 2 to update${NC}"
+            echo "          ${CYAN}↑ Select option 2 to update${NC}"
         else
             echo "Dev:      ${GREEN}Up to date with origin/$CURRENT_BRANCH${NC}"
         fi
@@ -1302,68 +1321,71 @@ show_startup_diagnostics() {
 show_help() {
     cat << 'EOF'
 
-═══════════════════════════════════════════════════════════
+════════════════════════════════════════════════════════════════════════════════
    LyreBirdAudio Version Manager - Help Guide
-═══════════════════════════════════════════════════════════
+════════════════════════════════════════════════════════════════════════════════
 
 SIMPLE UPDATE WORKFLOW:
   For most users: Just select option 1
   This updates you to the latest stable, tested version
 
-═══ MAIN OPTIONS ═══
+━━━ MAIN OPTIONS ━━━
 
 1) Switch to Latest Stable Release
-   → Most recently released version
-   → Recommended for production use
-   → Automatically checks for updates
+   ↑ Newest tested version
+   ↑ Recommended for production use
+   ↑ Automatically checks for updates
+   ↑ Your changes will be saved temporarily
 
 2) Switch to Development Version
-   → Latest code with newest features
-   → May have bugs or incomplete features
-   → For testing and development
+   ↑ Latest code with newest features
+   ↑ May have bugs or incomplete features
+   ↑ For testing and development
+   ↑ Your changes will be saved temporarily
 
 3) Switch to Specific Version
-   → Choose any version from a list
-   → Useful for testing or rollback
+   ↑ Choose any version from a list
+   ↑ Useful for testing or rollback
+   ↑ Your changes will be saved temporarily
 
 4) Check for New Updates
-   → Downloads version information
-   → Doesn't change your current version
-   → Shows what's available
+   ↑ Downloads version information
+   ↑ Doesn't change your current version
+   ↑ Shows what's available
 
 5) Show Detailed Status
-   → Your current version
-   → Local modifications
-   → Sync status with remote
+   ↑ Your current version and branch
+   ↑ Local modifications
+   ↑ Sync status with remote
+   ↑ Repository information
 
 6) Discard All Changes & Reset
-   → PERMANENTLY deletes local changes
-   → Resets to a clean version
-   → Use with caution!
+   ↑ PERMANENTLY deletes local modifications
+   ↑ Resets to a clean version
+   ↑ Use with caution!
 
-═══ SAFETY FEATURES ═══
+━━━ SAFETY FEATURES ━━━
 
-✓ Automatic backup of your changes
+✓ Your changes are automatically saved before updating
 ✓ Confirmation required for destructive actions
 ✓ Automatic rollback if operations fail
 ✓ Clear warnings before permanent actions
-✓ Transaction-based operations
 
-═══ COMMON QUESTIONS ═══
+━━━ COMMON QUESTIONS ━━━
 
 Q: What happens to my changes when I update?
-A: They're automatically saved and restored after the update
+A: They're automatically saved and will be restored after the update
 
 Q: Can I undo an update?
 A: Yes, use option 3 to switch back to any previous version
 
 Q: What if something goes wrong?
-A: The script automatically rolls back failed operations
+A: The script automatically tries to recover
 
 Q: How do I start fresh with no modifications?
 A: Use option 6 to reset to a clean state
 
-═══ MORE HELP ═══
+━━━ MORE HELP ━━━
 
 Visit: https://github.com/tomtom215/LyreBirdAudio
 
@@ -1377,9 +1399,9 @@ main_menu() {
         
         clear
         echo
-        echo "${BOLD}╔════════════════════════════════════════════════════════╗${NC}"
-        echo "${BOLD}║     LyreBirdAudio - Version Manager v${VERSION}      ║${NC}"
-        echo "${BOLD}╚════════════════════════════════════════════════════════╝${NC}"
+        echo "${BOLD}┌─────────────────────────────────────────────────────────┐${NC}"
+        echo "${BOLD}│     LyreBirdAudio - Version Manager v${VERSION}      │${NC}"
+        echo "${BOLD}└─────────────────────────────────────────────────────────┘${NC}"
         echo
         
         # Status header
@@ -1390,22 +1412,25 @@ main_menu() {
         fi
         
         if [[ "$HAS_LOCAL_CHANGES" == "true" ]]; then
-            echo "  Changes:  ${YELLOW}Uncommitted changes${NC}"
+            echo "  Changes:  ${YELLOW}Has local modifications${NC}"
         else
             echo "  Changes:  ${GREEN}None${NC}"
         fi
         
         echo
-        echo "${BOLD}═══ UPDATE ═══${NC}"
+        echo "${BOLD}━━━ UPDATE ━━━${NC}"
         echo "  ${BOLD}1${NC}) Switch to Latest Stable Release"
+        echo "     (Newest tested version—recommended)"
         echo "  ${BOLD}2${NC}) Switch to Development Version ($DEFAULT_BRANCH)"
-        echo "  ${BOLD}3${NC}) Switch to Specific Version..."
+        echo "     (Latest code with new features—may have bugs)"
+        echo "  ${BOLD}3${NC}) Switch to Specific Version"
+        echo "     (Choose from older releases or branches)"
         echo
-        echo "${BOLD}═══ INFO ═══${NC}"
+        echo "${BOLD}━━━ INFO ━━━${NC}"
         echo "  ${BOLD}4${NC}) Check for New Updates"
         echo "  ${BOLD}5${NC}) Show Detailed Status"
         echo
-        echo "${BOLD}═══ ADVANCED ═══${NC}"
+        echo "${BOLD}━━━ DANGER ZONE ━━━${NC}"
         echo "  ${BOLD}6${NC}) Discard All Changes & Reset..."
         echo
         echo "  ${BOLD}H${NC}) Help  |  ${BOLD}Q${NC}) Quit"
@@ -1458,11 +1483,12 @@ main_menu() {
 reset_menu() {
     while true; do
         echo
-        echo "${BOLD}═══ DISCARD CHANGES & RESET ═══${NC}"
-        log_warn "This will PERMANENTLY delete all your local changes!"
+        echo "${BOLD}━━━ DISCARD CHANGES & RESET ━━━${NC}"
+        log_warn "This will PERMANENTLY delete all your local modifications!"
         echo
         echo "Reset to:"
         echo "  ${BOLD}1${NC}) Latest remote version of current branch"
+        echo "     (Only available if you're tracking a branch)"
         echo "  ${BOLD}2${NC}) Latest development version ($DEFAULT_BRANCH)"
         echo "  ${BOLD}3${NC}) Specific version (let me choose)"
         echo "  ${BOLD}C${NC}) Cancel"
@@ -1473,7 +1499,7 @@ reset_menu() {
             1)
                 get_current_version
                 if [[ "$IS_DETACHED" == "true" ]]; then
-                    log_warn "You're viewing a specific version (detached HEAD)"
+                    log_warn "You're viewing a specific version (not tracking a branch)"
                     log_info "Resetting to HEAD won't change anything"
                     log_info "Choose option 2 or 3 instead"
                     read -r -p "Press Enter to continue..."
@@ -1589,7 +1615,7 @@ main() {
                         log_info "To restore: git stash pop $stash_ref"
                     fi
                 else
-                    log_warn "Could not find stashed changes"
+                    log_warn "Could not find your saved changes"
                 fi
                 
                 echo
