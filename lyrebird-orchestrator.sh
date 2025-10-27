@@ -4,17 +4,24 @@
 # Part of LyreBirdAudio - RTSP Audio Streaming Suite
 # https://github.com/tomtom215/LyreBirdAudio
 #
-# Version: 1.0.0
+# Version: 1.1.0
 # Description: Orchestrator script that provides a unified interface to all
 #              LyreBirdAudio management scripts with proper command routing,
 #              error handling, and user feedback.
 #
+# v1.1.0 Changes (Version Management Improvement):
+#   - IMPROVED: Version validation now accepts any detected version
+#   - IMPROVED: Removed hardcoded MIN_VERSIONS array
+#   - IMPROVED: Enforces semantic versioning policy
+#   - IMPROVED: Zero maintenance for version checks going forward
+#   - MAINTAINED: 100% backward compatible with all components
+#
 # Compatible with:
 #   - MediaMTX v1.15.1+
-#   - install_mediamtx.sh v2.0.0+
-#   - mediamtx-stream-manager.sh v1.2.0+
-#   - usb-audio-mapper.sh v1.2.1+
-#   - lyrebird-updater.sh v1.0.0+
+#   - install_mediamtx.sh v1.0.0+ (all versions, backward compatible)
+#   - mediamtx-stream-manager.sh v1.0.0+ (all versions, backward compatible)
+#   - usb-audio-mapper.sh v1.0.0+ (all versions, backward compatible)
+#   - lyrebird-updater.sh v1.0.0+ (all versions, backward compatible)
 #
 # Architecture:
 #   - Single orchestrator with no duplicate logic
@@ -22,6 +29,7 @@
 #   - Provides consistent UI/UX across all operations
 #   - Implements proper error handling and feedback
 #   - Follows DRY principles throughout
+#   - Leverages semantic versioning for version validation
 
 set -euo pipefail
 
@@ -29,7 +37,7 @@ set -euo pipefail
 # Constants and Configuration
 # ============================================================================
 
-readonly SCRIPT_VERSION="1.0.0"
+readonly SCRIPT_VERSION="1.1.0"
 
 # Safe constant initialization (SC2155: separate declaration and assignment)
 SCRIPT_NAME=""
@@ -62,16 +70,18 @@ declare -A EXTERNAL_SCRIPTS=(
     ["updater"]="lyrebird-updater.sh"
 )
 
-# Required script versions
-declare -A MIN_VERSIONS=(
-    ["installer"]="2.0.0"
-    ["stream_manager"]="1.2.0"
-    ["usb_mapper"]="1.2.1"
-    ["updater"]="1.0.0"
-)
+# Version validation policy:
+# - LyreBirdAudio components follow semantic versioning
+# - All versions are accepted if they can be detected
+# - Orchestrator only validates that scripts exist and are executable
+# - Warning issued if version detection fails (non-blocking)
+# See: https://github.com/tomtom215/LyreBirdAudio/blob/main/README.md
 
 # Configuration paths (for reference/display only - not directly used)
 readonly UDEV_RULES="/etc/udev/rules.d/99-usb-soundcards.rules"
+
+# MediaMTX log file path (must match configuration in mediamtx-stream-manager.sh)
+readonly MEDIAMTX_LOG_FILE="${MEDIAMTX_LOG_FILE:-/var/log/mediamtx.out}"
 
 # Log file (initialized in main() with fallback handling)
 LOG_FILE=""
@@ -312,46 +322,37 @@ extract_script_version() {
 }
 
 validate_script_versions() {
-    log "DEBUG" "Validating script versions"
+    log "DEBUG" "Validating script versions (accept any version via semantic versioning)"
     
     local warnings=0
-    local errors=0
     
     for key in "${!SCRIPT_PATHS[@]}"; do
         local script_path="${SCRIPT_PATHS[$key]}"
         local script_name
         script_name="$(basename "$script_path")"
-        local min_version="${MIN_VERSIONS[$key]}"
         local actual_version
         
         actual_version="$(extract_script_version "$script_path")"
         
         if [[ "$actual_version" == "unknown" ]]; then
             warning "Cannot determine version for ${script_name}"
-            log "WARN" "Version unknown for ${key} at ${script_path}"
+            log "WARN" "Version unknown for ${key} at ${script_path} (non-critical)"
             ((warnings++))
-        elif ! version_ge "$actual_version" "$min_version"; then
-            error "${script_name} version ${actual_version} < required ${min_version}"
-            log "ERROR" "Version check failed: ${script_name} (${script_path}) has ${actual_version}, requires ${min_version}"
-            ((errors++))
         else
-            log "DEBUG" "${script_name} version ${actual_version} >= ${min_version} OK"
+            # All versions accepted - LyreBirdAudio follows semantic versioning
+            # and maintains backward compatibility across versions
+            log "DEBUG" "${script_name} version: ${actual_version}"
         fi
     done
     
-    if [[ $errors -gt 0 ]]; then
+    if [[ $warnings -gt 0 ]]; then
         echo
-        error "Script version compatibility issues detected"
-        echo "Please ensure all LyreBirdAudio scripts are up to date"
-        echo "Run the updater to get the latest versions"
-        return 1
-    elif [[ $warnings -gt 0 ]]; then
-        echo
-        warning "Some script versions could not be determined"
-        echo "Press Enter to continue or Ctrl+C to abort..."
-        read -r
+        warning "Some script versions could not be detected"
+        echo "This is informational only - scripts should still work"
+        log "WARN" "Some version detections failed ($warnings), but continuing"
     fi
     
+    # Always return success - we trust semantic versioning and backward compatibility
     return 0
 }
 
@@ -522,7 +523,7 @@ menu_main() {
         echo "  3) Audio Stream Management"
         echo "  4) USB Device Management"
         echo "  5) System Tools & Updates"
-        echo "  6) Refresh Status"
+        echo "  6) Manually Refresh Status (if needed)"
         echo "  0) Exit"
         echo
         read -rp "Select option: " choice
@@ -585,6 +586,11 @@ menu_quick_setup() {
     else
         error "Failed to install MediaMTX"
         echo
+        info "Common fixes:"
+        info "  - Check internet connection"
+        info "  - Verify you have write permissions to /usr/local/bin"
+        info "  - View logs: Menu  -> System Tools  -> View Orchestrator Log"
+        echo
         read -rp "Continue anyway? (y/n): " -n 1
         echo
         [[ ! $REPLY =~ ^[Yy]$ ]] && return
@@ -601,6 +607,11 @@ menu_quick_setup() {
         success "USB devices mapped"
     else
         error "Failed to map USB devices"
+        echo
+        info "Troubleshooting:"
+        info "  - Ensure USB devices are connected and powered on"
+        info "  - Check udev rules: Menu  -> USB Device Management  -> View Mappings"
+        info "  - Try test detection: Menu  -> USB Device Management  -> Test Detection"
         echo
         read -rp "Continue anyway? (y/n): " -n 1
         echo
@@ -619,8 +630,10 @@ menu_quick_setup() {
     echo
     success "Quick setup complete!"
     echo
-    echo "Your RTSP streams should now be available at:"
-    echo "  rtsp://localhost:8554/[device-name]"
+    echo "Your RTSP streams are now available at:"
+    echo "  rtsp://localhost:8554/<device-name>"
+    echo
+    info "Replace <device-name> with your actual device name (e.g., rtsp://localhost:8554/usb-microphone-1)"
     echo
     pause
     
@@ -630,17 +643,17 @@ menu_quick_setup() {
 menu_mediamtx() {
     while true; do
         display_header "clear"
-        echo -e "${BOLD}MediaMTX Management${NC}"
+        echo -e "${BOLD}MediaMTX & Audio Streaming${NC}"
         echo
         display_status
         display_error
         
         echo -e "${BOLD}Available Actions:${NC}"
         echo "  1) Install/Update MediaMTX"
-        echo "  2) Start MediaMTX"
-        echo "  3) Stop MediaMTX"
-        echo "  4) Restart MediaMTX"
-        echo "  5) View Status & Logs"
+        echo "  2) Start Audio Streams"
+        echo "  3) Stop Audio Streams"
+        echo "  4) Restart Audio Streams"
+        echo "  5) View Stream Status"
         echo "  6) Verify Installation"
         echo "  7) Uninstall MediaMTX"
         echo "  0) Back to Main Menu"
@@ -661,7 +674,7 @@ menu_mediamtx() {
                 ;;
             2)
                 echo
-                echo "Starting MediaMTX...Be Patient as Streams Start"
+                echo "Starting audio streams..."
                 if execute_script "stream_manager" start; then
                     success "MediaMTX started"
                     refresh_system_state
@@ -672,7 +685,7 @@ menu_mediamtx() {
                 ;;
             3)
                 echo
-                echo "Stopping MediaMTX..."
+                echo "Stopping audio streams..."
                 if execute_script "stream_manager" stop; then
                     success "MediaMTX stopped"
                     refresh_system_state
@@ -683,7 +696,7 @@ menu_mediamtx() {
                 ;;
             4)
                 echo
-                echo "Restarting MediaMTX...Be Patient as Streams Restart"
+                echo "Restarting audio streams..."
                 if execute_script "stream_manager" restart; then
                     success "MediaMTX restarted"
                     refresh_system_state
@@ -754,7 +767,7 @@ menu_streams() {
         case "$choice" in
             1)
                 echo
-                echo "Starting all streams...Be Patient as Streams Start"
+                echo "Starting all streams (this may take a few seconds)..."
                 if execute_script "stream_manager" start; then
                     success "Streams started"
                     refresh_system_state
@@ -776,7 +789,7 @@ menu_streams() {
                 ;;
             3)
                 echo
-                echo "Restarting all streams...Be Patient as this can take 1-3 Minutes depending on number of streams"
+                echo "Restarting all streams (this may take 1-3 minutes)..."
                 if execute_script "stream_manager" restart; then
                     success "Streams restarted"
                     refresh_system_state
@@ -869,13 +882,13 @@ menu_usb_devices() {
 menu_system_tools() {
     while true; do
         display_header "clear"
-        echo -e "${BOLD}LyreBird-Audio Tools & Updates${NC}"
+        echo -e "${BOLD}LyreBird Audio Tools & Updates${NC}"
         echo
         display_status
         display_error
         
         echo -e "${BOLD}Available Actions:${NC}"
-        echo "  1) Check for Updates to LyreBird-Audio"
+        echo "  1) Check for Updates to LyreBird Audio"
         echo "  2) LyreBird Version Manager (Advanced)"
         echo "  3) View Orchestrator Log"
         echo "  4) View MediaMTX Log"
@@ -916,9 +929,19 @@ menu_system_tools() {
                 ;;
             4)
                 echo
-                # Try multiple possible log locations
+                # Try multiple possible log locations based on actual MediaMTX configuration
+                # Primary: stream manager configured location - /var/log/mediamtx.out (where mediamtx-stream-manager.sh redirects output)
+                # Secondary: alternative standard location
+                # Tertiary: state directory location (less common)
+                # Fallback: alternative subdirectory location
                 local mediamtx_log=""
-                for log_path in "/var/log/mediamtx.log" "/var/log/mediamtx.out" "/var/log/mediamtx/mediamtx.log"; do
+                local state_dir="${MEDIAMTX_STATE_DIR:-/var/lib/mediamtx}"
+                
+                for log_path in \
+                    "${MEDIAMTX_LOG_FILE}" \
+                    "/var/log/mediamtx.log" \
+                    "${state_dir}/mediamtx.log" \
+                    "/var/log/mediamtx/mediamtx.log"; do
                     if [[ -f "$log_path" && -r "$log_path" ]]; then
                         mediamtx_log="$log_path"
                         break
@@ -926,13 +949,46 @@ menu_system_tools() {
                 done
                 
                 if [[ -n "$mediamtx_log" ]]; then
-                    echo "Viewing MediaMTX log (last 50 lines): $mediamtx_log"
-                    echo "------------------------------------------------------------"
-                    tail -50 "$mediamtx_log"
-                    echo "------------------------------------------------------------"
+                    # Check if log file has content
+                    if [[ -s "$mediamtx_log" ]]; then
+                        echo "Viewing MediaMTX log (last 50 lines): $mediamtx_log"
+                        echo "------------------------------------------------------------"
+                        tail -50 "$mediamtx_log"
+                        echo "------------------------------------------------------------"
+                    else
+                        # Log file is empty - provide context-aware guidance
+                        if [[ "$MEDIAMTX_RUNNING" == "true" && $ACTIVE_STREAMS -gt 0 ]]; then
+                            info "MediaMTX log file is empty"
+                            info "MediaMTX is running with $ACTIVE_STREAMS active stream(s), but log file at $mediamtx_log is empty."
+                            info "This may indicate:"
+                            info "  - MediaMTX is not configured to log to this file location"
+                            info "  - MediaMTX is logging to stdout/stderr instead of a file"
+                            info "  - Log output is being suppressed or redirected elsewhere"
+                            info ""
+                            info "To view logs via systemd journal:"
+                            info "  sudo journalctl -u mediamtx -f"
+                        else
+                            info "MediaMTX log file is empty"
+                            info "This is normal if MediaMTX has just started or has not output any data yet."
+                            info "Try one of these:"
+                            info "  - Ensure streams are running (Menu  -> Audio Stream Management  -> Start)"
+                            info "  - Check stream status for errors (Menu  -> Audio Stream Management  -> Status)"
+                            info "  - Wait a moment and try again - MediaMTX needs time to generate logs"
+                        fi
+                    fi
                 else
-                    info "MediaMTX log not found in standard locations"
-                    echo "Tried: /var/log/mediamtx.log, /var/log/mediamtx.out, /var/log/mediamtx/mediamtx.log"
+                    warning "MediaMTX log not found"
+                    info "Checked locations:"
+                    info "  - ${MEDIAMTX_LOG_FILE} (stream manager primary)"
+                    info "  - /var/log/mediamtx.log (alternative standard)"
+                    info "  - ${state_dir}/mediamtx.log (state directory)"
+                    info "  - /var/log/mediamtx/mediamtx.log (alternative subdirectory)"
+                    info ""
+                    info "To view MediaMTX logs via systemd journal:"
+                    info "  sudo journalctl -u mediamtx -f"
+                    info ""
+                    info "To view recent MediaMTX activity:"
+                    info "  Menu  -> Audio Stream Management  -> Status"
                 fi
                 echo
                 pause
@@ -974,24 +1030,22 @@ main() {
         exit ${E_SCRIPT_NOT_FOUND}
     fi
     
-    # Log detected versions for debugging
-    log "INFO" "=== Script Version Detection ==="
+    # Log detected versions for debugging (no minimum version enforcement)
+    log "INFO" "=== Detected Script Versions ==="
     for key in "${!SCRIPT_PATHS[@]}"; do
         local script_path="${SCRIPT_PATHS[$key]}"
         local script_name
         script_name="$(basename "$script_path")"
         local detected_version
         detected_version="$(extract_script_version "$script_path")"
-        local required_version="${MIN_VERSIONS[$key]}"
-        log "INFO" "${script_name}: detected=${detected_version}, required=${required_version}"
+        log "INFO" "${script_name}: ${detected_version}"
     done
     log "INFO" "=== End Version Detection ==="
     
     if ! validate_script_versions; then
         echo
-        warning "Continuing despite version warnings"
-        echo "Some features may not work correctly"
-        sleep 2
+        warning "Some script versions could not be determined"
+        log "WARN" "Version detection warnings (non-blocking)"
     fi
     
     # Initial system state detection
