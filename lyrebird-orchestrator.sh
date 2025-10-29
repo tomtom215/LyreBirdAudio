@@ -404,9 +404,11 @@ detect_active_streams() {
     # Count FFmpeg processes streaming to MediaMTX
     if command_exists pgrep; then
         ACTIVE_STREAMS=$(pgrep -fc "ffmpeg.*rtsp://.*:8554" 2>/dev/null || echo 0)
+        # Remove any whitespace/newlines
+        ACTIVE_STREAMS=$(echo "$ACTIVE_STREAMS" | tr -d '\n\r' | xargs)
     fi
     
-    log "DEBUG" "Active streams=$ACTIVE_STREAMS"
+    log DEBUG "Active streams=$ACTIVE_STREAMS"
 }
 
 refresh_system_state() {
