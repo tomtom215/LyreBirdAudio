@@ -893,7 +893,7 @@ download_mediamtx() {
     
     # Verify checksum (enforced by default)
     log_info "Verifying download..."
-    local checksum_url="https://github.com/${DEFAULT_GITHUB_REPO}/releases/download/v${version}/checksums.sha256"
+    local checksum_url="https://github.com/${DEFAULT_GITHUB_REPO}/releases/download/${version}/checksums.sha256"
     if ! download_file "${checksum_url}" "${checksum}"; then
         if [[ "${FORCE_MODE}" != "true" ]]; then
             fatal "Failed to download checksum file (use --force to skip verification)" 6
