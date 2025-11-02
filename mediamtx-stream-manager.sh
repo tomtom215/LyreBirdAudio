@@ -6,10 +6,32 @@
 # This script automatically detects USB microphones and creates MediaMTX 
 # configurations for continuous 24/7 RTSP audio streams.
 #
-# Version: 1.2.0 - PRODUCTION READY with comprehensive reliability improvements
+# Version: 1.3.2 - Production hardening for multiplex mode
 # Compatible with MediaMTX v1.15.0+
 #
 # Version History:
+# v1.3.2 - Production hardening for multiplex mode
+#   - CRITICAL: Fixed array expansion bug in multiplex wrapper script
+#   - IMPROVED: Added systemd detection for signal handlers to prevent conflicts
+#   - IMPROVED: Added multiplex configuration to systemd service file
+#   - IMPROVED: Enhanced installation messages with mode configuration
+#   - VERIFIED: All fixes maintain 100% backward compatibility
+# v1.3.1 - Enhanced user interface for multiplex mode
+#   - NEW: -f/--filter option for intuitive filter type selection
+#   - NEW: -n/--name option for custom stream naming
+#   - NEW: Input validation for filter types
+#   - IMPROVED: Cleaner command-line interface
+#   - IMPROVED: Simpler systemd service configuration
+#   - PRESERVED: 100% backward compatibility with v1.3.0 and v1.2.0
+# v1.3.0 - Enhanced version with complete v1.2.0 compatibility
+#   - NEW: Individual and multiplex streaming modes (FULLY IMPLEMENTED)
+#   - NEW: Multiplex filter support (amix for mixing, amerge for channel separation)
+#   - NEW: Complete start_ffmpeg_multiplex_stream() function
+#   - NEW: Enhanced command-line argument parsing
+#   - NEW: Improved signal handling with multiple signal types
+#   - NEW: Modular service management functions
+#   - NEW: Extended configuration options
+#   - PRESERVED: All v1.2.0 critical fixes and functionality
 # v1.2.0 - Major production reliability overhaul
 #   - CRITICAL: Fixed CONFIG_LOCK_FILE subshell isolation for proper config updates
 #   - CRITICAL: Fixed PID file permission race condition for systemd compatibility
@@ -49,7 +71,7 @@ if [[ "${DEBUG:-false}" == "true" ]]; then
 fi
 
 # Constants
-readonly VERSION="1.2.0"
+readonly VERSION="1.3.2"
 
 # Script identification
 SCRIPT_NAME="$(basename "${BASH_SOURCE[0]}")"
@@ -76,6 +98,10 @@ readonly LOG_FILE="${MEDIAMTX_LOG_FILE:-/var/log/mediamtx-stream-manager.log}"
 readonly MEDIAMTX_LOG_FILE="${MEDIAMTX_LOG_FILE:-/var/log/mediamtx.out}"
 readonly MEDIAMTX_BIN="${MEDIAMTX_BINARY:-/usr/local/bin/mediamtx}"
 readonly MEDIAMTX_HOST="${MEDIAMTX_HOST:-localhost}"
+# Note: These are NOT readonly to allow command-line option overrides
+STREAM_MODE="${STREAM_MODE:-individual}"
+MULTIPLEX_STREAM_NAME="${MULTIPLEX_STREAM_NAME:-all_mics}"
+MULTIPLEX_FILTER_TYPE="${MULTIPLEX_FILTER_TYPE:-amix}"
 readonly RESTART_MARKER="${MEDIAMTX_RESTART_MARKER:-/var/run/mediamtx-audio.restart}"
 readonly CLEANUP_MARKER="${MEDIAMTX_CLEANUP_MARKER:-/var/run/mediamtx-audio.cleanup}"
 readonly CONFIG_LOCK_FILE="${CONFIG_DIR}/.config.lock"
@@ -233,6 +259,16 @@ cleanup() {
 # Set trap for cleanup only in main script
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]] && [[ $$ -eq $BASHPID ]]; then
     trap cleanup EXIT INT TERM HUP QUIT
+    
+    # Enhanced signal handlers for v1.3.0/v1.3.2
+    # FIX v1.3.2: Only set custom handlers when NOT running under systemd
+    if [[ -z "${INVOCATION_ID:-}" ]]; then
+        # Not running under systemd - safe to use custom handlers
+        trap 'log INFO "Received SIGHUP, reloading configuration"; restart_mediamtx' HUP
+        # Redirect output for USR1 since we might be daemonized
+        trap 'log INFO "Received SIGUSR1, dumping status"; show_status >/dev/null 2>&1 || log INFO "Status dump completed"' USR1
+    fi
+    # Note: When running under systemd (INVOCATION_ID is set), default signal handlers are used
 fi
 
 # v1.4.2 FIX: Enhanced deferred cleanup handler with staleness check
@@ -615,7 +651,7 @@ is_lock_stale() {
     
     # Check if lock file has a PID
     local lock_pid
-    lock_pid="$(cat "${LOCK_FILE}" 2>/dev/null | head -n1 | tr -d '[:space:]')"
+    lock_pid="$(head -n1 "${LOCK_FILE}" 2>/dev/null | tr -d '[:space:]')"
     
     if [[ -z "$lock_pid" ]] || ! [[ "$lock_pid" =~ ^[0-9]+$ ]]; then
         log WARN "Lock file exists but contains no valid PID"
@@ -1325,6 +1361,446 @@ generate_stream_path() {
     echo "$base_path"
 }
 
+# Start FFmpeg multiplex stream (single stream from multiple devices)
+start_ffmpeg_multiplex_stream() {
+    local -a devices=("$@")
+    
+    if [[ ${#devices[@]} -eq 0 ]]; then
+        log ERROR "No devices provided for multiplex stream"
+        return 1
+    fi
+    
+    local stream_path="${MULTIPLEX_STREAM_NAME}"
+    local pid_file="${FFMPEG_PID_DIR}/${stream_path}.pid"
+    
+    # Check if already running
+    if [[ -f "$pid_file" ]]; then
+        local existing_pid
+        existing_pid="$(read_pid_safe "$pid_file")"
+        if [[ -n "$existing_pid" ]] && kill -0 "$existing_pid" 2>/dev/null; then
+            log DEBUG "Multiplex stream $stream_path already running"
+            return 0
+        fi
+    fi
+    
+    # Validate filter type
+    if [[ "${MULTIPLEX_FILTER_TYPE}" != "amix" ]] && [[ "${MULTIPLEX_FILTER_TYPE}" != "amerge" ]]; then
+        log ERROR "Invalid MULTIPLEX_FILTER_TYPE: ${MULTIPLEX_FILTER_TYPE}. Must be 'amix' or 'amerge'"
+        return 1
+    fi
+    
+    # Build device array and validate all devices
+    local -a valid_devices=()
+    local -a card_numbers=()
+    local -a device_names=()
+    
+    for device_info in "${devices[@]}"; do
+        IFS=':' read -r device_name card_num <<< "$device_info"
+        
+        if [[ -z "$device_name" ]] || [[ -z "$card_num" ]]; then
+            log WARN "Skipping invalid device info: $device_info"
+            continue
+        fi
+        
+        if ! check_audio_device "$card_num"; then
+            log WARN "Audio device card ${card_num} is not accessible, skipping"
+            continue
+        fi
+        
+        valid_devices+=("$device_info")
+        card_numbers+=("$card_num")
+        device_names+=("$device_name")
+    done
+    
+    if [[ ${#valid_devices[@]} -eq 0 ]]; then
+        log ERROR "No valid audio devices available for multiplex stream"
+        return 1
+    fi
+    
+    log INFO "Starting multiplex FFmpeg stream with ${#valid_devices[@]} devices (filter: ${MULTIPLEX_FILTER_TYPE})"
+    
+    # Get audio configuration from first device (all devices should match)
+    local first_device="${device_names[0]}"
+    local sample_rate channels codec bitrate thread_queue
+    sample_rate="$(get_device_config "$first_device" "SAMPLE_RATE" "$DEFAULT_SAMPLE_RATE")"
+    channels="$(get_device_config "$first_device" "CHANNELS" "$DEFAULT_CHANNELS")"
+    codec="$(get_device_config "$first_device" "CODEC" "$DEFAULT_CODEC")"
+    bitrate="$(get_device_config "$first_device" "BITRATE" "$DEFAULT_BITRATE")"
+    thread_queue="$(get_device_config "$first_device" "THREAD_QUEUE" "$DEFAULT_THREAD_QUEUE")"
+    
+    # Create wrapper script
+    local wrapper_script="${FFMPEG_PID_DIR}/${stream_path}.sh"
+    local ffmpeg_log="${FFMPEG_PID_DIR}/${stream_path}.log"
+    
+    # Create wrapper with all variables properly quoted
+    cat > "$wrapper_script" << 'WRAPPER_START'
+#!/bin/bash
+set -euo pipefail
+
+# Ensure PATH includes common binary locations
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
+
+WRAPPER_START
+
+    # Write configuration variables
+    cat >> "$wrapper_script" << EOF
+# Stream Configuration
+STREAM_PATH="$stream_path"
+SAMPLE_RATE="$sample_rate"
+CHANNELS="$channels"
+BITRATE="$bitrate"
+THREAD_QUEUE="$thread_queue"
+ANALYZEDURATION="$DEFAULT_ANALYZEDURATION"
+PROBESIZE="$DEFAULT_PROBESIZE"
+CODEC="$codec"
+FILTER_TYPE="${MULTIPLEX_FILTER_TYPE}"
+
+# File paths
+FFMPEG_LOG="$ffmpeg_log"
+LOG_FILE="$LOG_FILE"
+WRAPPER_PID_FILE="$pid_file"
+CLEANUP_MARKER="$CLEANUP_MARKER"
+MEDIAMTX_HOST="$MEDIAMTX_HOST"
+
+# Restart configuration
+RESTART_COUNT=0
+CONSECUTIVE_FAILURES=0
+MAX_CONSECUTIVE_FAILURES=5
+MAX_WRAPPER_RESTARTS=$MAX_WRAPPER_RESTARTS
+WRAPPER_SUCCESS_DURATION=$WRAPPER_SUCCESS_DURATION
+RESTART_DELAY=10
+FFMPEG_LOG_MAX_SIZE=$FFMPEG_LOG_MAX_SIZE
+
+# Device arrays (initialized empty, populated below)
+declare -a CARD_NUMBERS=()
+declare -a DEVICE_NAMES=()
+
+FFMPEG_PID=""
+PARENT_PID=\$PPID
+EOF
+    
+    # FIX v1.3.2: Populate arrays with proper quoting to handle spaces in device names
+    for i in "${!card_numbers[@]}"; do
+        cat >> "$wrapper_script" << EOF
+CARD_NUMBERS+=("${card_numbers[$i]}")
+DEVICE_NAMES+=("${device_names[$i]}")
+EOF
+    done
+    
+    # Add device count after arrays are populated
+    cat >> "$wrapper_script" << EOF
+
+# Number of devices
+NUM_DEVICES=${#valid_devices[@]}
+EOF
+
+    # Add the wrapper logic
+    cat >> "$wrapper_script" << 'WRAPPER_LOGIC'
+
+# Create log file if it doesn't exist
+touch "${FFMPEG_LOG}" 2>/dev/null || true
+
+log_message() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [MULTIPLEX-WRAPPER] $1" >> "${FFMPEG_LOG}" 2>/dev/null || true
+}
+
+log_critical() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STREAM:${STREAM_PATH}] $1" >> "${LOG_FILE}" 2>/dev/null || true
+}
+
+# Cleanup handler
+cleanup_wrapper() {
+    local exit_code=$?
+    log_message "Wrapper cleanup initiated (exit code: $exit_code)"
+    
+    # Atomic check and kill
+    local ffmpeg_pid="${FFMPEG_PID:-}"
+    if [[ -n "$ffmpeg_pid" ]]; then
+        if kill -0 "$ffmpeg_pid" 2>/dev/null; then
+            log_message "Sending SIGINT to FFmpeg process ${ffmpeg_pid}"
+            kill -INT "$ffmpeg_pid" 2>/dev/null || true
+            
+            # Wait briefly for termination
+            local term_wait=0
+            while kill -0 "$ffmpeg_pid" 2>/dev/null && [[ $term_wait -lt 5 ]]; do
+                sleep 0.2
+                ((term_wait++))
+            done
+            
+            # Force kill if still running
+            if kill -0 "$ffmpeg_pid" 2>/dev/null; then
+                kill -KILL "$ffmpeg_pid" 2>/dev/null || true
+            fi
+        fi
+    fi
+    
+    rm -f "${WRAPPER_PID_FILE}"
+    log_critical "Multiplex stream wrapper terminated for ${STREAM_PATH}"
+    exit "$exit_code"
+}
+
+trap cleanup_wrapper EXIT INT TERM
+
+# Run FFmpeg with multiplex configuration
+run_ffmpeg() {
+    log_message "Starting FFmpeg with ${NUM_DEVICES} devices (filter: ${FILTER_TYPE})"
+    
+    # Build command array to handle spaces properly
+    local ffmpeg_cmd=(
+        ffmpeg
+        -hide_banner
+        -loglevel warning
+    )
+    
+    # Add input for each device
+    for i in "${!CARD_NUMBERS[@]}"; do
+        local card_num="${CARD_NUMBERS[$i]}"
+        local audio_device="plughw:${card_num},0"
+        
+        log_message "Adding input $((i+1))/${NUM_DEVICES}: ${DEVICE_NAMES[$i]} (card ${card_num})"
+        
+        ffmpeg_cmd+=(
+            -analyzeduration "${ANALYZEDURATION}"
+            -probesize "${PROBESIZE}"
+            -f alsa
+            -ar "${SAMPLE_RATE}"
+            -ac "${CHANNELS}"
+            -thread_queue_size "${THREAD_QUEUE}"
+            -i "${audio_device}"
+        )
+    done
+    
+    # Build filter complex based on filter type
+    if [[ "${FILTER_TYPE}" == "amix" ]]; then
+        # Mix all audio inputs into a single output
+        # Create input labels [0:a][1:a][2:a]... and use amix filter
+        local filter_inputs=""
+        for i in "${!CARD_NUMBERS[@]}"; do
+            filter_inputs+="[${i}:a]"
+        done
+        
+        local filter_complex="${filter_inputs}amix=inputs=${NUM_DEVICES}:duration=longest:normalize=0,aresample=async=1:first_pts=0"
+        ffmpeg_cmd+=(-filter_complex "$filter_complex")
+        
+        log_message "Using amix filter to mix ${NUM_DEVICES} audio streams"
+        
+    elif [[ "${FILTER_TYPE}" == "amerge" ]]; then
+        # Merge all audio inputs keeping channels separate
+        # This creates a single stream with (NUM_DEVICES * CHANNELS) channels
+        local filter_inputs=""
+        for i in "${!CARD_NUMBERS[@]}"; do
+            filter_inputs+="[${i}:a]"
+        done
+        
+        local filter_complex="${filter_inputs}amerge=inputs=${NUM_DEVICES},aresample=async=1:first_pts=0"
+        ffmpeg_cmd+=(-filter_complex "$filter_complex")
+        
+        log_message "Using amerge filter to merge ${NUM_DEVICES} audio streams"
+    else
+        log_message "ERROR: Invalid filter type: ${FILTER_TYPE}"
+        return 1
+    fi
+    
+    # Add codec options based on codec type
+    case "${CODEC}" in
+        opus)
+            ffmpeg_cmd+=(-c:a libopus -b:a "${BITRATE}" -application audio)
+            ;;
+        aac)
+            ffmpeg_cmd+=(-c:a aac -b:a "${BITRATE}")
+            ;;
+        mp3)
+            ffmpeg_cmd+=(-c:a libmp3lame -b:a "${BITRATE}")
+            ;;
+        *)
+            ffmpeg_cmd+=(-c:a libopus -b:a "${BITRATE}")
+            ;;
+    esac
+    
+    # Add output options
+    ffmpeg_cmd+=(
+        -f rtsp
+        -rtsp_transport tcp
+        "rtsp://${MEDIAMTX_HOST}:8554/${STREAM_PATH}"
+    )
+    
+    # Log the complete command for debugging
+    log_message "FFmpeg command: ${ffmpeg_cmd[*]}"
+    
+    # Start FFmpeg with proper process group
+    if command -v setsid &>/dev/null; then
+        setsid "${ffmpeg_cmd[@]}" >> "${FFMPEG_LOG}" 2>&1 &
+        FFMPEG_PID=$!
+    else
+        "${ffmpeg_cmd[@]}" >> "${FFMPEG_LOG}" 2>&1 &
+        FFMPEG_PID=$!
+    fi
+    
+    # Validate FFmpeg process started
+    sleep 0.5
+    if ! kill -0 "$FFMPEG_PID" 2>/dev/null; then
+        log_message "ERROR: FFmpeg failed to start"
+        if [[ -f "${FFMPEG_LOG}" ]]; then
+            log_message "Last output: $(tail -n 5 "${FFMPEG_LOG}" 2>/dev/null | tr '\n' ' ')"
+        fi
+        FFMPEG_PID=""
+        return 1
+    fi
+    
+    log_message "Started multiplex FFmpeg with PID ${FFMPEG_PID}"
+    return 0
+}
+
+check_devices_exist() {
+    for card_num in "${CARD_NUMBERS[@]}"; do
+        if [[ ! -e "/dev/snd/pcmC${card_num}D0c" ]]; then
+            log_message "Device card ${card_num} no longer exists"
+            return 1
+        fi
+    done
+    return 0
+}
+
+# Check if parent is still alive
+check_parent_alive() {
+    if [[ -n "${PARENT_PID}" ]] && [[ "${PARENT_PID}" -gt 1 ]]; then
+        if ! kill -0 "${PARENT_PID}" 2>/dev/null; then
+            log_message "Parent process ${PARENT_PID} died, exiting"
+            return 1
+        fi
+    fi
+    return 0
+}
+
+# Log startup
+log_critical "Multiplex stream wrapper starting for ${STREAM_PATH} with ${NUM_DEVICES} devices"
+log_message "Wrapper PID: $$, Parent PID: ${PARENT_PID}"
+log_message "Filter type: ${FILTER_TYPE}"
+
+# Main restart loop
+while true; do
+    # Check parent is alive
+    if ! check_parent_alive; then
+        break
+    fi
+    
+    if [[ -f "${CLEANUP_MARKER}" ]]; then
+        log_message "Cleanup in progress, stopping wrapper"
+        break
+    fi
+    
+    if ! check_devices_exist; then
+        log_message "One or more devices no longer exist"
+        break
+    fi
+    
+    if [[ $CONSECUTIVE_FAILURES -ge $MAX_CONSECUTIVE_FAILURES ]]; then
+        log_message "Too many consecutive failures ($CONSECUTIVE_FAILURES)"
+        break
+    fi
+    
+    if [[ $RESTART_COUNT -ge $MAX_WRAPPER_RESTARTS ]]; then
+        log_message "Max restarts reached ($RESTART_COUNT)"
+        break
+    fi
+    
+    log_message "Starting FFmpeg (attempt #$((RESTART_COUNT + 1)))"
+    
+    START_TIME=$(date +%s)
+    
+    if ! run_ffmpeg; then
+        log_message "Failed to start FFmpeg"
+        ((CONSECUTIVE_FAILURES++))
+        RESTART_DELAY=$((RESTART_DELAY * 2))
+        if [[ $RESTART_DELAY -gt 300 ]]; then
+            RESTART_DELAY=300
+        fi
+        sleep $RESTART_DELAY
+        continue
+    fi
+    
+    # Wait for FFmpeg to exit
+    wait "${FFMPEG_PID}" 2>/dev/null
+    exit_code=$?
+    
+    FFMPEG_PID=""
+    
+    END_TIME=$(date +%s)
+    RUN_TIME=$((END_TIME - START_TIME))
+    
+    log_message "FFmpeg exited with code ${exit_code} after ${RUN_TIME} seconds"
+    
+    ((RESTART_COUNT++))
+    
+    # Reset failures and delay if ran successfully
+    if [[ ${RUN_TIME} -gt ${WRAPPER_SUCCESS_DURATION} ]]; then
+        CONSECUTIVE_FAILURES=0
+        RESTART_DELAY=10
+        log_message "Successful run, reset delay to ${RESTART_DELAY}s"
+    else
+        ((CONSECUTIVE_FAILURES++))
+        RESTART_DELAY=$((RESTART_DELAY * 2))
+        if [[ $RESTART_DELAY -gt 300 ]]; then
+            RESTART_DELAY=300
+        fi
+    fi
+    
+    # Check parent before sleeping
+    if ! check_parent_alive; then
+        break
+    fi
+    
+    log_message "Waiting ${RESTART_DELAY}s before restart (failures: $CONSECUTIVE_FAILURES)"
+    sleep ${RESTART_DELAY}
+done
+
+log_message "Wrapper exiting for ${STREAM_PATH}"
+WRAPPER_LOGIC
+    
+    chmod +x "$wrapper_script"
+    
+    # Check wrapper script was created properly
+    if [[ ! -x "$wrapper_script" ]]; then
+        log ERROR "Failed to create executable wrapper script"
+        return 1
+    fi
+    
+    # Validate wrapper script syntax
+    if ! bash -n "$wrapper_script" 2>/dev/null; then
+        log ERROR "Wrapper script has syntax errors"
+        return 1
+    fi
+    
+    # Start wrapper with process group using setsid if available
+    log DEBUG "Starting multiplex wrapper script: $wrapper_script"
+    if command_exists setsid; then
+        nohup setsid bash "$wrapper_script" >/dev/null 2>&1 &
+    else
+        nohup bash "$wrapper_script" >/dev/null 2>&1 &
+    fi
+    
+    local wrapper_pid=$!
+    
+    # Give wrapper time to start
+    sleep "${QUICK_SLEEP}"
+    
+    # Verify wrapper is running
+    if ! kill -0 "$wrapper_pid" 2>/dev/null; then
+        log ERROR "Multiplex wrapper failed to start"
+        return 1
+    fi
+    
+    # Write wrapper PID atomically
+    if ! write_pid_atomic "$wrapper_pid" "$pid_file"; then
+        log ERROR "Failed to write multiplex wrapper PID"
+        kill -TERM "$wrapper_pid" 2>/dev/null || true
+        return 1
+    fi
+    
+    log INFO "Multiplex stream started successfully (wrapper PID: $wrapper_pid)"
+    return 0
+}
+
 # Start FFmpeg stream
 start_ffmpeg_stream() {
     local device_name="$1"
@@ -1844,11 +2320,25 @@ webrtc: no
 srt: no
 
 paths:
+EOF
+    
+    # Add paths based on stream mode
+    if [[ "${STREAM_MODE}" == "multiplex" ]]; then
+        cat >> "$tmp_config" << EOF
+  ${MULTIPLEX_STREAM_NAME}:
+    source: publisher
+    sourceProtocol: automatic
+    sourceOnDemand: no
+EOF
+    else
+        # Individual mode - accept any stream name
+        cat >> "$tmp_config" << EOF
   '~^[a-zA-Z0-9_-]+$':
     source: publisher
     sourceProtocol: automatic
     sourceOnDemand: no
 EOF
+    fi
     
     # Atomically move into place
     mv -f "$tmp_config" "${CONFIG_FILE}"
@@ -1972,24 +2462,46 @@ start_mediamtx() {
     
     log INFO "MediaMTX started successfully (PID: $pid)"
     
-    # Pass the stable device list to start function
-    start_all_ffmpeg_streams "${devices[@]}"
+    # Start streams based on mode
+    if [[ "${STREAM_MODE}" == "multiplex" ]]; then
+        log INFO "Multiplex mode - starting single multiplexed stream to ${MULTIPLEX_STREAM_NAME}"
+        # Start single multiplex stream with all devices
+        if ! start_ffmpeg_multiplex_stream "${devices[@]}"; then
+            log ERROR "Failed to start multiplex stream"
+            return 1
+        fi
+    else
+        log INFO "Individual stream mode - starting separate streams"
+        # Pass the stable device list to start function
+        start_all_ffmpeg_streams "${devices[@]}"
+    fi
     
-    # Use the same device list for status display
+    # Display stream status based on mode
     echo
     echo -e "${GREEN}=== Available RTSP Streams ===${NC}"
     
-    for device_info in "${devices[@]}"; do
-        IFS=':' read -r device_name card_num <<< "$device_info"
-        local stream_path
-        stream_path="$(generate_stream_path "$device_name" "$card_num")"
-        
+    if [[ "${STREAM_MODE}" == "multiplex" ]]; then
+        # In multiplex mode, validate the single multiplexed stream
+        local stream_path="${MULTIPLEX_STREAM_NAME}"
         if validate_stream "$stream_path"; then
-            echo -e "${GREEN}✔${NC} rtsp://${MEDIAMTX_HOST}:8554/${stream_path}"
+            echo -e "${GREEN}✔${NC} rtsp://${MEDIAMTX_HOST}:8554/${stream_path} (multiplexed from ${#devices[@]} devices)"
         else
             echo -e "${RED}✗${NC} rtsp://${MEDIAMTX_HOST}:8554/${stream_path} (failed)"
         fi
-    done
+    else
+        # In individual mode, validate each device's stream
+        for device_info in "${devices[@]}"; do
+            IFS=':' read -r device_name card_num <<< "$device_info"
+            local stream_path
+            stream_path="$(generate_stream_path "$device_name" "$card_num")"
+            
+            if validate_stream "$stream_path"; then
+                echo -e "${GREEN}✔${NC} rtsp://${MEDIAMTX_HOST}:8554/${stream_path}"
+            else
+                echo -e "${RED}✗${NC} rtsp://${MEDIAMTX_HOST}:8554/${stream_path} (failed)"
+            fi
+        done
+    fi
     
     echo
     return 0
@@ -2101,35 +2613,74 @@ show_status() {
     fi
     
     echo
-    echo "Detected USB audio devices:"
+    
+    # Detect if multiplex mode is active by checking for multiplex PID file
+    local multiplex_pid_file="${FFMPEG_PID_DIR}/${MULTIPLEX_STREAM_NAME}.pid"
+    local is_multiplex_mode=false
+    
+    if [[ -f "$multiplex_pid_file" ]]; then
+        local multiplex_pid
+        multiplex_pid="$(read_pid_safe "$multiplex_pid_file")"
+        if [[ -n "$multiplex_pid" ]] && kill -0 "$multiplex_pid" 2>/dev/null; then
+            is_multiplex_mode=true
+        fi
+    fi
+    
     local devices=()
     readarray -t devices < <(detect_audio_devices)
     
-    if [[ ${#devices[@]} -eq 0 ]]; then
-        echo "  No devices found"
+    if [[ "$is_multiplex_mode" == "true" ]]; then
+        # Multiplex mode is active
+        echo "Multiplex stream (combining ${#devices[@]} devices):"
+        echo "  Stream: rtsp://${MEDIAMTX_HOST}:8554/${MULTIPLEX_STREAM_NAME}"
+        
+        local multiplex_pid
+        multiplex_pid="$(read_pid_safe "$multiplex_pid_file")"
+        if [[ -n "$multiplex_pid" ]] && kill -0 "$multiplex_pid" 2>/dev/null; then
+            echo -e "  Status: ${GREEN}Running${NC} (PID: $multiplex_pid)"
+        else
+            echo -e "  Status: ${RED}Not running${NC}"
+        fi
+        
+        echo
+        echo "Source devices:"
+        if [[ ${#devices[@]} -eq 0 ]]; then
+            echo "  No devices found"
+        else
+            for device_info in "${devices[@]}"; do
+                IFS=':' read -r device_name card_num <<< "$device_info"
+                echo "  - $device_name (card $card_num)"
+            done
+        fi
     else
-        for device_info in "${devices[@]}"; do
-            IFS=':' read -r device_name card_num <<< "$device_info"
-            
-            local stream_path
-            stream_path="$(generate_stream_path "$device_name" "$card_num")"
-            
-            echo "  - $device_name (card $card_num)"
-            echo "    Stream: rtsp://${MEDIAMTX_HOST}:8554/$stream_path"
-            
-            local pid_file="${FFMPEG_PID_DIR}/${stream_path}.pid"
-            if [[ -f "$pid_file" ]]; then
-                local pid
-                pid="$(read_pid_safe "$pid_file")"
-                if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
-                    echo -e "    Status: ${GREEN}Running${NC} (PID: $pid)"
+        # Individual stream mode
+        echo "Detected USB audio devices:"
+        if [[ ${#devices[@]} -eq 0 ]]; then
+            echo "  No devices found"
+        else
+            for device_info in "${devices[@]}"; do
+                IFS=':' read -r device_name card_num <<< "$device_info"
+                
+                local stream_path
+                stream_path="$(generate_stream_path "$device_name" "$card_num")"
+                
+                echo "  - $device_name (card $card_num)"
+                echo "    Stream: rtsp://${MEDIAMTX_HOST}:8554/$stream_path"
+                
+                local pid_file="${FFMPEG_PID_DIR}/${stream_path}.pid"
+                if [[ -f "$pid_file" ]]; then
+                    local pid
+                    pid="$(read_pid_safe "$pid_file")"
+                    if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+                        echo -e "    Status: ${GREEN}Running${NC} (PID: $pid)"
+                    else
+                        echo -e "    Status: ${RED}Not running${NC}"
+                    fi
                 else
                     echo -e "    Status: ${RED}Not running${NC}"
                 fi
-            else
-                echo -e "    Status: ${RED}Not running${NC}"
-            fi
-        done
+            done
+        fi
     fi
     
     SKIP_CLEANUP=false
@@ -2151,6 +2702,11 @@ show_config() {
 # Create systemd service
 create_systemd_service() {
     local service_file="/etc/systemd/system/mediamtx-audio.service"
+    
+    # FIX v1.3.2: Capture current configuration for systemd service
+    local stream_mode="${STREAM_MODE:-individual}"
+    local multiplex_filter="${MULTIPLEX_FILTER_TYPE:-amix}"
+    local multiplex_name="${MULTIPLEX_STREAM_NAME:-all_mics}"
     
     cat > "$service_file" << EOF
 [Unit]
@@ -2184,6 +2740,9 @@ ReadWritePaths=/etc/mediamtx /var/lib/mediamtx-ffmpeg /var/log /var/run
 
 Environment="HOME=/root"
 Environment="USB_STABILIZATION_DELAY=10"
+Environment="STREAM_MODE=${stream_mode}"
+Environment="MULTIPLEX_FILTER_TYPE=${multiplex_filter}"
+Environment="MULTIPLEX_STREAM_NAME=${multiplex_name}"
 Environment="INVOCATION_ID=systemd"
 WorkingDirectory=${SCRIPT_DIR}
 
@@ -2250,6 +2809,21 @@ EOF
     
     echo "Systemd service created: $service_file"
     echo "Monitoring cron job created: /etc/cron.d/mediamtx-monitor"
+    echo ""
+    echo "=== Stream Mode Configuration ==="
+    echo "Current mode: ${stream_mode}"
+    if [[ "${stream_mode}" == "multiplex" ]]; then
+        echo "  Filter type: ${multiplex_filter}"
+        echo "  Stream name: ${multiplex_name}"
+    fi
+    echo ""
+    echo "To change mode after installation:"
+    echo "  sudo systemctl edit mediamtx-audio"
+    echo "  Add/modify: Environment=\"STREAM_MODE=multiplex\""
+    echo "  Add/modify: Environment=\"MULTIPLEX_FILTER_TYPE=amix\""
+    echo "  Add/modify: Environment=\"MULTIPLEX_STREAM_NAME=studio\""
+    echo "  Then: sudo systemctl daemon-reload && sudo systemctl restart mediamtx-audio"
+    echo ""
     echo "Enable: sudo systemctl enable mediamtx-audio"
     echo "Start: sudo systemctl start mediamtx-audio"
 }
@@ -2260,7 +2834,19 @@ show_help() {
 MediaMTX Stream Manager v${VERSION}
 Part of LyreBirdAudio - RTSP Audio Streaming Suite
 
-Usage: ${SCRIPT_NAME} [COMMAND]
+Usage: ${SCRIPT_NAME} [OPTIONS] COMMAND
+
+Options:
+    -m, --mode MODE      Stream mode (individual|multiplex) [default: individual]
+    -f, --filter TYPE    Multiplex filter type (amix|amerge) [default: amix]
+    -n, --name NAME      Multiplex stream name [default: all_mics]
+    -d, --debug          Enable debug output
+    -h, --help           Show this help message
+
+Environment Variables:
+    MULTIPLEX_FILTER_TYPE    Multiplex audio filter type [default: amix]
+                             - amix: Mix all audio sources into one output
+                             - amerge: Merge sources keeping channels separate
 
 Commands:
     start       Start MediaMTX and FFmpeg streams
@@ -2278,6 +2864,31 @@ Configuration files:
     MediaMTX config: ${CONFIG_FILE}
     System log: ${LOG_FILE}
     MediaMTX log: ${MEDIAMTX_LOG_FILE}
+
+Multiplex Mode Usage:
+    Individual mode (default):
+        sudo ./mediamtx-stream-manager.sh start
+        Creates separate RTSP streams for each USB microphone
+    
+    Multiplex mode - Mix audio (amix):
+        sudo ./mediamtx-stream-manager.sh -m multiplex -f amix start
+        # Or use default filter (amix)
+        sudo ./mediamtx-stream-manager.sh -m multiplex start
+        Mixes all microphones into a single audio stream
+        Output: rtsp://localhost:8554/${MULTIPLEX_STREAM_NAME}
+    
+    Multiplex mode - Separate channels (amerge):
+        sudo ./mediamtx-stream-manager.sh -m multiplex -f amerge start
+        Merges all microphones keeping channels separate
+        Output: Single stream with (num_devices * channels_per_device) total channels
+    
+    Custom stream name:
+        sudo ./mediamtx-stream-manager.sh -m multiplex -f amix -n studio start
+        Output: rtsp://localhost:8554/studio
+    
+    Environment variables (still supported):
+        sudo MULTIPLEX_FILTER_TYPE=amix ./mediamtx-stream-manager.sh -m multiplex start
+        sudo MULTIPLEX_STREAM_NAME=studio ./mediamtx-stream-manager.sh -m multiplex start
 
 Version ${VERSION} - Production Ready Fixes Applied:
 v1.4.2:
@@ -2314,11 +2925,72 @@ Exit Codes:
 EOF
 }
 
-# Main function
+# Main function with enhanced argument parsing
+parse_arguments() {
+    # Parse options
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -m|--mode)
+                shift
+                STREAM_MODE="${1}"
+                if [[ "${STREAM_MODE}" != "individual" ]] && [[ "${STREAM_MODE}" != "multiplex" ]]; then
+                    echo "Error: Invalid stream mode '${STREAM_MODE}'. Use 'individual' or 'multiplex'" >&2
+                    exit 1
+                fi
+                shift
+                ;;
+            -f|--filter)
+                shift
+                MULTIPLEX_FILTER_TYPE="${1}"
+                if [[ "${MULTIPLEX_FILTER_TYPE}" != "amix" ]] && [[ "${MULTIPLEX_FILTER_TYPE}" != "amerge" ]]; then
+                    echo "Error: Invalid filter type '${MULTIPLEX_FILTER_TYPE}'. Use 'amix' or 'amerge'" >&2
+                    exit 1
+                fi
+                shift
+                ;;
+            -n|--name)
+                shift
+                MULTIPLEX_STREAM_NAME="${1}"
+                shift
+                ;;
+            -d|--debug)
+                export DEBUG=true
+                shift
+                ;;
+            -h|--help)
+                show_help
+                exit 0
+                ;;
+            -*)
+                echo "Error: Unknown option '$1'" >&2
+                show_help
+                exit 1
+                ;;
+            *)
+                # This is the command - return it and preserve remaining args
+                COMMAND="$1"
+                return 0
+                ;;
+        esac
+    done
+    
+    # No command specified
+    COMMAND="help"
+}
+
 main() {
     local exit_code=0
     
-    case "${1:-help}" in
+    # Parse arguments
+    COMMAND=""
+    parse_arguments "$@"
+    
+    # Log stream mode if set
+    if [[ -n "${STREAM_MODE}" ]] && [[ "${STREAM_MODE}" != "individual" ]]; then
+        log INFO "Stream mode: ${STREAM_MODE}"
+    fi
+    
+    case "${COMMAND}" in
         start)
             check_root
             check_dependencies
