@@ -1,17 +1,16 @@
 #!/bin/bash
 # mediamtx-stream-manager.sh - Mono-only: raw L/R + filtered L/R, Opus
-# Version: 1.6.0
+# Version: 1.6.1
 
 set -euo pipefail
 
-readonly VERSION="1.6.0"
+readonly VERSION="1.6.1"
 SCRIPT_NAME="$(basename "${BASH_SOURCE[0]}")"
 readonly SCRIPT_NAME
 
 # ========= Paths =========
 readonly CONFIG_DIR="/etc/mediamtx"
 readonly CONFIG_FILE="${CONFIG_DIR}/mediamtx.yml"
-readonly DEVICE_CONFIG_FILE="${CONFIG_DIR}/audio-devices.conf"   # reserved
 readonly PID_FILE="/var/run/mediamtx-audio.pid"
 readonly FFMPEG_PID_DIR="/var/lib/mediamtx-ffmpeg"
 readonly LOCK_FILE="/var/run/mediamtx-audio.lock"
@@ -20,14 +19,14 @@ readonly MEDIAMTX_LOG_FILE="/var/log/mediamtx.out"
 readonly MEDIAMTX_BIN="/usr/local/bin/mediamtx"
 readonly MEDIAMTX_HOST="localhost"
 
-# ========= Settings (mono sources only) =========
+# ========= Settings =========
 readonly DEFAULT_SAMPLE_RATE="48000"
-readonly DEFAULT_CHANNELS="2"            # device input is stereo; outputs are mono
+readonly DEFAULT_CHANNELS="2"            # capture stereo → split to mono
 readonly DEFAULT_CODEC="opus"
 readonly DEFAULT_MONO_BITRATE="64k"
 readonly DEFAULT_FILTERS="highpass=f=800,lowpass=f=10000,aresample=async=1:first_pts=0"
 
-# ========= Global state =========
+# ========= Globals =========
 declare -gi MAIN_LOCK_FD=-1
 declare -g STOPPING_SERVICE=false
 
@@ -81,17 +80,12 @@ cleanup_stale_processes() {
 }
 
 detect_audio_devices() {
-  local output
-  output=$(arecord -l 2>/dev/null) || return 1
+  local output; output=$(arecord -l 2>/dev/null) || return 1
   local -a devices
   while IFS= read -r line; do
     if [[ "$line" =~ card\ ([0-9]+):\ ([^,]+) ]]; then
-      local card_num="${BASH_REMATCH[1]}"
-      local card_name="${BASH_REMATCH[2]}"
-      # Only USB cards (heuristic)
-      if [[ -f "/proc/asound/card${card_num}/usbid" ]]; then
-        devices+=("${card_name}:${card_num}")
-      fi
+      local card_num="${BASH_REMATCH[1]}"; local card_name="${BASH_REMATCH[2]}"
+      [[ -f "/proc/asound/card${card_num}/usbid" ]] && devices+=("${card_name}:${card_num}")
     fi
   done <<< "$output"
   [[ ${#devices[@]} -gt 0 ]] || return 1
@@ -115,13 +109,11 @@ wait_for_mediamtx_ready() {
   for _ in {1..30}; do
     kill -0 "$pid" 2>/dev/null || { log ERROR "MediaMTX died"; return 1; }
     if command_exists curl && curl -s --max-time 2 "http://${MEDIAMTX_HOST}:9997/v3/paths/list" >/dev/null 2>&1; then
-      log INFO "MediaMTX API ready"
-      return 0
+      log INFO "MediaMTX API ready"; return 0
     fi
     sleep 1
   done
-  log ERROR "MediaMTX API timeout"
-  return 1
+  log ERROR "MediaMTX API timeout"; return 1
 }
 
 generate_mediamtx_config() {
@@ -144,23 +136,13 @@ EOF
 }
 
 start_ffmpeg_stream() {
-  local device_name="$1"
-  local card_num="$2"
-  local stream_name="$3"
+  local device_name="$1"; local card_num="$2"; local stream_name="$3"
 
-  log INFO "Starting stream (mono raw L/R + mono filtered L/R): $stream_name (card $card_num)"
-
+  log INFO "Starting mono stream set: $stream_name (card $card_num)"
   local wrapper="${FFMPEG_PID_DIR}/${stream_name}.sh"
   local log_file="${FFMPEG_PID_DIR}/${stream_name}.log"
-
   mkdir -p "${FFMPEG_PID_DIR}"
 
-  # Filter graph:
-  # 1) Split stereo into [L][R] mono with channelsplit
-  # 2) Split each into raw+filtered branches; apply DEFAULT_FILTERS to filtered branches
-  #    [L]asplit=2[Lu][Lf]; [Lf]DEFAULT_FILTERS[Lfx]
-  #    [R]asplit=2[Ru][Rf]; [Rf]DEFAULT_FILTERS[Rfx]
-  # 3) Map Lu,Ru,Lfx,Rfx -> four mono RTSP outputs
   cat > "$wrapper" << EOF
 #!/bin/bash
 while true; do
@@ -173,9 +155,9 @@ while true; do
 [Lf]${DEFAULT_FILTERS}[Lfx]; \
 [R]asplit=2[Ru][Rf]; \
 [Rf]${DEFAULT_FILTERS}[Rfx]" \
-    -map "[Lu]" -ac 1 -c:a ${DEFAULT_CODEC} -b:a ${DEFAULT_MONO_BITRATE} -application audio -vbr on \
+    -map "[Lu]"  -ac 1 -c:a ${DEFAULT_CODEC} -b:a ${DEFAULT_MONO_BITRATE} -application audio -vbr on \
       -f rtsp -rtsp_transport tcp rtsp://${MEDIAMTX_HOST}:8554/${stream_name}_left_raw \
-    -map "[Ru]" -ac 1 -c:a ${DEFAULT_CODEC} -b:a ${DEFAULT_MONO_BITRATE} -application audio -vbr on \
+    -map "[Ru]"  -ac 1 -c:a ${DEFAULT_CODEC} -b:a ${DEFAULT_MONO_BITRATE} -application audio -vbr on \
       -f rtsp -rtsp_transport tcp rtsp://${MEDIAMTX_HOST}:8554/${stream_name}_right_raw \
     -map "[Lfx]" -ac 1 -c:a ${DEFAULT_CODEC} -b:a ${DEFAULT_MONO_BITRATE} -application audio -vbr on \
       -f rtsp -rtsp_transport tcp rtsp://${MEDIAMTX_HOST}:8554/${stream_name}_left_filt \
@@ -199,13 +181,11 @@ start_mediamtx() {
   cleanup_stale_processes
 
   log INFO "Starting MediaMTX..."
-  local -a devices
-  mapfile -t devices < <(detect_audio_devices)
+  local -a devices; mapfile -t devices < <(detect_audio_devices)
   [[ ${#devices[@]} -gt 0 ]] || error_exit "No USB audio devices found"
-
   log INFO "Found ${#devices[@]} USB audio device(s)"
-  generate_mediamtx_config
 
+  generate_mediamtx_config
   nohup "${MEDIAMTX_BIN}" "${CONFIG_FILE}" >> "${MEDIAMTX_LOG_FILE}" 2>&1 &
   local pid=$!; echo "$pid" > "${PID_FILE}"
   sleep 1
@@ -213,21 +193,21 @@ start_mediamtx() {
   wait_for_mediamtx_ready "$pid" || error_exit "MediaMTX not ready"
   log INFO "MediaMTX started (PID: $pid)"
 
-  for device_info in "${devices[@]}"; do
-    IFS=':' read -r device_name card_num <<< "$device_info"
+  for dev in "${devices[@]}"; do
+    IFS=':' read -r device_name card_num <<< "$dev"
     local stream_name; stream_name="$(generate_stream_name "$device_name")"
     start_ffmpeg_stream "$device_name" "$card_num" "$stream_name"
   done
 
-  echo
-  echo -e "${GREEN}=== Available RTSP Streams ===${NC}"
-  for device_info in "${devices[@]}"; do
-    IFS=':' read -r device_name card_num <<< "$device_info"
+  echo; echo -e "${GREEN}=== Available RTSP Streams ===${NC}"
+  for dev in "${devices[@]}"; do
+    IFS=':' read -r device_name card_num <<< "$dev"
     local stream_name; stream_name="$(generate_stream_name "$device_name")"
-    echo -e "${GREEN}✔${NC} rtsp://${MEDIAMTX_HOST}:8554/${stream_name}_left_raw"
-    echo -e "   rtsp://${MEDIAMTX_HOST}:8554/${stream_name}_right_raw"
-    echo -e "   rtsp://${MEDIAMTX_HOST}:8554/${stream_name}_left_filt"
-    echo -e "   rtsp://${MEDIAMTX_HOST}:8554/${stream_name}_right_filt"
+    echo -e "${GREEN}✔${NC} ${stream_name}:"
+    echo "   rtsp://${MEDIAMTX_HOST}:8554/${stream_name}_left_raw"
+    echo "   rtsp://${MEDIAMTX_HOST}:8554/${stream_name}_right_raw"
+    echo "   rtsp://${MEDIAMTX_HOST}:8554/${stream_name}_left_filt"
+    echo "   rtsp://${MEDIAMTX_HOST}:8554/${stream_name}_right_filt"
   done
   echo
   release_lock
@@ -257,14 +237,12 @@ show_status() {
   fi
   echo
   echo "USB Audio Devices:"
-
-  local -a devices
-  mapfile -t devices < <(detect_audio_devices 2>/dev/null || true)
+  local -a devices; mapfile -t devices < <(detect_audio_devices 2>/dev/null || true)
   if [[ ${#devices[@]} -eq 0 ]]; then
     echo "  No devices found"
   else
-    for device_info in "${devices[@]}"; do
-      IFS=':' read -r device_name card_num <<< "$device_info"
+    for dev in "${devices[@]}"; do
+      IFS=':' read -r device_name card_num <<< "$dev"
       local stream_name; stream_name="$(generate_stream_name "$device_name")"
       echo "  - $device_name (card $card_num)"
       echo "    Streams:"
@@ -310,7 +288,7 @@ main() {
       echo "Usage: $SCRIPT_NAME {start|stop|restart|status}"
       exit 1
       ;;
-  }
+  esac
 }
 
 main "$@"
