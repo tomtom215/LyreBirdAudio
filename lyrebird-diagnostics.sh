@@ -7,14 +7,22 @@
 # system components, USB audio devices, MediaMTX service, and streaming health.
 # Generates production-ready diagnostic bundles for GitHub issue submission.
 #
-# Version: 1.0.0
+# Version: 1.0.1
 # Requires: bash 4.4+, standard GNU/Linux utilities (no external dependencies)
 # Compatible: Ubuntu 20.04+, Debian 11+, Raspberry Pi OS, Alpine Linux
+#
+# v1.0.1 Enhancement Release:
+#   - IMPROVED: Audio device detection uses battle-tested logic from usb-audio-mapper.sh
+#   - Checks /proc/asound/card{N}/usbid for definitive USB device identification
+#   - Clear separation: "USB Audio Devices" (what matters) vs "System Audio Cards" (all hardware)
+#   - Output format: "USB Audio Devices: N device(s)" followed by system breakdown
+#   - FIXED: Udev rules detection now counts actual rules (non-empty, non-comment lines)
+#   - Addresses user confusion about HDMI/onboard audio being included in counts
 
 set -euo pipefail
 
 # Script metadata
-readonly SCRIPT_VERSION="1.0.0"
+readonly SCRIPT_VERSION="1.0.1"
 declare SCRIPT_NAME
 SCRIPT_NAME="$(basename "${BASH_SOURCE[0]}")"
 readonly SCRIPT_NAME
@@ -613,7 +621,11 @@ get_stream_source_count() {
     fi
     
     local count
-    count=$(($(grep -c "source:" "${MEDIAMTX_DEVICE_CONFIG}" 2>/dev/null) + 0))
+    count=$(grep -c "source:" "${MEDIAMTX_DEVICE_CONFIG}" 2>/dev/null || true)
+    count=${count:-0}
+    if [[ ! "${count}" =~ ^[0-9]+$ ]]; then
+        count=0
+    fi
     echo "${count}"
 }
 
@@ -1022,7 +1034,13 @@ get_alsa_modules() {
         return
     fi
     
-    lsmod 2>/dev/null | grep -cE "^snd|^soundcore"
+    local count
+    count=$(lsmod 2>/dev/null | grep -cE "^snd|^soundcore" || true)
+    count=${count:-0}
+    if [[ ! "${count}" =~ ^[0-9]+$ ]]; then
+        count=0
+    fi
+    echo "${count}"
 }
 
 # Validate MediaMTX config is valid YAML
@@ -1627,8 +1645,9 @@ check_system_info() {
     
     if [[ -f "/proc/cpuinfo" ]]; then
         local cpu_count
-        cpu_count=$(($(grep -c "^processor" /proc/cpuinfo 2>/dev/null) + 0))
-        if [[ "${cpu_count}" -gt 0 ]]; then
+        cpu_count=$(grep -c "^processor" /proc/cpuinfo 2>/dev/null || true)
+        cpu_count=${cpu_count:-0}
+        if [[ "${cpu_count}" =~ ^[0-9]+$ ]] && (( cpu_count > 0 )); then
             print_status "CPU Count" "INFO" "${cpu_count} core(s)"
         fi
     fi
@@ -1650,7 +1669,7 @@ check_system_info() {
     fi
 }
 
-# Diagnostic Check 3: USB Devices
+# Diagnostic Check 3: USB Devices - IMPROVED VERSION with battle-tested logic
 check_usb_devices() {
     print_section "4. USB AUDIO DEVICES"
     
@@ -1661,18 +1680,68 @@ check_usb_devices() {
     print_status "ALSA Status" "PASS" "ALSA subsystem available"
     
     if [[ -f "/proc/asound/cards" ]]; then
-        local card_count
-        card_count=$(($(grep -c "^[0-9]" /proc/asound/cards 2>/dev/null) + 0))
+        local card_count=0
+        local usb_count=0
+        local hdmi_count=0
+        local other_count=0
+        
+        # Read /proc/asound/cards to get card numbers
+        # Format: " 0 [DeviceName]" with leading space
+        while IFS= read -r line; do
+            # Match card number lines (leading space + digit + space + [name])
+            if [[ "${line}" =~ ^\ ([0-9]+)\ \[([^\]]+)\] ]]; then
+                local card_num="${BASH_REMATCH[1]}"
+                local card_name="${BASH_REMATCH[2]}"
+                ((++card_count))
+                
+                # Battle-tested logic from usb-audio-mapper.sh:
+                # Check /proc/asound/card{N}/usbid to definitively determine if USB
+                local card_dir="/proc/asound/card${card_num}"
+                if [[ -f "${card_dir}/usbid" ]]; then
+                    # Definitive USB audio device (has USB vendor:product ID)
+                    ((++usb_count))
+                    log DEBUG "Card ${card_num} (${card_name}): USB device (has usbid)"
+                elif [[ "${card_name}" =~ HDMI ]] || [[ "${card_name}" =~ vc4-hdmi ]]; then
+                    # HDMI audio device (by name, no USB ID)
+                    ((++hdmi_count))
+                    log DEBUG "Card ${card_num} (${card_name}): HDMI device"
+                else
+                    # Other audio device (PCI, onboard, etc.)
+                    ((++other_count))
+                    log DEBUG "Card ${card_num} (${card_name}): Other device type"
+                fi
+            fi
+        done < /proc/asound/cards
         
         if [[ "${card_count}" -eq 0 ]]; then
             print_status "Audio Devices" "WARN" "No audio devices found"
         else
-            print_status "Audio Devices" "PASS" "Found ${card_count} audio device(s)"
+            # Report USB audio devices first (what matters for LyreBirdAudio)
+            if [[ "${usb_count}" -gt 0 ]]; then
+                print_status "USB Audio Devices" "PASS" "${usb_count} device(s)"
+            else
+                print_status "USB Audio Devices" "WARN" "No USB audio devices detected"
+            fi
+            
+            # Show system breakdown for context (includes HDMI, onboard audio, etc.)
+            if [[ "${hdmi_count}" -gt 0 ]] || [[ "${other_count}" -gt 0 ]]; then
+                local system_detail="Total system: ${card_count} card(s) ("
+                
+                [[ "${usb_count}" -gt 0 ]] && system_detail="${system_detail}USB: ${usb_count}, "
+                [[ "${hdmi_count}" -gt 0 ]] && system_detail="${system_detail}HDMI: ${hdmi_count}, "
+                [[ "${other_count}" -gt 0 ]] && system_detail="${system_detail}Other: ${other_count}, "
+                
+                # Remove trailing comma and space, add closing paren
+                system_detail="${system_detail%, })"
+                
+                print_status "System Audio Cards" "INFO" "${system_detail}"
+            fi
         fi
     else
         print_status "Audio Devices" "WARN" "Cannot read /proc/asound/cards"
     fi
     
+    # Check USB subsystem for total USB device count
     if [[ -d "/sys/bus/usb/devices" ]]; then
         local usb_audio_count=0
         local usb_device
@@ -1692,10 +1761,17 @@ check_usb_devices() {
         print_status "USB Devices" "WARN" "Cannot check USB devices"
     fi
     
+    # Check udev persistence rules
     local udev_rules_file="/etc/udev/rules.d/99-usb-soundcards.rules"
     if [[ -f "${udev_rules_file}" ]]; then
         local rule_count
-        rule_count=$(($(grep -c "SUBSYSTEMS" "${udev_rules_file}" 2>/dev/null) + 0))
+        # Count non-empty, non-comment lines (actual rules)
+        rule_count=$(grep -cvE '^\s*(#|$)' "${udev_rules_file}" 2>/dev/null || true)
+        rule_count=${rule_count:-0}
+        if [[ ! "${rule_count}" =~ ^[0-9]+$ ]]; then
+            rule_count=0
+        fi
+        
         if [[ "${rule_count}" -gt 0 ]]; then
             print_status "USB Persistence" "PASS" "Found ${rule_count} udev rule(s)"
         else
@@ -1735,7 +1811,12 @@ check_audio_capabilities() {
     
     if has_command ffmpeg; then
         local encoders
-        encoders=$(($(ffmpeg -encoders 2>/dev/null | grep -c "aac\|opus\|mp3") + 0))
+        encoders=$(ffmpeg -encoders 2>/dev/null | grep -c "aac\|opus\|mp3" || true)
+        encoders=${encoders:-0}
+        if [[ ! "${encoders}" =~ ^[0-9]+$ ]]; then
+            encoders=0
+        fi
+        
         if [[ "${encoders}" -gt 0 ]]; then
             print_status "Codecs" "PASS" "Audio codecs available (ffmpeg)"
         else
@@ -1781,7 +1862,12 @@ check_mediamtx_service() {
     if is_readable "${config_file}"; then
         local path_count
         # Match any YAML key with flexible indentation (spaces or tabs) and any valid identifier
-        path_count=$(($(grep -cE "^[[:space:]]+[a-zA-Z0-9_-]+:" "${config_file}" 2>/dev/null) + 0))
+        path_count=$(grep -cE "^[[:space:]]+[a-zA-Z0-9_-]+:" "${config_file}" 2>/dev/null || true)
+        path_count=${path_count:-0}
+        if [[ ! "${path_count}" =~ ^[0-9]+$ ]]; then
+            path_count=0
+        fi
+        
         if [[ ${path_count} -gt 0 ]]; then
             print_status "Device Config" "PASS" "Found with ${path_count} RTSP path(s) configured"
         else
@@ -2178,7 +2264,11 @@ check_service_configuration() {
     
     if systemctl list-unit-files "mediamtx*" 2>/dev/null | grep -q mediamtx; then
         local service_count
-        service_count=$(($(systemctl list-unit-files "mediamtx*" 2>/dev/null | grep -c mediamtx)))
+        service_count=$(systemctl list-unit-files "mediamtx*" 2>/dev/null | grep -c mediamtx || true)
+        service_count=${service_count:-0}
+        if [[ ! "${service_count}" =~ ^[0-9]+$ ]]; then
+            service_count=0
+        fi
         print_status "Registered Services" "INFO" "Found ${service_count} service(s)"
     fi
 }
