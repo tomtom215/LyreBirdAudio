@@ -380,8 +380,14 @@ sanitize_device_name() {
     local name="$1"
     local sanitized
     
+    # Remove all non-ASCII characters first, then clean up
+    sanitized=$(printf '%s' "$name" | iconv -f UTF-8 -t ASCII//TRANSLIT 2>/dev/null || printf '%s' "$name")
+    
     # Convert to uppercase, replace non-alphanumeric with underscore
-    sanitized=$(printf '%s' "$name" | tr '[:lower:]' '[:upper:]' | sed 's/[^A-Z0-9]/_/g; s/__*/_/g; s/^_//; s/_$//')
+    sanitized=$(printf '%s' "$sanitized" | tr '[:lower:]' '[:upper:]' | sed 's/[^A-Z0-9]/_/g; s/__*/_/g; s/^_//; s/_$//')
+    
+    # Remove any remaining problematic characters
+    sanitized=$(printf '%s' "$sanitized" | tr -cd 'A-Z0-9_')
     
     [[ "$sanitized" =~ ^[0-9] ]] && sanitized="DEV_${sanitized}"
     [[ -z "$sanitized" ]] && sanitized="UNKNOWN_$(date +%s)"
