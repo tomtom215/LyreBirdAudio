@@ -3,7 +3,7 @@
 # Part of LyreBirdAudio - RTSP Audio Streaming Suite
 # https://github.com/tomtom215/LyreBirdAudio
 #
-# Version: 1.4.1 - UI/UX Improvements & Production Hardening Release
+# Version: 1.4.2 - Enhanced Branch Selection & UX Clarity
 #
 # This script provides safe, reliable version management with:
 #   - Atomic operations with automatic rollback on failure
@@ -39,7 +39,7 @@ SCRIPT_NAME="$(basename "${BASH_SOURCE[0]}")"
 readonly SCRIPT_NAME
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly SCRIPT_DIR
-readonly VERSION="1.4.1"
+readonly VERSION="1.4.2"
 LOCKFILE="${SCRIPT_DIR}/.lyrebird-updater.lock"
 readonly LOCKFILE
 
@@ -161,6 +161,14 @@ acquire_lock() {
     local max_wait=30
     local waited=0
     
+    # Verify SCRIPT_DIR is writable before attempting lock file operations
+    if [[ ! -w "$SCRIPT_DIR" ]]; then
+        log_error "Cannot write to script directory: $SCRIPT_DIR"
+        log_info "The lock file needs to be created in this directory"
+        log_info "Permission denied or directory is read-only"
+        return "$E_PERMISSION"
+    fi
+    
     while [[ -f "$LOCKFILE" ]]; do
         if [[ $waited -ge $max_wait ]]; then
             log_error "Another instance of this script is running"
@@ -182,8 +190,19 @@ acquire_lock() {
 # shellcheck disable=SC2317  # Function invoked indirectly via cleanup
 release_lock() {
     if [[ -f "$LOCKFILE" ]]; then
+        # Verify lock file is readable before attempting operations
+        if [[ ! -r "$LOCKFILE" ]]; then
+            log_debug "Lock file exists but is not readable (permissions issue)"
+            return 0
+        fi
+        
         local lock_pid
         lock_pid=$(cat "$LOCKFILE" 2>/dev/null || echo "")
+        
+        if [[ -z "$lock_pid" ]]; then
+            log_debug "Lock file exists but is empty or unreadable"
+            return 0
+        fi
         
         if [[ "$lock_pid" == "$$" ]]; then
             rm -f "$LOCKFILE"
@@ -227,6 +246,27 @@ trap 'log_error "Script interrupted by user"; exit $E_USER_ABORT' INT TERM
 
 check_prerequisites() {
     log_debug "Checking prerequisites..."
+    
+    # IMPORTANT: Warn if running with sudo or as root
+    if [[ "${SUDO_USER:-}" != "" ]] || [[ "$EUID" -eq 0 ]]; then
+        log_warn "⚠️  WARNING: This script is running with root/sudo privileges"
+        log_warn "This may change file ownership in the repository"
+        echo
+        
+        if [[ "${SUDO_USER:-}" != "" ]]; then
+            log_info "You used: sudo ./lyrebird-updater.sh"
+            log_info "This is usually NOT needed. Try running without sudo"
+        else
+            log_warn "Running directly as root is not recommended"
+        fi
+        echo
+        
+        if ! confirm_action "Continue anyway? (may modify file ownership)"; then
+            log_error "Cancelled by user"
+            return "$E_USER_ABORT"
+        fi
+        echo
+    fi
     
     # Check for git
     if ! command -v git >/dev/null 2>&1; then
@@ -432,32 +472,63 @@ validate_clean_state() {
 get_default_branch() {
     log_debug "Detecting default branch..."
     
-    # Try to get from remote HEAD
-    local remote_default
-    if remote_default="$(git ls-remote --symref origin HEAD 2>/dev/null | awk '/^ref:/ {sub(/refs\/heads\//, "", $2); print $2; exit}')"; then
-        if [[ -n "$remote_default" ]]; then
-            log_debug "Default branch from remote: $remote_default"
-            echo "$remote_default"
+    # Special handling for git-flow: if both main and develop exist, develop is development branch
+    local has_develop=false
+    local has_main=false
+    local remote_head=""
+    
+    # Check what branches exist
+    if git show-ref --verify --quiet refs/remotes/origin/develop 2>/dev/null; then
+        has_develop=true
+        log_debug "Found develop branch"
+    fi
+    
+    if git show-ref --verify --quiet refs/remotes/origin/main 2>/dev/null; then
+        has_main=true
+        log_debug "Found main branch"
+    fi
+    
+    # Git-flow pattern: both main and develop exist → develop is development
+    if [[ "$has_develop" == "true" && "$has_main" == "true" ]]; then
+        log_debug "Git-flow detected (both main and develop exist) → using develop as development branch"
+        echo "develop"
+        return 0
+    fi
+    
+    # Try to get remote HEAD (but only use if not in git-flow pattern)
+    if remote_head="$(git ls-remote --symref origin HEAD 2>/dev/null | awk '/^ref:/ {sub(/refs\/heads\//, "", $2); print $2; exit}')"; then
+        if [[ -n "$remote_head" ]]; then
+            log_debug "Remote HEAD points to: $remote_head"
+            echo "$remote_head"
             return 0
         fi
     fi
     
-    # Check if main exists
-    if git show-ref --verify --quiet refs/remotes/origin/main 2>/dev/null; then
-        log_debug "Default branch: main"
+    log_debug "Remote HEAD detection failed, checking local branches..."
+    
+    # Check for develop (single develop branch without main)
+    if [[ "$has_develop" == "true" ]]; then
+        log_debug "Default branch: develop (git-flow single)"
+        echo "develop"
+        return 0
+    fi
+    
+    # Check for main (GitHub modern)
+    if [[ "$has_main" == "true" ]]; then
+        log_debug "Default branch: main (GitHub)"
         echo "main"
         return 0
     fi
     
-    # Check if master exists
+    # Check for master (legacy)
     if git show-ref --verify --quiet refs/remotes/origin/master 2>/dev/null; then
-        log_debug "Default branch: master"
+        log_debug "Default branch: master (legacy)"
         echo "master"
         return 0
     fi
     
-    # Fallback to main
-    log_debug "Default branch: main (fallback)"
+    # Fallback
+    log_debug "No standard branches found, using fallback: main"
     echo "main"
     return 0
 }
@@ -831,6 +902,22 @@ switch_version_safe() {
     # Perform the checkout
     log_step "Switching to version: $target_version"
     
+    # Verify write permissions to working directory before checkout
+    local repo_root
+    repo_root="$(git rev-parse --show-toplevel 2>/dev/null)"
+    if [[ -z "$repo_root" ]]; then
+        log_error "Could not determine repository root"
+        transaction_rollback
+        return "$E_GENERAL"
+    fi
+    
+    if [[ ! -w "$repo_root" ]]; then
+        log_error "No write permission for working directory: $repo_root"
+        log_info "To fix: sudo chown -R $USER:$USER $repo_root"
+        transaction_rollback
+        return "$E_PERMISSION"
+    fi
+    
     local checkout_output
     if ! checkout_output=$(git checkout "$target_version" 2>&1); then
         log_error "Failed to switch to version: $target_version"
@@ -862,7 +949,12 @@ switch_version_safe() {
         log_info "Restarting with updated version..."
         
         # Make sure new script is executable
-        chmod +x "./$SCRIPT_NAME" 2>/dev/null || true
+        if ! chmod +x "./$SCRIPT_NAME" 2>/dev/null; then
+            log_error "Failed to make new script executable"
+            log_error "Self-update cannot proceed"
+            transaction_rollback
+            return "$E_PERMISSION"
+        fi
         
         # Prepare restart arguments
         local restart_args=()
@@ -1001,7 +1093,10 @@ set_script_permissions() {
     
     for script in "${scripts[@]}"; do
         if [[ -f "$script" ]]; then
-            chmod +x "$script" 2>/dev/null || true
+            if ! chmod +x "$script" 2>/dev/null; then
+                log_warn "Could not set executable permission on $script (permission denied)"
+                log_debug "This may cause issues when running $script"
+            fi
         fi
     done
     
@@ -1043,19 +1138,30 @@ list_available_releases() {
     fi
     
     echo
-    echo "${BOLD}Development Branches (active development, may contain bugs):${NC}"
+    echo "${BOLD}Development & Feature Branches (select any to switch):${NC}"
+    echo "  The '${DEFAULT_BRANCH}' branch is where active development happens."
+    echo
     
     local branch_counter=$((${#AVAILABLE_VERSIONS[@]} + 1))
-    if git branch -r | grep -v HEAD | sed 's/origin\///' | sed 's/^[[:space:]]*//' | grep -q .; then
+    local git_branches
+    git_branches=$(git branch -r | grep -v HEAD | sed 's/origin\///' | sed 's/^[[:space:]]*//')
+    
+    if [[ -n "$git_branches" ]]; then
         while IFS= read -r branch; do
-            printf "  %2d) %s\n" "$branch_counter" "$branch"
+            if [[ "$branch" == "$DEFAULT_BRANCH" ]]; then
+                printf "  %2d) %s %s\n" "$branch_counter" "$branch" "(development)"
+            else
+                printf "  %2d) %s\n" "$branch_counter" "$branch"
+            fi
             AVAILABLE_VERSIONS+=("$branch")
             ((branch_counter++))
-        done < <(git branch -r | grep -v HEAD | sed 's/origin\///' | sed 's/^[[:space:]]*//')
+        done <<< "$git_branches"
     else
         echo "  (no development branches found)"
     fi
     
+    echo
+    echo "${CYAN}Tip: You can also enter any commit hash or branch name directly${NC}"
     echo
 }
 
@@ -1070,8 +1176,10 @@ select_version_interactive() {
     list_available_releases
     
     echo "You can enter:"
-    echo "  - A number from the list (e.g., 1)"
-    echo "  - A version name directly (e.g., v1.2.0 or main)"
+    echo "  - A number from the list (e.g., 1, 5)"
+    echo "  - A tag directly (e.g., v1.2.0)"
+    echo "  - A branch name (e.g., ${DEFAULT_BRANCH}, feature/streaming)"
+    echo "  - A commit hash (e.g., abc1234)"
     echo "  - Press Enter to cancel"
     echo
     read -r -p "Your selection: " selection
@@ -1168,6 +1276,13 @@ show_status() {
         echo "  Branch:     ${BOLD}$CURRENT_BRANCH${NC}"
         echo "  Commit:     ${BOLD}$CURRENT_VERSION${NC}"
         
+        # Show branch type
+        if [[ "$CURRENT_BRANCH" == "$DEFAULT_BRANCH" ]]; then
+            echo "  Type:       ${CYAN}Development (where new features are added)${NC}"
+        else
+            echo "  Type:       Feature/Release branch"
+        fi
+        
         # Check if on a tag
         local current_tag
         current_tag=$(git describe --exact-match --tags HEAD 2>/dev/null || echo "")
@@ -1231,7 +1346,9 @@ show_status() {
     if [[ -f ".git/FETCH_HEAD" ]]; then
         if command -v stat >/dev/null 2>&1; then
             last_fetch=$(stat -c %y ".git/FETCH_HEAD" 2>/dev/null | cut -d'.' -f1 || \
-                        stat -f %Sm ".git/FETCH_HEAD" 2>/dev/null || echo "unknown")
+                        stat -f %Sm ".git/FETCH_HEAD" 2>/dev/null || echo "unknown") || last_fetch="unknown"
+            # Ensure last_fetch is not empty (fallback for edge case where stat succeeds but produces no output)
+            [[ -z "$last_fetch" ]] && last_fetch="unknown"
         fi
     fi
     echo "  Last fetch: $last_fetch"
@@ -1251,7 +1368,11 @@ show_startup_diagnostics() {
     if [[ "$IS_DETACHED" == "true" ]]; then
         echo "Current:  ${YELLOW}Viewing Release: ${BOLD}$CURRENT_VERSION${NC}${YELLOW} (not tracking a branch)${NC}"
     else
-        echo "Current:  ${GREEN}Branch ${BOLD}$CURRENT_BRANCH${NC} @ $CURRENT_VERSION"
+        if [[ "$CURRENT_BRANCH" == "$DEFAULT_BRANCH" ]]; then
+            echo "Current:  ${GREEN}Development Branch ${BOLD}$CURRENT_BRANCH${NC} @ $CURRENT_VERSION"
+        else
+            echo "Current:  ${CYAN}Branch ${BOLD}$CURRENT_BRANCH${NC} @ $CURRENT_VERSION"
+        fi
     fi
     
     if [[ "$HAS_LOCAL_CHANGES" == "true" ]]; then
@@ -1276,9 +1397,9 @@ show_startup_diagnostics() {
     fi
     
     if [[ "$fetch_ok" == "true" ]]; then
-        echo -e "          ${GREEN}✓${NC} Connected to GitHub"
+        echo "          ${GREEN}✓${NC} Connected to GitHub"
     else
-        echo -e "          ${YELLOW}!${NC} Could not connect (using cached data)"
+        echo "          ${YELLOW}!${NC} Could not connect (using cached data)"
     fi
     
     # Check for stable releases
@@ -1319,15 +1440,23 @@ show_startup_diagnostics() {
 ################################################################################
 
 show_help() {
-    cat << 'EOF'
+    cat << EOF
 
 ════════════════════════════════════════════════════════════════════════════════
    LyreBirdAudio Version Manager - Help Guide
 ════════════════════════════════════════════════════════════════════════════════
 
-SIMPLE UPDATE WORKFLOW:
-  For most users: Just select option 1
-  This updates you to the latest stable, tested version
+BRANCH TYPES:
+  • Stable Releases (tags like v1.2.0)
+    - Tested, production-ready versions
+    - Recommended for most users
+    - Updates released periodically
+
+  • Development Branch (${DEFAULT_BRANCH})
+    - Latest code with new features
+    - Where active development happens
+    - May contain bugs or incomplete features
+    - Good for testing new functionality
 
 ━━━ MAIN OPTIONS ━━━
 
@@ -1337,25 +1466,29 @@ SIMPLE UPDATE WORKFLOW:
    ↑ Automatically checks for updates
    ↑ Your changes will be saved temporarily
 
-2) Switch to Development Version
+2) Switch to Development Version (${DEFAULT_BRANCH})
    ↑ Latest code with newest features
+   ↑ Where new features are actively developed
    ↑ May have bugs or incomplete features
    ↑ For testing and development
    ↑ Your changes will be saved temporarily
 
-3) Switch to Specific Version
-   ↑ Choose any version from a list
-   ↑ Useful for testing or rollback
+3) Switch to Specific Version or Branch
+   ↑ Choose any stable release (tag), development branch, or feature branch
+   ↑ Full list shows all available options
+   ↑ Can input version name directly (v1.2.0, develop, feature/xyz)
+   ↑ Useful for testing, switching between branches, or rollback
    ↑ Your changes will be saved temporarily
 
 4) Check for New Updates
-   ↑ Downloads version information
+   ↑ Downloads version information from GitHub
    ↑ Doesn't change your current version
    ↑ Shows what's available
 
 5) Show Detailed Status
    ↑ Your current version and branch
-   ↑ Local modifications
+   ↑ What type of branch you're on
+   ↑ Local modifications status
    ↑ Sync status with remote
    ↑ Repository information
 
@@ -1385,6 +1518,9 @@ A: The script automatically tries to recover
 Q: How do I start fresh with no modifications?
 A: Use option 6 to reset to a clean state
 
+Q: What's the difference between stable and development?
+A: Stable = tested releases (v1.2.0). Development = latest code (${DEFAULT_BRANCH})
+
 ━━━ MORE HELP ━━━
 
 Visit: https://github.com/tomtom215/LyreBirdAudio
@@ -1408,7 +1544,11 @@ main_menu() {
         if [[ "$IS_DETACHED" == "true" ]]; then
             echo "  Current:  ${YELLOW}$CURRENT_VERSION${NC}"
         else
-            echo "  Current:  ${CYAN}$CURRENT_BRANCH${NC} @ ${BOLD}$CURRENT_VERSION${NC}"
+            if [[ "$CURRENT_BRANCH" == "$DEFAULT_BRANCH" ]]; then
+                echo "  Current:  ${GREEN}$CURRENT_BRANCH${NC} (development) @ ${BOLD}$CURRENT_VERSION${NC}"
+            else
+                echo "  Current:  ${CYAN}$CURRENT_BRANCH${NC} @ ${BOLD}$CURRENT_VERSION${NC}"
+            fi
         fi
         
         if [[ "$HAS_LOCAL_CHANGES" == "true" ]]; then
@@ -1421,10 +1561,10 @@ main_menu() {
         echo "${BOLD}━━━ UPDATE ━━━${NC}"
         echo "  ${BOLD}1${NC}) Switch to Latest Stable Release"
         echo "     (Newest tested version—recommended)"
-        echo "  ${BOLD}2${NC}) Switch to Development Version ($DEFAULT_BRANCH)"
-        echo "     (Latest code with new features—may have bugs)"
-        echo "  ${BOLD}3${NC}) Switch to Specific Version"
-        echo "     (Choose from older releases or branches)"
+        echo "  ${BOLD}2${NC}) Switch to Development Version (${DEFAULT_BRANCH})"
+        echo "     (Latest code with new features—where active development happens)"
+        echo "  ${BOLD}3${NC}) Switch to Specific Version or Branch"
+        echo "     (Any release tag, branch, or commit—full flexibility)"
         echo
         echo "${BOLD}━━━ INFO ━━━${NC}"
         echo "  ${BOLD}4${NC}) Check for New Updates"
@@ -1489,7 +1629,7 @@ reset_menu() {
         echo "Reset to:"
         echo "  ${BOLD}1${NC}) Latest remote version of current branch"
         echo "     (Only available if you're tracking a branch)"
-        echo "  ${BOLD}2${NC}) Latest development version ($DEFAULT_BRANCH)"
+        echo "  ${BOLD}2${NC}) Latest development version (${DEFAULT_BRANCH})"
         echo "  ${BOLD}3${NC}) Specific version (let me choose)"
         echo "  ${BOLD}C${NC}) Cancel"
         echo
@@ -1514,10 +1654,10 @@ reset_menu() {
                 return 0
                 ;;
             2)
-                if git show-ref --verify --quiet "refs/remotes/origin/$DEFAULT_BRANCH"; then
-                    reset_to_clean_state "origin/$DEFAULT_BRANCH"
+                if git show-ref --verify --quiet "refs/remotes/origin/${DEFAULT_BRANCH}"; then
+                    reset_to_clean_state "origin/${DEFAULT_BRANCH}"
                 else
-                    log_error "Development branch not found: origin/$DEFAULT_BRANCH"
+                    log_error "Development branch not found: origin/${DEFAULT_BRANCH}"
                     log_info "Try option 4 from main menu to fetch updates"
                 fi
                 read -r -p "Press Enter to continue..."
@@ -1585,7 +1725,7 @@ main() {
     # Configure git
     git config core.fileMode false 2>/dev/null || true
     
-    # Detect default branch
+    # Detect default branch (CRITICAL: Must be done early and consistently used)
     DEFAULT_BRANCH="$(get_default_branch)"
     log_debug "Default branch: $DEFAULT_BRANCH"
     
