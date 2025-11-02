@@ -148,36 +148,40 @@ start_ffmpeg_stream() {
     local device_name="$1"
     local card_num="$2"
     local stream_name="$3"
-    
-    log INFO "Starting stream: $stream_name (card $card_num)"
-    
+
+    log INFO "Starting stream (stereo + L/R): $stream_name (card $card_num)"
+
     local wrapper="${FFMPEG_PID_DIR}/${stream_name}.sh"
     local log_file="${FFMPEG_PID_DIR}/${stream_name}.log"
-    
+
     mkdir -p "${FFMPEG_PID_DIR}"
-    
+
     cat > "$wrapper" << EOF
 #!/bin/bash
 while true; do
-    ffmpeg -hide_banner -loglevel warning \\
-        -f alsa -ar ${DEFAULT_SAMPLE_RATE} -ac ${DEFAULT_CHANNELS} -i plughw:${card_num},0 \\
-        -af "aresample=async=1:first_pts=0" \\
-        -c:a ${DEFAULT_CODEC} -b:a ${DEFAULT_BITRATE} -application audio \\
-        -f rtsp -rtsp_transport tcp \\
-        rtsp://${MEDIAMTX_HOST}:8554/${stream_name} >> ${log_file} 2>&1
-    
-    echo "[\$(date)] FFmpeg exited, restarting in 5s" >> ${log_file}
-    sleep 5
+  ffmpeg -hide_banner -loglevel warning \
+    -thread_queue_size 512 \
+    -f alsa -ar ${DEFAULT_SAMPLE_RATE} -ac ${DEFAULT_CHANNELS} -i plughw:${card_num},0 \
+    -filter_complex "[0:a]${DEFAULT_FILTERS},asplit=3[st][L][R];[L]pan=mono|c0=FL[l];[R]pan=mono|c0=FR[r]" \
+    -map "[st]" -c:a ${DEFAULT_CODEC} -b:a ${DEFAULT_STEREO_BITRATE} -application audio -vbr on \
+      -f rtsp -rtsp_transport tcp rtsp://${MEDIAMTX_HOST}:8554/${stream_name} \
+    -map "[l]" -ac 1 -c:a ${DEFAULT_CODEC} -b:a ${DEFAULT_MONO_BITRATE} -application audio -vbr on \
+      -f rtsp -rtsp_transport tcp rtsp://${MEDIAMTX_HOST}:8554/${stream_name}_left \
+    -map "[r]" -ac 1 -c:a ${DEFAULT_CODEC} -b:a ${DEFAULT_MONO_BITRATE} -application audio -vbr on \
+      -f rtsp -rtsp_transport tcp rtsp://${MEDIAMTX_HOST}:8554/${stream_name}_right \
+    >> ${log_file} 2>&1
+
+  echo "[\$(date)] FFmpeg exited, restarting in 5s" >> ${log_file}
+  sleep 5
 done
 EOF
-    
+
     chmod +x "$wrapper"
     nohup bash "$wrapper" >/dev/null 2>&1 &
-    
+
     echo $! > "${FFMPEG_PID_DIR}/${stream_name}.pid"
     log INFO "Stream started: $stream_name (PID: $!)"
 }
-
 generate_mediamtx_config() {
     mkdir -p "${CONFIG_DIR}"
     
