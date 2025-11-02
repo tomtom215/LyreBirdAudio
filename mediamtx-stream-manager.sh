@@ -411,7 +411,6 @@ get_device_config() {
     fi
 }
 
-# NEW: Improved device detection using arecord (from quickfix)
 detect_audio_devices() {
     command_exists arecord || { log ERROR "arecord not found"; return 1; }
     
@@ -434,9 +433,14 @@ detect_audio_devices() {
         fi
     done <<< "$arecord_output"
     
-    [[ ${#devices[@]} -gt 0 ]] || { log WARN "No USB audio devices found"; return 1; }
+    if [[ ${#devices[@]} -eq 0 ]]; then
+        log ERROR "No USB audio devices found"
+        return 1
+    fi
     
+    # Output devices to stdout
     printf '%s\n' "${devices[@]}"
+    return 0
 }
 
 # NEW: Device accessibility test (from quickfix)
