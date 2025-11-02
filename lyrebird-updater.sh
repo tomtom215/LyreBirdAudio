@@ -1,1284 +1,1449 @@
 #!/bin/bash
-# lyrebird-updater.sh - Interactive LyreBirdAudio Version Manager
+# lyrebird-updater.sh - Production-Ready Version Manager
 # Part of LyreBirdAudio - RTSP Audio Streaming Suite
 # https://github.com/tomtom215/LyreBirdAudio
 #
-# This script provides an interactive interface for managing LyreBirdAudio versions,
-# handling git operations, and switching between releases safely.
+# Version: 1.4.1 - UI/UX Improvements & Production Hardening Release
 #
-# Version: 1.0.0 - Production Ready Release
-# Compatible with: LyreBirdAudio v1.0.0+
+# This script provides safe, reliable version management with:
+#   - Atomic operations with automatic rollback on failure
+#   - Comprehensive git state validation and recovery
+#   - Lock file protection against concurrent execution
+#   - Transaction-based stash management
+#   - Progressive error recovery with user guidance
+#   - Clear, non-technical UX for non-git-expert users
+#   - Network resilience with retries
 #
 # Prerequisites:
-#   - Git 2.0+ must be installed
-#   - Bash 4.0+ required
+#   - Git 2.0+ and Bash 4.0+
 #   - Must be run from within a cloned LyreBirdAudio git repository
-#   - Internet connection required for fetching updates
-#
-# This script REQUIRES a git repository and cannot work with non-git installations
 
-# Ensure we're running with bash
+# Ensure bash is being used
 if [ -z "$BASH_VERSION" ]; then
     echo "Error: This script requires bash. Please run with: bash $0 $*" >&2
     exit 1
 fi
 
-set -euo pipefail
+# Strict error handling
+set -o errexit   # Exit on any command failure
+set -o pipefail  # Catch errors in pipes
+set -o nounset   # Exit if uninitialized variable is used
+set -o errtrace  # Inherit ERR trap in functions
 
-# Script identification
+################################################################################
+# Constants and Configuration
+################################################################################
+
+# Script metadata
 SCRIPT_NAME="$(basename "${BASH_SOURCE[0]}")"
 readonly SCRIPT_NAME
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly SCRIPT_DIR
+readonly VERSION="1.4.1"
+LOCKFILE="${SCRIPT_DIR}/.lyrebird-updater.lock"
+readonly LOCKFILE
 
-# Version
-readonly VERSION="1.0.0"
-
-# Repository information
-readonly REPO_URL="https://github.com/tomtom215/LyreBirdAudio.git"
+# Repository configuration
 readonly REPO_OWNER="tomtom215"
 readonly REPO_NAME="LyreBirdAudio"
-
-# Minimum required versions
-readonly MIN_BASH_MAJOR=4
-readonly MIN_GIT_MAJOR=2
-
-# Initialize color codes (set before readonly)
-if [[ -t 1 ]] && command -v tput >/dev/null 2>&1 && tput colors &>/dev/null 2>&1; then
-    RED="$(tput setaf 1 2>/dev/null || echo "")"
-    GREEN="$(tput setaf 2 2>/dev/null || echo "")"
-    YELLOW="$(tput setaf 3 2>/dev/null || echo "")"
-    BLUE="$(tput setaf 4 2>/dev/null || echo "")"
-    CYAN="$(tput setaf 6 2>/dev/null || echo "")"
-    BOLD="$(tput bold 2>/dev/null || echo "")"
-    NC="$(tput sgr0 2>/dev/null || echo "")"
-else
-    RED=""
-    GREEN=""
-    YELLOW=""
-    BLUE=""
-    CYAN=""
-    BOLD=""
-    NC=""
-fi
-readonly RED GREEN YELLOW BLUE CYAN BOLD NC
+readonly REPO_URL="https://github.com/${REPO_OWNER}/${REPO_NAME}.git"
 
 # Exit codes
 readonly E_SUCCESS=0
 readonly E_GENERAL=1
-readonly E_NOT_GIT_REPO=2
-readonly E_GIT_ERROR=3
-readonly E_USER_ABORT=4
-readonly E_NETWORK_ERROR=5
-readonly E_MERGE_CONFLICT=6
-readonly E_PREREQUISITES=7
+readonly E_PREREQUISITES=2
+readonly E_NOT_GIT_REPO=3
+readonly E_NO_REMOTE=4
+readonly E_PERMISSION=5
+readonly E_LOCKED=7
+readonly E_BAD_STATE=8
+readonly E_USER_ABORT=9
 
-# Global state
+# Version requirements
+readonly MIN_GIT_MAJOR=2
+readonly MIN_GIT_MINOR=0
+readonly MIN_BASH_MAJOR=4
+readonly MIN_BASH_MINOR=0
+
+# Operation timeouts and retries
+readonly FETCH_TIMEOUT=30
+readonly FETCH_RETRIES=3
+readonly FETCH_RETRY_DELAY=2
+
+# Colors for output (using tput for portability)
+if command -v tput >/dev/null 2>&1 && [[ -t 1 ]]; then
+    RED=$(tput setaf 1)
+    readonly RED
+    GREEN=$(tput setaf 2)
+    readonly GREEN
+    YELLOW=$(tput setaf 3)
+    readonly YELLOW
+    BLUE=$(tput setaf 4)
+    readonly BLUE
+    CYAN=$(tput setaf 6)
+    readonly CYAN
+    BOLD=$(tput bold)
+    readonly BOLD
+    NC=$(tput sgr0)
+    readonly NC
+else
+    readonly RED=""
+    readonly GREEN=""
+    readonly YELLOW=""
+    readonly BLUE=""
+    readonly CYAN=""
+    readonly BOLD=""
+    readonly NC=""
+fi
+
+################################################################################
+# Global State Variables
+################################################################################
+
+# Debug mode
+DEBUG="${DEBUG:-false}"
+
+# Repository state (populated and validated by functions)
+DEFAULT_BRANCH=""
 CURRENT_VERSION=""
 CURRENT_BRANCH=""
 IS_DETACHED=false
 HAS_LOCAL_CHANGES=false
-STASH_CREATED=false
-LAST_STASH_NAME=""
-CLEANUP_REQUIRED=false
-DEFAULT_BRANCH=""
+GIT_STATE="unknown"  # clean, dirty, merge, rebase, cherry-pick, bisect
 
-# Required scripts that should be executable (add/remove as needed for your project)
-readonly -a REQUIRED_EXECUTABLE_SCRIPTS=(
-    "install_mediamtx.sh"
-    "usb-audio-mapper.sh"
-    "stream-manager.sh"
-    "lyrebird-updater.sh"
+# Transaction state for rollback capability
+declare -A TRANSACTION_STATE=(
+    [active]=false
+    [stash_hash]=""
+    [original_ref]=""
+    [original_head]=""
+    [operation]=""
 )
 
-# Logging functions
+# Available versions array
+declare -a AVAILABLE_VERSIONS=()
+
+################################################################################
+# Logging Functions
+################################################################################
+
+log_debug() {
+    if [[ "$DEBUG" == "true" ]]; then
+        echo "${CYAN}[DEBUG]${NC} $*" >&2
+    fi
+}
+
 log_info() {
-    echo -e "${GREEN}[INFO]${NC} $*"
-}
-
-log_warn() {
-    echo -e "${YELLOW}[WARN]${NC} $*"
-}
-
-log_error() {
-    echo -e "${RED}[ERROR]${NC} $*" >&2
+    echo "${BLUE}[INFO]${NC} $*"
 }
 
 log_success() {
-    echo -e "${GREEN}[SUCCESS]${NC} $*"
+    echo "${GREEN}[✓]${NC} $*"
 }
 
-log_header() {
-    echo
-    echo -e "${CYAN}${BOLD}=== $* ===${NC}"
-    echo
+log_warn() {
+    echo "${YELLOW}[!]${NC} $*" >&2
 }
 
-log_debug() {
-    if [[ "${DEBUG:-0}" == "1" ]]; then
-        echo -e "${BLUE}[DEBUG]${NC} $*" >&2
-    fi
+log_error() {
+    echo "${RED}[✗]${NC} $*" >&2
 }
 
-# Cleanup handler for graceful exit
-# shellcheck disable=SC2317  # Invoked via trap on EXIT, not directly called
-cleanup_on_exit() {
-    local exit_code=$?
+log_step() {
+    echo "${BOLD}▸${NC} $*"
+}
+
+################################################################################
+# Lock File Management
+################################################################################
+
+acquire_lock() {
+    local max_wait=30
+    local waited=0
     
-    if [[ "$CLEANUP_REQUIRED" == "true" ]]; then
-        # Only show warning message if exit was due to error or interruption
-        # (not for user abort or intentional stash retention)
-        if [[ "$exit_code" -ne 0 && "$exit_code" -ne "$E_USER_ABORT" ]]; then
-            log_warn "Script interrupted or failed during operation"
+    while [[ -f "$LOCKFILE" ]]; do
+        if [[ $waited -ge $max_wait ]]; then
+            log_error "Another instance of this script is running"
+            log_error "If you're sure no other instance is running, remove: $LOCKFILE"
+            return "$E_LOCKED"
         fi
         
-        if [[ "$STASH_CREATED" == "true" && -n "$LAST_STASH_NAME" ]]; then
-            echo
-            log_info "Your local changes are saved in stash: $LAST_STASH_NAME"
-            log_info "To restore them later:"
-            log_info "  git stash list              # View all stashes"
-            log_info "  git stash apply stash@{N}   # Apply specific stash"
-            log_info "  git stash pop               # Apply and remove latest stash"
+        log_info "Waiting for other instance to finish..."
+        sleep 2
+        waited=$((waited + 2))
+    done
+    
+    # Create lock file with PID
+    echo "$$" > "$LOCKFILE"
+    log_debug "Lock acquired (PID: $$)"
+    return 0
+}
+
+# shellcheck disable=SC2317  # Function invoked indirectly via cleanup
+release_lock() {
+    if [[ -f "$LOCKFILE" ]]; then
+        local lock_pid
+        lock_pid=$(cat "$LOCKFILE" 2>/dev/null || echo "")
+        
+        if [[ "$lock_pid" == "$$" ]]; then
+            rm -f "$LOCKFILE"
+            log_debug "Lock released"
+        else
+            log_debug "Lock file not owned by this process (PID: $$, lock: $lock_pid)"
         fi
     fi
+}
+
+################################################################################
+# Cleanup and Error Handlers
+################################################################################
+
+# shellcheck disable=SC2317  # Function invoked indirectly via trap
+cleanup() {
+    local exit_code=$?
     
+    log_debug "Cleanup triggered (exit code: $exit_code)"
+    
+    # If we're in an active transaction and exiting with error, attempt rollback
+    if [[ "${TRANSACTION_STATE[active]}" == "true" ]] && [[ $exit_code -ne 0 ]]; then
+        log_error "Operation failed - attempting automatic rollback..."
+        transaction_rollback
+    fi
+    
+    # Release lock file
+    release_lock
+    
+    # Don't override the exit code
     exit "$exit_code"
 }
 
-# Set up signal handlers
-trap cleanup_on_exit EXIT
-trap 'log_error "Received SIGINT, exiting..."; exit 130' INT
-trap 'log_error "Received SIGTERM, exiting..."; exit 143' TERM
+# Trap all exit conditions
+trap cleanup EXIT
+trap 'log_error "Script interrupted by user"; exit $E_USER_ABORT' INT TERM
 
-# Offer assistance with cloning the repository
-# This is called when the script is run from a non-git directory
-offer_clone_assistance() {
-    log_header "Clone Repository Assistant"
-    
-    local default_clone_dir="$HOME/LyreBirdAudio"
-    local current_dir
-    current_dir="$(pwd)"
-    
-    echo "I'll help you clone the LyreBirdAudio repository."
-    echo
-    echo "Current directory (with WIP files): ${CYAN}${current_dir}${NC}"
-    echo "Suggested clone location: ${CYAN}${default_clone_dir}${NC}"
-    echo
-    
-    read -r -p "Enter clone directory [${default_clone_dir}]: " clone_dir
-    clone_dir="${clone_dir:-$default_clone_dir}"
-    
-    # Expand tilde
-    clone_dir="${clone_dir/#\~/$HOME}"
-    
-    # Check if directory already exists
-    if [[ -e "$clone_dir" ]]; then
-        log_error "Directory already exists: $clone_dir"
-        
-        if [[ -d "$clone_dir/.git" ]]; then
-            log_info "This appears to be a git repository already."
-            echo
-            read -r -p "Switch to this directory and run the script? [Y/n] " response
-            if [[ ! "$response" =~ ^[Nn]$ ]]; then
-                log_info "Run these commands:"
-                echo "  cd \"$clone_dir\""
-                echo "  ./lyrebird-updater.sh"
-            fi
-        else
-            log_warn "Please choose a different directory or remove/rename the existing one"
-        fi
-        return "$E_GENERAL"
-    fi
-    
-    # Create parent directory if needed
-    local parent_dir
-    parent_dir="$(dirname "$clone_dir")"
-    if [[ ! -d "$parent_dir" ]]; then
-        log_info "Creating parent directory: $parent_dir"
-        if ! mkdir -p "$parent_dir" 2>/dev/null; then
-            log_error "Failed to create parent directory: $parent_dir"
-            log_error "You may need to use sudo or choose a different location"
-            return "$E_GENERAL"
-        fi
-    fi
-    
-    # Clone the repository
-    log_info "Cloning repository to: $clone_dir"
-    echo
-    
-    if git clone "$REPO_URL" "$clone_dir"; then
-        log_success "Repository cloned successfully!"
-        echo
-        log_info "Next steps:"
-        echo "  1. Switch to the cloned directory:"
-        echo "     ${CYAN}cd \"$clone_dir\"${NC}"
-        echo
-        echo "  2. Run the version manager:"
-        echo "     ${CYAN}./lyrebird-updater.sh${NC}"
-        echo
-        echo "  3. If you have custom changes in: ${CYAN}${current_dir}${NC}"
-        echo "     Review and copy them carefully to avoid overwriting repository files"
-        echo
-        log_warn "Keep your WIP directory separate to avoid confusion!"
-        return 0
-    else
-        log_error "Failed to clone repository"
-        log_error "Please check:"
-        echo "  - Internet connection"
-        echo "  - GitHub access"
-        echo "  - Write permissions for: $clone_dir"
-        return "$E_GIT_ERROR"
-    fi
-}
+################################################################################
+# Prerequisite Checks
+################################################################################
 
-# Check if command exists
-command_exists() {
-    command -v "$1" &>/dev/null
-}
-
-# Check prerequisites
 check_prerequisites() {
-    local errors=0
+    log_debug "Checking prerequisites..."
     
-    # Check bash version
-    if [[ "${BASH_VERSINFO[0]}" -lt "$MIN_BASH_MAJOR" ]]; then
-        log_error "This script requires bash ${MIN_BASH_MAJOR}.0 or higher"
-        log_error "Current version: ${BASH_VERSION}"
-        ((++errors))
-    fi
-    
-    # Check git installation
-    if ! command_exists git; then
-        log_error "Git is not installed. Please install git first:"
-        echo "  Debian/Ubuntu: sudo apt-get install git"
-        echo "  RHEL/CentOS:   sudo yum install git"
-        echo "  macOS:         brew install git"
-        ((++errors))
-        return 1
+    # Check for git
+    if ! command -v git >/dev/null 2>&1; then
+        log_error "Git is not installed or not in PATH"
+        log_info "Installation instructions:"
+        log_info "  Debian/Ubuntu: sudo apt-get install git"
+        log_info "  Fedora/RHEL:   sudo dnf install git"
+        log_info "  macOS:         brew install git"
+        return "$E_PREREQUISITES"
     fi
     
     # Check git version
     local git_version
-    git_version=$(git --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+' | head -1 || echo "0.0")
-    local git_major="${git_version%%.*}"
-    
-    if [[ "$git_major" -lt "$MIN_GIT_MAJOR" ]]; then
-        log_error "This script requires git ${MIN_GIT_MAJOR}.0 or higher"
-        log_error "Current version: $(git --version 2>/dev/null || echo 'unknown')"
-        ((++errors))
-    fi
-    
-    if [[ "$errors" -gt 0 ]]; then
+    if ! git_version="$(git --version 2>/dev/null | awk '{print $3}')"; then
+        log_error "Could not determine git version"
         return "$E_PREREQUISITES"
     fi
     
+    local git_major git_minor
+    git_major="${git_version%%.*}"
+    git_minor="${git_version#*.}"
+    git_minor="${git_minor%%.*}"
+    
+    if [[ "$git_major" -lt "$MIN_GIT_MAJOR" ]] || \
+       [[ "$git_major" -eq "$MIN_GIT_MAJOR" && "$git_minor" -lt "$MIN_GIT_MINOR" ]]; then
+        log_error "Git version $git_version is too old (required: ${MIN_GIT_MAJOR}.${MIN_GIT_MINOR}+)"
+        return "$E_PREREQUISITES"
+    fi
+    
+    log_debug "Git version: $git_version ✓"
+    
+    # Check bash version
+    local bash_major="${BASH_VERSINFO[0]}"
+    local bash_minor="${BASH_VERSINFO[1]}"
+    
+    if [[ "$bash_major" -lt "$MIN_BASH_MAJOR" ]] || \
+       [[ "$bash_major" -eq "$MIN_BASH_MAJOR" && "$bash_minor" -lt "$MIN_BASH_MINOR" ]]; then
+        log_error "Bash version $bash_major.$bash_minor is too old (required: ${MIN_BASH_MAJOR}.${MIN_BASH_MINOR}+)"
+        return "$E_PREREQUISITES"
+    fi
+    
+    log_debug "Bash version: $bash_major.$bash_minor ✓"
+    
     return 0
 }
 
-# Check if we're in a git repository
+################################################################################
+# Git Repository Validation
+################################################################################
+
 check_git_repository() {
-    local git_dir
+    log_debug "Validating git repository..."
     
-    if ! git_dir=$(git rev-parse --git-dir 2>&1); then
+    # Check if we're in a git repository
+    if ! git rev-parse --git-dir >/dev/null 2>&1; then
         log_error "Not a git repository"
-        log_error "Error details: $git_dir"
+        log_error "This script must be run from within the LyreBirdAudio repository"
         echo
-        
-        # Offer helpful guidance based on the situation
-        if [[ -f "lyrebird-updater.sh" ]] || [[ -f "install_mediamtx.sh" ]] || [[ -f "usb-audio-mapper.sh" ]]; then
-            log_warn "It looks like you have LyreBirdAudio scripts here, but no git repository."
-            echo
-            echo "This version manager requires git to function. You have two options:"
-            echo
-            echo "Option 1: Clone the repository to a new directory (RECOMMENDED)"
-            echo "  This keeps your work-in-progress files separate from the managed version."
-            echo
-            echo "  Steps:"
-            echo "    1. Clone the repo: git clone ${REPO_URL} ~/LyreBirdAudio"
-            echo "    2. Run this script from there: cd ~/LyreBirdAudio && ./lyrebird-updater.sh"
-            echo "    3. Copy any custom changes you need from this directory"
-            echo
-            echo "Option 2: Initialize git here and connect to remote (ADVANCED)"
-            echo "  Warning: This may conflict with your work-in-progress files."
-            echo
-            echo "  Steps:"
-            echo "    1. Backup this directory: cp -r $(pwd) $(pwd).backup"
-            echo "    2. Initialize git: git init"
-            echo "    3. Add remote: git remote add origin ${REPO_URL}"
-            echo "    4. Fetch: git fetch origin"
-            echo "    5. Reset to default branch: git reset --hard origin/main (or origin/master)"
-            echo "    6. Then run this script again"
-            echo
-            read -r -p "Would you like help cloning the repository now? [y/N] " response
-            if [[ "$response" =~ ^[Yy]$ ]]; then
-                # Capture and return the actual result from offer_clone_assistance
-                offer_clone_assistance
-                local clone_result=$?
-                return $clone_result
-            fi
-        else
-            log_error "Please run this script from within the LyreBirdAudio directory"
-            log_error "To clone the repository:"
-            echo "  git clone ${REPO_URL}"
-        fi
-        
+        log_info "To get started:"
+        log_info "  1. Clone: git clone $REPO_URL"
+        log_info "  2. Enter:  cd $REPO_NAME"
+        log_info "  3. Run:    ./$SCRIPT_NAME"
         return "$E_NOT_GIT_REPO"
     fi
     
-    # Verify this is the LyreBirdAudio repository
-    local remote_url
-    remote_url="$(git config --get remote.origin.url 2>/dev/null || echo "")"
+    # Verify remote is configured
+    local origin_url
+    if ! origin_url="$(git remote get-url origin 2>/dev/null)"; then
+        log_error "No 'origin' remote configured"
+        log_info "To fix: git remote add origin $REPO_URL"
+        return "$E_NOT_GIT_REPO"
+    fi
     
-    if [[ -z "$remote_url" ]]; then
-        log_warn "No remote 'origin' configured"
-        log_warn "This repository may not be properly configured"
+    # Validate origin URL
+    if [[ ! "$origin_url" =~ github\.com[:/]${REPO_OWNER}/${REPO_NAME} ]]; then
+        log_warn "Remote 'origin' URL does not match expected repository"
+        log_warn "Expected: $REPO_URL"
+        log_warn "Found:    $origin_url"
         echo
-        read -r -p "Continue anyway? [y/N] " response
-        if [[ ! "$response" =~ ^[Yy]$ ]]; then
-            return "$E_USER_ABORT"
-        fi
-    elif [[ "$remote_url" != *"$REPO_OWNER/$REPO_NAME"* ]]; then
-        log_warn "This doesn't appear to be the $REPO_OWNER/$REPO_NAME repository"
-        log_warn "Remote URL: $remote_url"
-        log_warn "Expected: ${REPO_OWNER}/${REPO_NAME}"
-        echo
-        read -r -p "Continue anyway? [y/N] " response
-        if [[ ! "$response" =~ ^[Yy]$ ]]; then
-            return "$E_USER_ABORT"
+        if ! confirm_action "Continue anyway?"; then
+            return "$E_NOT_GIT_REPO"
         fi
     fi
     
-    # Check if repository is corrupted
-    if ! git rev-parse HEAD &>/dev/null; then
-        log_error "Git repository appears to be corrupted"
-        log_error "Try: git fsck --full"
-        return "$E_GIT_ERROR"
+    # Check git permissions
+    local git_dir
+    if ! git_dir="$(git rev-parse --git-dir 2>/dev/null)"; then
+        log_error "Could not determine .git directory location"
+        return "$E_PERMISSION"
     fi
     
-    return 0
-}
-
-# Detect the default branch name (main vs master)
-get_default_branch() {
-    local default_branch
-    
-    # Try to get the default branch from remote
-    default_branch="$(git symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's@^refs/remotes/origin/@@')"
-    
-    # If that fails, try common names
-    if [[ -z "$default_branch" ]]; then
-        if git show-ref --verify --quiet refs/remotes/origin/main; then
-            default_branch="main"
-        elif git show-ref --verify --quiet refs/remotes/origin/master; then
-            default_branch="master"
-        else
-            # Fallback to local branch
-            default_branch="$(git branch --list 'main' 'master' | head -n1 | tr -d ' *')"
-        fi
+    if [[ ! -w "$git_dir" ]]; then
+        log_error "No write permission for git repository: $git_dir"
+        log_info "To fix: sudo chown -R $USER:$USER $(git rev-parse --show-toplevel)"
+        return "$E_PERMISSION"
     fi
     
-    echo "${default_branch:-main}"  # Updated fallback to 'main'
-}
-
-# Normalize version string for comparison (remove 'v' prefix)
-normalize_version() {
-    local version="$1"
-    echo "${version#v}"
-}
-
-# Get current version information
-get_current_version() {
-    CURRENT_VERSION="$(git describe --tags --always 2>/dev/null || echo "unknown")"
-    CURRENT_BRANCH="$(git branch --show-current 2>/dev/null || echo "")"
-    
-    # Check if we're in detached HEAD state
-    if [[ -z "$CURRENT_BRANCH" ]]; then
-        IS_DETACHED=true
-        local head_ref
-        head_ref="$(git describe --tags 2>/dev/null || git rev-parse --short HEAD 2>/dev/null || echo "detached")"
-        CURRENT_BRANCH="detached HEAD at $head_ref"
-    else
-        IS_DETACHED=false
-    fi
-}
-
-# Check for local modifications
-check_local_changes() {
-    if git diff-index --quiet HEAD -- 2>/dev/null && \
-       [[ -z "$(git ls-files --others --exclude-standard 2>/dev/null)" ]]; then
-        HAS_LOCAL_CHANGES=false
-    else
-        HAS_LOCAL_CHANGES=true
-    fi
-}
-
-# Create backup stash with unique name
-# Saves uncommitted changes and untracked files to a git stash
-# Uses timestamp and PID to prevent naming collisions
-create_backup_stash() {
-    if [[ "$HAS_LOCAL_CHANGES" != "true" ]]; then
-        return 0
-    fi
-    
-    # Create unique stash name with timestamp and PID to prevent collisions
-    LAST_STASH_NAME="lyrebird-updater-backup-$(date +%Y%m%d-%H%M%S)-$$"
-    
-    log_info "Creating backup of local changes..."
-    
-    local stash_output
-    if stash_output=$(git stash push -u -m "$LAST_STASH_NAME" 2>&1); then
-        STASH_CREATED=true
-        CLEANUP_REQUIRED=true
-        log_success "Backup created: $LAST_STASH_NAME"
-        return 0
-    else
-        log_error "Failed to create backup stash"
-        log_error "Git output: $stash_output"
-        return "$E_GIT_ERROR"
-    fi
-}
-
-# Restore from stash
-restore_backup_stash() {
-    if [[ "$STASH_CREATED" != "true" ]]; then
-        return 0
-    fi
-    
-    log_info "Restoring local changes from backup..."
-    
-    local pop_output
-    if pop_output=$(git stash pop 2>&1); then
-        log_success "Local changes restored successfully"
-        STASH_CREATED=false
-        CLEANUP_REQUIRED=false
-        return 0
-    else
-        log_warn "Could not automatically restore local changes"
-        log_warn "Git output: $pop_output"
-        log_warn "Your changes are still in the stash: $LAST_STASH_NAME"
-        log_info "To restore manually:"
-        log_info "  git stash list              # Find your stash"
-        log_info "  git stash apply stash@{N}   # Apply specific stash"
-        return 1
-    fi
-}
-
-# Check network connectivity to GitHub
-check_network_connectivity() {
-    log_debug "Testing network connectivity to GitHub..."
-    
-    if ! git ls-remote --exit-code origin HEAD &>/dev/null; then
-        log_warn "Cannot reach GitHub repository"
-        log_warn "Please check your internet connection"
-        return "$E_NETWORK_ERROR"
-    fi
-    
-    return 0
-}
-
-# Fetch latest repository information
-fetch_updates() {
-    log_info "Fetching latest repository information..."
-    
-    # Check network first
-    if ! check_network_connectivity; then
-        log_error "Cannot fetch updates: No network connectivity"
-        return "$E_NETWORK_ERROR"
-    fi
-    
-    local fetch_output
-    local fetch_status=0
-    
-    fetch_output=$(git fetch --tags --prune origin 2>&1) || fetch_status=$?
-    
-    if [[ "$fetch_status" -ne 0 ]]; then
-        log_error "Failed to fetch updates from repository"
-        log_error "Git output: $fetch_output"
-        return "$E_GIT_ERROR"
-    fi
-    
-    log_success "Repository information updated"
-    log_debug "Fetch output: $fetch_output"
-    return 0
-}
-
-# Get latest stable release (dynamically determined)
-get_latest_stable_release() {
-    local latest
-    
-    # Get all version tags, sort by version number, exclude pre-releases (those with -)
-    latest="$(git tag -l 'v*.*.*' --sort=-v:refname 2>/dev/null | grep -vE '\-?(alpha|beta|rc|pre|dev)' | head -n1)"
-    
-    if [[ -z "$latest" ]]; then
-        # Fallback: try any v* tag
-        latest="$(git tag -l 'v*' --sort=-v:refname 2>/dev/null | head -n1)"
-    fi
-    
-    if [[ -z "$latest" ]]; then
-        log_error "No stable releases found in repository"
-        return "$E_GENERAL"
-    fi
-    
-    echo "$latest"
-    return 0
-}
-
-# Check for merge conflicts
-check_merge_conflicts() {
-    if git ls-files -u 2>/dev/null | grep -q .; then
-        return 0  # Conflicts exist
-    else
-        return 1  # No conflicts
-    fi
-}
-
-# Handle merge conflicts
-handle_merge_conflicts() {
-    log_error "Merge conflict detected"
-    echo
-    log_error "Files in conflict:"
-    git diff --name-only --diff-filter=U 2>/dev/null | sed 's/^/  /' || echo "  (unable to list conflicted files)"
-    echo
-    log_error "Please resolve conflicts manually using one of these methods:"
-    echo
-    echo "  Option 1: Abort the merge and restore previous state"
-    echo "    git merge --abort"
-    echo
-    echo "  Option 2: Reset to clean state (DESTRUCTIVE)"
-    echo "    git reset --hard HEAD"
-    echo "    git clean -fd"
-    echo
-    echo "  Option 3: Resolve conflicts manually"
-    echo "    - Edit conflicted files"
-    echo "    - git add <resolved-files>"
-    echo "    - git commit"
-    echo
-    return "$E_MERGE_CONFLICT"
-}
-
-# List available releases
-list_available_releases() {
-    log_header "Available Releases"
-    
-    local tags
-    tags="$(git tag -l 'v*' --sort=-v:refname 2>/dev/null || echo "")"
-    
-    if [[ -n "$tags" ]]; then
-        echo "Stable Releases (recommended for production):"
-        echo
+    # Check if git directory is owned by root (common issue)
+    if [[ -e "$git_dir/config" ]]; then
+        local owner
+        owner="$(stat -c %U "$git_dir/config" 2>/dev/null || stat -f %Su "$git_dir/config" 2>/dev/null || echo "$USER")"
         
-        local count=0
-        while IFS= read -r tag; do
-            [[ -z "$tag" ]] && continue
-            ((++count))
-            
-            # Get tag date
-            local tag_date
-            tag_date="$(git log -1 --format=%ai "$tag" 2>/dev/null | cut -d' ' -f1)"
-            
-            # Check if this is the current version
-            local marker=""
-            if [[ "$(normalize_version "$CURRENT_VERSION")" == "$(normalize_version "$tag")" ]]; then
-                marker=" ${GREEN}(current)${NC}"
-            fi
-            
-            printf "  ${CYAN}%-12s${NC} - %s%s\n" "$tag" "$tag_date" "$marker"
-        done <<< "$tags"
-        
-        echo
-        if [[ "$count" -eq 0 ]]; then
-            log_warn "No version tags found"
-        else
-            echo "Total releases: $count"
-        fi
-        echo
-    else
-        log_warn "No release tags found in repository"
-        echo
-    fi
-    
-    echo "Development Branch:"
-    local branch_marker=""
-    if [[ "$CURRENT_BRANCH" == "$DEFAULT_BRANCH" ]]; then
-        branch_marker=" ${GREEN}(current)${NC}"
-    fi
-    echo -e "  ${YELLOW}${DEFAULT_BRANCH}${NC}      - Latest development (may have bugs)${branch_marker}"
-    echo
-}
-
-# Show current status
-show_status() {
-    log_header "Current Status"
-    
-    get_current_version
-    check_local_changes
-    
-    echo "Repository Information:"
-    echo -e "  Location: ${CYAN}${SCRIPT_DIR}${NC}"
-    
-    local remote_url
-    remote_url="$(git config --get remote.origin.url 2>/dev/null || echo 'not configured')"
-    echo -e "  Remote:   ${CYAN}${remote_url}${NC}"
-    echo
-    
-    echo "Version Information:"
-    if [[ "$IS_DETACHED" == "true" ]]; then
-        echo -e "  State:    ${YELLOW}Detached HEAD${NC}"
-        echo -e "  Version:  ${CYAN}${CURRENT_VERSION}${NC}"
-    else
-        echo -e "  Branch:   ${CYAN}${CURRENT_BRANCH}${NC}"
-        echo -e "  Commit:   ${CYAN}${CURRENT_VERSION}${NC}"
-    fi
-    echo
-    
-    echo "Local Changes:"
-    if [[ "$HAS_LOCAL_CHANGES" == "true" ]]; then
-        echo -e "  Status:   ${YELLOW}Modified files detected${NC}"
-        echo
-        echo "  Modified files:"
-        git status --short 2>/dev/null | sed 's/^/    /' || echo "    (unable to list changes)"
-    else
-        echo -e "  Status:   ${GREEN}Clean (no modifications)${NC}"
-    fi
-    echo
-    
-    # Check if we're behind remote
-    if [[ "$IS_DETACHED" == "false" ]]; then
-        local behind_count ahead_count
-        behind_count="$(git rev-list HEAD..origin/"$CURRENT_BRANCH" --count 2>/dev/null || echo "?")"
-        ahead_count="$(git rev-list origin/"$CURRENT_BRANCH"..HEAD --count 2>/dev/null || echo "?")"
-        
-        if [[ "$behind_count" != "?" && "$ahead_count" != "?" ]]; then
-            if [[ "$behind_count" -gt 0 ]]; then
-                echo -e "Update Status: ${YELLOW}$behind_count commit(s) behind remote${NC}"
-                if [[ "$ahead_count" -gt 0 ]]; then
-                    echo -e "               ${YELLOW}$ahead_count commit(s) ahead of remote${NC}"
-                fi
-            elif [[ "$ahead_count" -gt 0 ]]; then
-                echo -e "Update Status: ${YELLOW}$ahead_count commit(s) ahead of remote${NC}"
-            else
-                echo -e "Update Status: ${GREEN}Up to date${NC}"
-            fi
+        if [[ "$owner" == "root" ]]; then
+            log_error "Git repository files are owned by root"
+            log_info "To fix: sudo chown -R $USER:$USER $(git rev-parse --show-toplevel)"
+            return "$E_PERMISSION"
         fi
     fi
-}
-
-# Set executable permissions on required scripts
-set_script_permissions() {
-    log_debug "Setting script permissions..."
     
-    local script
-    local errors=0
-    
-    for script in "${REQUIRED_EXECUTABLE_SCRIPTS[@]}"; do
-        if [[ -f "$script" ]]; then
-            if ! chmod +x "$script" 2>/dev/null; then
-                log_warn "Could not set execute permission on: $script"
-                ((++errors))
-            else
-                log_debug "Set executable: $script"
-            fi
-        else
-            log_debug "Script not found (skipping): $script"
-        fi
-    done
-    
-    if [[ "$errors" -gt 0 ]]; then
-        log_warn "Failed to set permissions on $errors script(s)"
-        return 1
-    fi
-    
+    log_debug "Git repository validated ✓"
     return 0
 }
 
-# Validate that a version/tag/branch exists
-validate_version_exists() {
-    local target="$1"
-    
-    # Check if it's a local branch
-    if git show-ref --verify --quiet "refs/heads/$target"; then
-        return 0
-    fi
-    
-    # Check if it's a remote branch
-    if git show-ref --verify --quiet "refs/remotes/origin/$target"; then
-        return 0
-    fi
-    
-    # Check if it's a tag
-    if git show-ref --verify --quiet "refs/tags/$target"; then
-        return 0
-    fi
-    
-    # Try to resolve as a commit hash
-    if git rev-parse --verify --quiet "$target^{commit}" >/dev/null 2>&1; then
-        return 0
-    fi
-    
-    return 1
-}
+################################################################################
+# Git State Detection and Validation
+################################################################################
 
-# Switch to version (tag or branch)
-# Workflow:
-#   1. Verify target exists (tag or branch)
-#   2. Handle local changes (backup or discard with user confirmation)
-#   3. Perform git checkout to target version
-#   4. If branch: pull latest changes from remote
-#   5. Set executable permissions on required scripts
-#   6. Offer to restore backed-up changes
-# Args:
-#   $1 - target_version (tag name or branch name)
-switch_version() {
-    local target_version="$1"
-    local is_branch=false
+detect_git_state() {
+    log_debug "Detecting git state..."
     
-    log_header "Switching to $target_version"
+    local git_dir
+    git_dir="$(git rev-parse --git-dir 2>/dev/null)"
     
-    # Verify target exists
-    if git show-ref --verify --quiet "refs/heads/$target_version"; then
-        is_branch=true
-        log_debug "Target is a local branch: $target_version"
-    elif git show-ref --verify --quiet "refs/remotes/origin/$target_version"; then
-        is_branch=true
-        log_debug "Target is a remote branch: $target_version"
-    elif git show-ref --verify --quiet "refs/tags/$target_version"; then
-        is_branch=false
-        log_debug "Target is a tag: $target_version"
-    else
-        log_error "Unknown or unreachable version: $target_version"
-        log_info "Run 'Fetch Updates' first, or check the version name"
-        return "$E_GENERAL"
+    # Check for ongoing operations
+    if [[ -f "$git_dir/MERGE_HEAD" ]]; then
+        GIT_STATE="merge"
+        log_debug "Git state: merge in progress"
+        return 0
+    elif [[ -d "$git_dir/rebase-merge" ]] || [[ -d "$git_dir/rebase-apply" ]]; then
+        GIT_STATE="rebase"
+        log_debug "Git state: rebase in progress"
+        return 0
+    elif [[ -f "$git_dir/CHERRY_PICK_HEAD" ]]; then
+        GIT_STATE="cherry-pick"
+        log_debug "Git state: cherry-pick in progress"
+        return 0
+    elif [[ -f "$git_dir/BISECT_LOG" ]]; then
+        GIT_STATE="bisect"
+        log_debug "Git state: bisect in progress"
+        return 0
     fi
     
     # Check for local changes
     check_local_changes
     
     if [[ "$HAS_LOCAL_CHANGES" == "true" ]]; then
-        log_warn "You have local modifications"
-        echo
-        git status --short 2>/dev/null || echo "(unable to show status)"
-        echo
-        echo "Options:"
-        echo "  1) Backup and continue (saves changes, switches version)"
-        echo "  2) Discard and continue (loses changes, switches version)"
-        echo "  3) Cancel"
-        echo
-        read -r -p "Choose option [1-3]: " choice
-        
-        case "$choice" in
-            1)
-                if ! create_backup_stash; then
-                    return "$E_GIT_ERROR"
-                fi
-                ;;
-            2)
-                log_warn "Discarding local changes..."
-                local reset_output
-                if ! reset_output=$(git reset --hard HEAD 2>&1); then
-                    log_error "Failed to discard changes"
-                    log_error "Git output: $reset_output"
-                    return "$E_GIT_ERROR"
-                fi
-                ;;
-            3)
-                log_info "Operation cancelled"
-                return "$E_USER_ABORT"
-                ;;
-            *)
-                log_error "Invalid choice"
-                return "$E_GENERAL"
-                ;;
-        esac
+        GIT_STATE="dirty"
+        log_debug "Git state: dirty (local modifications)"
+    else
+        GIT_STATE="clean"
+        log_debug "Git state: clean"
     fi
     
-    # Perform the switch
-    log_info "Switching to $target_version..."
+    return 0
+}
+
+validate_clean_state() {
+    detect_git_state
     
-    local checkout_output
-    local checkout_status=0
+    case "$GIT_STATE" in
+        merge)
+            log_error "Git merge in progress"
+            log_info "You must complete or abort the merge first:"
+            log_info "  To continue merge:  git merge --continue"
+            log_info "  To cancel merge:    git merge --abort"
+            return "$E_BAD_STATE"
+            ;;
+        rebase)
+            log_error "Git rebase in progress"
+            log_info "You must complete or abort the rebase first:"
+            log_info "  To continue rebase: git rebase --continue"
+            log_info "  To cancel rebase:   git rebase --abort"
+            return "$E_BAD_STATE"
+            ;;
+        cherry-pick)
+            log_error "Git cherry-pick in progress"
+            log_info "You must complete or abort the cherry-pick first:"
+            log_info "  To continue:        git cherry-pick --continue"
+            log_info "  To cancel:          git cherry-pick --abort"
+            return "$E_BAD_STATE"
+            ;;
+        bisect)
+            log_error "Git bisect in progress"
+            log_info "You must finish the bisect first:"
+            log_info "  To complete: git bisect reset"
+            return "$E_BAD_STATE"
+            ;;
+        clean|dirty)
+            # These are valid states
+            return 0
+            ;;
+        *)
+            log_warn "Unknown git state detected"
+            return 0
+            ;;
+    esac
+}
+
+################################################################################
+# Repository State Functions
+################################################################################
+
+get_default_branch() {
+    log_debug "Detecting default branch..."
     
-    checkout_output=$(git checkout "$target_version" 2>&1) || checkout_status=$?
-    
-    if [[ "$checkout_status" -ne 0 ]]; then
-        log_error "Failed to switch to $target_version"
-        log_error "Git output: $checkout_output"
-        restore_backup_stash
-        return "$E_GIT_ERROR"
+    # Try to get from remote HEAD
+    local remote_default
+    if remote_default="$(git ls-remote --symref origin HEAD 2>/dev/null | awk '/^ref:/ {sub(/refs\/heads\//, "", $2); print $2; exit}')"; then
+        if [[ -n "$remote_default" ]]; then
+            log_debug "Default branch from remote: $remote_default"
+            echo "$remote_default"
+            return 0
+        fi
     fi
     
-    if [[ "$is_branch" == "true" ]]; then
-        # Pull latest changes for branch
-        log_info "Pulling latest changes..."
+    # Check if main exists
+    if git show-ref --verify --quiet refs/remotes/origin/main 2>/dev/null; then
+        log_debug "Default branch: main"
+        echo "main"
+        return 0
+    fi
+    
+    # Check if master exists
+    if git show-ref --verify --quiet refs/remotes/origin/master 2>/dev/null; then
+        log_debug "Default branch: master"
+        echo "master"
+        return 0
+    fi
+    
+    # Fallback to main
+    log_debug "Default branch: main (fallback)"
+    echo "main"
+    return 0
+}
+
+get_current_version() {
+    log_debug "Getting current version..."
+    
+    # Check if HEAD exists
+    if ! git rev-parse --verify --quiet HEAD >/dev/null 2>&1; then
+        CURRENT_VERSION="(empty repository)"
+        CURRENT_BRANCH=""
+        IS_DETACHED=false
+        return 0
+    fi
+    
+    # Get short commit hash
+    CURRENT_VERSION="$(git rev-parse --short HEAD 2>/dev/null)"
+    
+    # Check if detached HEAD
+    if ! git symbolic-ref -q HEAD >/dev/null 2>&1; then
+        IS_DETACHED=true
+        CURRENT_BRANCH=""
         
-        local pull_output
-        local pull_status=0
+        # Try to get tag name
+        local tag_name
+        if tag_name="$(git describe --tags --exact-match HEAD 2>/dev/null)"; then
+            CURRENT_VERSION="$tag_name"
+        fi
         
-        pull_output=$(git pull origin "$target_version" 2>&1) || pull_status=$?
-        
-        if [[ "$pull_status" -ne 0 ]]; then
-            # Check for merge conflicts
-            if check_merge_conflicts; then
-                handle_merge_conflicts
-                restore_backup_stash
-                return "$E_MERGE_CONFLICT"
-            else
-                log_warn "Pull operation had issues but no conflicts detected"
-                log_warn "Git output: $pull_output"
-                log_warn "Continuing with current state..."
+        log_debug "Viewing specific version: $CURRENT_VERSION"
+    else
+        IS_DETACHED=false
+        CURRENT_BRANCH="$(git rev-parse --abbrev-ref HEAD 2>/dev/null)"
+        log_debug "On branch $CURRENT_BRANCH at $CURRENT_VERSION"
+    fi
+    
+    return 0
+}
+
+check_local_changes() {
+    log_debug "Checking for local changes..."
+    
+    # Check if HEAD exists
+    if ! git rev-parse --verify --quiet HEAD >/dev/null 2>&1; then
+        HAS_LOCAL_CHANGES=false
+        return 0
+    fi
+    
+    # Check for any changes
+    if ! git diff-index --quiet HEAD 2>/dev/null || \
+       git ls-files --others --exclude-standard 2>/dev/null | grep -q .; then
+        HAS_LOCAL_CHANGES=true
+        log_debug "Local modifications detected"
+    else
+        HAS_LOCAL_CHANGES=false
+        log_debug "No local modifications"
+    fi
+    
+    return 0
+}
+
+################################################################################
+# User Interaction Helpers
+################################################################################
+
+confirm_action() {
+    local prompt="$1"
+    local default="${2:-N}"
+    local response
+    
+    if [[ "$default" == "Y" ]]; then
+        read -r -p "${prompt} [Y/n] " response
+        response="${response:-Y}"
+    else
+        read -r -p "${prompt} [y/N] " response
+        response="${response:-N}"
+    fi
+    
+    [[ "$response" =~ ^[Yy]$ ]]
+}
+
+# Require explicit "yes" confirmation for destructive operations
+confirm_destructive_action() {
+    local prompt="$1"
+    local response
+    
+    read -r -p "${prompt} " response
+    [[ "$response" == "yes" ]]
+}
+
+################################################################################
+# Transaction Management (for atomic operations with rollback)
+################################################################################
+
+transaction_begin() {
+    local operation="$1"
+    
+    if [[ "${TRANSACTION_STATE[active]}" == "true" ]]; then
+        log_error "Transaction already active: ${TRANSACTION_STATE[operation]}"
+        return "$E_GENERAL"
+    fi
+    
+    log_debug "Transaction begin: $operation"
+    
+    # Save current state
+    TRANSACTION_STATE[active]=true
+    TRANSACTION_STATE[operation]="$operation"
+    TRANSACTION_STATE[original_head]="$(git rev-parse HEAD 2>/dev/null || echo "")"
+    
+    if ! git symbolic-ref -q HEAD >/dev/null 2>&1; then
+        TRANSACTION_STATE[original_ref]="HEAD"  # Detached
+    else
+        TRANSACTION_STATE[original_ref]="$(git rev-parse --abbrev-ref HEAD 2>/dev/null)"
+    fi
+    
+    return 0
+}
+
+transaction_stash_changes() {
+    if [[ "${TRANSACTION_STATE[active]}" != "true" ]]; then
+        log_error "No active transaction"
+        return "$E_GENERAL"
+    fi
+    
+    log_debug "Creating transaction stash..."
+    
+    local stash_message
+    stash_message="lyrebird-tx-${TRANSACTION_STATE[operation]}-$$-$(date +%s)"
+    
+    if ! git stash push -u -m "$stash_message" >/dev/null 2>&1; then
+        log_error "Failed to save your changes"
+        return "$E_GENERAL"
+    fi
+    
+    # Verify stash was created and get its hash
+    local stash_hash
+    if ! stash_hash="$(git rev-parse 'stash@{0}' 2>/dev/null)"; then
+        log_error "Failed to save your changes (couldn't verify save)"
+        return "$E_GENERAL"
+    fi
+    
+    TRANSACTION_STATE[stash_hash]="$stash_hash"
+    log_debug "Transaction stash created: $stash_hash"
+    
+    return 0
+}
+
+transaction_commit() {
+    if [[ "${TRANSACTION_STATE[active]}" != "true" ]]; then
+        log_error "No active transaction"
+        return "$E_GENERAL"
+    fi
+    
+    log_debug "Transaction commit: ${TRANSACTION_STATE[operation]}"
+    
+    # Clear transaction state
+    TRANSACTION_STATE[active]=false
+    TRANSACTION_STATE[stash_hash]=""
+    TRANSACTION_STATE[original_ref]=""
+    TRANSACTION_STATE[original_head]=""
+    TRANSACTION_STATE[operation]=""
+    
+    return 0
+}
+
+transaction_rollback() {
+    if [[ "${TRANSACTION_STATE[active]}" != "true" ]]; then
+        log_debug "No active transaction to rollback"
+        return 0
+    fi
+    
+    log_warn "Rolling back: ${TRANSACTION_STATE[operation]}"
+    
+    # Attempt to return to original ref
+    if [[ -n "${TRANSACTION_STATE[original_ref]}" ]]; then
+        log_debug "Restoring original ref: ${TRANSACTION_STATE[original_ref]}"
+        if ! git checkout "${TRANSACTION_STATE[original_ref]}" --force >/dev/null 2>&1; then
+            log_error "Could not restore original ref"
+            # Try to at least get to original HEAD
+            if [[ -n "${TRANSACTION_STATE[original_head]}" ]]; then
+                git checkout "${TRANSACTION_STATE[original_head]}" --force >/dev/null 2>&1 || true
             fi
         fi
     fi
+    
+    # Restore stashed changes if any
+    if [[ -n "${TRANSACTION_STATE[stash_hash]}" ]]; then
+        log_debug "Restoring saved changes: ${TRANSACTION_STATE[stash_hash]}"
+        
+        # Find stash ref from hash
+        local stash_ref
+        stash_ref=$(git stash list --format="%gd %H" | grep "${TRANSACTION_STATE[stash_hash]}" | cut -d' ' -f1 || echo "")
+        
+        if [[ -n "$stash_ref" ]]; then
+            if git stash pop "$stash_ref" >/dev/null 2>&1; then
+                log_success "Your changes were restored"
+            else
+                log_warn "Could not restore your changes automatically"
+                log_info "Your changes are saved in: $stash_ref"
+                log_info "To restore: git stash pop $stash_ref"
+            fi
+        else
+            log_warn "Could not find your saved changes"
+        fi
+    fi
+    
+    # Clear transaction state
+    TRANSACTION_STATE[active]=false
+    TRANSACTION_STATE[stash_hash]=""
+    TRANSACTION_STATE[original_ref]=""
+    TRANSACTION_STATE[original_head]=""
+    TRANSACTION_STATE[operation]=""
+    
+    log_warn "Rollback complete"
+    
+    return 0
+}
+
+################################################################################
+# Git Operations with Validation
+################################################################################
+
+fetch_updates_safe() {
+    log_step "Checking for updates from GitHub..."
+    
+    local attempt=1
+    local fetch_output
+    local fetch_succeeded=false
+    
+    while [[ $attempt -le $FETCH_RETRIES ]]; do
+        if [[ $attempt -gt 1 ]]; then
+            log_info "Retry attempt $attempt of $FETCH_RETRIES (waiting ${FETCH_RETRY_DELAY}s...)"
+            sleep "$FETCH_RETRY_DELAY"
+        fi
+        
+        # Try fetch with timeout if available
+        if command -v timeout >/dev/null 2>&1; then
+            if fetch_output=$(timeout "$FETCH_TIMEOUT" git fetch --all --tags --prune 2>&1); then
+                fetch_succeeded=true
+                break
+            fi
+        else
+            # No timeout command, try without it
+            if fetch_output=$(git fetch --all --tags --prune 2>&1); then
+                fetch_succeeded=true
+                break
+            fi
+        fi
+        
+        log_debug "Fetch attempt $attempt failed"
+        attempt=$((attempt + 1))
+    done
+    
+    if [[ "$fetch_succeeded" != "true" ]]; then
+        log_error "Failed to fetch updates after $FETCH_RETRIES attempts"
+        log_error "Please check your internet connection"
+        log_debug "Last error: $fetch_output"
+        return "$E_NO_REMOTE"
+    fi
+    
+    # Update remote HEAD reference
+    git remote set-head origin --auto >/dev/null 2>&1 || true
+    
+    log_success "Updates fetched successfully"
+    return 0
+}
+
+validate_version_exists() {
+    local version="$1"
+    
+    if [[ -z "$version" ]]; then
+        return 1
+    fi
+    
+    log_debug "Validating version: $version"
+    
+    # Check various ref types
+    if git rev-parse --verify --quiet "refs/tags/$version" >/dev/null 2>&1; then
+        log_debug "Found as tag: $version"
+        return 0
+    elif git rev-parse --verify --quiet "refs/heads/$version" >/dev/null 2>&1; then
+        log_debug "Found as local branch: $version"
+        return 0
+    elif git rev-parse --verify --quiet "refs/remotes/origin/$version" >/dev/null 2>&1; then
+        log_debug "Found as remote branch: $version"
+        return 0
+    elif git rev-parse --verify --quiet "$version^{commit}" >/dev/null 2>&1; then
+        log_debug "Found as commit: $version"
+        return 0
+    fi
+    
+    log_debug "Version not found: $version"
+    return 1
+}
+
+switch_version_safe() {
+    local target_version="$1"
+    
+    if [[ -z "$target_version" ]]; then
+        log_error "No version specified"
+        return "$E_GENERAL"
+    fi
+    
+    # Validate we're in a clean state for the operation
+    if ! validate_clean_state; then
+        return "$E_BAD_STATE"
+    fi
+    
+    # Validate target exists
+    if ! validate_version_exists "$target_version"; then
+        log_error "Version '$target_version' does not exist"
+        log_info "Try running 'Check for Updates' first (option 4)"
+        return "$E_GENERAL"
+    fi
+    
+    # Get current state
+    get_current_version
+    
+    # Check if already on this version
+    if [[ "$CURRENT_VERSION" == "$target_version" ]]; then
+        log_info "Already on version: $target_version"
+        return 0
+    fi
+    
+    # Begin transaction
+    if ! transaction_begin "switch to $target_version"; then
+        return "$E_GENERAL"
+    fi
+    
+    # Handle local changes
+    check_local_changes
+    if [[ "$HAS_LOCAL_CHANGES" == "true" ]]; then
+        echo
+        log_warn "You have local modifications"
+        echo
+        git status --short 2>/dev/null | head -n 15
+        
+        local total_changes
+        total_changes=$(git status --short 2>/dev/null | wc -l)
+        if [[ "$total_changes" -gt 15 ]]; then
+            echo "  ... and $((total_changes - 15)) more files"
+        fi
+        echo
+        
+        log_info "Your changes must be saved before switching versions"
+        echo
+        if ! confirm_action "Save your changes temporarily? (recommended)"; then
+            log_info "Operation cancelled"
+            transaction_rollback
+            return "$E_USER_ABORT"
+        fi
+        
+        if ! transaction_stash_changes; then
+            transaction_rollback
+            return "$E_GENERAL"
+        fi
+        
+        log_success "Your changes have been saved and will be restored after the update"
+    fi
+    
+    # Check if script itself will be modified (self-update)
+    local script_will_change=false
+    if ! git diff --quiet HEAD "$target_version" -- "$SCRIPT_NAME" 2>/dev/null; then
+        script_will_change=true
+        log_info "The updater script itself will be updated"
+        log_info "The process will restart automatically after the update"
+        echo
+        sleep 2
+    fi
+    
+    # Perform the checkout
+    log_step "Switching to version: $target_version"
+    
+    local checkout_output
+    if ! checkout_output=$(git checkout "$target_version" 2>&1); then
+        log_error "Failed to switch to version: $target_version"
+        echo "$checkout_output" >&2
+        transaction_rollback
+        return "$E_GENERAL"
+    fi
+    
+    # Verify we actually switched to the target
+    local new_head
+    new_head="$(git rev-parse HEAD 2>/dev/null)"
+    local target_head
+    target_head="$(git rev-parse "$target_version" 2>/dev/null)"
+    
+    if [[ "$new_head" != "$target_head" ]]; then
+        log_error "Checkout completed but HEAD does not match target"
+        log_error "This indicates a git state inconsistency"
+        transaction_rollback
+        return "$E_GENERAL"
+    fi
+    
+    log_success "Switched to version: $target_version"
+    
+    # Set executable permissions on known scripts
+    set_script_permissions
+    
+    # Handle self-update scenario
+    if [[ "$script_will_change" == "true" ]]; then
+        log_info "Restarting with updated version..."
+        
+        # Make sure new script is executable
+        chmod +x "./$SCRIPT_NAME" 2>/dev/null || true
+        
+        # Prepare restart arguments
+        local restart_args=()
+        if [[ -n "${TRANSACTION_STATE[stash_hash]}" ]]; then
+            restart_args=("--post-update-restore" "${TRANSACTION_STATE[stash_hash]}")
+        else
+            restart_args=("--post-update-complete")
+        fi
+        
+        # Mark transaction as committed before exec (we're transferring responsibility)
+        transaction_commit
+        
+        # Replace this process with the new script
+        # shellcheck disable=SC2093  # exec is intentional here for self-update
+        exec "./$SCRIPT_NAME" "${restart_args[@]}"
+        
+        # This line only reached if exec fails
+        log_error "Failed to restart with new version"
+        return "$E_GENERAL"
+    fi
+    
+    # Restore stashed changes (if not self-updating)
+    if [[ -n "${TRANSACTION_STATE[stash_hash]}" ]]; then
+        echo
+        log_step "Restoring your saved changes..."
+        
+        local stash_ref
+        stash_ref=$(git stash list --format="%gd %H" | grep "${TRANSACTION_STATE[stash_hash]}" | cut -d' ' -f1 || echo "")
+        
+        if [[ -z "$stash_ref" ]]; then
+            log_warn "Could not find your saved changes"
+            log_info "Your changes may have been lost (stash hash: ${TRANSACTION_STATE[stash_hash]})"
+        else
+            # Try to pop the stash
+            if git stash pop "$stash_ref" >/dev/null 2>&1; then
+                log_success "Changes restored successfully"
+            else
+                # Pop failed, try apply
+                if git stash apply "$stash_ref" >/dev/null 2>&1; then
+                    log_success "Changes restored (with manual stash cleanup needed)"
+                    log_info "To remove the stash: git stash drop $stash_ref"
+                else
+                    log_warn "Could not restore changes automatically (conflicts detected)"
+                    log_info "Your changes are saved in: $stash_ref"
+                    log_info "To restore manually: git stash pop $stash_ref"
+                    log_info "You may need to resolve conflicts first"
+                fi
+            fi
+        fi
+    fi
+    
+    # Commit transaction
+    transaction_commit
+    
+    # Update state
+    get_current_version
+    check_local_changes
+    
+    echo
+    log_success "Version switch complete!"
+    
+    return 0
+}
+
+reset_to_clean_state() {
+    local target="$1"
+    
+    if [[ -z "$target" ]]; then
+        log_error "No target specified for reset"
+        return "$E_GENERAL"
+    fi
+    
+    # Validate we're not in a bad state
+    if ! validate_clean_state; then
+        return "$E_BAD_STATE"
+    fi
+    
+    # Validate target exists
+    if ! git rev-parse --verify --quiet "$target" >/dev/null 2>&1; then
+        log_error "Target '$target' does not exist"
+        return "$E_GENERAL"
+    fi
+    
+    # Show what will be deleted before confirmation
+    echo
+    log_warn "WARNING: This action CANNOT be undone!"
+    echo
+    log_warn "The following changes will be PERMANENTLY deleted:"
+    echo
+    git status --short 2>/dev/null || echo "  (no changes)"
+    echo
+    log_warn "Reset target: $target"
+    echo
+    
+    # Require explicit "yes" confirmation
+    if ! confirm_destructive_action "Type 'yes' (case-sensitive) to confirm reset, or anything else to cancel: "; then
+        log_info "Reset cancelled"
+        return 0
+    fi
+    
+    log_step "Resetting to clean state: $target"
+    
+    # Perform reset
+    if ! git reset --hard "$target" >/dev/null 2>&1; then
+        log_error "Failed to reset to $target"
+        return "$E_GENERAL"
+    fi
+    
+    # Clean untracked files
+    if ! git clean -fd >/dev/null 2>&1; then
+        log_warn "Could not remove all untracked files"
+    fi
+    
+    log_success "Reset complete. Your changes are gone. Repository is clean."
     
     # Set script permissions
     set_script_permissions
     
-    log_success "Successfully switched to $target_version"
-    
-    # Optionally restore local changes
-    if [[ "$STASH_CREATED" == "true" ]]; then
-        echo
-        read -r -p "Restore your backed-up changes? [y/N] " response
-        if [[ "$response" =~ ^[Yy]$ ]]; then
-            restore_backup_stash
-        else
-            log_info "Your changes remain in stash: $LAST_STASH_NAME"
-            log_info "Use 'git stash list' to see them"
-            log_info "Use 'git stash pop' to restore them later"
-            # User explicitly chose to keep stash - mark as user-managed
-            CLEANUP_REQUIRED=false
-            STASH_CREATED=false
-        fi
-    fi
-    
-    # Show new status
-    echo
-    get_current_version
-    log_success "Now on: $CURRENT_VERSION"
-    
-    return 0
-}
-
-# Update current version
-# Updates the current branch by pulling latest changes from remote
-# Only works when on a branch (not in detached HEAD state)
-update_current() {
-    log_header "Updating Current Version"
-    
+    # Update state
     get_current_version
     check_local_changes
     
-    if [[ "$IS_DETACHED" == "true" ]]; then
-        log_error "Cannot update: currently in detached HEAD state"
-        log_info "A detached HEAD means you're viewing a specific commit or tag"
-        log_info "Please switch to a branch first:"
-        log_info "  - Use option 3 to switch to '$DEFAULT_BRANCH' or a specific version"
-        log_info "  - Or use option 9 for quick switch to development branch"
+    return 0
+}
+
+set_script_permissions() {
+    log_debug "Setting executable permissions on scripts..."
+    
+    local scripts=(
+        "install_mediamtx.sh"
+        "lyrebird-orchestrator.sh"
+        "lyrebird-updater.sh"
+        "mediamtx-stream-manager.sh"
+        "usb-audio-mapper.sh"
+    )
+    
+    for script in "${scripts[@]}"; do
+        if [[ -f "$script" ]]; then
+            chmod +x "$script" 2>/dev/null || true
+        fi
+    done
+    
+    return 0
+}
+
+################################################################################
+# Version Listing and Selection
+################################################################################
+
+list_available_releases() {
+    AVAILABLE_VERSIONS=()
+    
+    echo
+    echo "${BOLD}━━━ Available Versions ━━━${NC}"
+    echo
+    
+    # List stable releases (tags)
+    echo "${BOLD}Stable Releases (numbered versions, tested and stable):${NC}"
+    
+    if git tag -l 'v*' --sort=-creatordate | head -n 20 | grep -q .; then
+        local counter=1
+        while IFS= read -r tag; do
+            local tag_date
+            tag_date=$(git log -1 --format=%ai "$tag" 2>/dev/null | cut -d' ' -f1 || echo "unknown")
+            printf "  %2d) %-15s (created: %s)\n" "$counter" "$tag" "$tag_date"
+            
+            AVAILABLE_VERSIONS+=("$tag")
+            ((counter++))
+        done < <(git tag -l 'v*' --sort=-creatordate | head -n 20)
+        
+        local tag_count
+        tag_count=$(git tag -l 'v*' | wc -l)
+        if [[ "$tag_count" -gt 20 ]]; then
+            echo "      ... and $((tag_count - 20)) more (not shown)"
+        fi
+    else
+        echo "  (no stable releases found)"
+    fi
+    
+    echo
+    echo "${BOLD}Development Branches (active development, may contain bugs):${NC}"
+    
+    local branch_counter=$((${#AVAILABLE_VERSIONS[@]} + 1))
+    if git branch -r | grep -v HEAD | sed 's/origin\///' | sed 's/^[[:space:]]*//' | grep -q .; then
+        while IFS= read -r branch; do
+            printf "  %2d) %s\n" "$branch_counter" "$branch"
+            AVAILABLE_VERSIONS+=("$branch")
+            ((branch_counter++))
+        done < <(git branch -r | grep -v HEAD | sed 's/origin\///' | sed 's/^[[:space:]]*//')
+    else
+        echo "  (no development branches found)"
+    fi
+    
+    echo
+}
+
+select_version_interactive() {
+    # Fetch updates first
+    if ! fetch_updates_safe; then
+        log_warn "Could not fetch updates - using cached information"
+        echo
+    fi
+    
+    # Show available versions
+    list_available_releases
+    
+    echo "You can enter:"
+    echo "  - A number from the list (e.g., 1)"
+    echo "  - A version name directly (e.g., v1.2.0 or main)"
+    echo "  - Press Enter to cancel"
+    echo
+    read -r -p "Your selection: " selection
+    
+    if [[ -z "$selection" ]]; then
+        log_info "Selection cancelled"
+        return 0
+    fi
+    
+    local target_version=""
+    
+    # Check if input is a number
+    if [[ "$selection" =~ ^[0-9]+$ ]]; then
+        local index=$((selection - 1))
+        
+        if [[ "$index" -ge 0 ]] && [[ "$index" -lt "${#AVAILABLE_VERSIONS[@]}" ]]; then
+            target_version="${AVAILABLE_VERSIONS[$index]}"
+            log_info "Selected: $target_version"
+        else
+            log_error "Invalid selection: $selection"
+            log_info "Please choose between 1 and ${#AVAILABLE_VERSIONS[@]}"
+            return "$E_GENERAL"
+        fi
+    else
+        # Direct version name
+        target_version="$selection"
+    fi
+    
+    switch_version_safe "$target_version"
+}
+
+switch_to_latest_stable() {
+    log_step "Finding latest stable release..."
+    
+    # Fetch first
+    if ! fetch_updates_safe; then
+        log_warn "Using cached version information"
+    fi
+    
+    # Get latest tag by creation date
+    local latest_tag
+    if ! latest_tag="$(git tag -l 'v*' --sort=-creatordate | head -n 1)"; then
+        log_error "No stable releases found"
         return "$E_GENERAL"
     fi
     
-    # Backup local changes if present
-    if [[ "$HAS_LOCAL_CHANGES" == "true" ]]; then
-        if ! create_backup_stash; then
-            return "$E_GIT_ERROR"
-        fi
+    if [[ -z "$latest_tag" ]]; then
+        log_error "No version tags found in repository"
+        log_info "The repository may not have any releases yet"
+        return "$E_GENERAL"
     fi
     
-    log_info "Updating $CURRENT_BRANCH..."
-    
-    local pull_output
-    local pull_status=0
-    
-    pull_output=$(git pull origin "$CURRENT_BRANCH" 2>&1) || pull_status=$?
-    
-    if [[ "$pull_status" -ne 0 ]]; then
-        # Check for merge conflicts
-        if check_merge_conflicts; then
-            handle_merge_conflicts
-            restore_backup_stash
-            return "$E_MERGE_CONFLICT"
-        else
-            log_error "Failed to update"
-            log_error "Git output: $pull_output"
-            restore_backup_stash
-            return "$E_GIT_ERROR"
-        fi
-    fi
-    
-    set_script_permissions
-    
-    log_success "Successfully updated $CURRENT_BRANCH"
-    
-    # Restore local changes
-    if [[ "$STASH_CREATED" == "true" ]]; then
-        restore_backup_stash
-    fi
-    
-    return 0
+    log_info "Latest stable release: $latest_tag"
+    switch_version_safe "$latest_tag"
 }
 
-# Reset to clean state
-# DESTRUCTIVE: Permanently deletes all local changes and untracked files
-# Args:
-#   $1 - target (commit/tag/branch to reset to)
-reset_clean() {
-    local target="$1"
+switch_to_development() {
+    log_step "Switching to development version..."
     
-    log_header "Reset to Clean State"
-    
-    echo -e "${RED}${BOLD}⚠️  WARNING: DESTRUCTIVE OPERATION  ⚠️${NC}"
-    echo
-    echo "This will permanently DELETE all local changes!"
-    echo
-    echo "This operation will:"
-    echo "  • Discard ALL uncommitted changes"
-    echo "  • Remove ALL untracked files (respecting .gitignore)"
-    echo "  • Reset to match: $target"
-    echo
-    echo -e "${YELLOW}${BOLD}THIS ACTION CANNOT BE UNDONE!${NC}"
-    echo
-    echo "Type the word 'DELETE' (in capitals) to confirm:"
-    read -r confirm
-    
-    if [[ "$confirm" != "DELETE" ]]; then
-        log_info "Operation cancelled (correct confirmation not provided)"
-        return "$E_USER_ABORT"
+    # Fetch first
+    if ! fetch_updates_safe; then
+        log_warn "Using cached version information"
     fi
     
-    log_info "Resetting to $target..."
-    
-    # Reset hard
-    local reset_output
-    local reset_status=0
-    
-    reset_output=$(git reset --hard "$target" 2>&1) || reset_status=$?
-    
-    if [[ "$reset_status" -ne 0 ]]; then
-        log_error "Failed to reset repository"
-        log_error "Git output: $reset_output"
-        return "$E_GIT_ERROR"
-    fi
-    
-    # Clean untracked files (BUG FIX: Removed -x flag to respect .gitignore)
-    log_info "Removing untracked files (respecting .gitignore)..."
-    local clean_output
-    local clean_status=0
-    
-    clean_output=$(git clean -fd 2>&1) || clean_status=$?
-    
-    if [[ "$clean_status" -ne 0 ]]; then
-        log_warn "Some untracked files could not be removed"
-        log_warn "Git output: $clean_output"
-    fi
-    
-    set_script_permissions
-    
-    log_success "Repository reset to clean state: $target"
-    
-    # Clear stash flags since we've nuked everything
-    STASH_CREATED=false
-    CLEANUP_REQUIRED=false
-    
-    return 0
+    switch_version_safe "$DEFAULT_BRANCH"
 }
 
-# Interactive version selection
-select_version_interactive() {
-    log_header "Select Version"
-    
-    # Fetch latest info
-    if ! fetch_updates; then
-        log_warn "Could not fetch latest information (continuing with cached data)"
-        echo
-        read -r -p "Press Enter to continue..."
-    fi
-    
-    # Get available releases
-    local -a releases
-    mapfile -t releases < <(git tag -l 'v*' --sort=-v:refname 2>/dev/null)
-    
-    echo "Available versions:"
-    echo
-    echo "  0) $DEFAULT_BRANCH (development branch)"
-    echo
-    
-    if [[ "${#releases[@]}" -gt 0 ]]; then
-        local index=1
-        for release in "${releases[@]}"; do
-            local marker=""
-            if [[ "$(normalize_version "$CURRENT_VERSION")" == "$(normalize_version "$release")" ]]; then
-                marker=" ${GREEN}(current)${NC}"
-            fi
-            printf "  %d) %s%s\n" "$index" "$release" "$marker"
-            ((index++))
-        done
-    else
-        log_warn "No release tags available"
-    fi
-    
-    echo
-    echo "  q) Cancel"
-    echo
-    
-    local max_choice="${#releases[@]}"
-    read -r -p "Select version [0-${max_choice}] or 'q': " choice
-    
-    if [[ "$choice" == "q" ]] || [[ "$choice" == "Q" ]]; then
-        return "$E_USER_ABORT"
-    fi
-    
-    if [[ "$choice" == "0" ]]; then
-        switch_version "$DEFAULT_BRANCH"
-        return $?
-    fi
-    
-    if [[ "$choice" =~ ^[0-9]+$ ]] && [[ "$choice" -ge 1 ]] && [[ "$choice" -le "${#releases[@]}" ]]; then
-        local selected_release="${releases[$((choice-1))]}"
-        
-        # Verify the tag exists and is reachable
-        if ! git rev-parse --verify "refs/tags/$selected_release" &>/dev/null; then
-            log_error "Version $selected_release is not available in the repository"
-            log_info "Try running 'Fetch Updates' first"
-            return "$E_GENERAL"
-        fi
-        
-        switch_version "$selected_release"
-        return $?
-    fi
-    
-    log_error "Invalid selection: $choice"
-    return "$E_GENERAL"
-}
+################################################################################
+# Status Display Functions
+################################################################################
 
-# Show main menu
-show_menu() {
-    log_header "LyreBirdAudio Version Manager v${VERSION}"
-    
+show_status() {
     get_current_version
+    check_local_changes
+    detect_git_state
     
-    echo -e "Current: ${CYAN}${CURRENT_VERSION}${NC}"
-    if [[ "$IS_DETACHED" == "false" ]]; then
-        echo -e "Branch:  ${CYAN}${CURRENT_BRANCH}${NC}"
+    echo
+    echo "${BOLD}━━━ Repository Status ━━━${NC}"
+    echo
+    
+    # Current position
+    if [[ "$IS_DETACHED" == "true" ]]; then
+        echo "${BOLD}Current State:${NC}"
+        echo "  Status:     ${YELLOW}Viewing a Specific Release (not on a branch)${NC}"
+        echo "  Version:    ${BOLD}$CURRENT_VERSION${NC}"
+        
+        local tags_here
+        tags_here=$(git tag --points-at HEAD 2>/dev/null | tr '\n' ' ')
+        if [[ -n "$tags_here" ]]; then
+            echo "  Tags:       $tags_here"
+        fi
+    else
+        echo "${BOLD}Current Branch:${NC}"
+        echo "  Branch:     ${BOLD}$CURRENT_BRANCH${NC}"
+        echo "  Commit:     ${BOLD}$CURRENT_VERSION${NC}"
+        
+        # Check if on a tag
+        local current_tag
+        current_tag=$(git describe --exact-match --tags HEAD 2>/dev/null || echo "")
+        if [[ -n "$current_tag" ]]; then
+            echo "  Tag:        ${GREEN}$current_tag${NC}"
+        fi
+        
+        # Show relationship to remote
+        if git show-ref --verify --quiet "refs/remotes/origin/$CURRENT_BRANCH" 2>/dev/null; then
+            local ahead behind
+            ahead=$(git rev-list --count "origin/$CURRENT_BRANCH..HEAD" 2>/dev/null || echo "0")
+            behind=$(git rev-list --count "HEAD..origin/$CURRENT_BRANCH" 2>/dev/null || echo "0")
+            
+            if [[ "$ahead" -gt 0 ]] && [[ "$behind" -gt 0 ]]; then
+                echo "  Remote:     ${YELLOW}Diverged ($ahead ahead, $behind behind)${NC}"
+            elif [[ "$ahead" -gt 0 ]]; then
+                echo "  Remote:     ${YELLOW}$ahead commit(s) ahead${NC}"
+            elif [[ "$behind" -gt 0 ]]; then
+                echo "  Remote:     ${YELLOW}$behind commit(s) behind${NC}"
+            else
+                echo "  Remote:     ${GREEN}In sync${NC}"
+            fi
+        else
+            echo "  Remote:     ${YELLOW}No remote tracking${NC}"
+        fi
     fi
-    echo
     
-    echo "Available Actions:"
     echo
-    echo "  ${BOLD}Version Management:${NC}"
-    echo "    1) Show current status"
-    echo "    2) List available versions"
-    echo "    3) Switch to different version"
-    echo "    4) Update current version"
+    echo "${BOLD}Working Directory:${NC}"
+    
+    case "$GIT_STATE" in
+        clean)
+            echo "  Status:     ${GREEN}Ready (no local modifications)${NC}"
+            ;;
+        dirty)
+            echo "  Status:     ${YELLOW}Has Local Modifications${NC}"
+            echo
+            echo "  File Status Legend:  M=modified  A=added  D=deleted  ?=untracked"
+            echo
+            git status --short | head -n 10 | sed 's/^/    /'
+            
+            local change_count
+            change_count=$(git status --short | wc -l)
+            if [[ "$change_count" -gt 10 ]]; then
+                echo "    ... and $((change_count - 10)) more"
+            fi
+            ;;
+        merge|rebase|cherry-pick|bisect)
+            echo "  Status:     ${RED}${GIT_STATE^^} IN PROGRESS${NC}"
+            ;;
+    esac
+    
     echo
-    echo "  ${BOLD}Maintenance:${NC}"
-    echo "    5) Reset to clean state"
-    echo "    6) Show local modifications"
-    echo "    7) Create backup of changes"
-    echo
-    echo "  ${BOLD}Quick Actions:${NC}"
-    echo "    8) Switch to latest stable release"
-    echo "    9) Switch to development ($DEFAULT_BRANCH)"
-    echo
-    echo "  ${BOLD}Other:${NC}"
-    echo "    h) Show help"
-    echo "    q) Quit"
+    echo "${BOLD}Repository Info:${NC}"
+    
+    local repo_remote
+    repo_remote=$(git remote get-url origin 2>/dev/null || echo "none")
+    echo "  Remote:     $repo_remote"
+    
+    local last_fetch="never"
+    if [[ -f ".git/FETCH_HEAD" ]]; then
+        if command -v stat >/dev/null 2>&1; then
+            last_fetch=$(stat -c %y ".git/FETCH_HEAD" 2>/dev/null | cut -d'.' -f1 || \
+                        stat -f %Sm ".git/FETCH_HEAD" 2>/dev/null || echo "unknown")
+        fi
+    fi
+    echo "  Last fetch: $last_fetch"
+    
     echo
 }
 
-# Show help
-show_help() {
-    log_header "Help"
+show_startup_diagnostics() {
+    get_current_version
+    check_local_changes
     
+    echo
+    echo "${BOLD}━━━ LyreBirdAudio Version Manager v${VERSION} ━━━${NC}"
+    echo
+    
+    # Current version
+    if [[ "$IS_DETACHED" == "true" ]]; then
+        echo "Current:  ${YELLOW}Viewing Release: ${BOLD}$CURRENT_VERSION${NC}${YELLOW} (not tracking a branch)${NC}"
+    else
+        echo "Current:  ${GREEN}Branch ${BOLD}$CURRENT_BRANCH${NC} @ $CURRENT_VERSION"
+    fi
+    
+    if [[ "$HAS_LOCAL_CHANGES" == "true" ]]; then
+        echo "Changes:  ${YELLOW}You have local modifications${NC}"
+    else
+        echo "Changes:  ${GREEN}Clean working directory${NC}"
+    fi
+    
+    echo
+    log_step "Checking for updates..."
+    
+    # Quick fetch (with short timeout)
+    local fetch_ok=false
+    if command -v timeout >/dev/null 2>&1; then
+        if timeout 5 git fetch --all --tags --prune --quiet 2>/dev/null; then
+            fetch_ok=true
+        fi
+    else
+        if git fetch --all --tags --prune --quiet 2>/dev/null; then
+            fetch_ok=true
+        fi
+    fi
+    
+    if [[ "$fetch_ok" == "true" ]]; then
+        echo -e "          ${GREEN}✓${NC} Connected to GitHub"
+    else
+        echo -e "          ${YELLOW}!${NC} Could not connect (using cached data)"
+    fi
+    
+    # Check for stable releases
+    local latest_tag
+    latest_tag="$(git tag -l 'v*' --sort=-creatordate 2>/dev/null | head -n 1)"
+    
+    if [[ -n "$latest_tag" ]]; then
+        local current_tag
+        current_tag="$(git describe --exact-match --tags HEAD 2>/dev/null || echo "")"
+        
+        if [[ -n "$current_tag" ]] && [[ "$current_tag" == "$latest_tag" ]]; then
+            echo "Stable:   ${GREEN}You're on latest: $latest_tag${NC}"
+        else
+            echo "Stable:   ${YELLOW}Update available: $latest_tag${NC}"
+            echo "          ${CYAN}↑ Select option 1 to update${NC}"
+        fi
+    fi
+    
+    # Check development branch
+    if [[ "$IS_DETACHED" == "false" ]]; then
+        local behind
+        behind=$(git rev-list --count "HEAD..origin/$CURRENT_BRANCH" 2>/dev/null || echo "0")
+        
+        if [[ "$behind" -gt 0 ]]; then
+            echo "Dev:      ${YELLOW}$behind commit(s) behind origin/$CURRENT_BRANCH${NC}"
+            echo "          ${CYAN}↑ Select option 2 to update${NC}"
+        else
+            echo "Dev:      ${GREEN}Up to date with origin/$CURRENT_BRANCH${NC}"
+        fi
+    fi
+    
+    echo
+    read -r -p "Press Enter to continue..."
+}
+
+################################################################################
+# Help and Menu Functions
+################################################################################
+
+show_help() {
     cat << 'EOF'
-LyreBirdAudio Version Manager
 
-This tool helps you manage different versions of LyreBirdAudio safely.
+════════════════════════════════════════════════════════════════════════════════
+   LyreBirdAudio Version Manager - Help Guide
+════════════════════════════════════════════════════════════════════════════════
 
-PREREQUISITES:
-  • Git 2.0+ must be installed
-  • Bash 4.0+ required
-  • Must be run from a git-cloned LyreBirdAudio repository
-  • Internet connection required for fetching updates
+SIMPLE UPDATE WORKFLOW:
+  For most users: Just select option 1
+  This updates you to the latest stable, tested version
 
-TERMINOLOGY:
-  • Release/Tag: Stable version (e.g., v1.1.0, v1.0.1)
-  • Branch: Development line (e.g., main, master)
-  • Local Changes: Modifications you've made to files
-  • Stash: Temporary backup of your changes
-  • Detached HEAD: Viewing a specific version without being on a branch
-  • Merge Conflict: Git cannot automatically merge changes
+━━━ MAIN OPTIONS ━━━
 
-COMMON WORKFLOWS:
+1) Switch to Latest Stable Release
+   ↑ Newest tested version
+   ↑ Recommended for production use
+   ↑ Automatically checks for updates
+   ↑ Your changes will be saved temporarily
 
-1. Update to latest stable release:
-   - Select option 8: "Switch to latest stable release"
-   - Or: List versions → Select newest release
-   - The script automatically finds the latest version
+2) Switch to Development Version
+   ↑ Latest code with newest features
+   ↑ May have bugs or incomplete features
+   ↑ For testing and development
+   ↑ Your changes will be saved temporarily
 
-2. Try development version:
-   - Select option 9: "Switch to development branch"
-   - Warning: Development branch may contain bugs
+3) Switch to Specific Version
+   ↑ Choose any version from a list
+   ↑ Useful for testing or rollback
+   ↑ Your changes will be saved temporarily
 
-3. Go back to stable after testing:
-   - Select option 3: "Switch to different version"
-   - Choose a release version (e.g., v1.1.0)
+4) Check for New Updates
+   ↑ Downloads version information
+   ↑ Doesn't change your current version
+   ↑ Shows what's available
 
-4. Update your current version:
-   - Select option 4: "Update current version"
-   - Only works when on a branch (not detached HEAD)
+5) Show Detailed Status
+   ↑ Your current version and branch
+   ↑ Local modifications
+   ↑ Sync status with remote
+   ↑ Repository information
 
-5. Fix broken installation:
-   - Select option 5: "Reset to clean state"
-   - Choose which version to reset to
-   - Warning: Loses ALL local changes permanently!
+6) Discard All Changes & Reset
+   ↑ PERMANENTLY deletes local modifications
+   ↑ Resets to a clean version
+   ↑ Use with caution!
 
-6. Save work before switching:
-   - Select option 7: "Create backup of changes"
-   - Then switch versions safely
-   - Your changes are saved in a git stash
+━━━ SAFETY FEATURES ━━━
 
-SAFETY FEATURES:
-  • Automatically backs up local changes when switching versions
-  • Warns before destructive operations with explicit confirmations
-  • Validates all operations before executing
-  • Provides clear status information and error messages
-  • Handles merge conflicts with clear resolution instructions
-  • Protects against network failures and git errors
-  • Graceful signal handling (Ctrl+C safe)
-  • Respects .gitignore when cleaning files
+✓ Your changes are automatically saved before updating
+✓ Confirmation required for destructive actions
+✓ Automatic rollback if operations fail
+✓ Clear warnings before permanent actions
 
-COMMAND LINE OPTIONS:
-  --version, -v     Show version information
-  --status, -s      Show current status (non-interactive)
-  --list, -l        List available versions (non-interactive)
-  --help, -h        Show this help text
+━━━ COMMON QUESTIONS ━━━
 
-TROUBLESHOOTING:
+Q: What happens to my changes when I update?
+A: They're automatically saved and will be restored after the update
 
-If you're not in a git repository:
-  • The script requires a git-cloned LyreBirdAudio directory
-  • If you have scripts locally without git:
-    1. Run the script and choose "yes" when offered clone assistance
-    2. Or manually clone: git clone https://github.com/tomtom215/LyreBirdAudio
-    3. Keep your work-in-progress files separate
-  • The script will detect this and offer to help
+Q: Can I undo an update?
+A: Yes, use option 3 to switch back to any previous version
 
-If you encounter merge conflicts:
-  • The script will detect and warn you
-  • Follow the on-screen instructions to resolve
-  • Common resolution: Use option 5 to reset to clean state
+Q: What if something goes wrong?
+A: The script automatically tries to recover
 
-If network operations fail:
-  • Check your internet connection
-  • Verify GitHub is accessible: ping github.com
-  • Try again after network is restored
+Q: How do I start fresh with no modifications?
+A: Use option 6 to reset to a clean state
 
-If the script reports repository corruption:
-  • Run: git fsck --full
-  • Consider re-cloning if corruption is severe
+━━━ MORE HELP ━━━
 
-For more information, visit:
-https://github.com/tomtom215/LyreBirdAudio
+Visit: https://github.com/tomtom215/LyreBirdAudio
 
 EOF
 }
 
-# Show local modifications
-show_local_modifications() {
-    log_header "Local Modifications"
-    
-    check_local_changes
-    
-    if [[ "$HAS_LOCAL_CHANGES" == "false" ]]; then
-        log_success "No local modifications detected"
-        return 0
-    fi
-    
-    echo "Modified and untracked files:"
-    git status --short 2>/dev/null || echo "(unable to show status)"
-    echo
-    
-    echo "Summary of changes:"
-    git diff --stat 2>/dev/null || echo "(unable to show diff summary)"
-    echo
-    
-    read -r -p "Show detailed changes? [y/N] " response
-    if [[ "$response" =~ ^[Yy]$ ]]; then
-        echo "Viewing detailed changes... (Press 'q' to quit, arrow keys to scroll)"
-        git diff 2>/dev/null | less -FRX || echo "(unable to show detailed diff)"
-    fi
-}
-
-# Create manual backup
-create_manual_backup() {
-    log_header "Create Backup"
-    
-    check_local_changes
-    
-    if [[ "$HAS_LOCAL_CHANGES" == "false" ]]; then
-        log_info "No local changes to backup"
-        return 0
-    fi
-    
-    echo "This will create a backup of your current changes."
-    echo "The backup is stored as a git stash."
-    echo "You can restore it later using 'git stash pop'"
-    echo
-    
-    read -r -p "Continue? [Y/n] " response
-    if [[ "$response" =~ ^[Nn]$ ]]; then
-        log_info "Operation cancelled"
-        return "$E_USER_ABORT"
-    fi
-    
-    local stash_name
-    stash_name="manual-backup-$(date +%Y%m%d-%H%M%S)-$$"
-    local stash_output
-    
-    if stash_output=$(git stash push -u -m "$stash_name" 2>&1); then
-        log_success "Backup created: $stash_name"
-        echo
-        echo "To restore this backup later:"
-        echo "  git stash list              # Find your backup in the list"
-        echo "  git stash apply stash@{N}   # Apply specific backup by number"
-        echo "  git stash pop               # Apply and remove most recent backup"
-        return 0
-    else
-        log_error "Failed to create backup"
-        log_error "Git output: $stash_output"
-        return "$E_GIT_ERROR"
-    fi
-}
-
-# Switch to latest stable (dynamic)
-switch_to_latest_stable() {
-    local latest_stable
-    
-    if ! latest_stable=$(get_latest_stable_release); then
-        log_error "Could not determine latest stable release"
-        log_info "Try running 'List Available Versions' first"
-        return "$E_GENERAL"
-    fi
-    
-    log_info "Latest stable release: $latest_stable"
-    switch_version "$latest_stable"
-    return $?
-}
-
-# Main menu loop
 main_menu() {
     while true; do
-        clear
-        show_menu
+        get_current_version
+        check_local_changes
         
-        read -r -p "Select option: " choice
+        clear
+        echo
+        echo "${BOLD}┌─────────────────────────────────────────────────────────┐${NC}"
+        echo "${BOLD}│     LyreBirdAudio - Version Manager v${VERSION}      │${NC}"
+        echo "${BOLD}└─────────────────────────────────────────────────────────┘${NC}"
+        echo
+        
+        # Status header
+        if [[ "$IS_DETACHED" == "true" ]]; then
+            echo "  Current:  ${YELLOW}$CURRENT_VERSION${NC}"
+        else
+            echo "  Current:  ${CYAN}$CURRENT_BRANCH${NC} @ ${BOLD}$CURRENT_VERSION${NC}"
+        fi
+        
+        if [[ "$HAS_LOCAL_CHANGES" == "true" ]]; then
+            echo "  Changes:  ${YELLOW}Has local modifications${NC}"
+        else
+            echo "  Changes:  ${GREEN}None${NC}"
+        fi
+        
+        echo
+        echo "${BOLD}━━━ UPDATE ━━━${NC}"
+        echo "  ${BOLD}1${NC}) Switch to Latest Stable Release"
+        echo "     (Newest tested version—recommended)"
+        echo "  ${BOLD}2${NC}) Switch to Development Version ($DEFAULT_BRANCH)"
+        echo "     (Latest code with new features—may have bugs)"
+        echo "  ${BOLD}3${NC}) Switch to Specific Version"
+        echo "     (Choose from older releases or branches)"
+        echo
+        echo "${BOLD}━━━ INFO ━━━${NC}"
+        echo "  ${BOLD}4${NC}) Check for New Updates"
+        echo "  ${BOLD}5${NC}) Show Detailed Status"
+        echo
+        echo "${BOLD}━━━ DANGER ZONE ━━━${NC}"
+        echo "  ${BOLD}6${NC}) Discard All Changes & Reset..."
+        echo
+        echo "  ${BOLD}H${NC}) Help  |  ${BOLD}Q${NC}) Quit"
+        echo
+        read -r -p "Select [1-6, H, Q]: " choice
         
         case "$choice" in
             1)
-                show_status
+                switch_to_latest_stable
                 read -r -p "Press Enter to continue..."
                 ;;
             2)
-                list_available_releases
+                switch_to_development
                 read -r -p "Press Enter to continue..."
                 ;;
             3)
@@ -1286,97 +1451,17 @@ main_menu() {
                 read -r -p "Press Enter to continue..."
                 ;;
             4)
-                update_current
+                if fetch_updates_safe; then
+                    list_available_releases
+                fi
                 read -r -p "Press Enter to continue..."
                 ;;
             5)
-                echo
-                echo "Reset to which version?"
-                echo "  1) Latest commit on current branch"
-                echo "  2) origin/$DEFAULT_BRANCH (latest development)"
-                echo "  3) Specific version (tag or branch)"
-                echo "  4) Cancel"
-                echo
-                read -r -p "Select [1-4]: " reset_choice
-                
-                case "$reset_choice" in
-                    1)
-                        # BUG FIX: Improved logic for detached HEAD and remote branch validation
-                        get_current_version
-                        if [[ "$IS_DETACHED" == "true" ]]; then
-                            log_warn "You are in detached HEAD state"
-                            log_warn "Resetting to HEAD won't change anything"
-                            log_info "Recommendation: Use option 2 or 3 instead"
-                            read -r -p "Continue anyway? [y/N] " response
-                            if [[ ! "$response" =~ ^[Yy]$ ]]; then
-                                log_info "Reset cancelled"
-                            else
-                                reset_clean "HEAD"
-                            fi
-                        else
-                            # Validate remote branch exists before resetting
-                            if git show-ref --verify --quiet "refs/remotes/origin/$CURRENT_BRANCH"; then
-                                reset_clean "origin/$CURRENT_BRANCH"
-                            else
-                                log_error "Remote branch origin/$CURRENT_BRANCH does not exist"
-                                log_info "Using local HEAD instead"
-                                read -r -p "Continue with local HEAD? [y/N] " response
-                                if [[ "$response" =~ ^[Yy]$ ]]; then
-                                    reset_clean "HEAD"
-                                else
-                                    log_info "Reset cancelled"
-                                fi
-                            fi
-                        fi
-                        ;;
-                    2)
-                        # Validate default branch exists
-                        if git show-ref --verify --quiet "refs/remotes/origin/$DEFAULT_BRANCH"; then
-                            reset_clean "origin/$DEFAULT_BRANCH"
-                        else
-                            log_error "Remote branch origin/$DEFAULT_BRANCH does not exist"
-                            log_info "Please fetch updates first or use option 3"
-                        fi
-                        ;;
-                    3)
-                        # BUG FIX: Validate version BEFORE asking for DELETE confirmation
-                        read -r -p "Enter version (e.g., v1.1.0 or $DEFAULT_BRANCH): " version
-                        if [[ -z "$version" ]]; then
-                            log_error "No version specified"
-                        elif ! validate_version_exists "$version"; then
-                            log_error "Version '$version' does not exist or is not reachable"
-                            log_info "Available options:"
-                            log_info "  - Run 'Fetch Updates' first"
-                            log_info "  - Use 'List Available Versions' to see valid versions"
-                            log_info "  - Check spelling/capitalization"
-                        else
-                            reset_clean "$version"
-                        fi
-                        ;;
-                    4)
-                        log_info "Reset cancelled"
-                        ;;
-                    *)
-                        log_error "Invalid choice"
-                        ;;
-                esac
+                show_status
                 read -r -p "Press Enter to continue..."
                 ;;
             6)
-                show_local_modifications
-                read -r -p "Press Enter to continue..."
-                ;;
-            7)
-                create_manual_backup
-                read -r -p "Press Enter to continue..."
-                ;;
-            8)
-                switch_to_latest_stable
-                read -r -p "Press Enter to continue..."
-                ;;
-            9)
-                switch_version "$DEFAULT_BRANCH"
-                read -r -p "Press Enter to continue..."
+                reset_menu
                 ;;
             h|H)
                 show_help
@@ -1385,7 +1470,6 @@ main_menu() {
             q|Q)
                 echo
                 log_info "Thank you for using LyreBirdAudio Version Manager"
-                CLEANUP_REQUIRED=false  # Normal exit, no cleanup needed
                 return 0
                 ;;
             *)
@@ -1396,7 +1480,86 @@ main_menu() {
     done
 }
 
-# Main function
+reset_menu() {
+    while true; do
+        echo
+        echo "${BOLD}━━━ DISCARD CHANGES & RESET ━━━${NC}"
+        log_warn "This will PERMANENTLY delete all your local modifications!"
+        echo
+        echo "Reset to:"
+        echo "  ${BOLD}1${NC}) Latest remote version of current branch"
+        echo "     (Only available if you're tracking a branch)"
+        echo "  ${BOLD}2${NC}) Latest development version ($DEFAULT_BRANCH)"
+        echo "  ${BOLD}3${NC}) Specific version (let me choose)"
+        echo "  ${BOLD}C${NC}) Cancel"
+        echo
+        read -r -p "Select [1-3, C]: " choice
+        
+        case "$choice" in
+            1)
+                get_current_version
+                if [[ "$IS_DETACHED" == "true" ]]; then
+                    log_warn "You're viewing a specific version (not tracking a branch)"
+                    log_info "Resetting to HEAD won't change anything"
+                    log_info "Choose option 2 or 3 instead"
+                    read -r -p "Press Enter to continue..."
+                else
+                    if git show-ref --verify --quiet "refs/remotes/origin/$CURRENT_BRANCH"; then
+                        reset_to_clean_state "origin/$CURRENT_BRANCH"
+                    else
+                        log_error "Remote branch not found: origin/$CURRENT_BRANCH"
+                    fi
+                fi
+                read -r -p "Press Enter to continue..."
+                return 0
+                ;;
+            2)
+                if git show-ref --verify --quiet "refs/remotes/origin/$DEFAULT_BRANCH"; then
+                    reset_to_clean_state "origin/$DEFAULT_BRANCH"
+                else
+                    log_error "Development branch not found: origin/$DEFAULT_BRANCH"
+                    log_info "Try option 4 from main menu to fetch updates"
+                fi
+                read -r -p "Press Enter to continue..."
+                return 0
+                ;;
+            3)
+                log_step "Fetching available versions..."
+                if ! fetch_updates_safe; then
+                    log_warn "Using cached information"
+                fi
+                
+                list_available_releases
+                echo
+                read -r -p "Enter version to reset to: " version
+                
+                if [[ -z "$version" ]]; then
+                    log_info "Cancelled"
+                elif ! validate_version_exists "$version"; then
+                    log_error "Version '$version' does not exist"
+                else
+                    reset_to_clean_state "$version"
+                fi
+                read -r -p "Press Enter to continue..."
+                return 0
+                ;;
+            c|C)
+                log_info "Cancelled"
+                read -r -p "Press Enter to continue..."
+                return 0
+                ;;
+            *)
+                log_error "Invalid choice"
+                sleep 1
+                ;;
+        esac
+    done
+}
+
+################################################################################
+# Main Entry Point
+################################################################################
+
 main() {
     # Change to script directory
     if ! cd "$SCRIPT_DIR" 2>/dev/null; then
@@ -1404,56 +1567,99 @@ main() {
         exit "$E_GENERAL"
     fi
     
-    # Check prerequisites first
+    # Check prerequisites
     if ! check_prerequisites; then
         exit "$E_PREREQUISITES"
     fi
     
-    # Check git repository
-    check_git_repository
-    local repo_check_status=$?
-    if [[ "$repo_check_status" -ne 0 ]]; then
-        exit "$repo_check_status"
+    # Acquire lock
+    if ! acquire_lock; then
+        exit "$E_LOCKED"
     fi
     
-    # Detect default branch (main vs master)
-    DEFAULT_BRANCH="$(get_default_branch)"
-    log_debug "Detected default branch: $DEFAULT_BRANCH"
+    # Validate git repository
+    if ! check_git_repository; then
+        exit "$E_NOT_GIT_REPO"
+    fi
     
-    # Check for command line arguments
+    # Configure git
+    git config core.fileMode false 2>/dev/null || true
+    
+    # Detect default branch
+    DEFAULT_BRANCH="$(get_default_branch)"
+    log_debug "Default branch: $DEFAULT_BRANCH"
+    
+    # Handle command line arguments
     if [[ $# -gt 0 ]]; then
         case "$1" in
+            --post-update-restore)
+                if [[ -z "${2:-}" ]]; then
+                    log_error "Missing stash hash argument"
+                    exit "$E_GENERAL"
+                fi
+                
+                echo
+                log_success "Updater has been updated!"
+                log_step "Restoring your saved changes..."
+                
+                local stash_hash="$2"
+                local stash_ref
+                stash_ref=$(git stash list --format="%gd %H" | grep "$stash_hash" | cut -d' ' -f1 || echo "")
+                
+                if [[ -n "$stash_ref" ]]; then
+                    if git stash pop "$stash_ref" >/dev/null 2>&1; then
+                        log_success "Changes restored successfully"
+                    else
+                        log_warn "Could not restore changes automatically"
+                        log_info "Your changes are in: $stash_ref"
+                        log_info "To restore: git stash pop $stash_ref"
+                    fi
+                else
+                    log_warn "Could not find your saved changes"
+                fi
+                
+                echo
+                read -r -p "Press Enter to continue..."
+                ;;
+                
+            --post-update-complete)
+                echo
+                log_success "Updater has been updated successfully!"
+                echo
+                read -r -p "Press Enter to continue..."
+                ;;
+                
             --version|-v)
                 echo "LyreBirdAudio Version Manager v${VERSION}"
-                echo "Requires: Git ${MIN_GIT_MAJOR}.0+, Bash ${MIN_BASH_MAJOR}.0+"
                 exit "$E_SUCCESS"
                 ;;
+                
             --help|-h)
                 show_help
                 exit "$E_SUCCESS"
                 ;;
+                
             --status|-s)
                 show_status
                 exit "$E_SUCCESS"
                 ;;
+                
             --list|-l)
-                if fetch_updates; then
-                    list_available_releases
-                else
-                    log_warn "Using cached repository information"
-                    list_available_releases
-                fi
+                fetch_updates_safe || true
+                list_available_releases
                 exit "$E_SUCCESS"
                 ;;
+                
             *)
                 log_error "Unknown option: $1"
-                echo
-                echo "Usage: $SCRIPT_NAME [OPTION]"
                 echo "Try '$SCRIPT_NAME --help' for more information"
                 exit "$E_GENERAL"
                 ;;
         esac
     fi
+    
+    # Show startup diagnostics
+    show_startup_diagnostics
     
     # Run interactive menu
     main_menu
