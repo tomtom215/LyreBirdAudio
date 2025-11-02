@@ -10,6 +10,7 @@
 #           installation with simplified rollback, enforced checksum verification (--force to skip),
 #           fixed BSD/macOS lock race conditions, improved SemVer comparison, state directory
 #           management, enhanced JSON parsing, better error handling, full shellcheck compliance
+#           fixed checksum validation function
 #   v1.2.0: Fixed checksum URL to use unified checksums.sha256 file
 #   v1.1.0: Added stream manager integration, dry-run mode, SemVer comparison
 #
@@ -256,7 +257,7 @@ acquire_lock() {
         local elapsed=0
         while ! flock -n -x 200 2>/dev/null; do
             sleep 1
-            ((elapsed++))
+            ((++elapsed))
             if [[ ${elapsed} -ge ${timeout} ]]; then
                 exec 200>&- 2>/dev/null || true
                 LOCK_FD=""
@@ -677,7 +678,7 @@ download_file() {
     
     local attempt=0
     while [[ ${attempt} -lt ${retries} ]]; do
-        ((attempt++))
+        ((++attempt))
         log_debug "Download attempt ${attempt}/${retries}: ${url}"
         
         local success=false
@@ -893,7 +894,8 @@ download_mediamtx() {
     
     # Verify checksum (enforced by default)
     log_info "Verifying download..."
-    local checksum_url="https://github.com/${DEFAULT_GITHUB_REPO}/releases/download/v${version}/checksums.sha256"
+    local version_normalized="${version#v}"
+    local checksum_url="https://github.com/${DEFAULT_GITHUB_REPO}/releases/download/v${version_normalized}/checksums.sha256"
     if ! download_file "${checksum_url}" "${checksum}"; then
         if [[ "${FORCE_MODE}" != "true" ]]; then
             fatal "Failed to download checksum file (use --force to skip verification)" 6
@@ -1536,13 +1538,13 @@ verify_installation() {
     # Check binary
     if [[ ! -f "${INSTALL_DIR}/mediamtx" ]]; then
         log_error "Binary not found: ${INSTALL_DIR}/mediamtx"
-        ((errors++))
+        ((++errors))
     elif [[ ! -x "${INSTALL_DIR}/mediamtx" ]]; then
         log_error "Binary not executable: ${INSTALL_DIR}/mediamtx"
-        ((errors++))
+        ((++errors))
     elif ! "${INSTALL_DIR}/mediamtx" --version &>/dev/null; then
         log_error "Binary verification failed"
-        ((errors++))
+        ((++errors))
     else
         log_info "Binary: OK"
     fi
@@ -1550,7 +1552,7 @@ verify_installation() {
     # Check config
     if [[ ! -f "${CONFIG_DIR}/${CONFIG_NAME}" ]]; then
         log_warn "Configuration not found: ${CONFIG_DIR}/${CONFIG_NAME}"
-        ((warnings++))
+        ((++warnings))
     else
         log_info "Configuration: OK"
     fi
@@ -1559,7 +1561,7 @@ verify_installation() {
     if command -v systemctl &>/dev/null; then
         if [[ ! -f "${SERVICE_DIR}/${SERVICE_NAME}" ]]; then
             log_warn "Service not configured"
-            ((warnings++))
+            ((++warnings))
         else
             log_info "Service: OK"
         fi
@@ -1568,7 +1570,7 @@ verify_installation() {
     # Check user
     if ! id "${SERVICE_USER}" &>/dev/null; then
         log_warn "Service user not found: ${SERVICE_USER}"
-        ((warnings++))
+        ((++warnings))
     else
         log_info "Service user: OK"
     fi
