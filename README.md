@@ -4,6 +4,10 @@
 **Platform:** Linux (Ubuntu/Debian/Raspberry Pi OS)  
 **Core Engine:** MediaMTX (latest stable recommended)
 
+**Author:** Tom F - https://github.com/tomtom215 
+
+**Copyright:** Tom F
+
 ## Table of Contents
 
 - [Overview](#overview)
