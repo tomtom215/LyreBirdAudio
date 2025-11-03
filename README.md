@@ -6,7 +6,7 @@
 
 **Author:** Tom F - https://github.com/tomtom215 
 
-**Copyright:** Tom F
+**Copyright:** Tom F & LyreBirdAudio contributors
 
 ## Table of Contents
 
