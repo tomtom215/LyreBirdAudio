@@ -3,6 +3,10 @@
 # Part of LyreBirdAudio - RTSP Audio Streaming Suite
 # https://github.com/tomtom215/LyreBirdAudio
 #
+# Author: Tom F (https://github.com/tomtom215)
+# Copyright: Tom F and LyreBirdAudio contributors
+# License: Apache 2.0
+#
 # This script creates udev rules for USB sound cards to ensure they maintain 
 # consistent names across reboots, with symlinks for easy access.
 #
