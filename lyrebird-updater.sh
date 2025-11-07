@@ -3,7 +3,11 @@
 # Part of LyreBirdAudio - RTSP Audio Streaming Suite
 # https://github.com/tomtom215/LyreBirdAudio
 #
-# Version: 1.4.2 - Enhanced Branch Selection & UX Clarity
+# Author: Tom F (https://github.com/tomtom215)
+# Copyright: Tom F and LyreBirdAudio contributors
+# License: Apache 2.0
+#
+# Version: 1.4.3 - Security and Reliability Hardening
 #
 # This script provides safe, reliable version management with:
 #   - Atomic operations with automatic rollback on failure
@@ -24,7 +28,10 @@ if [ -z "$BASH_VERSION" ]; then
     exit 1
 fi
 
-# Strict error handling
+# Strict error handling and security
+export LC_ALL=C      # Ensure consistent sorting and string handling
+umask 077            # Secure file creation (owner-only by default)
+
 set -o errexit   # Exit on any command failure
 set -o pipefail  # Catch errors in pipes
 set -o nounset   # Exit if uninitialized variable is used
@@ -39,9 +46,8 @@ SCRIPT_NAME="$(basename "${BASH_SOURCE[0]}")"
 readonly SCRIPT_NAME
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly SCRIPT_DIR
-readonly VERSION="1.4.2"
-LOCKFILE="${SCRIPT_DIR}/.lyrebird-updater.lock"
-readonly LOCKFILE
+readonly VERSION="1.4.3"
+readonly LOCKFILE="${SCRIPT_DIR}/.lyrebird-updater.lock"
 
 # Repository configuration
 readonly REPO_OWNER="tomtom215"
@@ -69,6 +75,8 @@ readonly MIN_BASH_MINOR=0
 readonly FETCH_TIMEOUT=30
 readonly FETCH_RETRIES=3
 readonly FETCH_RETRY_DELAY=2
+readonly LOCK_MAX_WAIT=30
+readonly TAG_LIST_LIMIT=20
 
 # Colors for output (using tput for portability)
 if command -v tput >/dev/null 2>&1 && [[ -t 1 ]]; then
@@ -102,6 +110,7 @@ fi
 
 # Debug mode
 DEBUG="${DEBUG:-false}"
+export DEBUG  # Export so child processes inherit
 
 # Repository state (populated and validated by functions)
 DEFAULT_BRANCH=""
@@ -109,7 +118,7 @@ CURRENT_VERSION=""
 CURRENT_BRANCH=""
 IS_DETACHED=false
 HAS_LOCAL_CHANGES=false
-GIT_STATE="unknown"  # clean, dirty, merge, rebase, cherry-pick, bisect
+GIT_STATE="unknown"  # clean, dirty, merge, rebase, revert, cherry-pick, bisect, sequencer
 
 # Transaction state for rollback capability
 declare -A TRANSACTION_STATE=(
@@ -122,6 +131,9 @@ declare -A TRANSACTION_STATE=(
 
 # Available versions array
 declare -a AVAILABLE_VERSIONS=()
+
+# Git configuration backup for restoration
+declare -A ORIGINAL_GIT_CONFIG=()
 
 ################################################################################
 # Logging Functions
@@ -154,11 +166,10 @@ log_step() {
 }
 
 ################################################################################
-# Lock File Management
+# Lock File Management (FIXED: Atomic operations with stale lock detection)
 ################################################################################
 
 acquire_lock() {
-    local max_wait=30
     local waited=0
     
     # Verify SCRIPT_DIR is writable before attempting lock file operations
@@ -169,52 +180,58 @@ acquire_lock() {
         return "$E_PERMISSION"
     fi
     
-    while [[ -f "$LOCKFILE" ]]; do
-        if [[ $waited -ge $max_wait ]]; then
-            log_error "Another instance of this script is running"
+    while true; do
+        # ATOMIC OPERATION: mkdir fails if directory exists
+        if mkdir "$LOCKFILE" 2>/dev/null; then
+            echo "$$" > "${LOCKFILE}/pid"
+            log_debug "Lock acquired (PID: $$)"
+            return 0
+        fi
+        
+        # Check if lock is stale (process no longer exists)
+        if [[ -f "${LOCKFILE}/pid" ]]; then
+            local lock_pid
+            lock_pid=$(cat "${LOCKFILE}/pid" 2>/dev/null || echo "")
+            
+            if [[ -n "$lock_pid" ]] && ! kill -0 "$lock_pid" 2>/dev/null; then
+                log_warn "Removing stale lock from dead process $lock_pid"
+                rm -rf "$LOCKFILE"
+                continue
+            fi
+        fi
+        
+        # Wait timeout
+        if [[ $waited -ge $LOCK_MAX_WAIT ]]; then
+            local lock_owner
+            lock_owner=$(cat "${LOCKFILE}/pid" 2>/dev/null || echo "unknown")
+            log_error "Lock held by process $lock_owner"
             log_error "If you're sure no other instance is running, remove: $LOCKFILE"
             return "$E_LOCKED"
         fi
         
-        log_info "Waiting for other instance to finish..."
-        sleep 2
-        waited=$((waited + 2))
+        [[ $waited -eq 0 ]] && log_info "Waiting for other instance to finish..."
+        sleep 1
+        ((waited++))
     done
-    
-    # Create lock file with PID
-    echo "$$" > "$LOCKFILE"
-    log_debug "Lock acquired (PID: $$)"
-    return 0
 }
 
 # shellcheck disable=SC2317  # Function invoked indirectly via cleanup
 release_lock() {
-    if [[ -f "$LOCKFILE" ]]; then
-        # Verify lock file is readable before attempting operations
-        if [[ ! -r "$LOCKFILE" ]]; then
-            log_debug "Lock file exists but is not readable (permissions issue)"
-            return 0
-        fi
-        
+    if [[ -d "$LOCKFILE" ]]; then
         local lock_pid
-        lock_pid=$(cat "$LOCKFILE" 2>/dev/null || echo "")
-        
-        if [[ -z "$lock_pid" ]]; then
-            log_debug "Lock file exists but is empty or unreadable"
-            return 0
-        fi
+        lock_pid=$(cat "${LOCKFILE}/pid" 2>/dev/null || echo "")
         
         if [[ "$lock_pid" == "$$" ]]; then
-            rm -f "$LOCKFILE"
+            rm -rf "$LOCKFILE"
             log_debug "Lock released"
         else
-            log_debug "Lock file not owned by this process (PID: $$, lock: $lock_pid)"
+            log_debug "Lock not owned by this process (PID: $$, lock: $lock_pid)"
         fi
     fi
 }
 
 ################################################################################
-# Cleanup and Error Handlers
+# Cleanup and Error Handlers (FIXED: No recursion on EXIT trap)
 ################################################################################
 
 # shellcheck disable=SC2317  # Function invoked indirectly via trap
@@ -223,16 +240,22 @@ cleanup() {
     
     log_debug "Cleanup triggered (exit code: $exit_code)"
     
+    # CRITICAL: Disable traps to prevent recursion
+    trap - EXIT INT TERM
+    
     # If we're in an active transaction and exiting with error, attempt rollback
     if [[ "${TRANSACTION_STATE[active]}" == "true" ]] && [[ $exit_code -ne 0 ]]; then
         log_error "Operation failed - attempting automatic rollback..."
         transaction_rollback
     fi
     
+    # Restore git configuration
+    restore_git_config
+    
     # Release lock file
     release_lock
     
-    # Don't override the exit code
+    # Exit without re-triggering trap
     exit "$exit_code"
 }
 
@@ -241,7 +264,39 @@ trap cleanup EXIT
 trap 'log_error "Script interrupted by user"; exit $E_USER_ABORT' INT TERM
 
 ################################################################################
-# Prerequisite Checks
+# Git Configuration Management (FIXED: Save and restore git config)
+################################################################################
+
+save_git_config() {
+    log_debug "Saving git configuration..."
+    
+    # Save core.fileMode setting
+    local current_filemode
+    current_filemode=$(git config --local core.fileMode 2>/dev/null || echo "")
+    ORIGINAL_GIT_CONFIG["core.fileMode"]="$current_filemode"
+    
+    # Apply our temporary setting
+    git config --local core.fileMode false 2>/dev/null || true
+    
+    log_debug "Git config saved (core.fileMode: ${current_filemode:-<unset>})"
+}
+
+# shellcheck disable=SC2317  # Function invoked indirectly via cleanup
+restore_git_config() {
+    log_debug "Restoring git configuration..."
+    
+    # Restore core.fileMode
+    if [[ -n "${ORIGINAL_GIT_CONFIG["core.fileMode"]:-}" ]]; then
+        git config --local core.fileMode "${ORIGINAL_GIT_CONFIG["core.fileMode"]}" 2>/dev/null || true
+    else
+        git config --unset --local core.fileMode 2>/dev/null || true
+    fi
+    
+    log_debug "Git config restored"
+}
+
+################################################################################
+# Prerequisite Checks (FIXED: Check for external dependencies)
 ################################################################################
 
 check_prerequisites() {
@@ -310,6 +365,42 @@ check_prerequisites() {
     
     log_debug "Bash version: $bash_major.$bash_minor ✓"
     
+    # FIXED: Check for required external utilities
+    local required_utils=("awk" "sed" "grep" "tput")
+    local missing_utils=()
+    
+    for util in "${required_utils[@]}"; do
+        if ! command -v "$util" >/dev/null 2>&1; then
+            missing_utils+=("$util")
+        fi
+    done
+    
+    if [[ ${#missing_utils[@]} -gt 0 ]]; then
+        log_error "Required utilities not found: ${missing_utils[*]}"
+        log_info "Please install these utilities and try again"
+        return "$E_PREREQUISITES"
+    fi
+    
+    # Check for stat (different syntax on different systems)
+    if ! command -v stat >/dev/null 2>&1; then
+        log_warn "Warning: 'stat' command not found"
+        log_info "Some features may not work properly"
+    fi
+    
+    # Check for timeout (optional but recommended)
+    if ! command -v timeout >/dev/null 2>&1; then
+        # Try gtimeout on macOS
+        if [[ "$OSTYPE" == "darwin"* ]] && command -v gtimeout >/dev/null 2>&1; then
+            log_debug "Using gtimeout (macOS coreutils)"
+            # Create function alias for compatibility
+            timeout() { gtimeout "$@"; }
+            export -f timeout
+        else
+            log_debug "Note: 'timeout' command not available (fetch operations may hang)"
+        fi
+    fi
+    
+    log_debug "All prerequisites checked ✓"
     return 0
 }
 
@@ -365,7 +456,7 @@ check_git_repository() {
     fi
     
     # Check if git directory is owned by root (common issue)
-    if [[ -e "$git_dir/config" ]]; then
+    if [[ -e "$git_dir/config" ]] && command -v stat >/dev/null 2>&1; then
         local owner
         owner="$(stat -c %U "$git_dir/config" 2>/dev/null || stat -f %Su "$git_dir/config" 2>/dev/null || echo "$USER")"
         
@@ -381,7 +472,7 @@ check_git_repository() {
 }
 
 ################################################################################
-# Git State Detection and Validation
+# Git State Detection and Validation (FIXED: Added REVERT_HEAD and sequencer)
 ################################################################################
 
 detect_git_state() {
@@ -390,7 +481,7 @@ detect_git_state() {
     local git_dir
     git_dir="$(git rev-parse --git-dir 2>/dev/null)"
     
-    # Check for ongoing operations
+    # Check for ongoing operations (order matters - check most specific first)
     if [[ -f "$git_dir/MERGE_HEAD" ]]; then
         GIT_STATE="merge"
         log_debug "Git state: merge in progress"
@@ -399,6 +490,10 @@ detect_git_state() {
         GIT_STATE="rebase"
         log_debug "Git state: rebase in progress"
         return 0
+    elif [[ -f "$git_dir/REVERT_HEAD" ]]; then
+        GIT_STATE="revert"
+        log_debug "Git state: revert in progress"
+        return 0
     elif [[ -f "$git_dir/CHERRY_PICK_HEAD" ]]; then
         GIT_STATE="cherry-pick"
         log_debug "Git state: cherry-pick in progress"
@@ -406,6 +501,10 @@ detect_git_state() {
     elif [[ -f "$git_dir/BISECT_LOG" ]]; then
         GIT_STATE="bisect"
         log_debug "Git state: bisect in progress"
+        return 0
+    elif [[ -d "$git_dir/sequencer" ]]; then
+        GIT_STATE="sequencer"
+        log_debug "Git state: sequencer operation in progress (interactive rebase/revert)"
         return 0
     fi
     
@@ -441,6 +540,13 @@ validate_clean_state() {
             log_info "  To cancel rebase:   git rebase --abort"
             return "$E_BAD_STATE"
             ;;
+        revert)
+            log_error "Git revert in progress"
+            log_info "You must complete or abort the revert first:"
+            log_info "  To continue:        git revert --continue"
+            log_info "  To cancel:          git revert --abort"
+            return "$E_BAD_STATE"
+            ;;
         cherry-pick)
             log_error "Git cherry-pick in progress"
             log_info "You must complete or abort the cherry-pick first:"
@@ -452,6 +558,12 @@ validate_clean_state() {
             log_error "Git bisect in progress"
             log_info "You must finish the bisect first:"
             log_info "  To complete: git bisect reset"
+            return "$E_BAD_STATE"
+            ;;
+        sequencer)
+            log_error "Git sequencer operation in progress"
+            log_info "You must complete or abort the current operation first"
+            log_info "Check 'git status' for details"
             return "$E_BAD_STATE"
             ;;
         clean|dirty)
@@ -620,7 +732,7 @@ confirm_destructive_action() {
 }
 
 ################################################################################
-# Transaction Management (for atomic operations with rollback)
+# Transaction Management (FIXED: Improved stash uniqueness, trap handling)
 ################################################################################
 
 transaction_begin() {
@@ -655,8 +767,12 @@ transaction_stash_changes() {
     
     log_debug "Creating transaction stash..."
     
+    # FIXED: Use nanoseconds + random for better uniqueness
+    local stash_nonce
+    stash_nonce="$(date +%s.%N 2>/dev/null || date +%s)-$$-$RANDOM"
+    
     local stash_message
-    stash_message="lyrebird-tx-${TRANSACTION_STATE[operation]}-$$-$(date +%s)"
+    stash_message="lyrebird-tx-${TRANSACTION_STATE[operation]}-${stash_nonce}"
     
     if ! git stash push -u -m "$stash_message" >/dev/null 2>&1; then
         log_error "Failed to save your changes"
@@ -702,6 +818,13 @@ transaction_rollback() {
     
     log_warn "Rolling back: ${TRANSACTION_STATE[operation]}"
     
+    # FIXED: Disable traps during rollback to prevent recursion
+    local original_exit_trap original_int_trap original_term_trap
+    original_exit_trap="$(trap -p EXIT)"
+    original_int_trap="$(trap -p INT)"
+    original_term_trap="$(trap -p TERM)"
+    trap - EXIT INT TERM
+    
     # Attempt to return to original ref
     if [[ -n "${TRANSACTION_STATE[original_ref]}" ]]; then
         log_debug "Restoring original ref: ${TRANSACTION_STATE[original_ref]}"
@@ -741,6 +864,11 @@ transaction_rollback() {
     TRANSACTION_STATE[original_ref]=""
     TRANSACTION_STATE[original_head]=""
     TRANSACTION_STATE[operation]=""
+    
+    # Restore traps
+    eval "$original_exit_trap"
+    eval "$original_int_trap"
+    eval "$original_term_trap"
     
     log_warn "Rollback complete"
     
@@ -944,16 +1072,29 @@ switch_version_safe() {
     # Set executable permissions on known scripts
     set_script_permissions
     
-    # Handle self-update scenario
+    # Handle self-update scenario (FIXED: Use absolute path)
     if [[ "$script_will_change" == "true" ]]; then
         log_info "Restarting with updated version..."
         
-        # Make sure new script is executable
-        if ! chmod +x "./$SCRIPT_NAME" 2>/dev/null; then
-            log_error "Failed to make new script executable"
-            log_error "Self-update cannot proceed"
-            transaction_rollback
-            return "$E_PERMISSION"
+        # FIXED: Compute absolute path for robustness
+        local script_path
+        if command -v realpath >/dev/null 2>&1; then
+            script_path="$(realpath "$SCRIPT_NAME" 2>/dev/null)"
+        elif command -v readlink >/dev/null 2>&1; then
+            script_path="$(readlink -f "$SCRIPT_NAME" 2>/dev/null)"
+        else
+            # Fallback to constructing absolute path
+            script_path="${SCRIPT_DIR}/${SCRIPT_NAME}"
+        fi
+        
+        # Ensure script is executable
+        if [[ ! -x "$script_path" ]]; then
+            if ! chmod +x "$script_path" 2>/dev/null; then
+                log_error "Failed to make new script executable: $script_path"
+                log_error "Self-update cannot proceed"
+                transaction_rollback
+                return "$E_PERMISSION"
+            fi
         fi
         
         # Prepare restart arguments
@@ -969,7 +1110,7 @@ switch_version_safe() {
         
         # Replace this process with the new script
         # shellcheck disable=SC2093  # exec is intentional here for self-update
-        exec "./$SCRIPT_NAME" "${restart_args[@]}"
+        exec "$script_path" "${restart_args[@]}"
         
         # This line only reached if exec fails
         log_error "Failed to restart with new version"
@@ -1104,7 +1245,7 @@ set_script_permissions() {
 }
 
 ################################################################################
-# Version Listing and Selection
+# Version Listing and Selection (FIXED: Input sanitization)
 ################################################################################
 
 list_available_releases() {
@@ -1117,7 +1258,7 @@ list_available_releases() {
     # List stable releases (tags)
     echo "${BOLD}Stable Releases (numbered versions, tested and stable):${NC}"
     
-    if git tag -l 'v*' --sort=-creatordate | head -n 20 | grep -q .; then
+    if git tag -l 'v*' --sort=-creatordate | head -n "$TAG_LIST_LIMIT" | grep -q .; then
         local counter=1
         while IFS= read -r tag; do
             local tag_date
@@ -1126,12 +1267,12 @@ list_available_releases() {
             
             AVAILABLE_VERSIONS+=("$tag")
             ((counter++))
-        done < <(git tag -l 'v*' --sort=-creatordate | head -n 20)
+        done < <(git tag -l 'v*' --sort=-creatordate | head -n "$TAG_LIST_LIMIT")
         
         local tag_count
         tag_count=$(git tag -l 'v*' | wc -l)
-        if [[ "$tag_count" -gt 20 ]]; then
-            echo "      ... and $((tag_count - 20)) more (not shown)"
+        if [[ "$tag_count" -gt "$TAG_LIST_LIMIT" ]]; then
+            echo "      ... and $((tag_count - TAG_LIST_LIMIT)) more (not shown)"
         fi
     else
         echo "  (no stable releases found)"
@@ -1204,8 +1345,21 @@ select_version_interactive() {
             return "$E_GENERAL"
         fi
     else
-        # Direct version name
+        # FIXED: Validate direct version name input against whitelist
+        if [[ ! "$selection" =~ ^[a-zA-Z0-9._/-]+$ ]]; then
+            log_error "Invalid version format"
+            log_error "Only alphanumeric characters, dots, underscores, slashes, and hyphens are allowed"
+            return "$E_GENERAL"
+        fi
+        
         target_version="$selection"
+    fi
+    
+    # Additional validation - verify version exists
+    if ! validate_version_exists "$target_version"; then
+        log_error "Version '$target_version' does not exist"
+        log_info "Try running 'Check for Updates' first (option 4)"
+        return "$E_GENERAL"
     fi
     
     switch_version_safe "$target_version"
@@ -1330,7 +1484,7 @@ show_status() {
                 echo "    ... and $((change_count - 10)) more"
             fi
             ;;
-        merge|rebase|cherry-pick|bisect)
+        merge|rebase|revert|cherry-pick|bisect|sequencer)
             echo "  Status:     ${RED}${GIT_STATE^^} IN PROGRESS${NC}"
             ;;
     esac
@@ -1343,13 +1497,11 @@ show_status() {
     echo "  Remote:     $repo_remote"
     
     local last_fetch="never"
-    if [[ -f ".git/FETCH_HEAD" ]]; then
-        if command -v stat >/dev/null 2>&1; then
-            last_fetch=$(stat -c %y ".git/FETCH_HEAD" 2>/dev/null | cut -d'.' -f1 || \
-                        stat -f %Sm ".git/FETCH_HEAD" 2>/dev/null || echo "unknown") || last_fetch="unknown"
-            # Ensure last_fetch is not empty (fallback for edge case where stat succeeds but produces no output)
-            [[ -z "$last_fetch" ]] && last_fetch="unknown"
-        fi
+    if [[ -f ".git/FETCH_HEAD" ]] && command -v stat >/dev/null 2>&1; then
+        last_fetch=$(stat -c %y ".git/FETCH_HEAD" 2>/dev/null | cut -d'.' -f1 || \
+                    stat -f %Sm ".git/FETCH_HEAD" 2>/dev/null || echo "unknown")
+        # Ensure last_fetch is not empty
+        [[ -z "$last_fetch" ]] && last_fetch="unknown"
     fi
     echo "  Last fetch: $last_fetch"
     
@@ -1432,14 +1584,21 @@ show_startup_diagnostics() {
     fi
     
     echo
-    read -r -p "Press Enter to continue..."
+    
+    # FIXED: Only prompt if stdin is a terminal
+    if [[ -t 0 ]]; then
+        read -r -p "Press Enter to continue..."
+    fi
 }
 
 ################################################################################
-# Help and Menu Functions
+# Help and Menu Functions (FIXED: Use dynamic branch name)
 ################################################################################
 
 show_help() {
+    # FIXED: Get default branch dynamically
+    local help_default_branch="${DEFAULT_BRANCH:-develop}"
+    
     cat << EOF
 
 ════════════════════════════════════════════════════════════════════════════════
@@ -1452,7 +1611,7 @@ BRANCH TYPES:
     - Recommended for most users
     - Updates released periodically
 
-  • Development Branch (${DEFAULT_BRANCH})
+  • Development Branch (${help_default_branch})
     - Latest code with new features
     - Where active development happens
     - May contain bugs or incomplete features
@@ -1466,7 +1625,7 @@ BRANCH TYPES:
    ↑ Automatically checks for updates
    ↑ Your changes will be saved temporarily
 
-2) Switch to Development Version (${DEFAULT_BRANCH})
+2) Switch to Development Version (${help_default_branch})
    ↑ Latest code with newest features
    ↑ Where new features are actively developed
    ↑ May have bugs or incomplete features
@@ -1519,7 +1678,7 @@ Q: How do I start fresh with no modifications?
 A: Use option 6 to reset to a clean state
 
 Q: What's the difference between stable and development?
-A: Stable = tested releases (v1.2.0). Development = latest code (${DEFAULT_BRANCH})
+A: Stable = tested releases (v1.2.0). Development = latest code (${help_default_branch})
 
 ━━━ MORE HELP ━━━
 
@@ -1722,8 +1881,8 @@ main() {
         exit "$E_NOT_GIT_REPO"
     fi
     
-    # Configure git
-    git config core.fileMode false 2>/dev/null || true
+    # FIXED: Save and configure git settings
+    save_git_config
     
     # Detect default branch (CRITICAL: Must be done early and consistently used)
     DEFAULT_BRANCH="$(get_default_branch)"
