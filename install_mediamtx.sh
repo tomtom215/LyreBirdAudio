@@ -5,6 +5,10 @@
 # Part of LyreBirdAudio - RTSP Audio Streaming Suite
 # https://github.com/tomtom215/LyreBirdAudio
 #
+# Author: Tom F (https://github.com/tomtom215)
+# Copyright: Tom F and LyreBirdAudio contributors
+# License: Apache 2.0
+#
 # Changelog:
 #   v2.0.1: Security and robustness improvements - fixed lock file cleanup (prevents accumulation),
 #           SemVer pre-release comparison (correctly handles numeric identifiers), state directory
