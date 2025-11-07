@@ -1,11 +1,16 @@
 #!/usr/bin/env bash
 #
 # MediaMTX Installation Manager - Production-Ready Install/Update/Uninstall
-# Version: 2.0.0
+# Version: 2.0.1
 # Part of LyreBirdAudio - RTSP Audio Streaming Suite
 # https://github.com/tomtom215/LyreBirdAudio
 #
 # Changelog:
+#   v2.0.1: Security and robustness improvements - fixed lock file cleanup (prevents accumulation),
+#           SemVer pre-release comparison (correctly handles numeric identifiers), state directory
+#           permissions hardened to 750, uninstall now stops all instances, automatic cleanup of
+#           old backup files (keeps last 3, removes >7 days), lock file path uses /run/lock on
+#           Linux and /tmp on BSD/macOS
 #   v2.0.0: Major rewrite with built-in --upgrade support (MediaMTX v1.15.0+), atomic binary
 #           installation with simplified rollback, enforced checksum verification (--force to skip),
 #           fixed BSD/macOS lock race conditions, improved SemVer comparison, state directory
@@ -21,7 +26,7 @@ set -o errtrace
 set -o functrace
 
 # Script metadata
-readonly SCRIPT_VERSION="2.0.0"
+readonly SCRIPT_VERSION="2.0.1"
 
 SCRIPT_NAME=""
 SCRIPT_NAME="$(basename "${BASH_SOURCE[0]}")"
@@ -72,7 +77,16 @@ readonly CONFIG_NAME="mediamtx.yml"
 TEMP_BASE="${TMPDIR:-/tmp}"
 TEMP_DIR=""
 LOG_FILE=""
-readonly LOCK_FILE="/var/lock/mediamtx-installer.lock"
+
+# FIX 1.1: Platform-specific lock file path
+if [[ "$(uname)" == "Linux" ]]; then
+    # Modern Linux uses /run/lock (tmpfs, auto-cleaned on boot)
+    readonly LOCK_FILE="/run/lock/mediamtx-installer.lock"
+else
+    # BSD/macOS fallback to /tmp
+    readonly LOCK_FILE="/tmp/mediamtx-installer.lock"
+fi
+
 LOCK_FD=""
 
 # GitHub API configuration
@@ -277,13 +291,14 @@ acquire_lock() {
     log_debug "Lock acquired (PID: ${SCRIPT_PID})"
 }
 
+# FIX 1.1: Remove lock file in release_lock()
 release_lock() {
     if [[ -n "${LOCK_FD}" ]]; then
         flock -u "${LOCK_FD}" 2>/dev/null || true
         exec 200>&- 2>/dev/null || true
-        rm -f "${LOCK_FILE}.pid" 2>/dev/null || true
+        rm -f "${LOCK_FILE}.pid" "${LOCK_FILE}" 2>/dev/null || true
         LOCK_FD=""
-        log_debug "Lock released"
+        log_debug "Lock released and file removed"
     fi
 }
 
@@ -468,6 +483,7 @@ validate_url() {
     [[ "${url}" =~ ${url_regex} ]] && return 0 || return 1
 }
 
+# FIX 1.2: SemVer-compliant pre-release version comparison
 version_compare() {
     # Returns 0 if v1 >= v2, 1 otherwise
     local v1="${1#v}"
@@ -517,18 +533,60 @@ version_compare() {
         fi
     done
     
-    # Equal base versions - check pre-release
+    # Equal base versions - check pre-release (SemVer compliant)
     local v1_pre="${v1#*-}"
     local v2_pre="${v2#*-}"
     
+    # No pre-release > has pre-release
     if [[ "$v1" == "$v1_pre" ]] && [[ "$v2" != "$v2_pre" ]]; then
-        return 0
+        return 0  # v1 has no pre-release, v2 does - v1 is newer
     elif [[ "$v1" != "$v1_pre" ]] && [[ "$v2" == "$v2_pre" ]]; then
-        return 1
-    elif [[ "$v1" != "$v1_pre" ]] && [[ "$v2" != "$v2_pre" ]]; then
-        [[ "$v1_pre" > "$v2_pre" ]] && return 0 || return 1
+        return 1  # v2 has no pre-release, v1 does - v2 is newer
     fi
     
+    # Both have pre-release - need SemVer comparison
+    if [[ "$v1" != "$v1_pre" ]] && [[ "$v2" != "$v2_pre" ]]; then
+        # Split by dots and dashes
+        local IFS='.-'
+        local -a v1_parts v2_parts
+        read -r -a v1_parts <<< "${v1_pre}"
+        read -r -a v2_parts <<< "${v2_pre}"
+        
+        # Compare each identifier
+        local max_parts=$((${#v1_parts[@]} > ${#v2_parts[@]} ? ${#v1_parts[@]} : ${#v2_parts[@]}))
+        local i
+        for ((i=0; i<max_parts; i++)); do
+            local p1="${v1_parts[$i]:-}"
+            local p2="${v2_parts[$i]:-}"
+            
+            # If one is empty, longer pre-release is newer
+            [[ -z "$p1" ]] && return 1
+            [[ -z "$p2" ]] && return 0
+            
+            # Both numeric - compare as integers
+            if [[ "$p1" =~ ^[0-9]+$ ]] && [[ "$p2" =~ ^[0-9]+$ ]]; then
+                [[ $p1 -gt $p2 ]] && return 0
+                [[ $p1 -lt $p2 ]] && return 1
+                continue
+            fi
+            
+            # One numeric, one not - numeric is lower precedence
+            if [[ "$p1" =~ ^[0-9]+$ ]]; then
+                return 1  # p1 numeric, p2 not - p2 is newer
+            elif [[ "$p2" =~ ^[0-9]+$ ]]; then
+                return 0  # p2 numeric, p1 not - p1 is newer
+            fi
+            
+            # Both non-numeric - lexicographic comparison
+            if [[ "$p1" > "$p2" ]]; then
+                return 0
+            elif [[ "$p1" < "$p2" ]]; then
+                return 1
+            fi
+        done
+    fi
+    
+    # Equal in all respects
     return 0
 }
 
@@ -1107,14 +1165,15 @@ create_user() {
         return 1
     fi
     
-    # Create and track state directory
+    # FIX 1.3: Create state directory with restrictive permissions
     if [[ ! -d "${STATE_DIR}" ]]; then
-        mkdir -p "${STATE_DIR}"
+        # Create with restrictive permissions from the start
+        (umask 027 && mkdir -p "${STATE_DIR}")
         STATE_DIR_CREATED=true
     fi
     
     chown "${SERVICE_USER}:${SERVICE_GROUP}" "${STATE_DIR}"
-    chmod 755 "${STATE_DIR}"
+    chmod 750 "${STATE_DIR}"  # Group-readable, no world access
 }
 
 # ============================================================================
@@ -1268,6 +1327,22 @@ update_mediamtx() {
         log_info "Updated to version: ${new_version}"
     fi
     
+    # FIX 1.5: Clean up old backup files
+    log_info "Cleaning up old backup files..."
+    if [[ -d "${INSTALL_DIR}" ]]; then
+        # Remove backups older than 7 days
+        find "${INSTALL_DIR}" -name "mediamtx.backup.*" -type f -mtime +7 -delete 2>/dev/null || true
+        
+        # Keep only last 3 backups if more exist
+        local backup_count
+        backup_count=$(find "${INSTALL_DIR}" -name "mediamtx.backup.*" -type f 2>/dev/null | wc -l)
+        if [[ ${backup_count} -gt 3 ]]; then
+            # Sort by timestamp (filename), delete oldest
+            find "${INSTALL_DIR}" -name "mediamtx.backup.*" -type f -printf '%T+ %p\n' 2>/dev/null | \
+                sort | head -n -3 | cut -d' ' -f2- | xargs -r rm -f 2>/dev/null || true
+        fi
+    fi
+    
     # Restart if it was running
     if [[ "${was_running}" == "true" ]]; then
         start_mediamtx "${management_mode}"
@@ -1356,6 +1431,7 @@ start_mediamtx() {
     esac
 }
 
+# FIX 1.4: Uninstall process management - stop all MediaMTX instances
 uninstall_mediamtx() {
     log_info "Uninstalling MediaMTX..."
     
@@ -1364,10 +1440,17 @@ uninstall_mediamtx() {
         return 0
     fi
     
-    # Stop and remove service
+    # Detect and stop any running MediaMTX instance
+    local mode
+    mode=$(detect_management_mode)
+    if [[ "${mode}" != "none" ]]; then
+        log_info "Stopping MediaMTX (${mode})..."
+        stop_mediamtx "${mode}"
+    fi
+    
+    # Remove systemd service if present
     if command -v systemctl &>/dev/null && [[ -f "${SERVICE_DIR}/${SERVICE_NAME}" ]]; then
-        log_info "Stopping and disabling service..."
-        systemctl stop mediamtx 2>/dev/null || true
+        log_info "Removing systemd service..."
         systemctl disable mediamtx 2>/dev/null || true
         rm -f "${SERVICE_DIR}/${SERVICE_NAME}"
         systemctl daemon-reload
@@ -1838,3 +1921,4 @@ main() {
 }
 
 main "$@"
+
