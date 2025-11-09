@@ -7,7 +7,16 @@
 # Copyright: Tom F and LyreBirdAudio contributors
 # License: Apache 2.0
 #
-# Version: 1.4.3 - Security and Reliability Hardening
+# Version: 1.5.0 - Systemd Service Update Integration
+#
+# NEW in v1.5.0:
+#   - Automatic systemd service detection and update handling
+#   - Pre-checkout service stop with state preservation
+#   - Post-checkout service reinstallation and restart
+#   - User customization detection and preservation
+#   - Rollback support for failed service updates
+#   - Self-update coordination with service updates
+#   - Cron job update handling
 #
 # This script provides safe, reliable version management with:
 #   - Atomic operations with automatic rollback on failure
@@ -17,6 +26,7 @@
 #   - Progressive error recovery with user guidance
 #   - Clear, non-technical UX for non-git-expert users
 #   - Network resilience with retries
+#   - Systemd service lifecycle management
 #
 # Prerequisites:
 #   - Git 2.0+ and Bash 4.0+
@@ -46,7 +56,7 @@ SCRIPT_NAME="$(basename "${BASH_SOURCE[0]}")"
 readonly SCRIPT_NAME
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly SCRIPT_DIR
-readonly VERSION="1.4.3"
+readonly VERSION="1.5.0"
 readonly LOCKFILE="${SCRIPT_DIR}/.lyrebird-updater.lock"
 
 # Repository configuration
@@ -77,6 +87,15 @@ readonly FETCH_RETRIES=3
 readonly FETCH_RETRY_DELAY=2
 readonly LOCK_MAX_WAIT=30
 readonly TAG_LIST_LIMIT=20
+
+# Service update configuration
+readonly SERVICE_NAME="mediamtx-audio"
+readonly SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
+readonly SERVICE_CRON_FILE="/etc/cron.d/mediamtx-monitor"
+readonly SERVICE_SCRIPT="mediamtx-stream-manager.sh"
+readonly SERVICE_UPDATE_MARKER="/run/lyrebird-service-update.marker"
+readonly SERVICE_STOP_TIMEOUT=30
+readonly SERVICE_START_TIMEOUT=10
 
 # Colors for output (using tput for portability)
 if command -v tput >/dev/null 2>&1 && [[ -t 1 ]]; then
@@ -135,6 +154,21 @@ declare -a AVAILABLE_VERSIONS=()
 # Git configuration backup for restoration
 declare -A ORIGINAL_GIT_CONFIG=()
 
+# Service update state
+declare -A SERVICE_STATE=(
+    [installed]=false
+    [was_running]=false
+    [was_enabled]=false
+    [has_customizations]=false
+    [service_file]=""
+    [cron_file]=""
+    [backup_service_file]=""
+    [backup_cron_file]=""
+)
+
+# Custom environment variables from service file
+declare -a SERVICE_CUSTOM_ENV=()
+
 ################################################################################
 # Logging Functions
 ################################################################################
@@ -166,7 +200,7 @@ log_step() {
 }
 
 ################################################################################
-# Lock File Management (FIXED: Atomic operations with stale lock detection)
+# Lock File Management
 ################################################################################
 
 acquire_lock() {
@@ -231,10 +265,661 @@ release_lock() {
 }
 
 ################################################################################
-# Cleanup and Error Handlers (FIXED: No recursion on EXIT trap)
+# Systemd Service Detection and State Management
 ################################################################################
 
-# shellcheck disable=SC2317  # Function invoked indirectly via trap
+# Detect if systemd service is installed and capture its state
+detect_systemd_service() {
+    log_debug "Detecting systemd service installation..."
+    
+    # Reset state
+    SERVICE_STATE[installed]=false
+    SERVICE_STATE[was_running]=false
+    SERVICE_STATE[was_enabled]=false
+    SERVICE_STATE[has_customizations]=false
+    SERVICE_STATE[service_file]="$SERVICE_FILE"
+    SERVICE_STATE[cron_file]="$SERVICE_CRON_FILE"
+    SERVICE_STATE[backup_service_file]=""
+    SERVICE_STATE[backup_cron_file]=""
+    SERVICE_CUSTOM_ENV=()
+    
+    # Check if service file exists
+    if [[ ! -f "$SERVICE_FILE" ]]; then
+        log_debug "No systemd service file found at: $SERVICE_FILE"
+        return 1
+    fi
+    
+    SERVICE_STATE[installed]=true
+    log_debug "Detected installed systemd service: $SERVICE_NAME"
+    
+    # Check if service is running
+    if systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null; then
+        SERVICE_STATE[was_running]=true
+        log_debug "Service is currently running"
+    fi
+    
+    # Check if service is enabled
+    if systemctl is-enabled --quiet "$SERVICE_NAME" 2>/dev/null; then
+        SERVICE_STATE[was_enabled]=true
+        log_debug "Service is enabled for boot"
+    fi
+    
+    # Detect customizations
+    detect_service_customizations
+    
+    return 0
+}
+
+# Detect custom environment variables in service file
+detect_service_customizations() {
+    local service_file="$SERVICE_FILE"
+    
+    # Known default environment variables that the script generates
+    local -A default_vars=(
+        ["HOME"]="/root"
+        ["PATH"]="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+        ["USB_STABILIZATION_DELAY"]="10"
+        ["STREAM_MODE"]="individual"
+        ["MULTIPLEX_FILTER_TYPE"]="amix"
+        ["MULTIPLEX_STREAM_NAME"]="all_mics"
+        ["INVOCATION_ID"]="systemd"
+    )
+    
+    # Extract Environment= lines from service file
+    local env_lines
+    env_lines=$(grep "^Environment=" "$service_file" 2>/dev/null || true)
+    
+    if [[ -z "$env_lines" ]]; then
+        log_debug "No environment variables found in service file"
+        return 0
+    fi
+    
+    # Check each environment line for customizations
+    while IFS= read -r line; do
+        if [[ -z "$line" ]]; then
+            continue
+        fi
+        
+        # Extract variable name and value
+        # Format: Environment="VAR=value" or Environment=VAR=value
+        local var_full="${line#Environment=}"
+        var_full="${var_full#\"}"
+        var_full="${var_full%\"}"
+        
+        local var_name="${var_full%%=*}"
+        local var_value="${var_full#*=}"
+        
+        # Check if this is a customized value
+        if [[ -n "${default_vars[$var_name]+isset}" ]]; then
+            # Known variable - check if value differs from default
+            if [[ "${default_vars[$var_name]}" != "$var_value" ]]; then
+                SERVICE_STATE[has_customizations]=true
+                SERVICE_CUSTOM_ENV+=("$line")
+                log_debug "Detected custom environment: $var_name=$var_value (default: ${default_vars[$var_name]})"
+            fi
+        else
+            # Unknown variable - definitely custom
+            SERVICE_STATE[has_customizations]=true
+            SERVICE_CUSTOM_ENV+=("$line")
+            log_debug "Detected custom environment variable: $var_name=$var_value"
+        fi
+    done <<< "$env_lines"
+    
+    if [[ "${SERVICE_STATE[has_customizations]}" == "true" ]]; then
+        log_debug "Found ${#SERVICE_CUSTOM_ENV[@]} custom environment variable(s)"
+    fi
+}
+
+# Backup service and cron files for rollback
+backup_service_files() {
+    log_debug "Backing up service files..."
+    
+    local service_file="${SERVICE_STATE[service_file]}"
+    local cron_file="${SERVICE_STATE[cron_file]}"
+    
+    # Backup service file
+    if [[ -f "$service_file" ]]; then
+        local backup_service
+        backup_service="$(mktemp "${service_file}.backup.XXXXXX")"
+        
+        if ! cp -a "$service_file" "$backup_service" 2>/dev/null; then
+            log_error "Failed to backup service file"
+            rm -f "$backup_service" 2>/dev/null || true
+            return 1
+        fi
+        
+        SERVICE_STATE[backup_service_file]="$backup_service"
+        log_debug "Backed up service file to: $backup_service"
+    fi
+    
+    # Backup cron file if it exists
+    if [[ -f "$cron_file" ]]; then
+        local backup_cron
+        backup_cron="$(mktemp "${cron_file}.backup.XXXXXX")"
+        
+        if ! cp -a "$cron_file" "$backup_cron" 2>/dev/null; then
+            log_warn "Failed to backup cron file (non-critical)"
+            rm -f "$backup_cron" 2>/dev/null || true
+            # Don't fail - cron backup is non-critical
+        else
+            SERVICE_STATE[backup_cron_file]="$backup_cron"
+            log_debug "Backed up cron file to: $backup_cron"
+        fi
+    fi
+    
+    return 0
+}
+
+# Stop service safely with timeout
+stop_service_safe() {
+    if [[ "${SERVICE_STATE[was_running]}" != "true" ]]; then
+        log_debug "Service was not running, skipping stop"
+        return 0
+    fi
+    
+    log_step "Stopping $SERVICE_NAME service..."
+    
+    # Try graceful stop
+    if systemctl stop "$SERVICE_NAME" 2>/dev/null; then
+        # Wait for service to actually stop
+        local elapsed=0
+        while systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null && [[ $elapsed -lt $SERVICE_STOP_TIMEOUT ]]; do
+            sleep 1
+            ((elapsed++))
+        done
+        
+        if systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null; then
+            log_warn "Service did not stop gracefully within ${SERVICE_STOP_TIMEOUT}s, forcing..."
+            systemctl kill "$SERVICE_NAME" 2>/dev/null || true
+            sleep 2
+        else
+            log_success "Service stopped successfully"
+            return 0
+        fi
+    else
+        log_warn "Failed to stop service gracefully, forcing..."
+        systemctl kill "$SERVICE_NAME" 2>/dev/null || true
+        sleep 2
+    fi
+    
+    # Verify stopped
+    if systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null; then
+        log_error "Failed to stop service after force kill"
+        return 1
+    fi
+    
+    log_success "Service stopped (forced)"
+    return 0
+}
+
+# Reinstall service definition while preserving customizations
+reinstall_service_with_customizations() {
+    local script_path="$1"
+    
+    log_step "Reinstalling service definition..."
+    
+    # Verify script exists and is executable
+    if [[ ! -f "$script_path" ]]; then
+        log_error "Service manager script not found: $script_path"
+        return 1
+    fi
+    
+    if [[ ! -x "$script_path" ]]; then
+        log_debug "Making script executable: $script_path"
+        chmod +x "$script_path" 2>/dev/null || {
+            log_error "Cannot make script executable: $script_path"
+            return 1
+        }
+    fi
+    
+    # Call install command to regenerate service file
+    # Capture output but suppress expected informational messages
+    local install_output
+    if ! install_output=$("$script_path" install 2>&1); then
+        log_error "Failed to reinstall service definition"
+        if [[ -n "$install_output" ]]; then
+            log_debug "Install output: $install_output"
+        fi
+        return 1
+    fi
+    
+    log_success "Service definition reinstalled"
+    
+    # If there were customizations, merge them back in
+    if [[ "${SERVICE_STATE[has_customizations]}" == "true" ]]; then
+        log_step "Restoring custom environment variables..."
+        
+        local service_file="${SERVICE_STATE[service_file]}"
+        
+        if [[ ! -f "$service_file" ]]; then
+            log_error "Service file not found after reinstall: $service_file"
+            return 1
+        fi
+        
+        # Create temporary file for merging
+        local temp_service
+        temp_service="$(mktemp)"
+        
+        # Strategy: Insert custom env vars after the last Environment= line
+        # This preserves the structure and ensures custom values override defaults
+        local last_env_line_num
+        last_env_line_num=$(grep -n "^Environment=" "$service_file" | tail -n1 | cut -d: -f1)
+        
+        if [[ -z "$last_env_line_num" ]]; then
+            # No Environment= lines found - insert after WorkingDirectory
+            local working_dir_line
+            working_dir_line=$(grep -n "^WorkingDirectory=" "$service_file" | tail -n1 | cut -d: -f1)
+            
+            if [[ -n "$working_dir_line" ]]; then
+                # Insert after WorkingDirectory
+                head -n "$working_dir_line" "$service_file" > "$temp_service"
+                for custom_env in "${SERVICE_CUSTOM_ENV[@]}"; do
+                    echo "$custom_env" >> "$temp_service"
+                    log_debug "Restored: $custom_env"
+                done
+                tail -n +"$((working_dir_line + 1))" "$service_file" >> "$temp_service"
+            else
+                log_warn "Could not find insertion point for custom variables"
+                cp "$service_file" "$temp_service"
+            fi
+        else
+            # Insert after last Environment= line
+            head -n "$last_env_line_num" "$service_file" > "$temp_service"
+            for custom_env in "${SERVICE_CUSTOM_ENV[@]}"; do
+                echo "$custom_env" >> "$temp_service"
+                log_debug "Restored: $custom_env"
+            done
+            tail -n +"$((last_env_line_num + 1))" "$service_file" >> "$temp_service"
+        fi
+        
+        # Atomically replace service file
+        if ! mv -f "$temp_service" "$service_file" 2>/dev/null; then
+            log_error "Failed to restore customizations to service file"
+            rm -f "$temp_service"
+            return 1
+        fi
+        
+        log_success "Custom environment variables restored (${#SERVICE_CUSTOM_ENV[@]} variable(s))"
+    fi
+    
+    return 0
+}
+
+# Start service safely with verification
+start_service_safe() {
+    if [[ "${SERVICE_STATE[was_running]}" != "true" ]]; then
+        log_debug "Service was not running before update, not starting"
+        return 0
+    fi
+    
+    log_step "Starting $SERVICE_NAME service..."
+    
+    # Start service
+    local start_output
+    if ! start_output=$(systemctl start "$SERVICE_NAME" 2>&1); then
+        log_error "Failed to start service"
+        if [[ -n "$start_output" ]]; then
+            log_debug "Start output: $start_output"
+        fi
+        log_info "Check status: systemctl status $SERVICE_NAME"
+        log_info "Check logs: journalctl -u $SERVICE_NAME -n 50 --no-pager"
+        return 1
+    fi
+    
+    # Wait for service to fully start
+    local elapsed=0
+    while ! systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null && [[ $elapsed -lt $SERVICE_START_TIMEOUT ]]; do
+        sleep 1
+        ((elapsed++))
+    done
+    
+    # Verify service is running
+    if ! systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null; then
+        log_error "Service failed to start within ${SERVICE_START_TIMEOUT}s"
+        log_info "Check status: systemctl status $SERVICE_NAME"
+        log_info "Check logs: journalctl -u $SERVICE_NAME -n 50 --no-pager"
+        return 1
+    fi
+    
+    log_success "Service started successfully"
+    return 0
+}
+
+# Restore service files from backup
+restore_service_from_backup() {
+    log_warn "Restoring service files from backup..."
+    
+    local service_file="${SERVICE_STATE[service_file]}"
+    local backup_service="${SERVICE_STATE[backup_service_file]}"
+    local cron_file="${SERVICE_STATE[cron_file]}"
+    local backup_cron="${SERVICE_STATE[backup_cron_file]}"
+    
+    local restore_failed=false
+    
+    # Restore service file
+    if [[ -f "$backup_service" ]]; then
+        if cp -a "$backup_service" "$service_file" 2>/dev/null; then
+            log_debug "Service file restored from backup"
+        else
+            log_error "Failed to restore service file from backup"
+            restore_failed=true
+        fi
+    fi
+    
+    # Restore cron file
+    if [[ -f "$backup_cron" ]]; then
+        if cp -a "$backup_cron" "$cron_file" 2>/dev/null; then
+            log_debug "Cron file restored from backup"
+        else
+            log_warn "Failed to restore cron file from backup (non-critical)"
+        fi
+    fi
+    
+    # Reload systemd to pick up restored service file
+    systemctl daemon-reload 2>/dev/null || true
+    
+    if [[ "$restore_failed" == "true" ]]; then
+        return 1
+    fi
+    
+    log_info "Service files restored from backup"
+    return 0
+}
+
+# Clean up backup files
+cleanup_service_backups() {
+    log_debug "Cleaning up service backup files..."
+    
+    local backup_service="${SERVICE_STATE[backup_service_file]}"
+    local backup_cron="${SERVICE_STATE[backup_cron_file]}"
+    
+    if [[ -f "$backup_service" ]]; then
+        rm -f "$backup_service" 2>/dev/null || true
+        log_debug "Removed service backup file"
+    fi
+    
+    if [[ -f "$backup_cron" ]]; then
+        rm -f "$backup_cron" 2>/dev/null || true
+        log_debug "Removed cron backup file"
+    fi
+}
+
+# Save service state to marker file for post-exec restoration
+save_service_state_to_marker() {
+    log_debug "Saving service state to marker file..."
+    
+    local marker="$SERVICE_UPDATE_MARKER"
+    local temp_marker
+    temp_marker="$(mktemp)"
+    
+    # Write state as simple key=value format for easy sourcing
+    cat > "$temp_marker" << EOF
+# Service update state - automatically generated
+INSTALLED=${SERVICE_STATE[installed]}
+WAS_RUNNING=${SERVICE_STATE[was_running]}
+WAS_ENABLED=${SERVICE_STATE[was_enabled]}
+HAS_CUSTOMIZATIONS=${SERVICE_STATE[has_customizations]}
+SERVICE_FILE=${SERVICE_STATE[service_file]}
+CRON_FILE=${SERVICE_STATE[cron_file]}
+BACKUP_SERVICE_FILE=${SERVICE_STATE[backup_service_file]}
+BACKUP_CRON_FILE=${SERVICE_STATE[backup_cron_file]}
+EOF
+    
+    # Append custom environment lines with indices
+    if [[ ${#SERVICE_CUSTOM_ENV[@]} -gt 0 ]]; then
+        echo "CUSTOM_ENV_COUNT=${#SERVICE_CUSTOM_ENV[@]}" >> "$temp_marker"
+        local i=0
+        for env_line in "${SERVICE_CUSTOM_ENV[@]}"; do
+            # Escape quotes for safe storage
+            local escaped_line="${env_line//\"/\\\"}"
+            echo "CUSTOM_ENV_${i}=\"${escaped_line}\"" >> "$temp_marker"
+            ((i++))
+        done
+    else
+        echo "CUSTOM_ENV_COUNT=0" >> "$temp_marker"
+    fi
+    
+    # Atomic move with restricted permissions
+    if ! mv -f "$temp_marker" "$marker" 2>/dev/null; then
+        log_error "Failed to save service state marker"
+        rm -f "$temp_marker"
+        return 1
+    fi
+    
+    chmod 600 "$marker" 2>/dev/null || true
+    log_debug "Service state saved to: $marker"
+    return 0
+}
+
+# Load service state from marker file
+load_service_state_from_marker() {
+    local marker="$SERVICE_UPDATE_MARKER"
+    
+    if [[ ! -f "$marker" ]]; then
+        log_debug "No service state marker file found"
+        return 1
+    fi
+    
+    log_debug "Loading service state from marker file..."
+    
+    # Reset state
+    SERVICE_STATE=()
+    SERVICE_CUSTOM_ENV=()
+    
+    # Source the marker file to load variables
+    # shellcheck source=/dev/null
+    source "$marker" 2>/dev/null || {
+        log_error "Failed to load service state marker"
+        return 1
+    }
+    
+    # Reconstruct SERVICE_STATE associative array
+    SERVICE_STATE[installed]="${INSTALLED:-false}"
+    SERVICE_STATE[was_running]="${WAS_RUNNING:-false}"
+    SERVICE_STATE[was_enabled]="${WAS_ENABLED:-false}"
+    SERVICE_STATE[has_customizations]="${HAS_CUSTOMIZATIONS:-false}"
+    SERVICE_STATE[service_file]="${SERVICE_FILE:-}"
+    SERVICE_STATE[cron_file]="${CRON_FILE:-}"
+    SERVICE_STATE[backup_service_file]="${BACKUP_SERVICE_FILE:-}"
+    SERVICE_STATE[backup_cron_file]="${BACKUP_CRON_FILE:-}"
+    
+    # Reconstruct SERVICE_CUSTOM_ENV array
+    local custom_env_count="${CUSTOM_ENV_COUNT:-0}"
+    for ((i=0; i<custom_env_count; i++)); do
+        local var_name="CUSTOM_ENV_${i}"
+        # Unescape quotes
+        local env_value="${!var_name}"
+        env_value="${env_value//\\\"/\"}"
+        SERVICE_CUSTOM_ENV+=("$env_value")
+    done
+    
+    log_debug "Service state loaded: installed=${SERVICE_STATE[installed]}, was_running=${SERVICE_STATE[was_running]}, customizations=${SERVICE_STATE[has_customizations]}"
+    return 0
+}
+
+# Check if there's a pending service update
+check_pending_service_update() {
+    if [[ -f "$SERVICE_UPDATE_MARKER" ]]; then
+        log_debug "Detected pending service update marker"
+        return 0
+    fi
+    return 1
+}
+
+# Complete a pending service update (called after script restart)
+complete_pending_service_update() {
+    if ! load_service_state_from_marker; then
+        log_debug "No pending service update found"
+        return 0
+    fi
+    
+    echo
+    log_info "Completing pending service update from previous operation..."
+    echo
+    
+    # Complete the service update
+    if ! post_checkout_service_update; then
+        log_error "Failed to complete pending service update"
+        log_warn "Service may need manual intervention"
+        log_info "Try: systemctl status $SERVICE_NAME"
+        return 1
+    fi
+    
+    # Remove marker on success
+    rm -f "$SERVICE_UPDATE_MARKER"
+    
+    echo
+    log_success "Service update completed successfully"
+    return 0
+}
+
+################################################################################
+# Service Update Handler (Pre-Checkout)
+################################################################################
+
+# Handle service update preparation before git checkout
+handle_systemd_service_update() {
+    local target_version="$1"
+    
+    # Detect if service is installed
+    if ! detect_systemd_service; then
+        log_debug "No systemd service installed, skipping service update handling"
+        return 0
+    fi
+    
+    log_info "Detected installed systemd service: $SERVICE_NAME"
+    
+    # Show service status
+    echo
+    echo "${BOLD}Systemd Service Status:${NC}"
+    echo "  Service file: ${SERVICE_STATE[service_file]}"
+    echo "  Currently running: ${SERVICE_STATE[was_running]}"
+    echo "  Enabled at boot: ${SERVICE_STATE[was_enabled]}"
+    
+    if [[ "${SERVICE_STATE[has_customizations]}" == "true" ]]; then
+        echo "  ${YELLOW}Custom environment variables: ${#SERVICE_CUSTOM_ENV[@]}${NC}"
+        echo
+        echo "${YELLOW}Detected customizations:${NC}"
+        for env_line in "${SERVICE_CUSTOM_ENV[@]}"; do
+            echo "    ${env_line}"
+        done
+        echo
+        log_info "These customizations will be preserved during the update"
+    fi
+    
+    echo
+    log_info "The service will be stopped during the update and restarted afterwards"
+    echo
+    
+    # Confirm if customizations exist
+    if [[ "${SERVICE_STATE[has_customizations]}" == "true" ]]; then
+        if ! confirm_action "Continue with service update?"; then
+            log_info "Service update cancelled by user"
+            return "$E_USER_ABORT"
+        fi
+        echo
+    fi
+    
+    # Backup service files
+    if ! backup_service_files; then
+        log_error "Failed to backup service files"
+        return "$E_GENERAL"
+    fi
+    
+    # Stop service if running
+    if ! stop_service_safe; then
+        log_error "Failed to stop service - cannot proceed with update"
+        # Cleanup backups since we're aborting
+        cleanup_service_backups
+        return "$E_GENERAL"
+    fi
+    
+    # Save state to marker file (for post-exec completion if updater restarts)
+    if ! save_service_state_to_marker; then
+        log_error "Failed to save service state"
+        # Try to restart service since we're aborting
+        if [[ "${SERVICE_STATE[was_running]}" == "true" ]]; then
+            systemctl start "$SERVICE_NAME" 2>/dev/null || true
+        fi
+        cleanup_service_backups
+        return "$E_GENERAL"
+    fi
+    
+    log_debug "Service update preparation completed"
+    return 0
+}
+
+################################################################################
+# Service Update Handler (Post-Checkout)
+################################################################################
+
+# Complete service update after successful git checkout
+post_checkout_service_update() {
+    local script_path="./${SERVICE_SCRIPT}"
+    
+    # Verify service was installed
+    if [[ "${SERVICE_STATE[installed]}" != "true" ]]; then
+        log_debug "Service not installed, skipping post-checkout service update"
+        return 0
+    fi
+    
+    # Check if service script exists in new version
+    if [[ ! -f "$script_path" ]]; then
+        log_error "Service script not found after checkout: $script_path"
+        log_error "This indicates the service script was removed or renamed"
+        return 1
+    fi
+    
+    # Check if the service script actually changed
+    local script_changed=false
+    if ! git diff --quiet "${TRANSACTION_STATE[original_head]}" HEAD -- "$script_path" 2>/dev/null; then
+        script_changed=true
+        log_info "Service script changed, reinstalling service definition..."
+    else
+        log_debug "Service script unchanged, skipping reinstallation"
+    fi
+    
+    # If script changed, reinstall service
+    if [[ "$script_changed" == "true" ]]; then
+        if ! reinstall_service_with_customizations "$script_path"; then
+            log_error "Failed to reinstall service definition"
+            return 1
+        fi
+        
+        # Reload systemd daemon to pick up new service definition
+        log_step "Reloading systemd daemon..."
+        if ! systemctl daemon-reload 2>&1 | grep -v "^$" | head -5; then
+            log_error "Failed to reload systemd daemon"
+            return 1
+        fi
+        log_success "Systemd daemon reloaded"
+    fi
+    
+    # Start service if it was running before
+    if ! start_service_safe; then
+        log_error "Service update failed - service did not start"
+        log_warn "Attempting to restore service from backup..."
+        
+        # Attempt rollback
+        restore_service_from_backup
+        systemctl daemon-reload 2>/dev/null || true
+        systemctl start "$SERVICE_NAME" 2>/dev/null || true
+        
+        return 1
+    fi
+    
+    # Success - cleanup backups
+    cleanup_service_backups
+    
+    log_success "Service update completed successfully"
+    return 0
+}
+
+################################################################################
+# Cleanup and Error Handlers
+################################################################################
+
+# shellcheck disable=SC2317  # Function invoked indirectly via cleanup
 cleanup() {
     local exit_code=$?
     
@@ -264,7 +949,7 @@ trap cleanup EXIT
 trap 'log_error "Script interrupted by user"; exit $E_USER_ABORT' INT TERM
 
 ################################################################################
-# Git Configuration Management (FIXED: Save and restore git config)
+# Git Configuration Management
 ################################################################################
 
 save_git_config() {
@@ -296,7 +981,7 @@ restore_git_config() {
 }
 
 ################################################################################
-# Prerequisite Checks (FIXED: Check for external dependencies)
+# Prerequisite Checks
 ################################################################################
 
 check_prerequisites() {
@@ -365,7 +1050,7 @@ check_prerequisites() {
     
     log_debug "Bash version: $bash_major.$bash_minor ✓"
     
-    # FIXED: Check for required external utilities
+    # Check for required external utilities
     local required_utils=("awk" "sed" "grep" "tput")
     local missing_utils=()
     
@@ -379,6 +1064,11 @@ check_prerequisites() {
         log_error "Required utilities not found: ${missing_utils[*]}"
         log_info "Please install these utilities and try again"
         return "$E_PREREQUISITES"
+    fi
+    
+    # Check for systemctl (for service management)
+    if ! command -v systemctl >/dev/null 2>&1; then
+        log_debug "systemctl not found - service update features will be limited"
     fi
     
     # Check for stat (different syntax on different systems)
@@ -472,7 +1162,7 @@ check_git_repository() {
 }
 
 ################################################################################
-# Git State Detection and Validation (FIXED: Added REVERT_HEAD and sequencer)
+# Git State Detection and Validation
 ################################################################################
 
 detect_git_state() {
@@ -732,7 +1422,7 @@ confirm_destructive_action() {
 }
 
 ################################################################################
-# Transaction Management (FIXED: Improved stash uniqueness, trap handling)
+# Transaction Management
 ################################################################################
 
 transaction_begin() {
@@ -767,7 +1457,7 @@ transaction_stash_changes() {
     
     log_debug "Creating transaction stash..."
     
-    # FIXED: Use nanoseconds + random for better uniqueness
+    # Use nanoseconds + random for better uniqueness
     local stash_nonce
     stash_nonce="$(date +%s.%N 2>/dev/null || date +%s)-$$-$RANDOM"
     
@@ -818,7 +1508,7 @@ transaction_rollback() {
     
     log_warn "Rolling back: ${TRANSACTION_STATE[operation]}"
     
-    # FIXED: Disable traps during rollback to prevent recursion
+    # Disable traps during rollback to prevent recursion
     local original_exit_trap original_int_trap original_term_trap
     original_exit_trap="$(trap -p EXIT)"
     original_int_trap="$(trap -p INT)"
@@ -856,6 +1546,27 @@ transaction_rollback() {
         else
             log_warn "Could not find your saved changes"
         fi
+    fi
+    
+    # Restore service files if update was in progress
+    if [[ -f "$SERVICE_UPDATE_MARKER" ]]; then
+        log_warn "Rolling back service update..."
+        if load_service_state_from_marker; then
+            restore_service_from_backup
+            
+            # Reload systemd and attempt to restart service
+            if [[ "${SERVICE_STATE[was_running]}" == "true" ]]; then
+                systemctl daemon-reload 2>/dev/null || true
+                systemctl start "$SERVICE_NAME" 2>/dev/null || {
+                    log_warn "Could not restart service after rollback"
+                    log_info "Manual intervention may be required"
+                    log_info "Check: systemctl status $SERVICE_NAME"
+                }
+            fi
+            
+            cleanup_service_backups
+        fi
+        rm -f "$SERVICE_UPDATE_MARKER"
     fi
     
     # Clear transaction state
@@ -1017,6 +1728,23 @@ switch_version_safe() {
         log_success "Your changes have been saved and will be restored after the update"
     fi
     
+    # Handle systemd service update (pre-checkout)
+    local service_update_result=0
+    if handle_systemd_service_update "$target_version"; then
+        log_debug "Service update preparation successful"
+    else
+        service_update_result=$?
+        if [[ $service_update_result -eq $E_USER_ABORT ]]; then
+            log_info "Operation cancelled by user during service update"
+            transaction_rollback
+            return "$E_USER_ABORT"
+        else
+            log_error "Service update preparation failed"
+            transaction_rollback
+            return "$E_GENERAL"
+        fi
+    fi
+    
     # Check if script itself will be modified (self-update)
     local script_will_change=false
     if ! git diff --quiet HEAD "$target_version" -- "$SCRIPT_NAME" 2>/dev/null; then
@@ -1072,11 +1800,11 @@ switch_version_safe() {
     # Set executable permissions on known scripts
     set_script_permissions
     
-    # Handle self-update scenario (FIXED: Use absolute path)
+    # Handle self-update scenario
     if [[ "$script_will_change" == "true" ]]; then
         log_info "Restarting with updated version..."
         
-        # FIXED: Compute absolute path for robustness
+        # Compute absolute path for robustness
         local script_path
         if command -v realpath >/dev/null 2>&1; then
             script_path="$(realpath "$SCRIPT_NAME" 2>/dev/null)"
@@ -1108,6 +1836,9 @@ switch_version_safe() {
         # Mark transaction as committed before exec (we're transferring responsibility)
         transaction_commit
         
+        # Service update marker remains for post-exec completion
+        # No need to cleanup - new script will handle it
+        
         # Replace this process with the new script
         # shellcheck disable=SC2093  # exec is intentional here for self-update
         exec "$script_path" "${restart_args[@]}"
@@ -1116,6 +1847,16 @@ switch_version_safe() {
         log_error "Failed to restart with new version"
         return "$E_GENERAL"
     fi
+    
+    # Complete service update (post-checkout)
+    if ! post_checkout_service_update; then
+        log_error "Service update failed after checkout"
+        transaction_rollback
+        return "$E_GENERAL"
+    fi
+    
+    # Remove service update marker on success
+    rm -f "$SERVICE_UPDATE_MARKER"
     
     # Restore stashed changes (if not self-updating)
     if [[ -n "${TRANSACTION_STATE[stash_hash]}" ]]; then
@@ -1245,7 +1986,7 @@ set_script_permissions() {
 }
 
 ################################################################################
-# Version Listing and Selection (FIXED: Input sanitization)
+# Version Listing and Selection
 ################################################################################
 
 list_available_releases() {
@@ -1345,7 +2086,7 @@ select_version_interactive() {
             return "$E_GENERAL"
         fi
     else
-        # FIXED: Validate direct version name input against whitelist
+        # Validate direct version name input against whitelist
         if [[ ! "$selection" =~ ^[a-zA-Z0-9._/-]+$ ]]; then
             log_error "Invalid version format"
             log_error "Only alphanumeric characters, dots, underscores, slashes, and hyphens are allowed"
@@ -1505,6 +2246,25 @@ show_status() {
     fi
     echo "  Last fetch: $last_fetch"
     
+    # Show systemd service status if installed
+    if [[ -f "$SERVICE_FILE" ]]; then
+        echo
+        echo "${BOLD}Systemd Service:${NC}"
+        echo "  Service:    $SERVICE_NAME"
+        
+        if systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null; then
+            echo "  Status:     ${GREEN}Running${NC}"
+        else
+            echo "  Status:     ${YELLOW}Stopped${NC}"
+        fi
+        
+        if systemctl is-enabled --quiet "$SERVICE_NAME" 2>/dev/null; then
+            echo "  Enabled:    ${GREEN}Yes${NC}"
+        else
+            echo "  Enabled:    ${YELLOW}No${NC}"
+        fi
+    fi
+    
     echo
 }
 
@@ -1585,18 +2345,18 @@ show_startup_diagnostics() {
     
     echo
     
-    # FIXED: Only prompt if stdin is a terminal
+    # Only prompt if stdin is a terminal
     if [[ -t 0 ]]; then
         read -r -p "Press Enter to continue..."
     fi
 }
 
 ################################################################################
-# Help and Menu Functions (FIXED: Use dynamic branch name)
+# Help and Menu Functions
 ################################################################################
 
 show_help() {
-    # FIXED: Get default branch dynamically
+    # Get default branch dynamically
     local help_default_branch="${DEFAULT_BRANCH:-develop}"
     
     cat << EOF
@@ -1624,6 +2384,7 @@ BRANCH TYPES:
    ↑ Recommended for production use
    ↑ Automatically checks for updates
    ↑ Your changes will be saved temporarily
+   ↑ Systemd services automatically updated
 
 2) Switch to Development Version (${help_default_branch})
    ↑ Latest code with newest features
@@ -1631,6 +2392,7 @@ BRANCH TYPES:
    ↑ May have bugs or incomplete features
    ↑ For testing and development
    ↑ Your changes will be saved temporarily
+   ↑ Systemd services automatically updated
 
 3) Switch to Specific Version or Branch
    ↑ Choose any stable release (tag), development branch, or feature branch
@@ -1638,6 +2400,7 @@ BRANCH TYPES:
    ↑ Can input version name directly (v1.2.0, develop, feature/xyz)
    ↑ Useful for testing, switching between branches, or rollback
    ↑ Your changes will be saved temporarily
+   ↑ Systemd services automatically updated
 
 4) Check for New Updates
    ↑ Downloads version information from GitHub
@@ -1650,35 +2413,58 @@ BRANCH TYPES:
    ↑ Local modifications status
    ↑ Sync status with remote
    ↑ Repository information
+   ↑ Systemd service status
 
 6) Discard All Changes & Reset
    ↑ PERMANENTLY deletes local modifications
    ↑ Resets to a clean version
    ↑ Use with caution!
 
+━━━ SYSTEMD SERVICE INTEGRATION ━━━
+
+The updater now automatically handles systemd service updates:
+
+  ✓ Detects if mediamtx-audio.service is installed
+  ✓ Stops service before version switch
+  ✓ Preserves custom environment variables
+  ✓ Reinstalls service definition if script changed
+  ✓ Restarts service after successful update
+  ✓ Rolls back service on failure
+
+Your custom service configuration (e.g., STREAM_MODE, MULTIPLEX_FILTER_TYPE)
+will be preserved during updates.
+
 ━━━ SAFETY FEATURES ━━━
 
 ✓ Your changes are automatically saved before updating
+✓ Service configurations are preserved across updates
 ✓ Confirmation required for destructive actions
 ✓ Automatic rollback if operations fail
 ✓ Clear warnings before permanent actions
+✓ Service restoration on update failure
 
 ━━━ COMMON QUESTIONS ━━━
 
 Q: What happens to my changes when I update?
 A: They're automatically saved and will be restored after the update
 
+Q: What happens to my systemd service?
+A: It's automatically stopped, updated, and restarted with your custom config
+
 Q: Can I undo an update?
 A: Yes, use option 3 to switch back to any previous version
 
 Q: What if something goes wrong?
-A: The script automatically tries to recover
+A: The script automatically tries to recover, including service restoration
 
 Q: How do I start fresh with no modifications?
 A: Use option 6 to reset to a clean state
 
 Q: What's the difference between stable and development?
 A: Stable = tested releases (v1.2.0). Development = latest code (${help_default_branch})
+
+Q: Will my custom service variables be lost?
+A: No, custom environment variables are automatically preserved
 
 ━━━ MORE HELP ━━━
 
@@ -1714,6 +2500,15 @@ main_menu() {
             echo "  Changes:  ${YELLOW}Has local modifications${NC}"
         else
             echo "  Changes:  ${GREEN}None${NC}"
+        fi
+        
+        # Show service status if installed
+        if [[ -f "$SERVICE_FILE" ]]; then
+            if systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null; then
+                echo "  Service:  ${GREEN}Running${NC}"
+            else
+                echo "  Service:  ${YELLOW}Stopped${NC}"
+            fi
         fi
         
         echo
@@ -1881,7 +2676,7 @@ main() {
         exit "$E_NOT_GIT_REPO"
     fi
     
-    # FIXED: Save and configure git settings
+    # Save and configure git settings
     save_git_config
     
     # Detect default branch (CRITICAL: Must be done early and consistently used)
@@ -1917,6 +2712,14 @@ main() {
                     log_warn "Could not find your saved changes"
                 fi
                 
+                # Check for pending service update
+                if check_pending_service_update; then
+                    if ! complete_pending_service_update; then
+                        log_error "Service update completion failed"
+                        log_info "You may need to manually check the service status"
+                    fi
+                fi
+                
                 echo
                 read -r -p "Press Enter to continue..."
                 ;;
@@ -1924,6 +2727,15 @@ main() {
             --post-update-complete)
                 echo
                 log_success "Updater has been updated successfully!"
+                
+                # Check for pending service update
+                if check_pending_service_update; then
+                    if ! complete_pending_service_update; then
+                        log_error "Service update completion failed"
+                        log_info "You may need to manually check the service status"
+                    fi
+                fi
+                
                 echo
                 read -r -p "Press Enter to continue..."
                 ;;
@@ -1955,6 +2767,20 @@ main() {
                 exit "$E_GENERAL"
                 ;;
         esac
+    fi
+    
+    # Check for pending service update (in case of abnormal termination)
+    if check_pending_service_update; then
+        log_warn "Detected incomplete service update from previous run"
+        if confirm_action "Complete the pending service update now?"; then
+            if ! complete_pending_service_update; then
+                log_error "Failed to complete pending service update"
+                log_info "You may need to manually check the service"
+            fi
+        else
+            log_info "Service update will be attempted on next version switch"
+        fi
+        echo
     fi
     
     # Show startup diagnostics
