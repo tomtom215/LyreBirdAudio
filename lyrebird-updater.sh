@@ -7,9 +7,14 @@
 # Copyright: Tom F and LyreBirdAudio contributors
 # License: Apache 2.0
 #
-# Version: 1.5.0 - Systemd Service Update Integration
+# Version: 1.5.1 - Self-Update Syntax Validation
 #
-# NEW in v1.5.0:
+# NEW in v1.5.1:
+#   - Pre-exec syntax validation for self-updates
+#   - Protection against broken script deployment
+#   - Enhanced error reporting for syntax failures
+#
+# v1.5.0 features:
 #   - Automatic systemd service detection and update handling
 #   - Pre-checkout service stop with state preservation
 #   - Post-checkout service reinstallation and restart
@@ -27,6 +32,7 @@
 #   - Clear, non-technical UX for non-git-expert users
 #   - Network resilience with retries
 #   - Systemd service lifecycle management
+#   - Self-update syntax validation
 #
 # Prerequisites:
 #   - Git 2.0+ and Bash 4.0+
@@ -56,7 +62,7 @@ SCRIPT_NAME="$(basename "${BASH_SOURCE[0]}")"
 readonly SCRIPT_NAME
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly SCRIPT_DIR
-readonly VERSION="1.5.0"
+readonly VERSION="1.5.1"
 readonly LOCKFILE="${SCRIPT_DIR}/.lyrebird-updater.lock"
 
 # Repository configuration
@@ -184,7 +190,7 @@ log_info() {
 }
 
 log_success() {
-    echo "${GREEN}[✓]${NC} $*"
+    echo "${GREEN}[[OK]]${NC} $*"
 }
 
 log_warn() {
@@ -192,11 +198,11 @@ log_warn() {
 }
 
 log_error() {
-    echo "${RED}[✗]${NC} $*" >&2
+    echo "${RED}[[X]]${NC} $*" >&2
 }
 
 log_step() {
-    echo "${BOLD}▸${NC} $*"
+    echo "${BOLD}>${NC} $*"
 }
 
 ################################################################################
@@ -989,7 +995,7 @@ check_prerequisites() {
     
     # IMPORTANT: Warn if running with sudo or as root
     if [[ "${SUDO_USER:-}" != "" ]] || [[ "$EUID" -eq 0 ]]; then
-        log_warn "⚠️  WARNING: This script is running with root/sudo privileges"
+        log_warn "[!]  WARNING: This script is running with root/sudo privileges"
         log_warn "This may change file ownership in the repository"
         echo
         
@@ -1036,7 +1042,7 @@ check_prerequisites() {
         return "$E_PREREQUISITES"
     fi
     
-    log_debug "Git version: $git_version ✓"
+    log_debug "Git version: $git_version [OK]"
     
     # Check bash version
     local bash_major="${BASH_VERSINFO[0]}"
@@ -1048,7 +1054,7 @@ check_prerequisites() {
         return "$E_PREREQUISITES"
     fi
     
-    log_debug "Bash version: $bash_major.$bash_minor ✓"
+    log_debug "Bash version: $bash_major.$bash_minor [OK]"
     
     # Check for required external utilities
     local required_utils=("awk" "sed" "grep" "tput")
@@ -1090,7 +1096,7 @@ check_prerequisites() {
         fi
     fi
     
-    log_debug "All prerequisites checked ✓"
+    log_debug "All prerequisites checked [OK]"
     return 0
 }
 
@@ -1157,7 +1163,7 @@ check_git_repository() {
         fi
     fi
     
-    log_debug "Git repository validated ✓"
+    log_debug "Git repository validated [OK]"
     return 0
 }
 
@@ -1290,9 +1296,9 @@ get_default_branch() {
         log_debug "Found main branch"
     fi
     
-    # Git-flow pattern: both main and develop exist → develop is development
+    # Git-flow pattern: both main and develop exist -> develop is development
     if [[ "$has_develop" == "true" && "$has_main" == "true" ]]; then
-        log_debug "Git-flow detected (both main and develop exist) → using develop as development branch"
+        log_debug "Git-flow detected (both main and develop exist) -> using develop as development branch"
         echo "develop"
         return 0
     fi
@@ -1825,6 +1831,21 @@ switch_version_safe() {
             fi
         fi
         
+        # CRITICAL: Validate syntax before committing transaction
+        log_debug "Validating new script syntax..."
+        if ! bash -n "$script_path" 2>/dev/null; then
+            log_error "New script has syntax errors!"
+            log_error "Cannot safely restart with broken script"
+            echo >&2
+            log_error "Syntax validation errors:"
+            bash -n "$script_path" 2>&1 | head -10 | sed 's/^/  /' >&2
+            echo >&2
+            log_error "Rolling back to previous version..."
+            transaction_rollback
+            return "$E_GENERAL"
+        fi
+        log_debug "Syntax validation passed [OK]"
+        
         # Prepare restart arguments
         local restart_args=()
         if [[ -n "${TRANSACTION_STATE[stash_hash]}" ]]; then
@@ -1833,7 +1854,7 @@ switch_version_safe() {
             restart_args=("--post-update-complete")
         fi
         
-        # Mark transaction as committed before exec (we're transferring responsibility)
+        # NOW safe to commit transaction (syntax validated)
         transaction_commit
         
         # Service update marker remains for post-exec completion
@@ -1843,9 +1864,12 @@ switch_version_safe() {
         # shellcheck disable=SC2093  # exec is intentional here for self-update
         exec "$script_path" "${restart_args[@]}"
         
-        # This line only reached if exec fails
-        log_error "Failed to restart with new version"
-        return "$E_GENERAL"
+        # This line only reached if exec fails (kernel-level failure)
+        log_error "Failed to restart with new version (exec failed)"
+        log_error "This is a critical error - manual intervention required"
+        log_error "The new version is checked out but not running"
+        log_error "Try running manually: $script_path"
+        exit "$E_GENERAL"
     fi
     
     # Complete service update (post-checkout)
@@ -1993,7 +2017,7 @@ list_available_releases() {
     AVAILABLE_VERSIONS=()
     
     echo
-    echo "${BOLD}━━━ Available Versions ━━━${NC}"
+    echo "${BOLD}=== Available Versions ===${NC}"
     echo
     
     # List stable releases (tags)
@@ -2152,7 +2176,7 @@ show_status() {
     detect_git_state
     
     echo
-    echo "${BOLD}━━━ Repository Status ━━━${NC}"
+    echo "${BOLD}=== Repository Status ===${NC}"
     echo
     
     # Current position
@@ -2273,7 +2297,7 @@ show_startup_diagnostics() {
     check_local_changes
     
     echo
-    echo "${BOLD}━━━ LyreBirdAudio Version Manager v${VERSION} ━━━${NC}"
+    echo "${BOLD}=== LyreBirdAudio Version Manager v${VERSION} ===${NC}"
     echo
     
     # Current version
@@ -2309,7 +2333,7 @@ show_startup_diagnostics() {
     fi
     
     if [[ "$fetch_ok" == "true" ]]; then
-        echo "          ${GREEN}✓${NC} Connected to GitHub"
+        echo "          ${GREEN}[OK]${NC} Connected to GitHub"
     else
         echo "          ${YELLOW}!${NC} Could not connect (using cached data)"
     fi
@@ -2326,7 +2350,7 @@ show_startup_diagnostics() {
             echo "Stable:   ${GREEN}You're on latest: $latest_tag${NC}"
         else
             echo "Stable:   ${YELLOW}Update available: $latest_tag${NC}"
-            echo "          ${CYAN}↑ Select option 1 to update${NC}"
+            echo "          ${CYAN}^ Select option 1 to update${NC}"
         fi
     fi
     
@@ -2337,7 +2361,7 @@ show_startup_diagnostics() {
         
         if [[ "$behind" -gt 0 ]]; then
             echo "Dev:      ${YELLOW}$behind commit(s) behind origin/$CURRENT_BRANCH${NC}"
-            echo "          ${CYAN}↑ Select option 2 to update${NC}"
+            echo "          ${CYAN}^ Select option 2 to update${NC}"
         else
             echo "Dev:      ${GREEN}Up to date with origin/$CURRENT_BRANCH${NC}"
         fi
@@ -2361,89 +2385,90 @@ show_help() {
     
     cat << EOF
 
-════════════════════════════════════════════════════════════════════════════════
+================================================================================
    LyreBirdAudio Version Manager - Help Guide
-════════════════════════════════════════════════════════════════════════════════
+================================================================================
 
 BRANCH TYPES:
-  • Stable Releases (tags like v1.2.0)
+  - Stable Releases (tags like v1.2.0)
     - Tested, production-ready versions
     - Recommended for most users
     - Updates released periodically
 
-  • Development Branch (${help_default_branch})
+  - Development Branch (${help_default_branch})
     - Latest code with new features
     - Where active development happens
     - May contain bugs or incomplete features
     - Good for testing new functionality
 
-━━━ MAIN OPTIONS ━━━
+=== MAIN OPTIONS ===
 
 1) Switch to Latest Stable Release
-   ↑ Newest tested version
-   ↑ Recommended for production use
-   ↑ Automatically checks for updates
-   ↑ Your changes will be saved temporarily
-   ↑ Systemd services automatically updated
+   ^ Newest tested version
+   ^ Recommended for production use
+   ^ Automatically checks for updates
+   ^ Your changes will be saved temporarily
+   ^ Systemd services automatically updated
 
 2) Switch to Development Version (${help_default_branch})
-   ↑ Latest code with newest features
-   ↑ Where new features are actively developed
-   ↑ May have bugs or incomplete features
-   ↑ For testing and development
-   ↑ Your changes will be saved temporarily
-   ↑ Systemd services automatically updated
+   ^ Latest code with newest features
+   ^ Where new features are actively developed
+   ^ May have bugs or incomplete features
+   ^ For testing and development
+   ^ Your changes will be saved temporarily
+   ^ Systemd services automatically updated
 
 3) Switch to Specific Version or Branch
-   ↑ Choose any stable release (tag), development branch, or feature branch
-   ↑ Full list shows all available options
-   ↑ Can input version name directly (v1.2.0, develop, feature/xyz)
-   ↑ Useful for testing, switching between branches, or rollback
-   ↑ Your changes will be saved temporarily
-   ↑ Systemd services automatically updated
+   ^ Choose any stable release (tag), development branch, or feature branch
+   ^ Full list shows all available options
+   ^ Can input version name directly (v1.2.0, develop, feature/xyz)
+   ^ Useful for testing, switching between branches, or rollback
+   ^ Your changes will be saved temporarily
+   ^ Systemd services automatically updated
 
 4) Check for New Updates
-   ↑ Downloads version information from GitHub
-   ↑ Doesn't change your current version
-   ↑ Shows what's available
+   ^ Downloads version information from GitHub
+   ^ Doesn't change your current version
+   ^ Shows what's available
 
 5) Show Detailed Status
-   ↑ Your current version and branch
-   ↑ What type of branch you're on
-   ↑ Local modifications status
-   ↑ Sync status with remote
-   ↑ Repository information
-   ↑ Systemd service status
+   ^ Your current version and branch
+   ^ What type of branch you're on
+   ^ Local modifications status
+   ^ Sync status with remote
+   ^ Repository information
+   ^ Systemd service status
 
 6) Discard All Changes & Reset
-   ↑ PERMANENTLY deletes local modifications
-   ↑ Resets to a clean version
-   ↑ Use with caution!
+   ^ PERMANENTLY deletes local modifications
+   ^ Resets to a clean version
+   ^ Use with caution!
 
-━━━ SYSTEMD SERVICE INTEGRATION ━━━
+=== SYSTEMD SERVICE INTEGRATION ===
 
 The updater now automatically handles systemd service updates:
 
-  ✓ Detects if mediamtx-audio.service is installed
-  ✓ Stops service before version switch
-  ✓ Preserves custom environment variables
-  ✓ Reinstalls service definition if script changed
-  ✓ Restarts service after successful update
-  ✓ Rolls back service on failure
+  [OK] Detects if mediamtx-audio.service is installed
+  [OK] Stops service before version switch
+  [OK] Preserves custom environment variables
+  [OK] Reinstalls service definition if script changed
+  [OK] Restarts service after successful update
+  [OK] Rolls back service on failure
 
 Your custom service configuration (e.g., STREAM_MODE, MULTIPLEX_FILTER_TYPE)
 will be preserved during updates.
 
-━━━ SAFETY FEATURES ━━━
+=== SAFETY FEATURES ===
 
-✓ Your changes are automatically saved before updating
-✓ Service configurations are preserved across updates
-✓ Confirmation required for destructive actions
-✓ Automatic rollback if operations fail
-✓ Clear warnings before permanent actions
-✓ Service restoration on update failure
+[OK] Your changes are automatically saved before updating
+[OK] Service configurations are preserved across updates
+[OK] Confirmation required for destructive actions
+[OK] Automatic rollback if operations fail
+[OK] Clear warnings before permanent actions
+[OK] Service restoration on update failure
+[OK] Syntax validation for self-updates
 
-━━━ COMMON QUESTIONS ━━━
+=== COMMON QUESTIONS ===
 
 Q: What happens to my changes when I update?
 A: They're automatically saved and will be restored after the update
@@ -2466,7 +2491,10 @@ A: Stable = tested releases (v1.2.0). Development = latest code (${help_default_
 Q: Will my custom service variables be lost?
 A: No, custom environment variables are automatically preserved
 
-━━━ MORE HELP ━━━
+Q: What if the updater itself has errors?
+A: Syntax validation prevents deployment of broken scripts
+
+=== MORE HELP ===
 
 Visit: https://github.com/tomtom215/LyreBirdAudio
 
@@ -2480,9 +2508,9 @@ main_menu() {
         
         clear
         echo
-        echo "${BOLD}┌─────────────────────────────────────────────────────────┐${NC}"
-        echo "${BOLD}│     LyreBirdAudio - Version Manager v${VERSION}      │${NC}"
-        echo "${BOLD}└─────────────────────────────────────────────────────────┘${NC}"
+        echo "${BOLD}+---------------------------------------------------------+${NC}"
+        echo "${BOLD}|     LyreBirdAudio - Version Manager v${VERSION}      |${NC}"
+        echo "${BOLD}+---------------------------------------------------------+${NC}"
         echo
         
         # Status header
@@ -2512,19 +2540,19 @@ main_menu() {
         fi
         
         echo
-        echo "${BOLD}━━━ UPDATE ━━━${NC}"
+        echo "${BOLD}=== UPDATE ===${NC}"
         echo "  ${BOLD}1${NC}) Switch to Latest Stable Release"
-        echo "     (Newest tested version—recommended)"
+        echo "     (Newest tested version-recommended)"
         echo "  ${BOLD}2${NC}) Switch to Development Version (${DEFAULT_BRANCH})"
-        echo "     (Latest code with new features—where active development happens)"
+        echo "     (Latest code with new features-where active development happens)"
         echo "  ${BOLD}3${NC}) Switch to Specific Version or Branch"
-        echo "     (Any release tag, branch, or commit—full flexibility)"
+        echo "     (Any release tag, branch, or commit-full flexibility)"
         echo
-        echo "${BOLD}━━━ INFO ━━━${NC}"
+        echo "${BOLD}=== INFO ===${NC}"
         echo "  ${BOLD}4${NC}) Check for New Updates"
         echo "  ${BOLD}5${NC}) Show Detailed Status"
         echo
-        echo "${BOLD}━━━ DANGER ZONE ━━━${NC}"
+        echo "${BOLD}=== DANGER ZONE ===${NC}"
         echo "  ${BOLD}6${NC}) Discard All Changes & Reset..."
         echo
         echo "  ${BOLD}H${NC}) Help  |  ${BOLD}Q${NC}) Quit"
@@ -2577,7 +2605,7 @@ main_menu() {
 reset_menu() {
     while true; do
         echo
-        echo "${BOLD}━━━ DISCARD CHANGES & RESET ━━━${NC}"
+        echo "${BOLD}=== DISCARD CHANGES & RESET ===${NC}"
         log_warn "This will PERMANENTLY delete all your local modifications!"
         echo
         echo "Reset to:"
