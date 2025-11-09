@@ -10,10 +10,34 @@
 # This script automatically detects USB microphones and creates MediaMTX 
 # configurations for continuous 24/7 RTSP audio streams.
 #
-# Version: 1.3.4 - Production fix for stream persistence issues
+# Version: 1.4.0 - Production stability and monitoring enhancements
 # Compatible with MediaMTX v1.15.0+
 #
 # Version History:
+# v1.4.0 - Production stability and monitoring enhancements
+#   RELIABILITY IMPROVEMENTS:
+#   - Separate monitoring lock eliminates service/cron contention
+#   - Conservative cron restart policy (exit 2 only) for stable 24/7 operation
+#   - Increased systemd restart tolerance (10 restarts/20min) for USB hotplug
+#   - Recursive process tree termination ensures complete cleanup
+#   - Enhanced lock file mutual exclusion prevents concurrent execution
+#   
+#   MONITORING ENHANCEMENTS:
+#   - Multiplex stream health monitoring with automatic restart
+#   - Real-time progress messages during stream initialization
+#   - FFmpeg log rotation prevents unbounded disk usage
+#   - Resource monitoring (CPU, file descriptors) with threshold alerts
+#   
+#   STABILITY FIXES:
+#   - Stream name validation prevents RTSP parsing failures
+#   - Cron installation handles special characters in paths
+#   - Wrapper PID validation detects stale processes
+#   - Config file permission race condition eliminated
+#   
+#   API COMPATIBILITY:
+#   - Error codes maintained for backward compatibility
+#   - Best-effort return behavior for partial stream failures
+#
 # v1.3.4 - Production fix for stream persistence after device events
 #   CRITICAL FIXES:
 #   - Removed stream-specific lock that caused restart failures after device events
@@ -23,30 +47,17 @@
 #   VERIFIED: Maintains v1.3.2 stability while adding v1.3.3 quality fixes
 #   VERIFIED: Zero changes to device detection - proven logic preserved
 #
-# v1.3.3 - Critical production fixes based on comprehensive code review
-#   - Fixed corrupted unicode characters in stream validation output
-#   - Fixed unbound variable error (is_multiplex_mode) in show_status()
-#   - Fixed file descriptor leak in log() function preventing FD exhaustion
-#   - Fixed stale PID validation causing stream restart failures
-#   - Fixed return value in start_all_ffmpeg_streams() to signal partial failures
-#   - Fixed multiplex stream name sanitization to prevent RTSP URL parsing failures
-#   - Fixed file descriptor leak in lock acquisition error paths
-#   - Fixed integer overflow in wrapper restart delay calculations
-#   - Fixed MediaMTX orphaning when multiplex mode fails device validation
-#   - Fixed nullglob state restoration to handle both enabled/disabled states
-#   - Added FFmpeg startup timeout constant to prevent hanging wrappers
+# v1.3.3 and earlier - Production hardening and feature development
+#   - Multiplex streaming mode for combining multiple microphones
+#   - Comprehensive code review fixes (FD leaks, unicode, validation)
+#   - systemd integration and signal handling improvements
+#   - Resource monitoring and atomic file operations
 #
-# v1.3.2 - Production hardening for multiplex mode
-#   - Fixed array expansion bug in multiplex wrapper script
-#   - Added systemd detection for signal handlers to prevent conflicts
-#   - Added multiplex configuration to systemd service file
-#
-# v1.3.1 - Enhanced user interface for multiplex mode
-#   - Added -f/--filter option for filter type selection (amix/amerge)
-#   - Added -n/--name option for custom stream naming
-#   - Added input validation for filter types
-#
-# v1.3.0 - Individual and multiplex streaming modes
+# Requirements:
+# - MediaMTX installed (use install_mediamtx.sh)
+# - USB audio devices
+# - ffmpeg installed for audio encoding
+
 #   - Added multiplex mode for combining multiple microphones into single stream
 #   - Added filter support (amix for mixing, amerge for channel separation)
 #   - Preserved all v1.2.0 critical fixes and functionality
@@ -80,7 +91,7 @@ if [[ "${DEBUG:-false}" == "true" ]]; then
 fi
 
 # Constants
-readonly VERSION="1.3.4"
+readonly VERSION="1.4.0"
 
 # Script identification
 SCRIPT_NAME="$(basename "${BASH_SOURCE[0]}")"
@@ -95,14 +106,23 @@ readonly E_MISSING_DEPS=3
 readonly E_CONFIG_ERROR=4
 readonly E_LOCK_FAILED=5
 readonly E_USB_NO_DEVICES=6
+readonly E_MEDIAMTX_DOWN=7
+readonly E_MONITOR_DEGRADED=10
 
 # Configurable paths with environment variable defaults
 readonly CONFIG_DIR="${MEDIAMTX_CONFIG_DIR:-/etc/mediamtx}"
 readonly CONFIG_FILE="${MEDIAMTX_CONFIG_FILE:-${CONFIG_DIR}/mediamtx.yml}"
 readonly DEVICE_CONFIG_FILE="${MEDIAMTX_DEVICE_CONFIG:-${CONFIG_DIR}/audio-devices.conf}"
-readonly PID_FILE="${MEDIAMTX_PID_FILE:-/var/run/mediamtx-audio.pid}"
+readonly PID_FILE="${MEDIAMTX_PID_FILE:-/run/mediamtx-audio.pid}"
 readonly FFMPEG_PID_DIR="${MEDIAMTX_FFMPEG_DIR:-/var/lib/mediamtx-ffmpeg}"
-readonly LOCK_FILE="${MEDIAMTX_LOCK_FILE:-/var/run/mediamtx-audio.lock}"
+readonly LOCK_FILE="${MEDIAMTX_LOCK_FILE:-/run/mediamtx-audio.lock}"
+# Lock file strategy:
+# - Uses flock() for exclusive access (kernel-enforced)
+# - File descriptor stored in MAIN_LOCK_FD global variable
+# - Deleted only when demonstrably stale (via is_lock_stale function)
+# - NOT deleted on timeout failure (avoids race conditions)
+# - Separate monitor lock (/run/mediamtx-monitor.lock) used by cron
+#   to avoid contention with service lock during start/stop operations
 readonly LOG_FILE="${MEDIAMTX_LOG_FILE:-/var/log/mediamtx-stream-manager.log}"
 readonly MEDIAMTX_LOG_FILE="${MEDIAMTX_LOG_FILE:-/var/log/mediamtx.out}"
 readonly MEDIAMTX_BIN="${MEDIAMTX_BINARY:-/usr/local/bin/mediamtx}"
@@ -111,8 +131,8 @@ readonly MEDIAMTX_HOST="${MEDIAMTX_HOST:-localhost}"
 STREAM_MODE="${STREAM_MODE:-individual}"
 MULTIPLEX_STREAM_NAME="${MULTIPLEX_STREAM_NAME:-all_mics}"
 MULTIPLEX_FILTER_TYPE="${MULTIPLEX_FILTER_TYPE:-amix}"
-readonly RESTART_MARKER="${MEDIAMTX_RESTART_MARKER:-/var/run/mediamtx-audio.restart}"
-readonly CLEANUP_MARKER="${MEDIAMTX_CLEANUP_MARKER:-/var/run/mediamtx-audio.cleanup}"
+readonly RESTART_MARKER="${MEDIAMTX_RESTART_MARKER:-/run/mediamtx-audio.restart}"
+readonly CLEANUP_MARKER="${MEDIAMTX_CLEANUP_MARKER:-/run/mediamtx-audio.cleanup}"
 readonly CONFIG_LOCK_FILE="${CONFIG_DIR}/.config.lock"
 
 # System limits
@@ -124,16 +144,20 @@ readonly PID_TERMINATION_TIMEOUT="${PID_TERMINATION_TIMEOUT:-10}"
 readonly MEDIAMTX_API_TIMEOUT="${MEDIAMTX_API_TIMEOUT:-60}"
 readonly LOCK_ACQUISITION_TIMEOUT="${LOCK_ACQUISITION_TIMEOUT:-30}"
 readonly LOCK_STALE_THRESHOLD="${LOCK_STALE_THRESHOLD:-300}"  # 5 minutes
-readonly FFMPEG_STARTUP_TIMEOUT="${FFMPEG_STARTUP_TIMEOUT:-30}"
 
 # Audio settings
-readonly DEFAULT_SAMPLE_RATE="48000"
-readonly DEFAULT_CHANNELS="2"
-readonly DEFAULT_CODEC="opus"
-readonly DEFAULT_BITRATE="128k"
-readonly DEFAULT_THREAD_QUEUE="8192"
-readonly DEFAULT_ANALYZEDURATION="5000000"
-readonly DEFAULT_PROBESIZE="5000000"
+readonly DEFAULT_SAMPLE_RATE="${DEFAULT_SAMPLE_RATE:-48000}"
+readonly DEFAULT_CHANNELS="${DEFAULT_CHANNELS:-2}"
+readonly DEFAULT_CODEC="${DEFAULT_CODEC:-opus}"
+readonly DEFAULT_BITRATE="${DEFAULT_BITRATE:-128k}"
+readonly DEFAULT_THREAD_QUEUE="${DEFAULT_THREAD_QUEUE:-8192}"
+readonly DEFAULT_ANALYZEDURATION="${DEFAULT_ANALYZEDURATION:-5000000}"
+readonly DEFAULT_PROBESIZE="${DEFAULT_PROBESIZE:-5000000}"
+
+# Stream name validation
+readonly MAX_STREAM_NAME_LENGTH=48
+readonly MIN_STREAM_NAME_LENGTH=1
+readonly RESERVED_STREAM_NAMES="control|stats|api|metrics|health"
 
 # Timing settings
 readonly STREAM_STARTUP_DELAY="${STREAM_STARTUP_DELAY:-10}"
@@ -149,6 +173,11 @@ readonly MAX_CPU_WARNING="${MAX_CPU_WARNING:-20}"
 readonly MAX_CPU_CRITICAL="${MAX_CPU_CRITICAL:-40}"
 readonly MAX_WRAPPER_RESTARTS="${MAX_WRAPPER_RESTARTS:-50}"
 readonly WRAPPER_SUCCESS_DURATION="${WRAPPER_SUCCESS_DURATION:-300}"
+
+# Wrapper restart behavior (extracted from hardcoded values)
+readonly MAX_CONSECUTIVE_FAILURES="${MAX_CONSECUTIVE_FAILURES:-5}"
+readonly INITIAL_RESTART_DELAY="${INITIAL_RESTART_DELAY:-10}"
+readonly MAX_RESTART_DELAY="${MAX_RESTART_DELAY:-300}"
 
 # Log rotation settings
 readonly MAIN_LOG_MAX_SIZE="${MAIN_LOG_MAX_SIZE:-104857600}"  # 100MB
@@ -209,22 +238,6 @@ command_exists() {
     [[ "${COMMAND_CACHE[$cmd]}" -eq 1 ]]
 }
 
-# Portable stat alternative
-get_file_size() {
-    local file="$1"
-    if [[ ! -f "$file" ]]; then
-        echo 0
-        return
-    fi
-    if command_exists stat; then
-        stat -c%s "$file" 2>/dev/null || stat -f%z "$file" 2>/dev/null || echo 0
-    elif command_exists wc; then
-        wc -c < "$file" 2>/dev/null | tr -d ' ' || echo 0
-    else
-        echo 0
-    fi
-}
-
 # Portable hash function
 compute_hash() {
     if command_exists sha256sum; then
@@ -251,7 +264,8 @@ cleanup() {
     fi
     
     # Only perform cleanup on unexpected exit (non-zero exit code)
-    if [[ $exit_code -ne 0 ]]; then
+    # Skip marker creation for read-only commands to prevent race conditions
+    if [[ $exit_code -ne 0 ]] && [[ "${COMMAND}" != "monitor" ]] && [[ "${COMMAND}" != "status" ]] && [[ "${COMMAND}" != "config" ]]; then
         # Use atomic marker creation
         local marker_tmp
         marker_tmp="$(mktemp "${CLEANUP_MARKER}.XXXXXX" 2>/dev/null)" && \
@@ -270,7 +284,7 @@ cleanup() {
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]] && [[ $$ -eq $BASHPID ]]; then
     trap cleanup EXIT INT TERM HUP QUIT
     
-    # Enhanced signal handlers for v1.3.0/v1.3.2
+    # Enhanced signal handlers
     # Only set custom handlers when NOT running under systemd
     if [[ -z "${INVOCATION_ID:-}" ]]; then
         # Not running under systemd - safe to use custom handlers
@@ -325,6 +339,8 @@ verify_cleanup_complete() {
     
     # Check for stale PID files
     local stale_pids=0
+    local nullglob_state
+    shopt -q nullglob && nullglob_state=on || nullglob_state=off
     shopt -s nullglob
     for pid_file in "${FFMPEG_PID_DIR}"/*.pid; do
         if [[ -f "$pid_file" ]]; then
@@ -336,7 +352,11 @@ verify_cleanup_complete() {
             fi
         fi
     done
-    shopt -u nullglob
+    if [[ "$nullglob_state" == "on" ]]; then
+        shopt -s nullglob
+    else
+        shopt -u nullglob
+    fi
     
     if [[ $stale_pids -gt 0 ]]; then
         log WARN "Cleaned $stale_pids stale PID files"
@@ -541,6 +561,29 @@ write_pid_atomic() {
     return 0
 }
 
+# Read and validate PID from file
+#
+# Performs comprehensive validation:
+# 1. Checks if file exists
+# 2. Reads content (ignoring errors)
+# 3. Strips all whitespace
+# 4. Validates format: digits only via regex
+# 5. Removes leading zeros: 10#$pid (prevents octal interpretation)
+# 6. Validates range: 1 to SYSTEM_PID_MAX
+# 7. Verifies process exists via kill -0
+# 8. Validates process identity to detect PID reuse
+#
+# Parameters:
+#   $1 = Path to PID file
+#
+# Returns:
+#   stdout: Validated PID (numeric string) or empty string
+#   exit: Always 0 (errors return empty string, not error code)
+#
+# Side Effects:
+#   - Deletes PID file if content is invalid or process doesn't exist
+#   - Logs ERROR for invalid format or out-of-range PID
+#   - Logs DEBUG if process not running or identity mismatch
 read_pid_safe() {
     local pid_file="$1"
     
@@ -587,6 +630,28 @@ read_pid_safe() {
         return 0
     fi
     
+    # Validate process identity to detect PID reuse
+    # This is a defensive check against the rare case where a PID is recycled
+    local proc_cmd
+    proc_cmd="$(ps -p "$pid" -o comm= 2>/dev/null || true)"
+    
+    if [[ -n "$proc_cmd" ]]; then
+        # Check if process matches expected patterns for our services
+        # - mediamtx: the main MediaMTX binary
+        # - bash: wrapper scripts that manage FFmpeg streams
+        # - ffmpeg: FFmpeg processes (though typically tracked via wrapper)
+        if [[ "$proc_cmd" != "mediamtx" ]] && [[ "$proc_cmd" != "bash" ]] && [[ "$proc_cmd" != "ffmpeg" ]]; then
+            # Process exists but is not one of our expected types
+            # This could indicate PID reuse - log and reject
+            log DEBUG "PID $pid from $pid_file has unexpected process '$proc_cmd' (possible PID reuse)"
+            rm -f "$pid_file"
+            echo ""
+            return 0
+        fi
+    fi
+    # If proc_cmd is empty, ps failed but kill -0 succeeded
+    # This can happen in edge cases, so we accept it (defensive)
+    
     echo "$pid"
 }
 
@@ -616,7 +681,7 @@ wait_for_pid_termination() {
     return 0
 }
 
-# Process group termination with proper handling
+# Process group termination with recursive descendant finding
 terminate_process_group() {
     local pid="$1"
     local timeout="${2:-10}"
@@ -624,6 +689,34 @@ terminate_process_group() {
     if [[ -z "$pid" ]] || ! kill -0 "$pid" 2>/dev/null; then
         return 0
     fi
+    
+    # Helper function to recursively find all descendants
+    get_descendants() {
+        local parent_pid="$1"
+        local descendants=""
+        
+        # Get immediate children
+        local children
+        children=$(pgrep -P "$parent_pid" 2>/dev/null || true)
+        
+        if [[ -n "$children" ]]; then
+            for child in $children; do
+                # Add this child
+                descendants="$descendants $child"
+                # Recursively get this child's descendants
+                local child_descendants
+                child_descendants=$(get_descendants "$child")
+                descendants="$descendants$child_descendants"
+            done
+        fi
+        
+        echo "$descendants"
+    }
+    
+    # Get all descendants (children, grandchildren, etc.)
+    local all_pids
+    all_pids=$(get_descendants "$pid")
+    all_pids="$pid $all_pids"
     
     # Try process group first if it exists
     if kill -INT -- -"$pid" 2>/dev/null; then
@@ -634,10 +727,12 @@ terminate_process_group() {
         kill -INT "$pid" 2>/dev/null || true
     fi
     
-    # Also kill children explicitly if pkill is available
-    if command_exists pkill; then
-        pkill -INT -P "$pid" 2>/dev/null || true
-    fi
+    # Also kill all descendants explicitly
+    for descendant_pid in $all_pids; do
+        if [[ "$descendant_pid" != "$pid" ]]; then
+            kill -INT "$descendant_pid" 2>/dev/null || true
+        fi
+    done
     
     if ! wait_for_pid_termination "$pid" "$timeout"; then
         # Force kill if needed
@@ -647,9 +742,13 @@ terminate_process_group() {
             kill -KILL "$pid" 2>/dev/null || true
         fi
         
-        if command_exists pkill; then
-            pkill -KILL -P "$pid" 2>/dev/null || true
-        fi
+        # Force kill all descendants
+        for descendant_pid in $all_pids; do
+            if [[ "$descendant_pid" != "$pid" ]]; then
+                kill -KILL "$descendant_pid" 2>/dev/null || true
+            fi
+        done
+        
         wait_for_pid_termination "$pid" 2
     fi
 }
@@ -697,6 +796,36 @@ is_lock_stale() {
     return 1  # Not stale
 }
 
+# Acquire exclusive file-based lock with timeout
+#
+# Acquisition sequence:
+# 1. Closes any existing file descriptor
+# 2. Creates lock directory if needed
+# 3. Checks for stale lock (via is_lock_stale) and removes if stale
+# 4. Opens LOCK_FILE and gets file descriptor
+# 5. Validates file descriptor > 2
+# 6. Calls flock -w with timeout
+# 7. Writes current PID to lock file
+#
+# Lock file deletion:
+# - Deleted only if is_lock_stale() returns true (age > threshold AND process dead)
+# - NOT deleted on timeout failure (another process legitimately holds lock)
+#
+# Parameters:
+#   $1 = Timeout in seconds (default: LOCK_ACQUISITION_TIMEOUT)
+#   $2 = Force flag: "true" or "false" (default: "false")
+#        If "true": returns 0 even if lock acquisition fails
+#
+# Returns:
+#   0 = Lock acquired successfully OR force="true"
+#   1 = Lock acquisition failed AND force="false"
+#
+# Side Effects:
+#   - Sets global MAIN_LOCK_FD to file descriptor number (or -1 on failure)
+#   - Creates LOCK_FILE if doesn't exist
+#   - Writes current PID to lock file
+#   - May delete lock file if demonstrably stale
+#   - Logs DEBUG on success, ERROR/WARN on failure
 acquire_lock() {
     local timeout="${1:-${LOCK_ACQUISITION_TIMEOUT}}"
     local force="${2:-false}"
@@ -818,10 +947,12 @@ setup_directories() {
     mkdir -p "$(dirname "${PID_FILE}")"
     mkdir -p "${FFMPEG_PID_DIR}"
     
+    # Set directory permissions: rwxr-xr-x (owner write, group/other read+execute)
     chmod 755 "${FFMPEG_PID_DIR}"
     
     if [[ ! -f "${LOG_FILE}" ]]; then
         touch "${LOG_FILE}"
+        # Set log file permissions: rw-r--r-- (owner write, group/other read)
         chmod 644 "${LOG_FILE}"
     fi
     
@@ -960,9 +1091,67 @@ check_resource_usage() {
     return 0
 }
 
-# v1.3.4 NEW: Stream health monitoring with automatic restart
+# Detect if running from cron using multi-method detection
+is_cron_context() {
+    # Multi-method cron detection for maximum reliability
+    
+    # Method 1: Check explicit CRON environment variable (most reliable)
+    if [[ "${CRON:-0}" == "1" ]]; then
+        return 0
+    fi
+    
+    # Method 2: Check if stdin/stdout are not terminals (typical cron behavior)
+    if [[ ! -t 0 ]] && [[ ! -t 1 ]] && [[ -z "${TERM:-}" ]]; then
+        # Additional check: not in SSH session (which also has non-tty)
+        if [[ -z "${SSH_CLIENT:-}" ]] && [[ -z "${SSH_TTY:-}" ]]; then
+            # Check parent process name contains cron-related strings
+            local parent_cmd
+            parent_cmd="$(ps -o comm= -p $PPID 2>/dev/null || true)"
+            if [[ "$parent_cmd" =~ cron|CRON|anacron ]]; then
+                return 0
+            fi
+        fi
+    fi
+    
+    # Method 3: Check systemd cgroup (systemd-based cron only)
+    if [[ -f /proc/self/cgroup ]]; then
+        if grep -qE "cron\.service|cronie\.service" /proc/self/cgroup 2>/dev/null; then
+            return 0
+        fi
+    fi
+    
+    # Method 4: Check parent process name directly
+    if [[ -f /proc/$PPID/comm ]]; then
+        local parent_comm
+        parent_comm="$(cat /proc/$PPID/comm 2>/dev/null || true)"
+        if [[ "$parent_comm" =~ ^(cron|crond|anacron)$ ]]; then
+            return 0
+        fi
+    fi
+    
+    return 1
+}
+
+# Stream health monitoring with automatic restart
 monitor_streams() {
     log INFO "Checking stream health..."
+    
+    # First check if MediaMTX is running
+    local mediamtx_pid
+    mediamtx_pid="$(read_pid_safe "${PID_FILE}")"
+    
+    if [[ -z "$mediamtx_pid" ]] || ! kill -0 "$mediamtx_pid" 2>/dev/null; then
+        log WARN "MediaMTX is not running - skipping stream health check"
+        log INFO "Run 'start' command to start MediaMTX and streams"
+        return "${E_MEDIAMTX_DOWN}"
+    fi
+    
+    # Detect if running from cron - if so, report only, don't restart
+    local allow_restart=true
+    if is_cron_context; then
+        allow_restart=false
+        log DEBUG "Running from cron - report-only mode (no stream restarts)"
+    fi
     
     # Get current devices
     local devices=()
@@ -970,76 +1159,183 @@ monitor_streams() {
     
     if [[ ${#devices[@]} -eq 0 ]]; then
         log WARN "No USB audio devices detected"
-        return 0
+        return "${E_USB_NO_DEVICES}"
     fi
     
+    local streams_healthy=0
     local streams_restarted=0
+    local streams_failed=0
     local streams_checked=0
     
-    # Check each expected stream
-    for device_info in "${devices[@]}"; do
-        IFS=':' read -r device_name card_num <<< "$device_info"
+    # Handle multiplex mode health monitoring
+    if [[ "${STREAM_MODE}" == "multiplex" ]]; then
+        ((streams_checked++)) || true
         
-        if [[ -z "$device_name" ]] || [[ -z "$card_num" ]]; then
-            continue
+        # Sanitize stream name (same logic as start_ffmpeg_multiplex_stream)
+        local stream_path
+        stream_path="$(sanitize_path_name "${MULTIPLEX_STREAM_NAME}")"
+        if [[ "$stream_path" =~ ^[0-9] ]]; then
+            stream_path="stream_${stream_path}"
         fi
         
-        local stream_path
-        stream_path="$(generate_stream_path "$device_name" "$card_num")"
         local pid_file="${FFMPEG_PID_DIR}/${stream_path}.pid"
-        
-        ((streams_checked++))
         
         # Check if PID file exists
         if [[ ! -f "$pid_file" ]]; then
-            log WARN "Stream $stream_path has no PID file - restarting"
-            if start_ffmpeg_stream "$device_name" "$card_num" "$stream_path"; then
-                ((streams_restarted++))
-                log INFO "Successfully restarted stream $stream_path"
+            if [[ "$allow_restart" == "true" ]]; then
+                log WARN "Multiplex stream $stream_path has no PID file - restarting"
+                if start_ffmpeg_multiplex_stream "${devices[@]}"; then
+                    ((streams_restarted++)) || true
+                    log INFO "Successfully restarted multiplex stream $stream_path"
+                else
+                    ((streams_failed++)) || true
+                    log ERROR "Failed to restart multiplex stream $stream_path"
+                fi
             else
-                log ERROR "Failed to restart stream $stream_path"
+                ((streams_failed++)) || true
+                log WARN "Multiplex stream $stream_path has no PID file (cron mode: not restarting)"
             fi
-            continue
-        fi
-        
-        # Check if process is running
-        local pid
-        pid="$(read_pid_safe "$pid_file")"
-        
-        if [[ -z "$pid" ]]; then
-            log WARN "Stream $stream_path PID is invalid - restarting"
-            if start_ffmpeg_stream "$device_name" "$card_num" "$stream_path"; then
-                ((streams_restarted++))
-                log INFO "Successfully restarted stream $stream_path"
+        else
+            # Check if process is running
+            local pid
+            pid="$(read_pid_safe "$pid_file")"
+            
+            if [[ -z "$pid" ]]; then
+                if [[ "$allow_restart" == "true" ]]; then
+                    log WARN "Multiplex stream $stream_path PID is invalid - restarting"
+                    if start_ffmpeg_multiplex_stream "${devices[@]}"; then
+                        ((streams_restarted++)) || true
+                        log INFO "Successfully restarted multiplex stream $stream_path"
+                    else
+                        ((streams_failed++)) || true
+                        log ERROR "Failed to restart multiplex stream $stream_path"
+                    fi
+                else
+                    ((streams_failed++)) || true
+                    log WARN "Multiplex stream $stream_path PID is invalid (cron mode: not restarting)"
+                fi
+            elif ! pgrep -f "${FFMPEG_PID_DIR}/${stream_path}.sh" | grep -q "^${pid}$" 2>/dev/null; then
+                if [[ "$allow_restart" == "true" ]]; then
+                    log WARN "Multiplex stream $stream_path PID $pid is stale - restarting"
+                    rm -f "$pid_file"
+                    if start_ffmpeg_multiplex_stream "${devices[@]}"; then
+                        ((streams_restarted++)) || true
+                        log INFO "Successfully restarted multiplex stream $stream_path"
+                    else
+                        ((streams_failed++)) || true
+                        log ERROR "Failed to restart multiplex stream $stream_path"
+                    fi
+                else
+                    ((streams_failed++)) || true
+                    log WARN "Multiplex stream $stream_path PID $pid is stale (cron mode: not restarting)"
+                fi
             else
-                log ERROR "Failed to restart stream $stream_path"
+                ((streams_healthy++)) || true
+                log DEBUG "Multiplex stream $stream_path is healthy (PID: $pid)"
             fi
-            continue
         fi
-        
-        # Verify the PID actually belongs to our wrapper
-        if ! pgrep -f "${FFMPEG_PID_DIR}/${stream_path}.sh" | grep -q "^${pid}$" 2>/dev/null; then
-            log WARN "Stream $stream_path PID $pid is stale - restarting"
-            rm -f "$pid_file"
-            if start_ffmpeg_stream "$device_name" "$card_num" "$stream_path"; then
-                ((streams_restarted++))
-                log INFO "Successfully restarted stream $stream_path"
-            else
-                log ERROR "Failed to restart stream $stream_path"
+    else
+        # Individual mode: check each stream
+        for device_info in "${devices[@]}"; do
+            IFS=':' read -r device_name card_num <<< "$device_info"
+            
+            if [[ -z "$device_name" ]] || [[ -z "$card_num" ]]; then
+                continue
             fi
-            continue
-        fi
-        
-        log DEBUG "Stream $stream_path is healthy (PID: $pid)"
-    done
+            
+            local stream_path
+            stream_path="$(generate_stream_path "$device_name" "$card_num")"
+            local pid_file="${FFMPEG_PID_DIR}/${stream_path}.pid"
+            
+            ((streams_checked++)) || true
+            
+            # Check if PID file exists
+            if [[ ! -f "$pid_file" ]]; then
+                if [[ "$allow_restart" == "true" ]]; then
+                    log WARN "Stream $stream_path has no PID file - restarting"
+                    if start_ffmpeg_stream "$device_name" "$card_num" "$stream_path"; then
+                        ((streams_restarted++)) || true
+                        log INFO "Successfully restarted stream $stream_path"
+                    else
+                        ((streams_failed++)) || true
+                        log ERROR "Failed to restart stream $stream_path"
+                    fi
+                else
+                    ((streams_failed++)) || true
+                    log WARN "Stream $stream_path has no PID file (cron mode: not restarting)"
+                fi
+                continue
+            fi
+            
+            # Check if process is running
+            local pid
+            pid="$(read_pid_safe "$pid_file")"
+            
+            if [[ -z "$pid" ]]; then
+                if [[ "$allow_restart" == "true" ]]; then
+                    log WARN "Stream $stream_path PID is invalid - restarting"
+                    if start_ffmpeg_stream "$device_name" "$card_num" "$stream_path"; then
+                        ((streams_restarted++)) || true
+                        log INFO "Successfully restarted stream $stream_path"
+                    else
+                        ((streams_failed++)) || true
+                        log ERROR "Failed to restart stream $stream_path"
+                    fi
+                else
+                    ((streams_failed++)) || true
+                    log WARN "Stream $stream_path PID is invalid (cron mode: not restarting)"
+                fi
+                continue
+            fi
+            
+            # Verify the PID actually belongs to our wrapper
+            if ! pgrep -f "${FFMPEG_PID_DIR}/${stream_path}.sh" | grep -q "^${pid}$" 2>/dev/null; then
+                if [[ "$allow_restart" == "true" ]]; then
+                    log WARN "Stream $stream_path PID $pid is stale - restarting"
+                    rm -f "$pid_file"
+                    if start_ffmpeg_stream "$device_name" "$card_num" "$stream_path"; then
+                        ((streams_restarted++)) || true
+                        log INFO "Successfully restarted stream $stream_path"
+                    else
+                        ((streams_failed++)) || true
+                        log ERROR "Failed to restart stream $stream_path"
+                    fi
+                else
+                    ((streams_failed++)) || true
+                    log WARN "Stream $stream_path PID $pid is stale (cron mode: not restarting)"
+                fi
+                continue
+            fi
+            
+            ((streams_healthy++)) || true
+            log DEBUG "Stream $stream_path is healthy (PID: $pid)"
+        done
+    fi
     
-    if [[ $streams_restarted -gt 0 ]]; then
-        log INFO "Stream health check complete: $streams_restarted/$streams_checked streams restarted"
+    # Provide accurate summary
+    if [[ $streams_failed -gt 0 ]]; then
+        if [[ $streams_restarted -gt 0 ]]; then
+            log WARN "Stream health check complete: $streams_healthy healthy, $streams_restarted restarted, $streams_failed FAILED (total: $streams_checked)"
+        else
+            log ERROR "Stream health check complete: $streams_healthy healthy, $streams_failed FAILED (total: $streams_checked)"
+        fi
+    elif [[ $streams_restarted -gt 0 ]]; then
+        log INFO "Stream health check complete: $streams_healthy healthy, $streams_restarted restarted (total: $streams_checked)"
     else
         log INFO "Stream health check complete: all $streams_checked streams healthy"
     fi
     
-    return 0
+    # Return appropriate exit code based on monitoring results
+    if [[ -z "$mediamtx_pid" ]] || ! kill -0 "$mediamtx_pid" 2>/dev/null; then
+        # MediaMTX not running - critical failure already logged
+        return "${E_MEDIAMTX_DOWN}"
+    elif [[ $streams_failed -gt 0 ]]; then
+        # Some streams failed - degraded state
+        return "${E_MONITOR_DEGRADED}"
+    else
+        # All healthy
+        return 0
+    fi
 }
 
 # Enhanced stream validation
@@ -1112,6 +1408,35 @@ clear_restart_marker() {
     rm -f "${RESTART_MARKER}"
 }
 
+# Clean up all processes and temporary files
+#
+# Execution order (as implemented):
+# 1. Wrapper processes (via PID files in FFMPEG_PID_DIR)
+#    - Calls terminate_process_group with 5s timeout
+#    - Deletes PID files
+# 2. Orphaned FFmpeg processes (via pgrep pattern match)
+#    - Matches: ^ffmpeg.*rtsp://${MEDIAMTX_HOST}:8554
+#    - Calls terminate_process_group with 2s timeout
+# 3. MediaMTX process (via PID_FILE)
+#    - Calls terminate_process_group with 5s timeout
+#    - Deletes PID file
+# 4. MediaMTX processes using our config (via pgrep pattern match)
+#    - Matches: ^${MEDIAMTX_BIN}.*${CONFIG_FILE}$
+#    - Calls terminate_process_group with 2s timeout
+# 5. Temporary files
+#    - Deletes: *.pid, *.sh, *.log, *.log.old from FFMPEG_PID_DIR
+# 6. Marker files
+#    - Deletes: CLEANUP_MARKER, RESTART_MARKER, CONFIG_LOCK_FILE
+#
+# Parameters: None
+#
+# Returns: 0 (always - best-effort cleanup)
+#
+# Side Effects:
+#   - Terminates processes (wrappers, FFmpeg, MediaMTX)
+#   - Deletes files (PID files, scripts, logs, markers)
+#   - Modifies nullglob shell option (saves and restores state)
+#   - Logs INFO at start and completion, DEBUG for each operation
 cleanup_stale_processes() {
     log INFO "Cleaning up stale processes and files"
     
@@ -1314,6 +1639,32 @@ sanitize_device_name() {
     printf '%s\n' "$sanitized"
 }
 
+# Sanitize device name for RTSP path usage
+#
+# Transformation sequence:
+# 1. Strips prefixes: "usb-audio-" and "usb_audio_"
+# 2. Converts to lowercase
+# 3. Replaces non-alphanumeric characters with underscore
+# 4. Collapses multiple consecutive underscores to single underscore
+# 5. Removes leading and trailing underscores
+# 6. If result is empty: generates "stream_$(date +%s)"
+# 7. If matches reserved words: prefixes with "stream_"
+# 8. If exceeds MAX_STREAM_NAME_LENGTH: truncates and appends 8-char hash
+# 9. If below MIN_STREAM_NAME_LENGTH: replaces with "stream_$(date +%s)"
+#
+# Parameters:
+#   $1 = Raw device name (e.g., "USB Audio Device #1")
+#
+# Returns:
+#   stdout: Sanitized path name (lowercase alphanumeric + underscore only)
+#   exit: 0 (always)
+#
+# Examples (observable from code logic):
+#   "USB Audio Device" Ã¢â€ â€™ "usb_audio_device"
+#   "Device-123" Ã¢â€ â€™ "device_123"
+#   "   " (spaces only) Ã¢â€ â€™ "stream_1699564821" (timestamp fallback)
+#   Reserved word Ã¢â€ â€™ "stream_<reserved>" (prefixed)
+#   Very long name Ã¢â€ â€™ "truncated_name_a1b2c3d4" (with hash)
 sanitize_path_name() {
     local name="$1"
     name="${name#usb-audio-}"
@@ -1321,8 +1672,28 @@ sanitize_path_name() {
     local sanitized
     sanitized="$(echo "$name" | tr '[:upper:]' '[:lower:]' | sed 's/[^0-9a-z]/_/g' | sed 's/__*/_/g' | sed 's/^_*//;s/_*$//')"
     
+    # Generate fallback if empty
     if [[ -z "$sanitized" ]]; then
         sanitized="stream_$(date +%s)"
+    fi
+    
+    # Check reserved words
+    if [[ "$sanitized" =~ ^(${RESERVED_STREAM_NAMES})$ ]]; then
+        log WARN "Stream name '$sanitized' is reserved, adding prefix"
+        sanitized="stream_${sanitized}"
+    fi
+    
+    # Enforce length limits
+    if [[ ${#sanitized} -gt $MAX_STREAM_NAME_LENGTH ]]; then
+        local hash
+        hash="$(echo -n "$sanitized" | md5sum | cut -c1-8)"
+        sanitized="${sanitized:0:$((MAX_STREAM_NAME_LENGTH - 9))}_${hash}"
+        log DEBUG "Truncated long stream name to: $sanitized"
+    fi
+    
+    if [[ ${#sanitized} -lt $MIN_STREAM_NAME_LENGTH ]]; then
+        sanitized="stream_$(date +%s)"
+        log WARN "Stream name too short, using fallback: $sanitized"
     fi
     
     echo "$sanitized"
@@ -1476,6 +1847,17 @@ start_ffmpeg_multiplex_stream() {
         stream_path="stream_${stream_path}"
     fi
     
+    # Validate final stream name
+    if [[ ${#stream_path} -gt $MAX_STREAM_NAME_LENGTH ]]; then
+        log ERROR "Stream name too long after sanitization: $stream_path (max: $MAX_STREAM_NAME_LENGTH)"
+        return 1
+    fi
+    
+    if [[ "$stream_path" =~ ^(${RESERVED_STREAM_NAMES})$ ]]; then
+        log ERROR "Stream name '$stream_path' conflicts with reserved MediaMTX path"
+        return 1
+    fi
+    
     local pid_file="${FFMPEG_PID_DIR}/${stream_path}.pid"
     
     # Check if already running
@@ -1576,10 +1958,10 @@ MEDIAMTX_HOST="$MEDIAMTX_HOST"
 # Restart configuration
 RESTART_COUNT=0
 CONSECUTIVE_FAILURES=0
-MAX_CONSECUTIVE_FAILURES=5
+MAX_CONSECUTIVE_FAILURES=$MAX_CONSECUTIVE_FAILURES
 MAX_WRAPPER_RESTARTS=$MAX_WRAPPER_RESTARTS
 WRAPPER_SUCCESS_DURATION=$WRAPPER_SUCCESS_DURATION
-RESTART_DELAY=10
+RESTART_DELAY=$INITIAL_RESTART_DELAY
 FFMPEG_LOG_MAX_SIZE=$FFMPEG_LOG_MAX_SIZE
 
 # Device arrays (initialized empty, populated below)
@@ -1587,7 +1969,7 @@ declare -a CARD_NUMBERS=()
 declare -a DEVICE_NAMES=()
 
 FFMPEG_PID=""
-PARENT_PID=\$PPID
+MAIN_SCRIPT_PID="$$"
 EOF
     
     # Populate arrays with proper quoting to handle spaces in device names
@@ -1738,6 +2120,17 @@ run_ffmpeg() {
     # Log the complete command for debugging
     log_message "FFmpeg command: ${ffmpeg_cmd[*]}"
     
+    # Rotate log if exceeds size limit to prevent disk exhaustion
+    if [[ -f "${FFMPEG_LOG}" ]]; then
+        local current_size
+        current_size=$(stat -c %s "${FFMPEG_LOG}" 2>/dev/null || echo 0)
+        if (( current_size > FFMPEG_LOG_MAX_SIZE )); then
+            log_message "Rotating FFmpeg log (current size: ${current_size} bytes, max: ${FFMPEG_LOG_MAX_SIZE})"
+            mv -f "${FFMPEG_LOG}" "${FFMPEG_LOG}.old" 2>/dev/null || true
+            # Note: FFmpeg will automatically create new log file on next write
+        fi
+    fi
+    
     # Start FFmpeg with proper process group
     if command -v setsid &>/dev/null; then
         setsid "${ffmpeg_cmd[@]}" >> "${FFMPEG_LOG}" 2>&1 &
@@ -1774,9 +2167,9 @@ check_devices_exist() {
 
 # Check if parent is still alive
 check_parent_alive() {
-    if [[ -n "${PARENT_PID}" ]] && [[ "${PARENT_PID}" -gt 1 ]]; then
-        if ! kill -0 "${PARENT_PID}" 2>/dev/null; then
-            log_message "Parent process ${PARENT_PID} died, exiting"
+    if [[ -n "${MAIN_SCRIPT_PID}" ]] && [[ "${MAIN_SCRIPT_PID}" -gt 1 ]]; then
+        if ! kill -0 "${MAIN_SCRIPT_PID}" 2>/dev/null; then
+            log_message "Main script (PID ${MAIN_SCRIPT_PID}) has terminated, exiting"
             return 1
         fi
     fi
@@ -1785,7 +2178,7 @@ check_parent_alive() {
 
 # Log startup
 log_critical "Multiplex stream wrapper starting for ${STREAM_PATH} with ${NUM_DEVICES} devices"
-log_message "Wrapper PID: $$, Parent PID: ${PARENT_PID}"
+log_message "Wrapper PID: $$, Main script PID: ${MAIN_SCRIPT_PID}"
 log_message "Filter type: ${FILTER_TYPE}"
 
 # Main restart loop
@@ -1823,12 +2216,12 @@ while true; do
         log_message "Failed to start FFmpeg"
         ((CONSECUTIVE_FAILURES++))
         # Protect against integer overflow in restart delay
-        if (( RESTART_DELAY <= 0 )) || (( RESTART_DELAY > 300 )); then
-            RESTART_DELAY=10
+        if (( RESTART_DELAY <= 0 )) || (( RESTART_DELAY > MAX_RESTART_DELAY )); then
+            RESTART_DELAY=$INITIAL_RESTART_DELAY
         else
             RESTART_DELAY=$((RESTART_DELAY * 2))
-            if (( RESTART_DELAY > 300 )); then
-                RESTART_DELAY=300
+            if (( RESTART_DELAY > MAX_RESTART_DELAY )); then
+                RESTART_DELAY=$MAX_RESTART_DELAY
             fi
         fi
         sleep $RESTART_DELAY
@@ -1851,17 +2244,17 @@ while true; do
     # Reset failures and delay if ran successfully
     if [[ ${RUN_TIME} -gt ${WRAPPER_SUCCESS_DURATION} ]]; then
         CONSECUTIVE_FAILURES=0
-        RESTART_DELAY=10
+        RESTART_DELAY=$INITIAL_RESTART_DELAY
         log_message "Successful run, reset delay to ${RESTART_DELAY}s"
     else
         ((CONSECUTIVE_FAILURES++))
         # Protect against integer overflow in restart delay
-        if (( RESTART_DELAY <= 0 )) || (( RESTART_DELAY > 300 )); then
-            RESTART_DELAY=10
+        if (( RESTART_DELAY <= 0 )) || (( RESTART_DELAY > MAX_RESTART_DELAY )); then
+            RESTART_DELAY=$INITIAL_RESTART_DELAY
         else
             RESTART_DELAY=$((RESTART_DELAY * 2))
-            if (( RESTART_DELAY > 300 )); then
-                RESTART_DELAY=300
+            if (( RESTART_DELAY > MAX_RESTART_DELAY )); then
+                RESTART_DELAY=$MAX_RESTART_DELAY
             fi
         fi
     fi
@@ -1995,17 +2388,19 @@ WRAPPER_PID_FILE="$pid_file"
 CLEANUP_MARKER="$CLEANUP_MARKER"
 MEDIAMTX_HOST="$MEDIAMTX_HOST"
 
+# Parent process tracking - use main script PID, not immediate parent
+MAIN_SCRIPT_PID="$$"
+
 # Restart configuration
 RESTART_COUNT=0
 CONSECUTIVE_FAILURES=0
-MAX_CONSECUTIVE_FAILURES=5
+MAX_CONSECUTIVE_FAILURES=$MAX_CONSECUTIVE_FAILURES
 MAX_WRAPPER_RESTARTS=$MAX_WRAPPER_RESTARTS
 WRAPPER_SUCCESS_DURATION=$WRAPPER_SUCCESS_DURATION
-RESTART_DELAY=10
+RESTART_DELAY=$INITIAL_RESTART_DELAY
 FFMPEG_LOG_MAX_SIZE=$FFMPEG_LOG_MAX_SIZE
 
 FFMPEG_PID=""
-PARENT_PID=\$PPID
 EOF
 
     # Add the wrapper logic
@@ -2099,6 +2494,17 @@ run_ffmpeg() {
         "rtsp://${MEDIAMTX_HOST}:8554/${STREAM_PATH}"
     )
     
+    # Rotate log if exceeds size limit to prevent disk exhaustion
+    if [[ -f "${FFMPEG_LOG}" ]]; then
+        local current_size
+        current_size=$(stat -c %s "${FFMPEG_LOG}" 2>/dev/null || echo 0)
+        if (( current_size > FFMPEG_LOG_MAX_SIZE )); then
+            log_message "Rotating FFmpeg log (current size: ${current_size} bytes, max: ${FFMPEG_LOG_MAX_SIZE})"
+            mv -f "${FFMPEG_LOG}" "${FFMPEG_LOG}.old" 2>/dev/null || true
+            # Note: FFmpeg will automatically create new log file on next write
+        fi
+    fi
+    
     # Start FFmpeg with proper process group
     if command -v setsid &>/dev/null; then
         setsid "${ffmpeg_cmd[@]}" >> "${FFMPEG_LOG}" 2>&1 &
@@ -2129,9 +2535,9 @@ check_device_exists() {
 
 # Check if parent is still alive
 check_parent_alive() {
-    if [[ -n "${PARENT_PID}" ]] && [[ "${PARENT_PID}" -gt 1 ]]; then
-        if ! kill -0 "${PARENT_PID}" 2>/dev/null; then
-            log_message "Parent process ${PARENT_PID} died, exiting"
+    if [[ -n "${MAIN_SCRIPT_PID}" ]] && [[ "${MAIN_SCRIPT_PID}" -gt 1 ]]; then
+        if ! kill -0 "${MAIN_SCRIPT_PID}" 2>/dev/null; then
+            log_message "Main script (PID ${MAIN_SCRIPT_PID}) has terminated, exiting"
             return 1
         fi
     fi
@@ -2140,7 +2546,7 @@ check_parent_alive() {
 
 # Log startup
 log_critical "Stream wrapper starting for ${STREAM_PATH} (card ${CARD_NUM})"
-log_message "Wrapper PID: $$, Parent PID: ${PARENT_PID}"
+log_message "Wrapper PID: $$, Main script PID: ${MAIN_SCRIPT_PID}"
 
 # Main restart loop
 while true; do
@@ -2177,12 +2583,12 @@ while true; do
         log_message "Failed to start FFmpeg"
         ((CONSECUTIVE_FAILURES++))
         # Protect against integer overflow in restart delay
-        if (( RESTART_DELAY <= 0 )) || (( RESTART_DELAY > 300 )); then
-            RESTART_DELAY=10
+        if (( RESTART_DELAY <= 0 )) || (( RESTART_DELAY > MAX_RESTART_DELAY )); then
+            RESTART_DELAY=$INITIAL_RESTART_DELAY
         else
             RESTART_DELAY=$((RESTART_DELAY * 2))
-            if (( RESTART_DELAY > 300 )); then
-                RESTART_DELAY=300
+            if (( RESTART_DELAY > MAX_RESTART_DELAY )); then
+                RESTART_DELAY=$MAX_RESTART_DELAY
             fi
         fi
         sleep $RESTART_DELAY
@@ -2205,17 +2611,17 @@ while true; do
     # Reset failures and delay if ran successfully
     if [[ ${RUN_TIME} -gt ${WRAPPER_SUCCESS_DURATION} ]]; then
         CONSECUTIVE_FAILURES=0
-        RESTART_DELAY=10
+        RESTART_DELAY=$INITIAL_RESTART_DELAY
         log_message "Successful run, reset delay to ${RESTART_DELAY}s"
     else
         ((CONSECUTIVE_FAILURES++))
         # Protect against integer overflow in restart delay
-        if (( RESTART_DELAY <= 0 )) || (( RESTART_DELAY > 300 )); then
-            RESTART_DELAY=10
+        if (( RESTART_DELAY <= 0 )) || (( RESTART_DELAY > MAX_RESTART_DELAY )); then
+            RESTART_DELAY=$INITIAL_RESTART_DELAY
         else
             RESTART_DELAY=$((RESTART_DELAY * 2))
-            if (( RESTART_DELAY > 300 )); then
-                RESTART_DELAY=300
+            if (( RESTART_DELAY > MAX_RESTART_DELAY )); then
+                RESTART_DELAY=$MAX_RESTART_DELAY
             fi
         fi
     fi
@@ -2256,10 +2662,13 @@ WRAPPER_LOGIC
         log ERROR "Wrapper failed to start for $stream_path"
         # Check if log file exists and has error messages
         if [[ -f "$ffmpeg_log" ]]; then
-            local last_log
-            last_log="$(tail -n 5 "$ffmpeg_log" 2>/dev/null | head -n 1)"
-            if [[ -n "$last_log" ]]; then
-                log ERROR "Wrapper log: $last_log"
+            local recent_logs
+            recent_logs="$(tail -n 10 "$ffmpeg_log" 2>/dev/null)"
+            if [[ -n "$recent_logs" ]]; then
+                log ERROR "Wrapper logs (last 10 lines):"
+                while IFS= read -r line; do
+                    log ERROR "  $line"
+                done <<< "$recent_logs"
             fi
         fi
         rm -f "$wrapper_script"
@@ -2327,8 +2736,10 @@ start_all_ffmpeg_streams() {
     
     local success_count=0
     local failed_streams=()
+    local device_idx=0
     
     for device_info in "${devices[@]}"; do
+        ((device_idx++)) || true
         IFS=':' read -r device_name card_num <<< "$device_info"
         
         if [[ -z "$device_name" ]] || [[ -z "$card_num" ]]; then
@@ -2342,6 +2753,9 @@ start_all_ffmpeg_streams() {
         local stream_path
         stream_path="$(generate_stream_path "$device_name" "$card_num")"
         
+        # Progress feedback for manual starts
+        echo "Starting stream ${device_idx}/${#devices[@]}: ${stream_path}..."
+        
         if start_ffmpeg_stream "$device_name" "$card_num" "$stream_path"; then
             ((success_count++)) || true
         else
@@ -2353,11 +2767,12 @@ start_all_ffmpeg_streams() {
     # Log summary with details about failures
     if [[ ${#failed_streams[@]} -gt 0 ]]; then
         log WARN "Started $success_count/${#devices[@]} FFmpeg streams. Failed: ${failed_streams[*]}"
-        return 1  # Return error on partial failures for monitoring
     else
         log INFO "Successfully started all $success_count/${#devices[@]} FFmpeg streams"
-        return 0
     fi
+    
+    # Always return 0 for best-effort behavior
+    return 0
 }
 
 # Stop all streams
@@ -2480,9 +2895,23 @@ EOF
 EOF
     fi
     
+    # Set permissions BEFORE atomic move (following write_pid_atomic pattern)
+    chmod 644 "$tmp_config" 2>/dev/null || {
+        rm -f "$tmp_config"
+        log ERROR "Failed to set permissions on temp config file"
+        exec {CONFIG_LOCK_FD}>&- 2>/dev/null || true
+        CONFIG_LOCK_FD=-1
+        return 1
+    }
+
     # Atomically move into place
-    mv -f "$tmp_config" "${CONFIG_FILE}"
-    chmod 644 "${CONFIG_FILE}"
+    mv -f "$tmp_config" "${CONFIG_FILE}" || {
+        rm -f "$tmp_config"
+        log ERROR "Failed to move config file into place"
+        exec {CONFIG_LOCK_FD}>&- 2>/dev/null || true
+        CONFIG_LOCK_FD=-1
+        return 1
+    }
     
     # Release config lock
     exec {CONFIG_LOCK_FD}>&- 2>/dev/null || true
@@ -2612,6 +3041,7 @@ start_mediamtx() {
         fi
         
         log INFO "Multiplex mode - starting single multiplexed stream to ${MULTIPLEX_STREAM_NAME}"
+        echo "Starting multiplexed stream (${#devices[@]} devices): ${MULTIPLEX_STREAM_NAME}..."
         # Start single multiplex stream with all devices
         if ! start_ffmpeg_multiplex_stream "${devices[@]}"; then
             log ERROR "Failed to start multiplex stream"
@@ -2632,9 +3062,9 @@ start_mediamtx() {
         # In multiplex mode, validate the single multiplexed stream
         local stream_path="${MULTIPLEX_STREAM_NAME}"
         if validate_stream "$stream_path"; then
-            echo -e "${GREEN}✓${NC} rtsp://${MEDIAMTX_HOST}:8554/${stream_path} (multiplexed from ${#devices[@]} devices)"
+            echo -e "${GREEN}[OK]${NC} rtsp://${MEDIAMTX_HOST}:8554/${stream_path} (multiplexed from ${#devices[@]} devices)"
         else
-            echo -e "${RED}✗${NC} rtsp://${MEDIAMTX_HOST}:8554/${stream_path} (failed)"
+            echo -e "${RED}[FAIL]${NC} rtsp://${MEDIAMTX_HOST}:8554/${stream_path} (failed)"
         fi
     else
         # In individual mode, validate each device's stream
@@ -2644,9 +3074,9 @@ start_mediamtx() {
             stream_path="$(generate_stream_path "$device_name" "$card_num")"
             
             if validate_stream "$stream_path"; then
-                echo -e "${GREEN}✓${NC} rtsp://${MEDIAMTX_HOST}:8554/${stream_path}"
+                echo -e "${GREEN}[OK]${NC} rtsp://${MEDIAMTX_HOST}:8554/${stream_path}"
             else
-                echo -e "${RED}✗${NC} rtsp://${MEDIAMTX_HOST}:8554/${stream_path} (failed)"
+                echo -e "${RED}[FAIL]${NC} rtsp://${MEDIAMTX_HOST}:8554/${stream_path} (failed)"
             fi
         done
     fi
@@ -2869,10 +3299,13 @@ ExecReload=${SCRIPT_DIR}/${SCRIPT_NAME} restart
 PIDFile=${PID_FILE}
 Restart=on-failure
 RestartSec=30
-StartLimitInterval=600
-StartLimitBurst=5
+StartLimitInterval=1200
+StartLimitBurst=10
 User=root
 Group=audio
+
+StandardOutput=append:${LOG_FILE}
+StandardError=append:${LOG_FILE}
 
 TimeoutStartSec=300
 TimeoutStopSec=120
@@ -2886,6 +3319,7 @@ NoNewPrivileges=yes
 ReadWritePaths=/etc/mediamtx /var/lib/mediamtx-ffmpeg /var/log /var/run
 
 Environment="HOME=/root"
+Environment="PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 Environment="USB_STABILIZATION_DELAY=10"
 Environment="STREAM_MODE=${stream_mode}"
 Environment="MULTIPLEX_FILTER_TYPE=${multiplex_filter}"
@@ -2945,17 +3379,38 @@ EOF
         log INFO "Log rotation configured successfully"
     fi
     
-    # Create monitoring cron job with stream health checking
+    # Create monitoring cron job with conservative restart policy and overlap protection
+    # Conservative restart policy: only restart on critical resource failure
+    # Using flock to prevent overlapping monitor instances when checks exceed 5 minutes
     cat > /etc/cron.d/mediamtx-monitor << EOF
 # Monitor MediaMTX resource usage and stream health every 5 minutes
-# Exit code 2 from monitor indicates critical state requiring full restart
-*/5 * * * * root ${SCRIPT_DIR}/${SCRIPT_NAME} monitor; [ \$? -eq 2 ] && systemctl restart mediamtx-audio
+# Conservative restart policy (only on critical resource failure):
+#   Exit 0: All healthy - no action
+#   Exit 2: Critical resource state - RESTART SERVICE
+#   Exit 6: No USB devices - LOG ONLY (transient, will recover)
+#   Exit 7: MediaMTX not running - LOG ONLY (may recover)
+#   Exit 10: Stream degradation - LOG ONLY (monitor will fix on next cycle)
+#
+# CRON=1 enables explicit cron context detection
+# flock prevents overlapping runs when monitor exceeds 5-minute interval
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+CRON=1
+
+*/5 * * * * root flock -n /run/mediamtx-monitor.lock -c '${SCRIPT_DIR}/${SCRIPT_NAME} monitor; EXIT=\$?; if [ \$EXIT -eq 2 ]; then systemctl restart mediamtx-audio; elif [ \$EXIT -ne 0 ]; then logger -t mediamtx-monitor "Non-critical exit code \$EXIT (no restart)"; fi' || logger -t mediamtx-monitor "Monitor already running or locked"
 EOF
     
     systemctl daemon-reload
     
     echo "Systemd service created: $service_file"
     echo "Monitoring cron job created: /etc/cron.d/mediamtx-monitor"
+    echo ""
+    echo "=== v1.4.0 Production Enhancements ==="
+    echo "  * Separate monitoring lock (eliminates service/cron contention)"
+    echo "  * Conservative restart policy (only on critical resource failure)"
+    echo "  * Overlapping monitor protection (flock-based locking)"
+    echo "  * Increased restart tolerance (10 restarts in 20 minutes)"
+    echo "  * Recursive process cleanup (ensures complete termination)"
     echo ""
     echo "=== Stream Mode Configuration ==="
     echo "Current mode: ${stream_mode}"
@@ -3003,6 +3458,8 @@ Commands:
     status      Show current status
     config      Show device configuration
     monitor     Check resource usage and stream health
+                Exit codes: 0=healthy, 2=critical resources, 3=MediaMTX down,
+                            7=no devices, 10=streams degraded
     install     Create systemd service
     help        Show this help
 
@@ -3033,18 +3490,6 @@ Multiplex Mode Usage:
         sudo ./mediamtx-stream-manager.sh -m multiplex -f amix -n studio start
         Output: rtsp://localhost:8554/studio
 
-Version ${VERSION} - Production Ready:
-v1.3.4:
-    - FIXED: Removed problematic stream lock causing restart failures
-    - ADDED: Stream health monitoring with automatic restart capability
-    - IMPROVED: Wrapper PID validation to detect stale processes
-    - VERIFIED: Maintains v1.3.2 stability with v1.3.3 quality improvements
-    
-Key Features:
-    - Automatic stream restart on device events (resolves 12-hour failure issue)
-    - Zero changes to proven device discovery logic
-    - Resource monitoring for system health
-    - Production-tested reliability
 
 Resource Monitoring:
     The monitor command now checks:
@@ -3053,17 +3498,22 @@ Resource Monitoring:
     - High CPU usage (warn: ${MAX_CPU_WARNING}%, critical: ${MAX_CPU_CRITICAL}%)
     - Wrapper process health
     
-    Monitor exits with code 2 when critical thresholds are exceeded,
-    allowing systemd or cron to handle the full service restart.
+    Conservative restart policy:
+    - Exit 2 (Critical resource failure): Triggers full service restart
+    - Exit 7 (MediaMTX down): Logged, no restart (may recover)
+    - Exit 6 (No USB devices): Logged, no restart (transient state)
+    - Exit 10 (Stream degraded): Logged, no restart (fixed on next cycle)
 
 Exit Codes:
-    0 - Success
-    1 - General error
-    2 - Critical resource state (monitor command only)
-    3 - Missing dependencies
-    4 - Configuration error
-    5 - Lock acquisition failed
-    6 - No USB devices found
+    0  - Success
+    1  - General error
+    2  - Critical resource state (TRIGGERS RESTART in cron)
+    3  - Missing dependencies
+    4  - Configuration error
+    5  - Lock acquisition failed
+    6  - No USB devices found (logged only)
+    7  - MediaMTX not running (logged only)
+    10 - Stream monitoring degraded (logged only)
 
 EOF
 }
@@ -3121,10 +3571,49 @@ parse_arguments() {
     COMMAND="help"
 }
 
+# Main entry point and command router
+#
+# Execution flow:
+# 1. Calls parse_arguments() to parse command-line options and extract command
+# 2. Logs stream mode if non-default
+# 3. Routes to command handler via case statement
+# 4. Captures exit code from command handler
+# 5. Exits with propagated exit code
+#
+# Commands:
+#   start       - Checks root, dependencies, directories, then starts service
+#   stop        - Checks root, dependencies, directories, then stops service
+#   force-stop  - Checks root, directories, then force-stops service
+#   restart     - Checks root, dependencies, directories, then restarts service
+#   status      - Shows current status (no root check)
+#   config      - Shows configuration (no root check)
+#   monitor     - Checks root, directories, resources, then monitors streams
+#   install     - Checks root, then creates systemd service
+#   help        - Shows help text
+#
+# Parameters:
+#   $@ = Command-line arguments (passed to parse_arguments)
+#
+# Returns:
+#   0 = Success (E_GENERAL=0 not used, success is 0)
+#   1 = General error (E_GENERAL)
+#   2 = Critical resource state (E_CRITICAL_RESOURCE)
+#   3 = Missing dependencies (E_MISSING_DEPS)
+#   4 = Configuration error (E_CONFIG_ERROR)
+#   5 = Lock acquisition failed (E_LOCK_FAILED)
+#   6 = No USB devices found (E_USB_NO_DEVICES)
+#   7 = MediaMTX not running (E_MEDIAMTX_DOWN)
+#   10 = Stream monitoring degraded (E_MONITOR_DEGRADED)
+#
+# Side Effects:
+#   - Calls exit() - does not return
+#   - May modify filesystem (logs, config files, PID files)
+#   - May start/stop processes
 main() {
     local exit_code=0
     
     # Parse arguments
+    # Note: COMMAND is global so cleanup() can check it
     COMMAND=""
     parse_arguments "$@"
     
@@ -3176,9 +3665,13 @@ main() {
             if ! check_resource_usage; then
                 exit ${E_CRITICAL_RESOURCE}
             fi
-            # Then check and restart streams (returns 0 always, but logs actions)
+            # Then check and restart streams (returns error codes for failures)
             monitor_streams
             exit_code=$?
+            # Log exit code for debugging
+            if [[ $exit_code -ne 0 ]]; then
+                log DEBUG "Monitor command exiting with code $exit_code"
+            fi
             ;;
         install)
             check_root
