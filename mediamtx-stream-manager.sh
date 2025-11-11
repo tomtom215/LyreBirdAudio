@@ -1676,11 +1676,11 @@ sanitize_device_name() {
 #   exit: 0 (always)
 #
 # Examples (observable from code logic):
-#   "USB Audio Device" ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ "usb_audio_device"
-#   "Device-123" ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ "device_123"
-#   "   " (spaces only) ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ "stream_1699564821" (timestamp fallback)
-#   Reserved word ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ "stream_<reserved>" (prefixed)
-#   Very long name ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ "truncated_name_a1b2c3d4" (with hash)
+#   "USB Audio Device" -> "usb_audio_device"
+#   "Device-123" -> "device_123"
+#   "   " (spaces only) -> "stream_1699564821" (timestamp fallback)
+#   Reserved word -> "stream_<reserved>" (prefixed)
+#   Very long name -> "truncated_name_a1b2c3d4" (with hash)
 sanitize_path_name() {
     local name="$1"
     name="${name#usb-audio-}"
