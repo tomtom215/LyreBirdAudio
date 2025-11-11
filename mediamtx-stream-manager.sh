@@ -10,10 +10,18 @@
 # This script automatically detects USB microphones and creates MediaMTX 
 # configurations for continuous 24/7 RTSP audio streams.
 #
-# Version: 1.4.0 - Production stability and monitoring enhancements
+# Version: 1.4.1 - Friendly name support for audio device configuration
 # Compatible with MediaMTX v1.15.0+
 #
 # Version History:
+# v1.4.1 - Friendly name support for audio device configuration
+#   CONFIGURATION ENHANCEMENT:
+#   - Added dual-lookup config system supporting both friendly and full device names
+#   - Users can now use friendly stream names (e.g., DEVICE_BLUE_YETI_SAMPLE_RATE=44100)
+#   - Friendly names match RTSP stream paths for easier configuration
+#   - Maintains 100% backward compatibility with existing full device name configs
+#   - Updated config file template with friendly name documentation and examples
+#
 # v1.4.0 - Production stability and monitoring enhancements
 #   RELIABILITY IMPROVEMENTS:
 #   - Separate monitoring lock eliminates service/cron contention
@@ -91,7 +99,7 @@ if [[ "${DEBUG:-false}" == "true" ]]; then
 fi
 
 # Constants
-readonly VERSION="1.4.0"
+readonly VERSION="1.4.1"
 
 # Script identification
 SCRIPT_NAME="$(basename "${BASH_SOURCE[0]}")"
@@ -1605,7 +1613,13 @@ save_device_config() {
     
     cat > "$tmp_config" << 'EOF'
 # Audio device configuration
-# Format: DEVICE_<sanitized_name>_<parameter>=value
+# Format: DEVICE_<name>_<parameter>=value
+#
+# You can use either:
+#   1. Friendly stream names (e.g., DEVICE_BLUE_YETI_SAMPLE_RATE=44100)
+#   2. Full device names (e.g., DEVICE_USB_AUDIO_BLUE_YETI_SAMPLE_RATE=44100)
+#
+# Friendly names are recommended and match the RTSP stream paths.
 
 # Universal defaults:
 # - Sample Rate: 48000 Hz
@@ -1614,9 +1628,11 @@ save_device_config() {
 # - Codec: opus
 # - Bitrate: 128k
 
-# Example overrides:
-# DEVICE_USB_BLUE_YETI_SAMPLE_RATE=44100
-# DEVICE_USB_BLUE_YETI_CHANNELS=1
+# Example overrides using friendly names:
+# DEVICE_BLUE_YETI_SAMPLE_RATE=44100
+# DEVICE_BLUE_YETI_CHANNELS=1
+# DEVICE_BLUE_YETI_CODEC=pcm_s16le
+# DEVICE_BLUE_YETI_BITRATE=256k
 EOF
     
     mv -f "$tmp_config" "${DEVICE_CONFIG_FILE}"
@@ -1660,11 +1676,11 @@ sanitize_device_name() {
 #   exit: 0 (always)
 #
 # Examples (observable from code logic):
-#   "USB Audio Device" Ã¢â€ â€™ "usb_audio_device"
-#   "Device-123" Ã¢â€ â€™ "device_123"
-#   "   " (spaces only) Ã¢â€ â€™ "stream_1699564821" (timestamp fallback)
-#   Reserved word Ã¢â€ â€™ "stream_<reserved>" (prefixed)
-#   Very long name Ã¢â€ â€™ "truncated_name_a1b2c3d4" (with hash)
+#   "USB Audio Device" ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ "usb_audio_device"
+#   "Device-123" ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ "device_123"
+#   "   " (spaces only) ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ "stream_1699564821" (timestamp fallback)
+#   Reserved word ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ "stream_<reserved>" (prefixed)
+#   Very long name ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ "truncated_name_a1b2c3d4" (with hash)
 sanitize_path_name() {
     local name="$1"
     name="${name#usb-audio-}"
@@ -1703,17 +1719,38 @@ get_device_config() {
     local device_name="$1"
     local param="$2"
     local default_value="$3"
+    local stream_path="${4:-}"  # Optional friendly stream path
     
-    local safe_name
-    safe_name="$(sanitize_device_name "$device_name")"
+    local config_value=""
     
-    local config_key="DEVICE_${safe_name^^}_${param^^}"
-    
-    if [[ -n "${!config_key+x}" ]]; then
-        echo "${!config_key}"
-    else
-        echo "$default_value"
+    # Strategy 1: Try friendly stream name first (if provided)
+    if [[ -n "$stream_path" ]]; then
+        local friendly_name
+        friendly_name="$(sanitize_device_name "$stream_path")"
+        local friendly_key="DEVICE_${friendly_name^^}_${param^^}"
+        
+        if [[ -n "${!friendly_key+x}" ]]; then
+            config_value="${!friendly_key}"
+        fi
     fi
+    
+    # Strategy 2: Fall back to full device name
+    if [[ -z "$config_value" ]]; then
+        local safe_name
+        safe_name="$(sanitize_device_name "$device_name")"
+        local device_key="DEVICE_${safe_name^^}_${param^^}"
+        
+        if [[ -n "${!device_key+x}" ]]; then
+            config_value="${!device_key}"
+        fi
+    fi
+    
+    # Strategy 3: Return default if no match
+    if [[ -z "$config_value" ]]; then
+        config_value="$default_value"
+    fi
+    
+    echo "$config_value"
 }
 
 # Detect USB audio devices
@@ -1915,11 +1952,11 @@ start_ffmpeg_multiplex_stream() {
     # Get audio configuration from first device (all devices should match)
     local first_device="${device_names[0]}"
     local sample_rate channels codec bitrate thread_queue
-    sample_rate="$(get_device_config "$first_device" "SAMPLE_RATE" "$DEFAULT_SAMPLE_RATE")"
-    channels="$(get_device_config "$first_device" "CHANNELS" "$DEFAULT_CHANNELS")"
-    codec="$(get_device_config "$first_device" "CODEC" "$DEFAULT_CODEC")"
-    bitrate="$(get_device_config "$first_device" "BITRATE" "$DEFAULT_BITRATE")"
-    thread_queue="$(get_device_config "$first_device" "THREAD_QUEUE" "$DEFAULT_THREAD_QUEUE")"
+    sample_rate="$(get_device_config "$first_device" "SAMPLE_RATE" "$DEFAULT_SAMPLE_RATE" "$stream_path")"
+    channels="$(get_device_config "$first_device" "CHANNELS" "$DEFAULT_CHANNELS" "$stream_path")"
+    codec="$(get_device_config "$first_device" "CODEC" "$DEFAULT_CODEC" "$stream_path")"
+    bitrate="$(get_device_config "$first_device" "BITRATE" "$DEFAULT_BITRATE" "$stream_path")"
+    thread_queue="$(get_device_config "$first_device" "THREAD_QUEUE" "$DEFAULT_THREAD_QUEUE" "$stream_path")"
     
     # Create wrapper script
     local wrapper_script="${FFMPEG_PID_DIR}/${stream_path}.sh"
@@ -2346,11 +2383,11 @@ start_ffmpeg_stream() {
     
     # Get device configuration
     local sample_rate channels codec bitrate thread_queue
-    sample_rate="$(get_device_config "$device_name" "SAMPLE_RATE" "$DEFAULT_SAMPLE_RATE")"
-    channels="$(get_device_config "$device_name" "CHANNELS" "$DEFAULT_CHANNELS")"
-    codec="$(get_device_config "$device_name" "CODEC" "$DEFAULT_CODEC")"
-    bitrate="$(get_device_config "$device_name" "BITRATE" "$DEFAULT_BITRATE")"
-    thread_queue="$(get_device_config "$device_name" "THREAD_QUEUE" "$DEFAULT_THREAD_QUEUE")"
+    sample_rate="$(get_device_config "$device_name" "SAMPLE_RATE" "$DEFAULT_SAMPLE_RATE" "$stream_path")"
+    channels="$(get_device_config "$device_name" "CHANNELS" "$DEFAULT_CHANNELS" "$stream_path")"
+    codec="$(get_device_config "$device_name" "CODEC" "$DEFAULT_CODEC" "$stream_path")"
+    bitrate="$(get_device_config "$device_name" "BITRATE" "$DEFAULT_BITRATE" "$stream_path")"
+    thread_queue="$(get_device_config "$device_name" "THREAD_QUEUE" "$DEFAULT_THREAD_QUEUE" "$stream_path")"
     
     log INFO "Starting FFmpeg for $stream_path (device: $device_name, card: $card_num)"
     
@@ -3404,6 +3441,11 @@ EOF
     
     echo "Systemd service created: $service_file"
     echo "Monitoring cron job created: /etc/cron.d/mediamtx-monitor"
+    echo ""
+    echo "=== v1.4.1 Configuration Enhancements ==="
+    echo "  * Friendly name support for audio device configuration"
+    echo "  * Use stream names in config (e.g., DEVICE_BLUE_YETI_SAMPLE_RATE=44100)"
+    echo "  * 100% backward compatible with existing full device name configs"
     echo ""
     echo "=== v1.4.0 Production Enhancements ==="
     echo "  * Separate monitoring lock (eliminates service/cron contention)"
