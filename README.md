@@ -384,7 +384,7 @@ sudo ./lyrebird-diagnostics.sh quick
 # rtsp://your-ip:8554/device-name
 ```
 
-**Reboot Recommended:** After initial USB device mapping, reboot for udev rules to take full effect.
+**Reboot Recommended:** After initial and after each individual USB device mapping, reboot for udev rules to take full effect. You will manually have to start the Orcestrator again after each reboot: cd LyreBirdAudio && sudo ./lyrebird-orchestrator.sh
 
 ### Post-Installation
 
