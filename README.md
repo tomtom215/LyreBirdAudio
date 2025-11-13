@@ -15,6 +15,7 @@ Turn USB microphones into reliable RTSP streams for continuous monitoring and re
 
 - [Quick Start](#quick-start)
 - [Features & Capabilities](#features--capabilities)
+- [System Overview](#system-overview)
 - [System Requirements](#system-requirements)
 - [Installation](#installation)
 - [Basic Usage](#basic-usage)
@@ -38,11 +39,11 @@ Turn USB microphones into reliable RTSP streams for continuous monitoring and re
 Get streaming in 5 minutes:
 
 ```bash
-# 1. Clone and setup, this clones the Main branch which should be up to date
+# 1. Clone and setup, this will clone the Main branch which has the most up to date features 
 git clone https://github.com/tomtom215/LyreBirdAudio.git
 cd LyreBirdAudio
 
-# If you want a tagged release instead of the Main branch: Checkout latest stable release
+# If you want to use a tagged release insted of the Main branch: Checkout latest stable release
 git checkout $(git describe --tags --abbrev=0)
 
 chmod +x *.sh
@@ -57,7 +58,7 @@ sudo ./lyrebird-orchestrator.sh
 
 That's it! The wizard handles installation, device mapping, configuration, and stream startup.
 
-**For Production Deployments:** Use tagged releases (shown above) for maximum stability. The main branch contains the latest features but may be work-in-progress. Tagged releases have normally been tested for at least 3-7 days continuous operation on a multi-micrpohone (5) Intel N100 test rig.
+**For Production Deployments:** Use tagged releases (shown above) for maximum stability. The main branch contains the latest features but may be work-in-progress. Tagged releases are normally tested for atleast 72 hours before releasing. Tests are performed on an Intel N100 mini-PC with 5 USB microphones running Ubuntu.
 
 For manual installation, see [Installation](#installation).
 
@@ -110,6 +111,132 @@ This project was inspired by monitoring bird activity using USB microphones and 
 - Detects audio subsystem conflicts
 - Provides actionable remediation steps
 
+---
+
+## System Overview
+
+These diagrams show how LyreBirdAudio components work together to transform USB microphones into reliable RTSP streams.
+
+### System Architecture Overview
+
+```
++----------------------------------------------------------+
+|                     Client Applications                  |
+|            (VLC, FFplay, OBS, Custom RTSP Clients)       |
++--------------------+-------------------------------------+
+                     | RTSP://host:8554/DeviceName
+                     v
++----------------------------------------------------------+
+|                       MediaMTX                           |
+|                  (Real-time Media Server)                |
+|  +----------------------------------------------------+  |
+|  | * RTSP Server (port 8554)                          |  |
+|  | * RTP/RTCP (ports 8000-8001)                       |  |
+|  | * HTTP API (port 9997)                             |  |
+|  | * WebRTC Support                                   |  |
+|  +----------------------------------------------------+  |
++--------------------+-------------------------------------+
+                     | Managed by
+                     v
++----------------------------------------------------------+
+|              Stream Manager / systemd                    |
+|  +----------------------------------------------------+  |
+|  | * Process lifecycle management                     |  |
+|  | * Automatic stream recovery                        |  |
+|  | * Health monitoring                                |  |
+|  | * Real-time scheduling                             |  |
+|  +----------------------------------------------------+  |
++--------------------+-------------------------------------+
+                     | Captures from
+                     v
++----------------------------------------------------------+
+|                  FFmpeg Audio Pipeline                   |
+|  +----------------------------------------------------+  |
+|  | * ALSA capture (hw:Device_N)                       |  |
+|  | * Audio encoding (Opus/AAC/PCM)                    |  |
+|  | * RTSP publishing to MediaMTX                      |  |
+|  | * Buffer management & thread queues                |  |
+|  +----------------------------------------------------+  |
++--------------------+-------------------------------------+
+                     | Reads from
+                     v
++----------------------------------------------------------+
+|              Persistent Device Layer (udev)              |
+|  +----------------------------------------------------+  |
+|  | * /dev/snd/by-usb-port/Device_1 -> /dev/snd/pcmC0D0c |
+|  | * /dev/snd/by-usb-port/Device_2 -> /dev/snd/pcmC1D0c |
+|  | * Consistent naming across reboots                 |  |
+|  +----------------------------------------------------+  |
++--------------------+-------------------------------------+
+                     | Maps
+                     v
++----------------------------------------------------------+
+|               Physical USB Audio Devices                 |
+|  +----------------------------------------------------+  |
+|  | * USB Port 1-1.4: USB Microphone                   |  |
+|  | * USB Port 1-1.5: USB Audio Interface              |  |
+|  | * USB Port 2-1.2: USB Microphone                   |  |
+|  +----------------------------------------------------+  |
++----------------------------------------------------------+
+```
+
+### Management Component Architecture
+
+```
++----------------------------------------------------------+
+|                 lyrebird-orchestrator.sh                 |
+|                 (Unified Management Interface)           |
+|  * Interactive TUI for all operations                    |
+|  * Delegates to specialized scripts                      |
+|  * No duplicate business logic                           |
+|  * Consistent error handling & feedback                  |
+|  * Hardware capability detection integration             |
++----------------------------------------------------------+
+          |
+          +----> install_mediamtx.sh
+          |       * MediaMTX installation & updates
+          |       * Binary management with checksums
+          |       * Service configuration
+          |       * Built-in upgrade support (v1.15.0+)
+          |       * Atomic installation with rollback
+          |
+          +----> mediamtx-stream-manager.sh
+          |       * FFmpeg process lifecycle management
+          |       * Stream health monitoring via API
+          |       * Automatic recovery with exponential backoff
+          |       * Individual & multiplex streaming modes
+          |       * Resource monitoring (CPU, FDs)
+          |       * Cron-based health checking
+          |
+          +----> usb-audio-mapper.sh
+          |       * USB device detection via lsusb
+          |       * udev rule generation
+          |       * Physical port mapping
+          |       * Persistent naming across reboots
+          |       * Interactive & non-interactive modes
+          |
+          +----> lyrebird-mic-check.sh
+          |       * Hardware capability detection
+          |       * ALSA format enumeration
+          |       * Quality tier recommendations
+          |       * Configuration generation & validation
+          |       * Backup management
+          |
+          +----> lyrebird-updater.sh
+          |       * Script version management
+          |       * Git-based updates
+          |       * Branch and tag support
+          |       * Rollback capabilities
+          |       * Service update coordination
+          |
+          +----> lyrebird-diagnostics.sh
+                  * Comprehensive system health checks
+                  * USB device validation
+                  * MediaMTX service monitoring
+                  * RTSP connectivity testing
+                  * Resource constraint detection
+                  * Quick/full/debug diagnostic modes
+```
 ---
 
 ## System Requirements
