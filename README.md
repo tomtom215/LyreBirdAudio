@@ -4,6 +4,10 @@ Production-hardened RTSP audio streaming suite for USB microphones with 24/7 rel
 
 Turn USB microphones into reliable RTSP streams for continuous monitoring and recording. Built on MediaMTX with automatic recovery, device persistence, and comprehensive diagnostics for unattended operation.
 
+If you like or use this project, please "star" this repository!
+
+If you are using it in a cool or interesting way or at a large scale, please tell me about it in our GitHub Discussions for this repository!
+
 **License:** Apache 2.0  
 **Platform:** Linux (Ubuntu/Debian/Raspberry Pi OS)  
 **Author:** Tom F - https://github.com/tomtom215  
