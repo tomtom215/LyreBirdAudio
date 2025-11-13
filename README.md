@@ -56,7 +56,7 @@ sudo ./lyrebird-orchestrator.sh
 # rtsp://your-ip:8554/device-name
 ```
 
-That's it! The wizard handles installation, device mapping, configuration, and stream startup.
+That's it! The Orechestrator will act as a wizard that guides you through installation, device mapping, configuration, and stream startup.
 
 **For Production Deployments:** Use tagged releases (shown above) for maximum stability. The main branch contains the latest features but may be work-in-progress. Tagged releases are normally tested for atleast 72 hours before releasing. Tests are performed on an Intel N100 mini-PC with 5 USB microphones running Ubuntu.
 
