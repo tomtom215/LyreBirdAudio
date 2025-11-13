@@ -39,7 +39,7 @@ Turn USB microphones into reliable RTSP streams for continuous monitoring and re
 Get streaming in 5 minutes:
 
 ```bash
-# 1. Clone and setup, this will clone the Main branch which has the most up to date features 
+# 1. Clone and setup, this will clone the Main branch which has the most up to date features
 git clone https://github.com/tomtom215/LyreBirdAudio.git
 cd LyreBirdAudio
 
@@ -1378,126 +1378,7 @@ EOF
 
 ## Architecture & Design
 
-### System Architecture Overview
-
-```
-+----------------------------------------------------------+
-|                     Client Applications                  |
-|            (VLC, FFplay, OBS, Custom RTSP Clients)       |
-+--------------------+-------------------------------------+
-                     | RTSP://host:8554/DeviceName
-                     v
-+----------------------------------------------------------+
-|                       MediaMTX                           |
-|                  (Real-time Media Server)                |
-|  +----------------------------------------------------+  |
-|  | * RTSP Server (port 8554)                          |  |
-|  | * RTP/RTCP (ports 8000-8001)                       |  |
-|  | * HTTP API (port 9997)                             |  |
-|  | * WebRTC Support                                   |  |
-|  +----------------------------------------------------+  |
-+--------------------+-------------------------------------+
-                     | Managed by
-                     v
-+----------------------------------------------------------+
-|              Stream Manager / systemd                    |
-|  +----------------------------------------------------+  |
-|  | * Process lifecycle management                     |  |
-|  | * Automatic stream recovery                        |  |
-|  | * Health monitoring                                |  |
-|  | * Real-time scheduling                             |  |
-|  +----------------------------------------------------+  |
-+--------------------+-------------------------------------+
-                     | Captures from
-                     v
-+----------------------------------------------------------+
-|                  FFmpeg Audio Pipeline                   |
-|  +----------------------------------------------------+  |
-|  | * ALSA capture (hw:Device_N)                       |  |
-|  | * Audio encoding (Opus/AAC/PCM)                    |  |
-|  | * RTSP publishing to MediaMTX                      |  |
-|  | * Buffer management & thread queues                |  |
-|  +----------------------------------------------------+  |
-+--------------------+-------------------------------------+
-                     | Reads from
-                     v
-+----------------------------------------------------------+
-|              Persistent Device Layer (udev)              |
-|  +----------------------------------------------------+  |
-|  | * /dev/snd/by-usb-port/Device_1 -> /dev/snd/pcmC0D0c |
-|  | * /dev/snd/by-usb-port/Device_2 -> /dev/snd/pcmC1D0c |
-|  | * Consistent naming across reboots                 |  |
-|  +----------------------------------------------------+  |
-+--------------------+-------------------------------------+
-                     | Maps
-                     v
-+----------------------------------------------------------+
-|               Physical USB Audio Devices                 |
-|  +----------------------------------------------------+  |
-|  | * USB Port 1-1.4: USB Microphone                   |  |
-|  | * USB Port 1-1.5: USB Audio Interface              |  |
-|  | * USB Port 2-1.2: USB Microphone                   |  |
-|  +----------------------------------------------------+  |
-+----------------------------------------------------------+
-```
-
-### Management Component Architecture
-
-```
-+----------------------------------------------------------+
-|                 lyrebird-orchestrator.sh                 |
-|                 (Unified Management Interface)           |
-|  * Interactive TUI for all operations                    |
-|  * Delegates to specialized scripts                      |
-|  * No duplicate business logic                           |
-|  * Consistent error handling & feedback                  |
-|  * Hardware capability detection integration             |
-+----------------------------------------------------------+
-          |
-          +----> install_mediamtx.sh
-          |       * MediaMTX installation & updates
-          |       * Binary management with checksums
-          |       * Service configuration
-          |       * Built-in upgrade support (v1.15.0+)
-          |       * Atomic installation with rollback
-          |
-          +----> mediamtx-stream-manager.sh
-          |       * FFmpeg process lifecycle management
-          |       * Stream health monitoring via API
-          |       * Automatic recovery with exponential backoff
-          |       * Individual & multiplex streaming modes
-          |       * Resource monitoring (CPU, FDs)
-          |       * Cron-based health checking
-          |
-          +----> usb-audio-mapper.sh
-          |       * USB device detection via lsusb
-          |       * udev rule generation
-          |       * Physical port mapping
-          |       * Persistent naming across reboots
-          |       * Interactive & non-interactive modes
-          |
-          +----> lyrebird-mic-check.sh
-          |       * Hardware capability detection
-          |       * ALSA format enumeration
-          |       * Quality tier recommendations
-          |       * Configuration generation & validation
-          |       * Backup management
-          |
-          +----> lyrebird-updater.sh
-          |       * Script version management
-          |       * Git-based updates
-          |       * Branch and tag support
-          |       * Rollback capabilities
-          |       * Service update coordination
-          |
-          +----> lyrebird-diagnostics.sh
-                  * Comprehensive system health checks
-                  * USB device validation
-                  * MediaMTX service monitoring
-                  * RTSP connectivity testing
-                  * Resource constraint detection
-                  * Quick/full/debug diagnostic modes
-```
+For system architecture diagrams, see the [System Overview](#system-overview) section.
 
 ### Architecture Philosophy
 
@@ -1521,6 +1402,9 @@ Each script handles one specific domain:
 - Diagnostics: System health validation
 
 This modular design prevents duplicate business logic and ensures maintainability.
+
+---
+
 
 ---
 
