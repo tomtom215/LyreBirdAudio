@@ -2986,6 +2986,7 @@ COMMANDS:
   quick       Run essential checks only (Prerequisites, USB, Service, RTSP)
   full        Run complete diagnostics (all checks) [default]
   debug       Run comprehensive debug mode with all checks and verbose output
+  verbose     Alias for debug command
   help        Display this help message
 
 OPTIONS:
@@ -3096,7 +3097,7 @@ parse_arguments() {
                 COMMAND="full"
                 shift
                 ;;
-            debug)
+            debug|verbose)
                 COMMAND="debug"
                 DEBUG="true"
                 shift
