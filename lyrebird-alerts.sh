@@ -109,6 +109,13 @@ LYREBIRD_ALERT_RETRIES="${LYREBIRD_ALERT_RETRIES:-3}"
 LYREBIRD_HOSTNAME="${LYREBIRD_HOSTNAME:-$(hostname -s 2>/dev/null || echo 'unknown')}"
 LYREBIRD_LOCATION="${LYREBIRD_LOCATION:-}"
 
+# Validate timeout bounds (5-120 seconds)
+if [[ "$LYREBIRD_ALERT_TIMEOUT" -lt 5 ]]; then
+    LYREBIRD_ALERT_TIMEOUT=5
+elif [[ "$LYREBIRD_ALERT_TIMEOUT" -gt 120 ]]; then
+    LYREBIRD_ALERT_TIMEOUT=120
+fi
+
 # Additional webhook URLs (space-separated)
 LYREBIRD_WEBHOOK_URLS="${LYREBIRD_WEBHOOK_URLS:-}"
 
@@ -124,7 +131,8 @@ LYREBIRD_NTFY_SERVER="${LYREBIRD_NTFY_SERVER:-https://ntfy.sh}"
 # Alert Levels
 #=============================================================================
 
-# shellcheck disable=SC2034  # These constants are exported for use by other scripts
+# Alert level constants - SC2034: These are exported for use by sourcing scripts
+# shellcheck disable=SC2034
 readonly ALERT_LEVEL_INFO="info"
 # shellcheck disable=SC2034
 readonly ALERT_LEVEL_WARNING="warning"
@@ -141,13 +149,19 @@ declare -A ALERT_COLORS=(
     [critical]=15548997 # Red
 )
 
-# Emoji for each level
-declare -A ALERT_EMOJI=(
-    [info]="ℹ️"
-    [warning]="⚠️"
-    [error]="❌"
-    [critical]="🚨"
+# Text prefixes for each alert level
+declare -A ALERT_PREFIX=(
+    [info]="[INFO]"
+    [warning]="[WARN]"
+    [error]="[ERROR]"
+    [critical]="[CRITICAL]"
 )
+
+# Get alert prefix for level
+get_alert_prefix() {
+    local level="$1"
+    echo "${ALERT_PREFIX[$level]:-[INFO]}"
+}
 
 #=============================================================================
 # Alert Types (for deduplication keys)
@@ -172,6 +186,37 @@ readonly ALERT_TYPE_CUSTOM="custom"
 #=============================================================================
 # Helper Functions
 #=============================================================================
+
+# URL-encode a string (handles all special characters)
+url_encode() {
+    local string="$1"
+    # Use jq if available, otherwise fall back to printf-based encoding
+    if command -v jq &>/dev/null; then
+        printf '%s' "$string" | jq -sRr @uri
+    else
+        # Fallback: encode using printf with hex conversion
+        local length="${#string}"
+        local i char
+        for ((i = 0; i < length; i++)); do
+            char="${string:i:1}"
+            case "$char" in
+                [a-zA-Z0-9.~_-]) printf '%s' "$char" ;;
+                *) printf '%%%02X' "'$char" ;;
+            esac
+        done
+    fi
+}
+
+# Mask sensitive URLs for safe debug output (shows first 30 chars + ***)
+mask_url() {
+    local url="$1"
+    local visible_len=30
+    if [[ ${#url} -gt $visible_len ]]; then
+        echo "${url:0:$visible_len}***"
+    else
+        echo "$url"
+    fi
+}
 
 # Load configuration file if it exists
 load_config() {
@@ -306,7 +351,8 @@ format_discord() {
     local message="$3"
     local alert_type="$4"
     local color="${ALERT_COLORS[$level]:-3447003}"
-    local emoji="${ALERT_EMOJI[$level]:-ℹ️}"
+    local emoji
+    emoji=$(get_alert_prefix "$level")
     local timestamp
     timestamp="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
 
@@ -341,7 +387,8 @@ format_slack() {
     local title="$2"
     local message="$3"
     local alert_type="$4"
-    local emoji="${ALERT_EMOJI[$level]:-ℹ️}"
+    local emoji
+    emoji=$(get_alert_prefix "$level")
 
     # Escape special characters for JSON
     message="${message//\\/\\\\}"
@@ -416,12 +463,13 @@ format_pushover() {
         *) priority="0" ;;
     esac
 
-    # URL-encode message (simple version)
-    message="${message// /%20}"
-    title="${title// /%20}"
+    # Properly URL-encode message and title (handles &, =, and all special chars)
+    local encoded_message encoded_title
+    encoded_message=$(url_encode "$message")
+    encoded_title=$(url_encode "$title")
 
     # Return form-encoded data
-    echo "token=${LYREBIRD_PUSHOVER_TOKEN}&user=${LYREBIRD_PUSHOVER_USER}&title=${title}&message=${message}&priority=${priority}"
+    echo "token=${LYREBIRD_PUSHOVER_TOKEN}&user=${LYREBIRD_PUSHOVER_USER}&title=${encoded_title}&message=${encoded_message}&priority=${priority}"
 }
 
 #=============================================================================
@@ -439,7 +487,7 @@ send_webhook() {
 
     while ((attempt < retries)); do
         ((attempt++))
-        log_debug "Sending webhook (attempt ${attempt}/${retries}): ${webhook_url}"
+        log_debug "Sending webhook (attempt ${attempt}/${retries}): $(mask_url "$webhook_url")"
 
         local http_code
         local curl_args=(-s -w '%{http_code}' -o /dev/null --connect-timeout "$timeout" --max-time "$((timeout * 2))")
@@ -488,9 +536,9 @@ send_webhook() {
             return 0
         fi
 
-        # Retry with backoff
+        # Retry with backoff and jitter (prevents thundering herd)
         if ((attempt < retries)); then
-            local delay=$((attempt * 2))
+            local delay=$(( (attempt * 2) + (RANDOM % 3) ))
             log_debug "Webhook failed, retrying in ${delay}s..."
             sleep "$delay"
         fi
@@ -591,6 +639,8 @@ send_alert() {
     if $any_success; then
         # Update rate limit only on success
         update_rate_limit "$alert_hash"
+        # Clean up old state files periodically
+        cleanup_state
         return 0
     else
         return 3
@@ -980,8 +1030,7 @@ cmd_send() {
 cmd_test() {
     echo "Sending test alert..."
 
-    # Temporarily enable if disabled
-    local was_enabled="${LYREBIRD_ALERT_ENABLED}"
+    # Force enable for test (no need to save/restore - script exits after test)
     LYREBIRD_ALERT_ENABLED="true"
 
     if send_alert "info" "Test Alert from LyreBirdAudio" \
@@ -993,8 +1042,6 @@ cmd_test() {
         echo "Failed to send test alert. Check your configuration."
         return 1
     fi
-
-    LYREBIRD_ALERT_ENABLED="$was_enabled"
 }
 
 #=============================================================================

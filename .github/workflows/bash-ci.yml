@@ -85,10 +85,10 @@ jobs:
 
           while IFS= read -r script; do
             if bash -n "$script" 2>&1; then
-              echo "✓ $script"
+              echo "[PASS] $script"
               success=$((success + 1))
             else
-              echo "✗ $script"
+              echo "[FAIL] $script"
               errors=$((errors + 1))
             fi
           done < <(find . -name '*.sh' -type f | sort)
@@ -181,9 +181,9 @@ jobs:
             notes=$(shellcheck --format=json "$script" 2>/dev/null | jq '[.[] | select(.level == "info" or .level == "style")] | length' || echo 0)
 
             if [[ "$errors" == "0" && "$warnings" == "0" ]]; then
-              status="✓"
+              status="PASS"
             else
-              status="✗"
+              status="FAIL"
             fi
 
             echo "| ${status} ${script} | ${errors} | ${warnings} | ${notes} |" >> "$GITHUB_STEP_SUMMARY"
@@ -226,7 +226,7 @@ jobs:
             # -d shows diff, -i 4 = 4 space indent, -bn = binary ops at start of line
             # -ci = indent case statements
             if diff=$(shfmt -d -i 4 -bn -ci "$script" 2>&1); then
-              echo "✓"
+              echo "[PASS]"
             else
               echo "needs formatting"
               echo "$diff"
@@ -339,11 +339,11 @@ jobs:
 
           if [[ -n "$dangerous_eval" ]]; then
             echo "$dangerous_eval"
-            echo "   ⚠ Found potentially dangerous eval - review for command injection"
+            echo "   [WARN] Found potentially dangerous eval - review for command injection"
             warnings=$((warnings + 1))
             warning_details+=("Dangerous eval patterns found")
           else
-            echo "   ✓ No dangerous eval patterns (safe patterns like 'eval set --' are OK)"
+            echo "   [OK] No dangerous eval patterns (safe patterns like 'eval set --' are OK)"
           fi
           echo ""
 
@@ -356,11 +356,11 @@ jobs:
 
           if [[ -n "$insecure_dl" ]]; then
             echo "$insecure_dl"
-            echo "   ⚠ Found downloads with disabled certificate verification"
+            echo "   [WARN] Found downloads with disabled certificate verification"
             warnings=$((warnings + 1))
             warning_details+=("Insecure download flags")
           else
-            echo "   ✓ No insecure download flags found"
+            echo "   [OK] No insecure download flags found"
           fi
           echo ""
 
@@ -375,11 +375,11 @@ jobs:
 
           if [[ -n "$world_writable" ]]; then
             echo "$world_writable"
-            echo "   ⚠ Found world-writable permissions"
+            echo "   [WARN] Found world-writable permissions"
             warnings=$((warnings + 1))
             warning_details+=("World-writable permissions")
           else
-            echo "   ✓ No world-writable permissions found"
+            echo "   [OK] No world-writable permissions found"
           fi
           echo ""
 
@@ -396,11 +396,11 @@ jobs:
 
           if [[ -n "$unquoted_cmd" ]]; then
             echo "$unquoted_cmd"
-            echo "   ⚠ Found unquoted command substitution in file operations"
+            echo "   [WARN] Found unquoted command substitution in file operations"
             warnings=$((warnings + 1))
             warning_details+=("Unquoted command substitution")
           else
-            echo "   ✓ No unquoted command substitution risks found"
+            echo "   [OK] No unquoted command substitution risks found"
           fi
           echo ""
 
@@ -419,11 +419,11 @@ jobs:
 
           if [[ -n "$hardcoded" ]]; then
             echo "$hardcoded"
-            echo "   ⚠ Found potential hardcoded secrets"
+            echo "   [WARN] Found potential hardcoded secrets"
             warnings=$((warnings + 1))
             warning_details+=("Hardcoded secrets")
           else
-            echo "   ✓ No hardcoded secrets found"
+            echo "   [OK] No hardcoded secrets found"
           fi
           echo ""
 
@@ -441,11 +441,11 @@ jobs:
 
           if [[ -n "$insecure_tmp" ]]; then
             echo "$insecure_tmp"
-            echo "   ⚠ Found predictable temp file names (consider using mktemp)"
+            echo "   [WARN] Found predictable temp file names (consider using mktemp)"
             warnings=$((warnings + 1))
             warning_details+=("Predictable temp files")
           else
-            echo "   ✓ No insecure temp file patterns found"
+            echo "   [OK] No insecure temp file patterns found"
           fi
           echo ""
 
@@ -472,12 +472,12 @@ jobs:
             echo ""
             echo "| Check | Status |"
             echo "|-------|--------|"
-            echo "| Dangerous eval patterns | ✓ |"
-            echo "| Insecure downloads (-k/--insecure) | ✓ |"
-            echo "| World-writable permissions (777/666) | ✓ |"
-            echo "| Unquoted command substitutions | ✓ |"
-            echo "| Hardcoded secrets | ✓ |"
-            echo "| Predictable temp files | ✓ |"
+            echo "| Dangerous eval patterns | OK |"
+            echo "| Insecure downloads (-k/--insecure) | OK |"
+            echo "| World-writable permissions (777/666) | OK |"
+            echo "| Unquoted command substitutions | OK |"
+            echo "| Hardcoded secrets | OK |"
+            echo "| Predictable temp files | OK |"
             echo ""
             echo "_Note: This scan uses pattern matching and may have false positives/negatives._"
             echo "_ShellCheck provides more comprehensive variable quoting analysis._"
@@ -496,7 +496,7 @@ jobs:
         run: |
           {
             # Header
-            echo "# 🔍 Bash CI Pipeline Results"
+            echo "# Bash CI Pipeline Results"
             echo ""
             echo "---"
             echo ""
@@ -507,9 +507,9 @@ jobs:
 
             # Determine overall result
             if [[ "${{ needs.bash-syntax.result }}" == "success" && "${{ needs.shellcheck.result }}" == "success" ]]; then
-              echo "### ✅ All Required Checks Passed"
+              echo "### All Required Checks Passed"
             else
-              echo "### ❌ Required Checks Failed"
+              echo "### Required Checks Failed"
             fi
             echo ""
 
@@ -518,21 +518,21 @@ jobs:
             echo ""
             echo "| Check | Type | Status | Description |"
             echo "|-------|------|--------|-------------|"
-            echo "| **Bash Syntax** | 🔴 Required | ${{ needs.bash-syntax.result == 'success' && '✅ Passed' || '❌ Failed' }} | Validates script syntax with \`bash -n\` |"
-            echo "| **ShellCheck** | 🔴 Required | ${{ needs.shellcheck.result == 'success' && '✅ Passed' || '❌ Failed' }} | Static analysis for bugs and issues |"
-            echo "| **shfmt** | 🟡 Advisory | ${{ needs.shfmt.result == 'success' && '✅ Passed' || '⚠️ Warnings' }} | Code formatting consistency |"
-            echo "| **bashate** | 🟡 Advisory | ${{ needs.bashate.result == 'success' && '✅ Passed' || '⚠️ Warnings' }} | OpenStack style guidelines |"
-            echo "| **Security** | 🟡 Advisory | ${{ needs.security-scan.result == 'success' && '✅ Passed' || '⚠️ Warnings' }} | Security anti-pattern detection |"
+            echo "| **Bash Syntax** | Required | ${{ needs.bash-syntax.result == 'success' && 'Passed' || 'Failed' }} | Validates script syntax with \`bash -n\` |"
+            echo "| **ShellCheck** | Required | ${{ needs.shellcheck.result == 'success' && 'Passed' || 'Failed' }} | Static analysis for bugs and issues |"
+            echo "| **shfmt** | Advisory | ${{ needs.shfmt.result == 'success' && 'Passed' || 'Warnings' }} | Code formatting consistency |"
+            echo "| **bashate** | Advisory | ${{ needs.bashate.result == 'success' && 'Passed' || 'Warnings' }} | OpenStack style guidelines |"
+            echo "| **Security** | Advisory | ${{ needs.security-scan.result == 'success' && 'Passed' || 'Warnings' }} | Security anti-pattern detection |"
             echo ""
 
             # Legend
             echo "<details>"
-            echo "<summary>📋 Check Type Legend</summary>"
+            echo "<summary>Check Type Legend</summary>"
             echo ""
             echo "| Type | Meaning |"
             echo "|------|---------|"
-            echo "| 🔴 Required | Must pass for PR to be merged |"
-            echo "| 🟡 Advisory | Informational only, does not block merge |"
+            echo "| Required | Must pass for PR to be merged |"
+            echo "| Advisory | Informational only, does not block merge |"
             echo ""
             echo "</details>"
             echo ""
@@ -588,7 +588,7 @@ jobs:
             echo ""
 
             # Quick Fix Guide
-            echo "## 🛠️ Quick Fix Guide"
+            echo "## Quick Fix Guide"
             echo ""
             echo "<details>"
             echo "<summary>How to fix common issues</summary>"
@@ -635,17 +635,17 @@ jobs:
           failed=0
 
           if [[ "${{ needs.bash-syntax.result }}" != "success" ]]; then
-            echo "::error::❌ Bash syntax validation failed"
+            echo "::error::Bash syntax validation failed"
             failed=1
           else
-            echo "✅ Bash syntax: passed"
+            echo "Bash syntax: passed"
           fi
 
           if [[ "${{ needs.shellcheck.result }}" != "success" ]]; then
-            echo "::error::❌ ShellCheck found errors or warnings"
+            echo "::error::ShellCheck found errors or warnings"
             failed=1
           else
-            echo "✅ ShellCheck: passed"
+            echo "ShellCheck: passed"
           fi
 
           echo ""

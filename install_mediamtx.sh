@@ -1308,7 +1308,7 @@ update_mediamtx() {
             if new_version=$("${INSTALL_DIR}/mediamtx" --version 2>&1 | grep -oE 'v?[0-9]+\.[0-9]+\.[0-9]+' | head -1); then
                 if [[ "${new_version}" != "${current_version}" ]]; then
                     upgrade_success=true
-                    log_info "Built-in upgrade completed successfully (${current_version} → ${new_version})"
+                    log_info "Built-in upgrade completed successfully (${current_version} -> ${new_version})"
                 else
                     log_warn "Built-in upgrade reported success but version unchanged"
                 fi
@@ -1540,7 +1540,7 @@ show_status() {
 
     # Installation
     if [[ -f "${INSTALL_DIR}/mediamtx" ]]; then
-        echo -e "Installation: ${GREEN}✓ Installed${NC}"
+        echo -e "Installation: ${GREEN}[OK] Installed${NC}"
         echo "Location: ${INSTALL_DIR}/mediamtx"
 
         local version="unknown"
@@ -1549,16 +1549,16 @@ show_status() {
         fi
         echo "Version: ${version}"
     else
-        echo -e "Installation: ${RED}✗ Not installed${NC}"
+        echo -e "Installation: ${RED}[--] Not installed${NC}"
     fi
 
     # Configuration
     echo ""
     if [[ -f "${CONFIG_DIR}/${CONFIG_NAME}" ]]; then
-        echo -e "Configuration: ${GREEN}✓ Present${NC}"
+        echo -e "Configuration: ${GREEN}[OK] Present${NC}"
         echo "Config file: ${CONFIG_DIR}/${CONFIG_NAME}"
     else
-        echo -e "Configuration: ${YELLOW}⚠ Missing${NC}"
+        echo -e "Configuration: ${YELLOW}[!] Missing${NC}"
     fi
 
     # Service and process status
@@ -1567,23 +1567,23 @@ show_status() {
     management_mode=$(detect_management_mode)
 
     if command -v systemctl &>/dev/null && [[ -f "${SERVICE_DIR}/${SERVICE_NAME}" ]]; then
-        echo -e "Service: ${GREEN}✓ Configured${NC}"
+        echo -e "Service: ${GREEN}[OK] Configured${NC}"
     else
-        echo -e "Service: ${YELLOW}⚠ Not configured${NC}"
+        echo -e "Service: ${YELLOW}[!] Not configured${NC}"
     fi
 
     case "${management_mode}" in
         systemd)
-            echo -e "Status: ${GREEN}● Running (systemd)${NC}"
+            echo -e "Status: ${GREEN}[OK] Running (systemd)${NC}"
             ;;
         stream-manager)
-            echo -e "Status: ${YELLOW}⚠ Running (stream manager)${NC}"
+            echo -e "Status: ${YELLOW}[!] Running (stream manager)${NC}"
             ;;
         manual)
-            echo -e "Status: ${YELLOW}⚠ Running (manual)${NC}"
+            echo -e "Status: ${YELLOW}[!] Running (manual)${NC}"
             ;;
         none)
-            echo -e "Status: ${RED}○ Not running${NC}"
+            echo -e "Status: ${RED}[--] Not running${NC}"
             ;;
     esac
 
@@ -1613,17 +1613,17 @@ show_status() {
 
             if [[ -n "${port_user}" ]]; then
                 if [[ "${port_user}" == "mediamtx" ]]; then
-                    echo -e "  ${label} (${port}): ${GREEN}✓ In use by MediaMTX${NC}"
+                    echo -e "  ${label} (${port}): ${GREEN}[OK] In use by MediaMTX${NC}"
                 else
-                    echo -e "  ${label} (${port}): ${GREEN}✓ In use by ${port_user}${NC}"
+                    echo -e "  ${label} (${port}): ${GREEN}[OK] In use by ${port_user}${NC}"
                 fi
             elif [[ -n "${port_status}" ]]; then
-                echo -e "  ${label} (${port}): ${GREEN}✓ In use${NC}"
+                echo -e "  ${label} (${port}): ${GREEN}[OK] In use${NC}"
             else
                 if [[ "${management_mode}" == "stream-manager" ]] || [[ "${management_mode}" == "systemd" ]]; then
-                    echo -e "  ${label} (${port}): ${YELLOW}⚠ Status unknown${NC}"
+                    echo -e "  ${label} (${port}): ${YELLOW}[?] Status unknown${NC}"
                 else
-                    echo -e "  ${label} (${port}): ${YELLOW}○ Not in use${NC}"
+                    echo -e "  ${label} (${port}): ${YELLOW}[--] Not in use${NC}"
                 fi
             fi
         done
@@ -1678,7 +1678,7 @@ verify_installation() {
 
     echo ""
     if [[ ${errors} -eq 0 ]] && [[ ${warnings} -eq 0 ]]; then
-        log_info "✓ Installation verified successfully"
+        log_info "Installation verified successfully"
         return 0
     elif [[ ${errors} -eq 0 ]]; then
         log_warn "Installation verified with ${warnings} warning(s)"

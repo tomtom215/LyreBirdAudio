@@ -64,7 +64,7 @@ brew install shellcheck bats-core
 ```bash
 # Check all scripts pass syntax validation
 for script in *.sh; do
-    bash -n "$script" && echo "✓ $script"
+    bash -n "$script" && echo "[OK] $script"
 done
 
 # Run ShellCheck on all scripts
@@ -196,11 +196,57 @@ if ! command -v ffmpeg &>/dev/null; then
 fi
 ```
 
+#### Logging
+
+LyreBirdAudio provides standardized logging through `lyrebird-common.sh`. Both patterns are acceptable:
+
+```bash
+# Wrapper functions (preferred for new code)
+log_info "Starting service..."
+log_warn "Configuration missing, using defaults"
+log_error "Failed to connect"
+log_debug "Variable value: ${value}"
+
+# Direct log calls (also acceptable)
+log INFO "Starting service..."
+log WARN "Configuration missing"
+```
+
+The logging functions write to both stderr and a log file when available.
+
+#### Variable Naming Prefixes
+
+Configuration variables follow these prefix conventions:
+
+- **`LYREBIRD_*`**: LyreBirdAudio-specific settings (alerts, storage, orchestrator)
+- **`MEDIAMTX_*`**: MediaMTX-related settings (API, ports, paths)
+
+```bash
+# LyreBirdAudio settings
+LYREBIRD_ALERT_ENABLED=true
+LYREBIRD_RECORDING_DIR=/var/lib/recordings
+
+# MediaMTX settings
+MEDIAMTX_API_PORT=9997
+MEDIAMTX_CONFIG_DIR=/etc/mediamtx
+```
+
 #### Comments
 
 - Comment complex logic, not obvious code
 - Use TODO for future work
 - Explain regex patterns and complex commands
+- Use section headers to organize code:
+
+```bash
+# ============================================================================
+# Section Name
+# ============================================================================
+
+# Inline comment for complex logic
+```
+
+Example:
 
 ```bash
 # Match USB device path format: /sys/devices/pci0000:00/0000:00:14.0/usb1/1-2/1-2.3
