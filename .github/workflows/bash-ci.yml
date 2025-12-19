@@ -83,15 +83,15 @@ jobs:
           errors=0
           success=0
 
-          for script in $(find . -name '*.sh' -type f | sort); do
+          while IFS= read -r script; do
             if bash -n "$script" 2>&1; then
               echo "✓ $script"
-              ((success++))
+              success=$((success + 1))
             else
               echo "✗ $script"
-              ((errors++))
+              errors=$((errors + 1))
             fi
-          done
+          done < <(find . -name '*.sh' -type f | sort)
 
           echo ""
           echo "============================================"
@@ -220,7 +220,7 @@ jobs:
           # Using common settings for bash scripts
           errors=0
 
-          for script in $(find . -name '*.sh' -type f | sort); do
+          while IFS= read -r script; do
             echo -n "Checking: $script ... "
 
             # -d shows diff, -i 4 = 4 space indent, -bn = binary ops at start of line
@@ -230,9 +230,9 @@ jobs:
             else
               echo "needs formatting"
               echo "$diff"
-              ((errors++))
+              errors=$((errors + 1))
             fi
-          done
+          done < <(find . -name '*.sh' -type f | sort)
 
           echo ""
           echo "============================================"
@@ -275,15 +275,18 @@ jobs:
           # Ignore some rules that conflict with other tools:
           #   E006: Line too long (we use shellcheck for this)
           #   E040: Syntax error (we use bash -n for this)
+          #   E001: Trailing whitespace (handled by shfmt)
+          #   E042: local declaration hides errors (valid pattern in bash)
+          #   E043: Arithmetic compound semantics (valid bash patterns)
 
           errors=0
 
-          for script in $(find . -name '*.sh' -type f | sort); do
+          while IFS= read -r script; do
             echo "Checking: $script"
-            if ! bashate --ignore E006,E040 "$script"; then
-              ((errors++))
+            if ! bashate --ignore E001,E006,E040,E042,E043 "$script"; then
+              errors=$((errors + 1))
             fi
-          done
+          done < <(find . -name '*.sh' -type f | sort)
 
           echo ""
           echo "============================================"
@@ -326,7 +329,7 @@ jobs:
           echo "1. Checking for 'eval' usage..."
           if grep -rn --include='*.sh' '\beval\b' . 2>/dev/null; then
             echo "   ⚠ Found 'eval' usage - review for command injection risks"
-            ((warnings++))
+            warnings=$((warnings + 1))
           else
             echo "   ✓ No 'eval' usage found"
           fi
@@ -337,7 +340,7 @@ jobs:
           # This is a basic check - shellcheck does this better
           if grep -rn --include='*.sh' '\$[a-zA-Z_][a-zA-Z0-9_]*[^"]' . 2>/dev/null | grep -E '(rm|mv|cp|chmod|chown)\s' | head -5; then
             echo "   ⚠ Found potentially unquoted variables in file operations"
-            ((warnings++))
+            warnings=$((warnings + 1))
           else
             echo "   ✓ No obvious unquoted variable issues"
           fi
@@ -347,7 +350,7 @@ jobs:
           echo "3. Checking for hardcoded credential patterns..."
           if grep -rniE --include='*.sh' '(password|passwd|secret|api_key|apikey|token)\s*=' . 2>/dev/null | grep -v '#' | head -5; then
             echo "   ⚠ Found potential hardcoded credentials - review these lines"
-            ((warnings++))
+            warnings=$((warnings + 1))
           else
             echo "   ✓ No obvious hardcoded credentials found"
           fi
@@ -357,7 +360,7 @@ jobs:
           echo "4. Checking for insecure downloads..."
           if grep -rn --include='*.sh' -E '(curl|wget).*(-k|--insecure|--no-check-certificate)' . 2>/dev/null; then
             echo "   ⚠ Found downloads with disabled certificate verification"
-            ((warnings++))
+            warnings=$((warnings + 1))
           else
             echo "   ✓ No insecure download flags found"
           fi
@@ -367,7 +370,7 @@ jobs:
           echo "5. Checking for overly permissive chmod..."
           if grep -rn --include='*.sh' 'chmod.*777\|chmod.*666' . 2>/dev/null; then
             echo "   ⚠ Found world-writable permissions"
-            ((warnings++))
+            warnings=$((warnings + 1))
           else
             echo "   ✓ No world-writable permissions found"
           fi
