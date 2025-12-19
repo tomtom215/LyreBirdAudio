@@ -1030,8 +1030,7 @@ cmd_send() {
 cmd_test() {
     echo "Sending test alert..."
 
-    # Temporarily enable if disabled
-    local was_enabled="${LYREBIRD_ALERT_ENABLED}"
+    # Force enable for test (no need to save/restore - script exits after test)
     LYREBIRD_ALERT_ENABLED="true"
 
     if send_alert "info" "Test Alert from LyreBirdAudio" \
@@ -1043,7 +1042,6 @@ cmd_test() {
         echo "Failed to send test alert. Check your configuration."
         return 1
     fi
-    # Note: was_enabled restoration removed - unreachable after return statements
 }
 
 #=============================================================================
