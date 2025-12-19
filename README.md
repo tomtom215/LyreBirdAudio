@@ -1851,6 +1851,177 @@ sudo ./install_mediamtx.sh uninstall
 
 ---
 
+### Webhook Alerts (lyrebird-alerts.sh)
+
+**Purpose:** Remote monitoring via webhook notifications (pure bash, no new dependencies)
+
+**Usage:**
+```bash
+# Interactive setup wizard
+./lyrebird-alerts.sh setup
+
+# Send a test alert
+./lyrebird-alerts.sh test
+
+# Send custom alert
+./lyrebird-alerts.sh send --level warning --title "Alert" --message "Something happened"
+
+# Check status
+./lyrebird-alerts.sh status
+
+# Show current configuration
+./lyrebird-alerts.sh config
+```
+
+**Supported Webhook Types:**
+- **Discord** - Discord channel webhooks
+- **Slack** - Slack incoming webhooks
+- **ntfy.sh** - Free, open-source notification service
+- **Pushover** - Mobile push notifications
+- **Generic** - Any HTTP POST endpoint
+
+**Configuration:** `/etc/lyrebird/alerts.conf`
+```bash
+LYREBIRD_ALERT_ENABLED=true
+LYREBIRD_WEBHOOK_URL="https://your-webhook-url"
+LYREBIRD_WEBHOOK_TYPE="discord"  # discord, slack, ntfy, pushover, generic
+LYREBIRD_ALERT_RATE_LIMIT=300    # Seconds between duplicate alerts
+LYREBIRD_HOSTNAME="field-unit-1"
+LYREBIRD_LOCATION="North Forest"
+```
+
+**Features:**
+- Rate limiting prevents alert spam
+- Alert deduplication within configurable window
+- Multiple webhook destinations
+- Pre-built functions for common alerts:
+  - `alert_stream_down` / `alert_stream_up`
+  - `alert_device_disconnect` / `alert_device_connect`
+  - `alert_disk_warning` / `alert_disk_critical`
+  - `alert_mediamtx_down` / `alert_mediamtx_up`
+  - `alert_network_down` / `alert_network_up`
+
+**Integration with other scripts:**
+```bash
+# Source alerts in your monitoring script
+source ./lyrebird-alerts.sh
+
+# Send alert when stream fails
+if ! check_stream_health "mic1"; then
+    alert_stream_down "mic1" "FFmpeg process died"
+fi
+```
+
+---
+
+### Prometheus Metrics (lyrebird-metrics.sh)
+
+**Purpose:** Export system and stream metrics in Prometheus format
+
+**Usage:**
+```bash
+# One-time metrics output
+./lyrebird-metrics.sh
+
+# Start HTTP metrics server (for Prometheus scraping)
+./lyrebird-metrics.sh serve --port 9100
+
+# Output specific metrics only
+./lyrebird-metrics.sh --streams-only
+./lyrebird-metrics.sh --system-only
+```
+
+**Metrics Exported:**
+```
+# MediaMTX service status
+lyrebird_mediamtx_up 1
+lyrebird_mediamtx_uptime_seconds 3600
+
+# Stream status (per stream)
+lyrebird_stream_active{name="mic1"} 1
+lyrebird_stream_uptime_seconds{name="mic1"} 1800
+
+# USB audio devices
+lyrebird_usb_devices_total 3
+lyrebird_usb_device_connected{name="mic1"} 1
+
+# System resources
+lyrebird_cpu_usage_percent 15.5
+lyrebird_memory_usage_percent 45.2
+lyrebird_disk_usage_percent{mount="/"} 62
+lyrebird_load_average_1m 0.5
+```
+
+**Prometheus Configuration:**
+```yaml
+# prometheus.yml
+scrape_configs:
+  - job_name: 'lyrebird'
+    static_configs:
+      - targets: ['field-unit-1:9100']
+    scrape_interval: 30s
+```
+
+**Features:**
+- Prometheus-compatible text format
+- HTTP server mode for remote scraping
+- Per-stream metrics with labels
+- System resource monitoring
+- MediaMTX API integration
+
+---
+
+### Storage Management (lyrebird-storage.sh)
+
+**Purpose:** Manage disk space and recording retention for long-term deployments
+
+**Usage:**
+```bash
+# Check storage status
+./lyrebird-storage.sh status
+
+# Clean up old recordings (respects retention policy)
+sudo ./lyrebird-storage.sh cleanup
+
+# Emergency cleanup (aggressive, ignores some limits)
+sudo ./lyrebird-storage.sh emergency
+
+# Monitor mode (continuous)
+./lyrebird-storage.sh monitor --interval 300
+```
+
+**Configuration:** Environment variables or `/etc/lyrebird/storage.conf`
+```bash
+# Retention settings
+RECORDING_RETENTION_DAYS=30      # Keep recordings for 30 days
+LOG_RETENTION_DAYS=7             # Keep logs for 7 days
+
+# Disk thresholds
+DISK_WARNING_PERCENT=80          # Warn at 80% usage
+DISK_CRITICAL_PERCENT=90         # Critical at 90% usage
+
+# Directories to manage
+RECORDING_DIR="/var/recordings"
+LOG_DIR="/var/log/lyrebird"
+```
+
+**Features:**
+- Configurable retention policies
+- Automatic cleanup of old recordings and logs
+- Disk usage monitoring with thresholds
+- Emergency cleanup mode for critical situations
+- Integration with alerting system
+- Dry-run mode for testing
+
+**Automated Cleanup via Cron:**
+```bash
+# Add to /etc/cron.d/lyrebird-storage
+0 3 * * * root /path/to/lyrebird-storage.sh cleanup --quiet
+*/15 * * * * root /path/to/lyrebird-storage.sh monitor --once
+```
+
+---
+
 ## Advanced Topics
 
 ### Custom Integration
@@ -2277,6 +2448,10 @@ sudo reboot  # If still not working
 ---
 
 ## Development & Contributing
+
+For detailed contribution guidelines, see **[CONTRIBUTING.md](CONTRIBUTING.md)**.
+
+For version history and release notes, see **[CHANGELOG.md](CHANGELOG.md)**.
 
 ### Code Standards
 

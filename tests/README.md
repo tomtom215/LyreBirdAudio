@@ -6,13 +6,16 @@ Unit tests for LyreBirdAudio using the [Bats](https://github.com/bats-core/bats-
 
 | Component | Test File | Tests | Est. Coverage |
 |-----------|-----------|-------|---------------|
-| lyrebird-common.sh | test_lyrebird_common.bats | 13 | 65% |
+| lyrebird-common.sh | test_lyrebird_common.bats | 30 | 75% |
 | mediamtx-stream-manager.sh | test_stream_manager.bats | 32 | 50% |
 | usb-audio-mapper.sh | test_usb_audio_mapper.bats | 15 | 45% |
 | lyrebird-diagnostics.sh | test_lyrebird_diagnostics.bats | 16 | 40% |
 | lyrebird-orchestrator.sh | test_lyrebird_orchestrator.bats | 14 | 35% |
+| lyrebird-alerts.sh | test_lyrebird_alerts.bats | 45 | 60% |
+| lyrebird-metrics.sh | test_lyrebird_metrics.bats | 32 | 55% |
+| lyrebird-storage.sh | test_lyrebird_storage.bats | 42 | 50% |
 
-**Total: ~90 tests covering approximately 50% of critical paths**
+**Total: ~226 tests covering approximately 55% of critical paths**
 
 ## Prerequisites
 
@@ -45,6 +48,9 @@ bats tests/test_stream_manager.bats
 bats tests/test_usb_audio_mapper.bats
 bats tests/test_lyrebird_diagnostics.bats
 bats tests/test_lyrebird_orchestrator.bats
+bats tests/test_lyrebird_alerts.bats
+bats tests/test_lyrebird_metrics.bats
+bats tests/test_lyrebird_storage.bats
 ```
 
 **Run with verbose output:**
@@ -66,11 +72,14 @@ bats tests/ --filter "validation"
 
 | File | Description |
 |------|-------------|
-| `test_lyrebird_common.bats` | Tests for shared library functions (hashing, timestamps, exit codes) |
+| `test_lyrebird_common.bats` | Tests for shared library functions (hashing, timestamps, exit codes, progress indicators, error helpers) |
 | `test_stream_manager.bats` | Tests for stream manager (sanitization, PID, locks, heartbeat, network) |
 | `test_usb_audio_mapper.bats` | Tests for USB device detection, sanitization, udev rules |
 | `test_lyrebird_diagnostics.bats` | Tests for diagnostic utilities (validation, port, disk, logs) |
 | `test_lyrebird_orchestrator.bats` | Tests for menu validation, version comparison, status display |
+| `test_lyrebird_alerts.bats` | Tests for webhook alerting (formatters, rate limiting, alert types) |
+| `test_lyrebird_metrics.bats` | Tests for Prometheus metrics export (collectors, formatting) |
+| `test_lyrebird_storage.bats` | Tests for storage management (cleanup, retention, disk usage) |
 
 ## Test Categories
 

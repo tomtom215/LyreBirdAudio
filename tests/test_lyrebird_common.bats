@@ -142,3 +142,110 @@ setup() {
     # Should complete without error
     [ $? -eq 0 ]
 }
+
+# ============================================================================
+# Progress Indicator Tests
+# ============================================================================
+
+@test "lyrebird_spinner_start function exists" {
+    run type lyrebird_spinner_start
+    [ "$status" -eq 0 ]
+}
+
+@test "lyrebird_spinner_stop function exists" {
+    run type lyrebird_spinner_stop
+    [ "$status" -eq 0 ]
+}
+
+@test "lyrebird_progress_bar function exists" {
+    run type lyrebird_progress_bar
+    [ "$status" -eq 0 ]
+}
+
+@test "lyrebird_with_spinner function exists" {
+    run type lyrebird_with_spinner
+    [ "$status" -eq 0 ]
+}
+
+@test "lyrebird_countdown function exists" {
+    run type lyrebird_countdown
+    [ "$status" -eq 0 ]
+}
+
+@test "lyrebird_step function exists" {
+    run type lyrebird_step
+    [ "$status" -eq 0 ]
+}
+
+@test "lyrebird_step outputs step number" {
+    run lyrebird_step 2 5 "Processing"
+    [ "$status" -eq 0 ]
+    [[ "$output" =~ "[2/5]" ]]
+}
+
+@test "lyrebird_step outputs message" {
+    run lyrebird_step 1 3 "Installing packages"
+    [ "$status" -eq 0 ]
+    [[ "$output" =~ "Installing packages" ]]
+}
+
+@test "LYREBIRD_SPINNER_CHARS is defined" {
+    [ -n "$LYREBIRD_SPINNER_CHARS" ]
+}
+
+@test "LYREBIRD_SPINNER_SIMPLE is defined" {
+    [ -n "$LYREBIRD_SPINNER_SIMPLE" ]
+}
+
+# ============================================================================
+# Error Helper Tests
+# ============================================================================
+
+@test "log_error_with_fix function exists" {
+    run type log_error_with_fix
+    [ "$status" -eq 0 ]
+}
+
+@test "log_error_with_fix outputs error message" {
+    run log_error_with_fix "Test error"
+    [ "$status" -eq 0 ]
+    [[ "$output" =~ "Test error" ]] || [[ "$output" =~ "ERROR" ]]
+}
+
+@test "log_error_with_fix outputs fix suggestion" {
+    run log_error_with_fix "Error occurred" "Try running with sudo"
+    [ "$status" -eq 0 ]
+    [[ "$output" =~ "sudo" ]] || [[ "$output" =~ "FIX" ]]
+}
+
+@test "die_with_fix function exists" {
+    run type die_with_fix
+    [ "$status" -eq 0 ]
+}
+
+@test "lyrebird_error_permission function exists" {
+    run type lyrebird_error_permission
+    [ "$status" -eq 0 ]
+}
+
+@test "lyrebird_error_not_found function exists" {
+    run type lyrebird_error_not_found
+    [ "$status" -eq 0 ]
+}
+
+@test "lyrebird_error_dependency function exists" {
+    run type lyrebird_error_dependency
+    [ "$status" -eq 0 ]
+}
+
+@test "lyrebird_error_dependency outputs install command" {
+    run lyrebird_error_dependency "ffmpeg" "ffmpeg"
+    [ "$status" -eq 0 ]
+    [[ "$output" =~ "apt-get install" ]] || [[ "$output" =~ "Install" ]]
+}
+
+@test "lyrebird_error_not_found outputs resource name" {
+    run lyrebird_error_not_found "Configuration file"
+    [ "$status" -eq 0 ]
+    [[ "$output" =~ "Configuration file" ]]
+}
