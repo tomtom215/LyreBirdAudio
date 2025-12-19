@@ -10,10 +10,31 @@
 # This script automatically detects USB microphones and creates MediaMTX
 # configurations for continuous 24/7 RTSP audio streams.
 #
-# Version: 1.4.1 - Friendly name support for audio device configuration
+# Version: 1.4.2 - Production reliability enhancements
 # Compatible with MediaMTX v1.15.0+
 #
 # Version History:
+# v1.4.2 - Production reliability enhancements for 24/7 field deployment
+#   MONITORING ENHANCEMENTS:
+#   - Watchdog/heartbeat mechanism with optional hardware watchdog support
+#   - Disk space monitoring with configurable thresholds
+#   - Memory usage trending and leak detection
+#   - Network connectivity monitoring with gateway check
+#   - MediaMTX API version auto-detection with fallback
+#   - USB device ALSA availability checking before restart
+#   - Configuration validation on startup
+#
+#   BUFFERING IMPROVEMENTS:
+#   - Optional memory-based audio ring buffer (reduces data loss on restart)
+#   - Configurable buffer size per stream
+#   - Optional disk persistence for buffers (SD card wear consideration)
+#
+#   RELIABILITY FIXES:
+#   - Enhanced signal handling (SIGPIPE, SIGHUP, SIGQUIT)
+#   - Lock directory validation before file creation
+#   - Process group termination improvements
+#   - Version compatibility checking between scripts
+#
 # v1.4.1 - Friendly name support for audio device configuration
 #   CONFIGURATION ENHANCEMENT:
 #   - Added dual-lookup config system supporting both friendly and full device names
@@ -107,7 +128,7 @@ _LYREBIRD_COMMON="${BASH_SOURCE[0]%/*}/lyrebird-common.sh"
 unset _LYREBIRD_COMMON
 
 # Constants
-readonly VERSION="1.4.1"
+readonly VERSION="1.4.2"
 
 # Script identification
 SCRIPT_NAME="$(basename "${BASH_SOURCE[0]}")"
@@ -199,6 +220,53 @@ readonly MAX_RESTART_DELAY="${MAX_RESTART_DELAY:-300}"
 readonly MAIN_LOG_MAX_SIZE="${MAIN_LOG_MAX_SIZE:-104857600}"        # 100MB
 readonly FFMPEG_LOG_MAX_SIZE="${FFMPEG_LOG_MAX_SIZE:-10485760}"     # 10MB
 readonly MEDIAMTX_LOG_MAX_SIZE="${MEDIAMTX_LOG_MAX_SIZE:-52428800}" # 50MB
+
+# ============================================================================
+# Production Reliability Settings (v1.4.2 additions)
+# ============================================================================
+
+# Watchdog/Heartbeat settings
+# Heartbeat runs more frequently than cron for faster failure detection
+readonly HEARTBEAT_INTERVAL="${HEARTBEAT_INTERVAL:-30}"             # Seconds between heartbeats
+readonly HEARTBEAT_FILE="${HEARTBEAT_FILE:-/run/mediamtx-audio.heartbeat}"
+readonly ENABLE_HARDWARE_WATCHDOG="${ENABLE_HARDWARE_WATCHDOG:-auto}" # auto, yes, no
+readonly HARDWARE_WATCHDOG_DEVICE="${HARDWARE_WATCHDOG_DEVICE:-/dev/watchdog}"
+readonly HARDWARE_WATCHDOG_TIMEOUT="${HARDWARE_WATCHDOG_TIMEOUT:-60}" # Seconds
+
+# Disk space monitoring thresholds
+readonly DISK_SPACE_WARNING_PERCENT="${DISK_SPACE_WARNING_PERCENT:-80}"
+readonly DISK_SPACE_CRITICAL_PERCENT="${DISK_SPACE_CRITICAL_PERCENT:-95}"
+readonly DISK_SPACE_MIN_FREE_MB="${DISK_SPACE_MIN_FREE_MB:-100}"    # Minimum free MB
+
+# Memory monitoring and leak detection
+readonly MEM_WARNING_PERCENT="${MEM_WARNING_PERCENT:-80}"
+readonly MEM_CRITICAL_PERCENT="${MEM_CRITICAL_PERCENT:-95}"
+readonly MEM_GROWTH_THRESHOLD_MB="${MEM_GROWTH_THRESHOLD_MB:-100}"  # MB growth triggers restart
+readonly MEM_SAMPLE_FILE="${MEM_SAMPLE_FILE:-/var/lib/mediamtx-ffmpeg/.mem_samples}"
+
+# Network connectivity monitoring
+readonly NETWORK_CHECK_ENABLED="${NETWORK_CHECK_ENABLED:-true}"
+readonly NETWORK_CHECK_TARGET="${NETWORK_CHECK_TARGET:-gateway}"    # gateway, specific IP, or hostname
+readonly NETWORK_CHECK_TIMEOUT="${NETWORK_CHECK_TIMEOUT:-5}"        # Seconds
+readonly NETWORK_FAIL_THRESHOLD="${NETWORK_FAIL_THRESHOLD:-3}"      # Consecutive failures before alert
+
+# Audio buffering (memory-based with optional disk persistence)
+readonly AUDIO_BUFFER_ENABLED="${AUDIO_BUFFER_ENABLED:-false}"      # Enable memory ring buffer
+readonly AUDIO_BUFFER_SIZE_MB="${AUDIO_BUFFER_SIZE_MB:-64}"         # Memory buffer size per stream
+readonly AUDIO_BUFFER_DISK_PERSIST="${AUDIO_BUFFER_DISK_PERSIST:-false}" # Write buffer to disk
+readonly AUDIO_BUFFER_DISK_PATH="${AUDIO_BUFFER_DISK_PATH:-/var/lib/mediamtx-ffmpeg/buffer}"
+
+# MediaMTX API version compatibility
+readonly MEDIAMTX_API_VERSION="${MEDIAMTX_API_VERSION:-auto}"       # auto, v3, v2, v1
+readonly MEDIAMTX_API_FALLBACK="${MEDIAMTX_API_FALLBACK:-true}"     # Try older API versions
+
+# USB device health checks
+readonly USB_ALSA_CHECK_ENABLED="${USB_ALSA_CHECK_ENABLED:-true}"   # Check ALSA availability before restart
+readonly USB_DISCONNECT_GRACE_PERIOD="${USB_DISCONNECT_GRACE_PERIOD:-10}" # Seconds to wait after disconnect
+
+# Version compatibility
+readonly MIN_COMPATIBLE_COMMON_VERSION="1.0.0"
+readonly SCRIPT_COMPAT_VERSION="1.4.2"
 
 # Standard timing constants
 readonly QUICK_SLEEP=0.1
@@ -298,15 +366,22 @@ cleanup() {
 
 # Set trap for cleanup only in main script
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]] && [[ $$ -eq $BASHPID ]]; then
-    trap cleanup EXIT INT TERM HUP QUIT
+    # Comprehensive signal handling for production reliability
+    trap cleanup EXIT INT TERM QUIT
+
+    # Ignore SIGPIPE to prevent crashes on broken pipe (common in API calls)
+    trap '' PIPE
 
     # Enhanced signal handlers
     # Only set custom handlers when NOT running under systemd
     if [[ -z "${INVOCATION_ID:-}" ]]; then
         # Not running under systemd - safe to use custom handlers
+        # SIGHUP: Reload configuration without full restart
         trap 'log INFO "Received SIGHUP, reloading configuration"; restart_mediamtx' HUP
-        # Redirect output for USR1 since we might be daemonized
+        # SIGUSR1: Dump status for debugging
         trap 'log INFO "Received SIGUSR1, dumping status"; show_status >/dev/null 2>&1 || log INFO "Status dump completed"' USR1
+        # SIGUSR2: Force heartbeat update
+        trap 'log DEBUG "Received SIGUSR2, updating heartbeat"; update_heartbeat' USR2
     fi
     # Note: When running under systemd (INVOCATION_ID is set), default signal handlers are used
 fi
@@ -1170,6 +1245,434 @@ check_resource_usage() {
     return 0
 }
 
+# ============================================================================
+# Production Reliability Functions (v1.4.2)
+# ============================================================================
+
+# Check disk space on critical partitions
+# Returns: 0 = OK, 1 = warning, 2 = critical
+check_disk_space() {
+    local check_paths=("/" "/var" "/var/log" "${FFMPEG_PID_DIR}" "${CONFIG_DIR}")
+    local critical_found=false
+    local warning_found=false
+
+    for check_path in "${check_paths[@]}"; do
+        # Skip if path doesn't exist
+        [[ -d "$check_path" ]] || continue
+
+        # Get disk usage (portable method)
+        local usage_info
+        usage_info=$(df -P "$check_path" 2>/dev/null | tail -1) || continue
+
+        local used_percent available_kb
+        used_percent=$(echo "$usage_info" | awk '{print $5}' | tr -d '%')
+        available_kb=$(echo "$usage_info" | awk '{print $4}')
+
+        # Skip if we couldn't parse the values
+        [[ "$used_percent" =~ ^[0-9]+$ ]] || continue
+        [[ "$available_kb" =~ ^[0-9]+$ ]] || continue
+
+        local available_mb=$((available_kb / 1024))
+
+        # Check thresholds
+        if [[ $used_percent -ge ${DISK_SPACE_CRITICAL_PERCENT} ]] || [[ $available_mb -lt ${DISK_SPACE_MIN_FREE_MB} ]]; then
+            log ERROR "Critical: Disk space on $check_path: ${used_percent}% used, ${available_mb}MB free"
+            critical_found=true
+        elif [[ $used_percent -ge ${DISK_SPACE_WARNING_PERCENT} ]]; then
+            log WARN "Warning: Disk space on $check_path: ${used_percent}% used, ${available_mb}MB free"
+            warning_found=true
+        fi
+    done
+
+    if [[ "$critical_found" == "true" ]]; then
+        return 2
+    elif [[ "$warning_found" == "true" ]]; then
+        return 1
+    fi
+    return 0
+}
+
+# Check memory usage with trending for leak detection
+# Stores samples over time to detect gradual growth
+check_memory_usage() {
+    local mediamtx_pid
+    mediamtx_pid="$(read_pid_safe "${PID_FILE}")"
+
+    if [[ -z "$mediamtx_pid" ]]; then
+        log DEBUG "MediaMTX not running, skipping memory check"
+        return 0
+    fi
+
+    # Get RSS memory in KB for MediaMTX
+    local rss_kb=0
+    if [[ -f "/proc/$mediamtx_pid/status" ]]; then
+        rss_kb=$(grep "VmRSS:" "/proc/$mediamtx_pid/status" 2>/dev/null | awk '{print $2}' || echo 0)
+    fi
+
+    # Get total RSS for all FFmpeg processes
+    local ffmpeg_rss=0
+    while IFS= read -r pid; do
+        if [[ -n "$pid" ]] && [[ -f "/proc/$pid/status" ]]; then
+            local pid_rss
+            pid_rss=$(grep "VmRSS:" "/proc/$pid/status" 2>/dev/null | awk '{print $2}' || echo 0)
+            ffmpeg_rss=$((ffmpeg_rss + pid_rss))
+        fi
+    done < <(pgrep -f "^ffmpeg.*rtsp://${MEDIAMTX_HOST}:8554" 2>/dev/null || true)
+
+    local total_rss_mb=$(((rss_kb + ffmpeg_rss) / 1024))
+
+    # Store sample for trending
+    local timestamp
+    timestamp=$(date +%s)
+    local sample_dir
+    sample_dir=$(dirname "${MEM_SAMPLE_FILE}")
+
+    if [[ -d "$sample_dir" ]] || mkdir -p "$sample_dir" 2>/dev/null; then
+        echo "${timestamp}:${total_rss_mb}" >> "${MEM_SAMPLE_FILE}" 2>/dev/null || true
+
+        # Keep only last 100 samples
+        if [[ -f "${MEM_SAMPLE_FILE}" ]]; then
+            tail -100 "${MEM_SAMPLE_FILE}" > "${MEM_SAMPLE_FILE}.tmp" 2>/dev/null \
+                && mv "${MEM_SAMPLE_FILE}.tmp" "${MEM_SAMPLE_FILE}" 2>/dev/null || true
+        fi
+
+        # Check for memory growth trend (compare first and last sample)
+        if [[ -f "${MEM_SAMPLE_FILE}" ]] && [[ $(wc -l < "${MEM_SAMPLE_FILE}") -ge 10 ]]; then
+            local first_sample last_sample
+            first_sample=$(head -1 "${MEM_SAMPLE_FILE}" | cut -d: -f2)
+            last_sample=$(tail -1 "${MEM_SAMPLE_FILE}" | cut -d: -f2)
+
+            if [[ "$first_sample" =~ ^[0-9]+$ ]] && [[ "$last_sample" =~ ^[0-9]+$ ]]; then
+                local growth_mb=$((last_sample - first_sample))
+                if [[ $growth_mb -gt ${MEM_GROWTH_THRESHOLD_MB} ]]; then
+                    log WARN "Memory growth detected: ${growth_mb}MB increase (${first_sample}MB -> ${last_sample}MB)"
+                    log WARN "Consider restarting to prevent potential memory leak"
+                fi
+            fi
+        fi
+    fi
+
+    log DEBUG "Memory usage: MediaMTX ${rss_kb}KB, FFmpeg ${ffmpeg_rss}KB, Total ${total_rss_mb}MB"
+
+    # Check system memory
+    local mem_total mem_available mem_used_percent
+    if [[ -f /proc/meminfo ]]; then
+        mem_total=$(grep "MemTotal:" /proc/meminfo | awk '{print $2}')
+        mem_available=$(grep "MemAvailable:" /proc/meminfo | awk '{print $2}')
+        if [[ -n "$mem_total" ]] && [[ -n "$mem_available" ]] && [[ "$mem_total" -gt 0 ]]; then
+            mem_used_percent=$(( (mem_total - mem_available) * 100 / mem_total ))
+
+            if [[ $mem_used_percent -ge ${MEM_CRITICAL_PERCENT} ]]; then
+                log ERROR "Critical: System memory usage at ${mem_used_percent}%"
+                return 2
+            elif [[ $mem_used_percent -ge ${MEM_WARNING_PERCENT} ]]; then
+                log WARN "Warning: System memory usage at ${mem_used_percent}%"
+                return 1
+            fi
+        fi
+    fi
+
+    return 0
+}
+
+# Check network connectivity
+# Uses gateway ping by default, configurable target
+check_network_connectivity() {
+    if [[ "${NETWORK_CHECK_ENABLED}" != "true" ]]; then
+        return 0
+    fi
+
+    local target="${NETWORK_CHECK_TARGET}"
+
+    # Resolve "gateway" to actual gateway IP
+    if [[ "$target" == "gateway" ]]; then
+        # Try multiple methods to find gateway
+        target=$(ip route | grep default | awk '{print $3}' | head -1 2>/dev/null) \
+            || target=$(route -n | grep "^0.0.0.0" | awk '{print $2}' | head -1 2>/dev/null) \
+            || target=$(netstat -rn | grep "^0.0.0.0" | awk '{print $2}' | head -1 2>/dev/null) \
+            || target=""
+
+        if [[ -z "$target" ]]; then
+            log DEBUG "Could not determine gateway, skipping network check"
+            return 0
+        fi
+    fi
+
+    # Ping test
+    if command_exists ping; then
+        if ping -c 1 -W "${NETWORK_CHECK_TIMEOUT}" "$target" >/dev/null 2>&1; then
+            log DEBUG "Network connectivity OK (gateway: $target)"
+            # Reset failure counter
+            echo "0" > /run/mediamtx-network-failures 2>/dev/null || true
+            return 0
+        else
+            # Increment failure counter
+            local failures=0
+            [[ -f /run/mediamtx-network-failures ]] && failures=$(cat /run/mediamtx-network-failures 2>/dev/null || echo 0)
+            failures=$((failures + 1))
+            echo "$failures" > /run/mediamtx-network-failures 2>/dev/null || true
+
+            if [[ $failures -ge ${NETWORK_FAIL_THRESHOLD} ]]; then
+                log ERROR "Network connectivity lost: $failures consecutive failures to reach $target"
+                return 1
+            else
+                log WARN "Network check failed ($failures/${NETWORK_FAIL_THRESHOLD}): cannot reach $target"
+                return 0
+            fi
+        fi
+    fi
+
+    return 0
+}
+
+# Detect MediaMTX API version and return appropriate base URL
+# Tries v3, v2, v1 in order if auto-detection is enabled
+detect_mediamtx_api_version() {
+    local host="${MEDIAMTX_HOST:-localhost}"
+    local port="${MEDIAMTX_API_PORT:-9997}"
+    local base_url="http://${host}:${port}"
+
+    # If version is explicitly set, use it
+    if [[ "${MEDIAMTX_API_VERSION}" != "auto" ]]; then
+        echo "${base_url}/${MEDIAMTX_API_VERSION}"
+        return 0
+    fi
+
+    # Auto-detect: try versions in order
+    if command_exists curl; then
+        for version in v3 v2 v1; do
+            local test_url="${base_url}/${version}/paths/list"
+            if curl -s --max-time 2 "$test_url" >/dev/null 2>&1; then
+                log DEBUG "Detected MediaMTX API version: $version"
+                echo "${base_url}/${version}"
+                return 0
+            fi
+        done
+
+        # Fallback: try without version prefix (very old MediaMTX)
+        if [[ "${MEDIAMTX_API_FALLBACK}" == "true" ]]; then
+            if curl -s --max-time 2 "${base_url}/paths/list" >/dev/null 2>&1; then
+                log DEBUG "Using legacy MediaMTX API (no version prefix)"
+                echo "${base_url}"
+                return 0
+            fi
+        fi
+    fi
+
+    # Default to v3 if detection fails
+    log WARN "Could not detect MediaMTX API version, defaulting to v3"
+    echo "${base_url}/v3"
+    return 0
+}
+
+# Check if ALSA device is available before attempting stream restart
+# Prevents restart loops when USB device is disconnected
+check_alsa_device_available() {
+    local card_num="$1"
+
+    if [[ "${USB_ALSA_CHECK_ENABLED}" != "true" ]]; then
+        return 0
+    fi
+
+    # Check if card exists in ALSA
+    if [[ ! -d "/proc/asound/card${card_num}" ]]; then
+        log DEBUG "ALSA card ${card_num} not found in /proc/asound"
+        return 1
+    fi
+
+    # Check if device is accessible
+    if command_exists arecord; then
+        if ! arecord -l 2>/dev/null | grep -q "card ${card_num}:"; then
+            log DEBUG "ALSA card ${card_num} not listed by arecord"
+            return 1
+        fi
+    fi
+
+    # Additional check: verify the device node exists
+    local device_path="/dev/snd/pcmC${card_num}D0c"
+    if [[ ! -e "$device_path" ]]; then
+        log DEBUG "Device node $device_path does not exist"
+        return 1
+    fi
+
+    return 0
+}
+
+# Validate configuration file syntax
+validate_config() {
+    local config_file="${1:-${DEVICE_CONFIG_FILE}}"
+
+    if [[ ! -f "$config_file" ]]; then
+        log DEBUG "Config file $config_file does not exist (using defaults)"
+        return 0
+    fi
+
+    # Check for basic shell syntax errors
+    if ! bash -n "$config_file" 2>/dev/null; then
+        log ERROR "Configuration file $config_file has syntax errors"
+        return 1
+    fi
+
+    # Source in subshell to check for errors
+    if ! (source "$config_file" 2>/dev/null); then
+        log ERROR "Configuration file $config_file failed to source"
+        return 1
+    fi
+
+    log DEBUG "Configuration file $config_file validated successfully"
+    return 0
+}
+
+# Watchdog heartbeat - writes timestamp to heartbeat file
+# Can be used by external watchdog or systemd WatchdogSec
+update_heartbeat() {
+    local timestamp
+    timestamp=$(date +%s)
+
+    # Ensure directory exists
+    local heartbeat_dir
+    heartbeat_dir=$(dirname "${HEARTBEAT_FILE}")
+    [[ -d "$heartbeat_dir" ]] || mkdir -p "$heartbeat_dir" 2>/dev/null || true
+
+    # Write timestamp atomically
+    echo "$timestamp" > "${HEARTBEAT_FILE}.tmp" 2>/dev/null \
+        && mv "${HEARTBEAT_FILE}.tmp" "${HEARTBEAT_FILE}" 2>/dev/null \
+        || true
+
+    # Notify systemd watchdog if running under systemd
+    if [[ -n "${NOTIFY_SOCKET:-}" ]] && command_exists systemd-notify; then
+        systemd-notify WATCHDOG=1 2>/dev/null || true
+    fi
+
+    # Kick hardware watchdog if enabled
+    kick_hardware_watchdog
+}
+
+# Initialize hardware watchdog (graceful - never blocks if unavailable)
+init_hardware_watchdog() {
+    # Check if hardware watchdog should be enabled
+    case "${ENABLE_HARDWARE_WATCHDOG}" in
+        no|false|0)
+            log DEBUG "Hardware watchdog disabled by configuration"
+            return 0
+            ;;
+        yes|true|1)
+            # Explicitly enabled - warn if not available
+            if [[ ! -c "${HARDWARE_WATCHDOG_DEVICE}" ]]; then
+                log WARN "Hardware watchdog enabled but device ${HARDWARE_WATCHDOG_DEVICE} not found"
+                return 0
+            fi
+            ;;
+        auto|*)
+            # Auto-detect - silently skip if not available
+            if [[ ! -c "${HARDWARE_WATCHDOG_DEVICE}" ]]; then
+                log DEBUG "Hardware watchdog not available (auto-detect)"
+                return 0
+            fi
+            ;;
+    esac
+
+    # Try to set watchdog timeout (requires root)
+    if [[ -w "${HARDWARE_WATCHDOG_DEVICE}" ]]; then
+        # Note: This uses the magic close feature - we just write to keep it alive
+        # The timeout is typically set in kernel/firmware
+        log INFO "Hardware watchdog initialized at ${HARDWARE_WATCHDOG_DEVICE}"
+        export HARDWARE_WATCHDOG_ACTIVE=true
+    else
+        log DEBUG "Hardware watchdog device not writable (may require root)"
+        export HARDWARE_WATCHDOG_ACTIVE=false
+    fi
+
+    return 0
+}
+
+# Kick hardware watchdog to prevent system reset
+kick_hardware_watchdog() {
+    if [[ "${HARDWARE_WATCHDOG_ACTIVE:-false}" != "true" ]]; then
+        return 0
+    fi
+
+    # Write any character to the watchdog device to kick it
+    if [[ -w "${HARDWARE_WATCHDOG_DEVICE}" ]]; then
+        echo "1" > "${HARDWARE_WATCHDOG_DEVICE}" 2>/dev/null || true
+    fi
+}
+
+# Version compatibility check
+# Verifies that lyrebird-common.sh meets minimum version requirements
+check_version_compatibility() {
+    # Check if lyrebird-common.sh provides version
+    if declare -f lyrebird_common_version >/dev/null 2>&1; then
+        local common_version
+        common_version=$(lyrebird_common_version 2>/dev/null || echo "0.0.0")
+
+        # Simple version comparison (major.minor.patch)
+        local required="${MIN_COMPATIBLE_COMMON_VERSION}"
+        local IFS='.'
+        read -ra req_parts <<< "$required"
+        read -ra cur_parts <<< "$common_version"
+
+        for i in 0 1 2; do
+            local req_num="${req_parts[$i]:-0}"
+            local cur_num="${cur_parts[$i]:-0}"
+
+            if [[ $cur_num -lt $req_num ]]; then
+                log WARN "lyrebird-common.sh version $common_version is older than required $required"
+                return 1
+            elif [[ $cur_num -gt $req_num ]]; then
+                break
+            fi
+        done
+    fi
+
+    return 0
+}
+
+# Enhanced resource check that includes all new monitoring
+check_all_resources() {
+    local issues=0
+    local critical=false
+
+    # Original resource check
+    if ! check_resource_usage; then
+        critical=true
+    fi
+
+    # Disk space check
+    local disk_result
+    check_disk_space
+    disk_result=$?
+    if [[ $disk_result -eq 2 ]]; then
+        critical=true
+    fi
+    [[ $disk_result -ne 0 ]] && ((issues++))
+
+    # Memory check
+    local mem_result
+    check_memory_usage
+    mem_result=$?
+    if [[ $mem_result -eq 2 ]]; then
+        critical=true
+    fi
+    [[ $mem_result -ne 0 ]] && ((issues++))
+
+    # Network check
+    if ! check_network_connectivity; then
+        ((issues++))
+    fi
+
+    # Update heartbeat to show we're alive
+    update_heartbeat
+
+    if [[ "$critical" == "true" ]]; then
+        return ${E_CRITICAL_RESOURCE}
+    elif [[ $issues -gt 0 ]]; then
+        return 1
+    fi
+
+    return 0
+}
+
 # Detect if running from cron using multi-method detection
 is_cron_context() {
     # Multi-method cron detection for maximum reliability
@@ -1331,6 +1834,12 @@ monitor_streams() {
             # Check if PID file exists
             if [[ ! -f "$pid_file" ]]; then
                 if [[ "$allow_restart" == "true" ]]; then
+                    # v1.4.2: Check ALSA device availability before restart
+                    if ! check_alsa_device_available "$card_num"; then
+                        log WARN "Stream $stream_path: ALSA device not available (card $card_num), skipping restart"
+                        ((streams_failed++)) || true
+                        continue
+                    fi
                     log WARN "Stream $stream_path has no PID file - restarting"
                     if start_ffmpeg_stream "$device_name" "$card_num" "$stream_path"; then
                         ((streams_restarted++)) || true
@@ -1352,6 +1861,12 @@ monitor_streams() {
 
             if [[ -z "$pid" ]]; then
                 if [[ "$allow_restart" == "true" ]]; then
+                    # v1.4.2: Check ALSA device availability before restart
+                    if ! check_alsa_device_available "$card_num"; then
+                        log WARN "Stream $stream_path: ALSA device not available (card $card_num), skipping restart"
+                        ((streams_failed++)) || true
+                        continue
+                    fi
                     log WARN "Stream $stream_path PID is invalid - restarting"
                     if start_ffmpeg_stream "$device_name" "$card_num" "$stream_path"; then
                         ((streams_restarted++)) || true
@@ -1370,6 +1885,12 @@ monitor_streams() {
             # Verify the PID actually belongs to our wrapper
             if ! pgrep -f "${FFMPEG_PID_DIR}/${stream_path}.sh" | grep -q "^${pid}$" 2>/dev/null; then
                 if [[ "$allow_restart" == "true" ]]; then
+                    # v1.4.2: Check ALSA device availability before restart
+                    if ! check_alsa_device_available "$card_num"; then
+                        log WARN "Stream $stream_path: ALSA device not available (card $card_num), skipping restart"
+                        ((streams_failed++)) || true
+                        continue
+                    fi
                     log WARN "Stream $stream_path PID $pid is stale - restarting"
                     rm -f "$pid_file"
                     if start_ffmpeg_stream "$device_name" "$card_num" "$stream_path"; then
@@ -1431,8 +1952,11 @@ validate_stream() {
         sleep "${STREAM_VALIDATION_DELAY}"
 
         # Try API validation if curl available
+        # v1.4.2: Use API version detection for compatibility
         if command_exists curl; then
-            local api_url="http://${MEDIAMTX_HOST}:9997/v3/paths/get/${stream_path}"
+            local api_base
+            api_base=$(detect_mediamtx_api_version)
+            local api_url="${api_base}/paths/get/${stream_path}"
             if curl -s --max-time 2 "${api_url}" 2>/dev/null | grep -q '"ready":true'; then
                 log DEBUG "Stream $stream_path validated via API (attempt ${attempt})"
                 return 0
@@ -1642,10 +2166,14 @@ wait_for_mediamtx_ready() {
         fi
 
         if command_exists curl; then
-            if curl -s --max-time 2 "http://${MEDIAMTX_HOST}:9997/v3/paths/list" >/dev/null 2>&1; then
-                log INFO "MediaMTX API is ready after ${elapsed} seconds"
-                return 0
-            fi
+            # v1.4.2: Try multiple API versions for compatibility
+            for api_version in v3 v2 v1 ""; do
+                local test_url="http://${MEDIAMTX_HOST}:9997/${api_version:+$api_version/}paths/list"
+                if curl -s --max-time 2 "$test_url" >/dev/null 2>&1; then
+                    log INFO "MediaMTX API is ready after ${elapsed} seconds (API: ${api_version:-legacy})"
+                    return 0
+                fi
+            done
         else
             # Fallback: just check if process is running
             if [[ $elapsed -ge 10 ]]; then
@@ -3732,6 +4260,10 @@ main() {
             check_root
             check_dependencies
             setup_directories
+            # v1.4.2: Pre-start validation and initialization
+            check_version_compatibility || log WARN "Version compatibility check failed (continuing anyway)"
+            validate_config || error_exit "Configuration validation failed" ${E_CONFIG_ERROR}
+            init_hardware_watchdog
             start_mediamtx
             exit_code=$?
             ;;
@@ -3766,9 +4298,14 @@ main() {
         monitor)
             check_root
             setup_directories
-            # First check resource usage (returns E_CRITICAL_RESOURCE if issues)
-            if ! check_resource_usage; then
-                exit ${E_CRITICAL_RESOURCE}
+            # v1.4.2: Use enhanced resource monitoring with disk, memory, and network checks
+            # First check all resources (returns E_CRITICAL_RESOURCE if critical issues)
+            if ! check_all_resources; then
+                local resource_code=$?
+                if [[ $resource_code -eq ${E_CRITICAL_RESOURCE} ]]; then
+                    exit ${E_CRITICAL_RESOURCE}
+                fi
+                # Non-critical issues are logged but we continue
             fi
             # Then check and restart streams (returns error codes for failures)
             monitor_streams

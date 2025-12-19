@@ -489,6 +489,18 @@ if ! declare -f run_with_timeout &>/dev/null; then
 fi
 
 #=============================================================================
+# Version Information
+#=============================================================================
+
+# Return the version of lyrebird-common.sh
+# Used by other scripts for compatibility checking
+if ! declare -f lyrebird_common_version &>/dev/null; then
+    lyrebird_common_version() {
+        echo "${LYREBIRD_COMMON_VERSION}"
+    }
+fi
+
+#=============================================================================
 # Library Load Complete
 #=============================================================================
 

@@ -3175,6 +3175,8 @@ main() {
             check_usb_devices
             check_mediamtx_service
             check_rtsp_connectivity
+            # v1.4.2: Add entropy check - low entropy causes stream setup delays
+            check_inotify_and_entropy
             ;;
         debug)
             check_prerequisites
