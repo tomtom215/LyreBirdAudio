@@ -556,6 +556,7 @@ fi
 
 # Spinner characters for progress indication
 readonly LYREBIRD_SPINNER_CHARS='⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'
+# shellcheck disable=SC2034  # Alternative spinner for non-Unicode terminals
 readonly LYREBIRD_SPINNER_SIMPLE='|/-\'
 
 # Global variable to track spinner PID

@@ -27,7 +27,8 @@
 set -euo pipefail
 
 readonly VERSION="1.0.0"
-readonly SCRIPT_NAME="$(basename "${BASH_SOURCE[0]}")"
+SCRIPT_NAME="$(basename "${BASH_SOURCE[0]}")"
+readonly SCRIPT_NAME
 
 # ============================================================================
 # Configuration

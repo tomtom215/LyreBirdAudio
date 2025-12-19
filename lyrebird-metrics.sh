@@ -25,11 +25,13 @@
 set -euo pipefail
 
 readonly VERSION="1.0.0"
-readonly SCRIPT_NAME="$(basename "${BASH_SOURCE[0]}")"
+SCRIPT_NAME="$(basename "${BASH_SOURCE[0]}")"
+readonly SCRIPT_NAME
 
 # Configuration
 readonly MEDIAMTX_API_HOST="${MEDIAMTX_HOST:-localhost}"
 readonly MEDIAMTX_API_PORT="${MEDIAMTX_API_PORT:-9997}"
+# shellcheck disable=SC2034  # Used by external scripts or for future features
 readonly MEDIAMTX_RTSP_PORT="${MEDIAMTX_PORT:-8554}"
 readonly HEARTBEAT_FILE="${HEARTBEAT_FILE:-/run/mediamtx-audio.heartbeat}"
 readonly PID_FILE="${PID_FILE:-/run/mediamtx-audio.pid}"

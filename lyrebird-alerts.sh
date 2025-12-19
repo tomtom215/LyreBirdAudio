@@ -65,7 +65,8 @@ set -euo pipefail
 
 readonly SCRIPT_NAME="lyrebird-alerts"
 readonly SCRIPT_VERSION="1.0.0"
-readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly SCRIPT_DIR
 
 #=============================================================================
 # Source Common Library
@@ -123,6 +124,7 @@ LYREBIRD_NTFY_SERVER="${LYREBIRD_NTFY_SERVER:-https://ntfy.sh}"
 # Alert Levels
 #=============================================================================
 
+# shellcheck disable=SC2034  # These constants are exported for use by other scripts
 readonly ALERT_LEVEL_INFO="info"
 readonly ALERT_LEVEL_WARNING="warning"
 readonly ALERT_LEVEL_ERROR="error"
@@ -161,6 +163,7 @@ readonly ALERT_TYPE_MEDIAMTX_UP="mediamtx_up"
 readonly ALERT_TYPE_NETWORK_DOWN="network_down"
 readonly ALERT_TYPE_NETWORK_UP="network_up"
 readonly ALERT_TYPE_TEST="test"
+# shellcheck disable=SC2034  # Exported for use by other scripts
 readonly ALERT_TYPE_CUSTOM="custom"
 
 #=============================================================================
