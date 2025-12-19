@@ -1,0 +1,66 @@
+# MediaMTX RTSP Server systemd Service
+# High-performance RTSP/RTMP/HLS/WebRTC media server
+#
+# Installation:
+#   sudo cp config/mediamtx.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable mediamtx
+#   sudo systemctl start mediamtx
+#
+# Note: Adjust paths if MediaMTX is installed elsewhere
+
+[Unit]
+Description=MediaMTX RTSP Media Server
+Documentation=https://github.com/bluenviron/mediamtx
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/mediamtx /etc/mediamtx/mediamtx.yml
+ExecReload=/bin/kill -HUP $MAINPID
+
+# Working directory
+WorkingDirectory=/var/lib/mediamtx
+
+# User/Group (uncomment to run as non-root)
+# User=mediamtx
+# Group=mediamtx
+
+# Restart policy for 24/7 operation
+Restart=always
+RestartSec=5
+RestartPreventExitStatus=SIGTERM SIGINT
+
+# Watchdog support for automatic recovery
+# MediaMTX will be restarted if it doesn't respond within 60 seconds
+WatchdogSec=60
+
+# Give time for graceful shutdown
+TimeoutStopSec=15
+
+# Limit restart frequency (max 5 restarts in 300 seconds)
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+# Increase file descriptor limit for many concurrent streams
+LimitNOFILE=65535
+
+# Increase core dump size for debugging (0 to disable)
+LimitCORE=0
+
+# Security hardening (optional, uncomment as needed)
+# NoNewPrivileges=yes
+# ProtectSystem=strict
+# ProtectHome=yes
+# PrivateTmp=yes
+# ReadWritePaths=/var/log /var/lib/mediamtx /etc/mediamtx
+# CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+
+# Logging
+StandardOutput=append:/var/log/mediamtx.out
+StandardError=append:/var/log/mediamtx.out
+SyslogIdentifier=mediamtx
+
+[Install]
+WantedBy=multi-user.target
