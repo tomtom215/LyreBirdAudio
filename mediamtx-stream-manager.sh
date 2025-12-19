@@ -323,6 +323,7 @@ readonly USB_DISCONNECT_GRACE_PERIOD="${USB_DISCONNECT_GRACE_PERIOD:-10}" # Seco
 
 # Version compatibility
 readonly MIN_COMPATIBLE_COMMON_VERSION="1.0.0"
+# shellcheck disable=SC2034 # SCRIPT_COMPAT_VERSION exported for external version checking tools
 readonly SCRIPT_COMPAT_VERSION="1.4.2"
 
 # Standard timing constants
@@ -1685,6 +1686,7 @@ check_all_audio_levels() {
 }
 
 # Validate configuration file syntax
+# shellcheck disable=SC2120 # Function accepts optional config_file parameter, defaults to DEVICE_CONFIG_FILE
 validate_config() {
     local config_file="${1:-${DEVICE_CONFIG_FILE}}"
 
@@ -1700,6 +1702,7 @@ validate_config() {
     fi
 
     # Source in subshell to check for errors
+    # shellcheck disable=SC1090 # Config file path is validated above, dynamic sourcing is intentional
     if ! (source "$config_file" 2>/dev/null); then
         log ERROR "Configuration file $config_file failed to source"
         return 1
