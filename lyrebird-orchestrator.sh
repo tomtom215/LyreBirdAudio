@@ -8,10 +8,16 @@
 # Copyright: Tom F and LyreBirdAudio contributors
 # License: Apache 2.0
 #
-# Version: 2.1.0
+# Version: 2.1.1
 # Description: Production-grade orchestrator providing unified access to all
 #              LyreBirdAudio components with comprehensive functionality,
 #              intuitive navigation, and robust error handling.
+#
+# v2.1.1 UI/UX Improvements:
+#   - Fixed: Stream URLs menu option now correctly calls 'status' command
+#   - Fixed: Status display no longer shows "MediaMTX:" on two lines
+#   - Added: Command line --help and --version flags
+#   - Improved: Status display combines version and running state on single line
 #
 # v2.1.0 Microphone Capability Detection & Enhanced Security:
 #   NEW FEATURES:
@@ -65,7 +71,7 @@ fi
 # Constants and Configuration
 # ============================================================================
 
-readonly SCRIPT_VERSION="2.1.0"
+readonly SCRIPT_VERSION="2.1.1"
 
 # Initialize constants safely (separate declaration from assignment to catch errors)
 SCRIPT_NAME=""
@@ -697,8 +703,17 @@ display_header() {
 
 display_status() {
     echo -e "${BOLD}System Status:${NC}"
-    echo "  MediaMTX:       $(if [[ "$MEDIAMTX_INSTALLED" == "true" ]]; then echo "Installed (${MEDIAMTX_VERSION})"; else echo "Not installed"; fi)"
-    echo "  MediaMTX:       $(if [[ "$MEDIAMTX_RUNNING" == "true" ]]; then echo -e "${GREEN}Running${NC}"; else echo -e "${RED}Stopped${NC}"; fi)"
+    if [[ "$MEDIAMTX_INSTALLED" == "true" ]]; then
+        local running_status
+        if [[ "$MEDIAMTX_RUNNING" == "true" ]]; then
+            running_status="${GREEN}Running${NC}"
+        else
+            running_status="${RED}Stopped${NC}"
+        fi
+        echo -e "  MediaMTX:       Installed (${MEDIAMTX_VERSION}) - ${running_status}"
+    else
+        echo "  MediaMTX:       Not installed"
+    fi
     echo "  Active Streams: ${ACTIVE_STREAMS}"
     echo "  USB Devices:    $(if [[ "$USB_DEVICES_MAPPED" == "true" ]]; then echo "Mapped"; else echo "Not mapped"; fi)"
     echo
@@ -1438,8 +1453,8 @@ menu_streaming() {
                 echo
                 info "Your streams are available at:"
                 echo
-                execute_script "stream_manager" list || true
-                echo
+                # Use 'status' which displays stream URLs along with their status
+                execute_script "stream_manager" status || true
                 echo "================================================================"
                 pause
                 ;;
@@ -1792,10 +1807,65 @@ menu_logs_status() {
 }
 
 # ============================================================================
+# Help Function
+# ============================================================================
+
+show_help() {
+    cat << 'EOF'
+LyreBirdAudio Orchestrator - Unified Management Interface
+
+Usage: sudo ./lyrebird-orchestrator.sh [OPTIONS]
+
+Options:
+  -h, --help      Show this help message and exit
+  -v, --version   Show version information and exit
+
+Description:
+  The orchestrator provides an interactive menu-driven interface for managing
+  all LyreBirdAudio components including MediaMTX installation, USB device
+  mapping, audio streaming, diagnostics, and version management.
+
+  This script must be run as root (use sudo).
+
+Quick Start:
+  1. Run: sudo ./lyrebird-orchestrator.sh
+  2. Select "Quick Setup Wizard" from the main menu
+  3. Follow the prompts to install MediaMTX, map devices, and start streaming
+
+For more information, see: https://github.com/tomtom215/LyreBirdAudio
+
+EOF
+    exit 0
+}
+
+show_version() {
+    echo "LyreBirdAudio Orchestrator v${SCRIPT_VERSION}"
+    exit 0
+}
+
+# ============================================================================
 # Main Function
 # ============================================================================
 
 main() {
+    # Handle command line arguments before root check
+    case "${1:-}" in
+        -h|--help)
+            show_help
+            ;;
+        -v|--version)
+            show_version
+            ;;
+        "")
+            # No arguments, continue to interactive mode
+            ;;
+        *)
+            echo "Unknown option: $1" >&2
+            echo "Use --help for usage information" >&2
+            exit 1
+            ;;
+    esac
+
     # Initial checks
     check_root
     check_terminal
