@@ -312,6 +312,66 @@ if ! declare -f log_success &>/dev/null; then
     }
 fi
 
+# Error with remediation steps
+# Usage: log_error_with_fix "Error message" "How to fix it"
+if ! declare -f log_error_with_fix &>/dev/null; then
+    log_error_with_fix() {
+        local error_msg="${1:-Unknown error}"
+        local fix_msg="${2:-}"
+
+        _lyrebird_log_to_file "ERROR" "$error_msg"
+        printf '%b[ERROR]%b %s\n' "${RED:-}" "${NC:-}" "$error_msg" >&2
+
+        if [[ -n "$fix_msg" ]]; then
+            printf '%b[FIX]%b   %s\n' "${CYAN:-}" "${NC:-}" "$fix_msg" >&2
+        fi
+    }
+fi
+
+# Die with error message and optional fix (exits with code 1)
+# Usage: die_with_fix "Error message" "How to fix it"
+if ! declare -f die_with_fix &>/dev/null; then
+    die_with_fix() {
+        local error_msg="${1:-Unknown error}"
+        local fix_msg="${2:-}"
+        local exit_code="${3:-1}"
+
+        log_error_with_fix "$error_msg" "$fix_msg"
+        exit "$exit_code"
+    }
+fi
+
+# Common error messages with fixes (reusable)
+# Usage: lyrebird_error_permission
+if ! declare -f lyrebird_error_permission &>/dev/null; then
+    lyrebird_error_permission() {
+        local resource="${1:-this operation}"
+        log_error_with_fix \
+            "Permission denied for ${resource}" \
+            "Run with sudo: sudo $0 $*"
+    }
+fi
+
+if ! declare -f lyrebird_error_not_found &>/dev/null; then
+    lyrebird_error_not_found() {
+        local what="${1:-Resource}"
+        local install_hint="${2:-}"
+        local fix_msg="Check that ${what} exists and path is correct"
+        [[ -n "$install_hint" ]] && fix_msg="$fix_msg. Install with: $install_hint"
+        log_error_with_fix "${what} not found" "$fix_msg"
+    }
+fi
+
+if ! declare -f lyrebird_error_dependency &>/dev/null; then
+    lyrebird_error_dependency() {
+        local cmd="${1:-command}"
+        local package="${2:-$cmd}"
+        log_error_with_fix \
+            "Required command '${cmd}' not found" \
+            "Install with: sudo apt-get install ${package}"
+    }
+fi
+
 # Generic log function with level parameter (used in stream-manager)
 if ! declare -f log &>/dev/null; then
     log() {
@@ -487,6 +547,185 @@ if ! declare -f run_with_timeout &>/dev/null; then
             # No timeout command, run directly
             "$@" 2>/dev/null
         fi
+    }
+fi
+
+#=============================================================================
+# Progress Indicators
+#=============================================================================
+
+# Spinner characters for progress indication
+readonly LYREBIRD_SPINNER_CHARS='⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'
+# shellcheck disable=SC2034  # Alternative spinner for non-Unicode terminals
+readonly LYREBIRD_SPINNER_SIMPLE='|/-\'
+
+# Global variable to track spinner PID
+_LYREBIRD_SPINNER_PID=""
+
+# Start a spinner with message
+# Usage: lyrebird_spinner_start "Downloading..."
+# Note: Call lyrebird_spinner_stop when operation completes
+if ! declare -f lyrebird_spinner_start &>/dev/null; then
+    lyrebird_spinner_start() {
+        local message="${1:-Working...}"
+
+        # Don't show spinner if not a terminal or NO_COLOR is set
+        if [[ ! -t 1 ]] || [[ -n "${NO_COLOR:-}" ]]; then
+            echo "${message}"
+            return 0
+        fi
+
+        # Kill any existing spinner
+        lyrebird_spinner_stop 2>/dev/null || true
+
+        # Start spinner in background
+        (
+            local i=0
+            local chars="${LYREBIRD_SPINNER_CHARS}"
+            local len=${#chars}
+
+            # Hide cursor
+            printf '\033[?25l'
+
+            while true; do
+                local char="${chars:$i:1}"
+                printf '\r%s %s ' "${char}" "${message}"
+                i=$(( (i + 1) % len ))
+                sleep 0.1
+            done
+        ) &
+        _LYREBIRD_SPINNER_PID=$!
+        disown "$_LYREBIRD_SPINNER_PID" 2>/dev/null || true
+    }
+fi
+
+# Stop the spinner
+# Usage: lyrebird_spinner_stop [status_message]
+if ! declare -f lyrebird_spinner_stop &>/dev/null; then
+    lyrebird_spinner_stop() {
+        local status_message="${1:-}"
+
+        if [[ -n "${_LYREBIRD_SPINNER_PID}" ]]; then
+            kill "$_LYREBIRD_SPINNER_PID" 2>/dev/null || true
+            wait "$_LYREBIRD_SPINNER_PID" 2>/dev/null || true
+            _LYREBIRD_SPINNER_PID=""
+        fi
+
+        # Show cursor and clear line
+        if [[ -t 1 ]] && [[ -z "${NO_COLOR:-}" ]]; then
+            printf '\033[?25h'  # Show cursor
+            printf '\r\033[K'   # Clear line
+        fi
+
+        # Print status message if provided
+        if [[ -n "${status_message}" ]]; then
+            echo "${status_message}"
+        fi
+    }
+fi
+
+# Show a progress bar
+# Usage: lyrebird_progress_bar <current> <total> [message]
+# Example: lyrebird_progress_bar 50 100 "Downloading"
+if ! declare -f lyrebird_progress_bar &>/dev/null; then
+    lyrebird_progress_bar() {
+        local current="${1:-0}"
+        local total="${2:-100}"
+        local message="${3:-Progress}"
+        local width=40
+
+        # Don't show progress bar if not a terminal
+        if [[ ! -t 1 ]] || [[ -n "${NO_COLOR:-}" ]]; then
+            return 0
+        fi
+
+        # Calculate percentage and filled width
+        local percent=0
+        if ((total > 0)); then
+            percent=$((current * 100 / total))
+        fi
+        local filled=$((width * current / total))
+        local empty=$((width - filled))
+
+        # Build the bar
+        local bar=""
+        local i
+        for ((i = 0; i < filled; i++)); do
+            bar+="█"
+        done
+        for ((i = 0; i < empty; i++)); do
+            bar+="░"
+        done
+
+        # Print the progress bar
+        printf '\r%s [%s] %3d%% ' "${message}" "${bar}" "${percent}"
+
+        # Newline when complete
+        if ((current >= total)); then
+            echo ""
+        fi
+    }
+fi
+
+# Run a command with a spinner
+# Usage: lyrebird_with_spinner "message" command [args...]
+# Returns: Exit code of the command
+if ! declare -f lyrebird_with_spinner &>/dev/null; then
+    lyrebird_with_spinner() {
+        local message="${1:-Working...}"
+        shift
+
+        lyrebird_spinner_start "${message}"
+        local exit_code=0
+        "$@" || exit_code=$?
+
+        if ((exit_code == 0)); then
+            lyrebird_spinner_stop "✓ ${message} - Done"
+        else
+            lyrebird_spinner_stop "✗ ${message} - Failed"
+        fi
+
+        return "$exit_code"
+    }
+fi
+
+# Show countdown timer
+# Usage: lyrebird_countdown <seconds> [message]
+if ! declare -f lyrebird_countdown &>/dev/null; then
+    lyrebird_countdown() {
+        local seconds="${1:-5}"
+        local message="${2:-Waiting}"
+
+        while ((seconds > 0)); do
+            if [[ -t 1 ]] && [[ -z "${NO_COLOR:-}" ]]; then
+                printf '\r%s... %d ' "${message}" "${seconds}"
+            fi
+            sleep 1
+            ((seconds--))
+        done
+
+        if [[ -t 1 ]] && [[ -z "${NO_COLOR:-}" ]]; then
+            printf '\r\033[K'  # Clear line
+        fi
+    }
+fi
+
+# Display step progress (e.g., "Step 3 of 5: Installing...")
+# Usage: lyrebird_step <current> <total> <message>
+if ! declare -f lyrebird_step &>/dev/null; then
+    lyrebird_step() {
+        local current="${1:-1}"
+        local total="${2:-1}"
+        local message="${3:-Working}"
+
+        local prefix
+        if [[ -t 1 ]] && [[ -z "${NO_COLOR:-}" ]]; then
+            prefix="${BLUE}[${current}/${total}]${NC}"
+        else
+            prefix="[${current}/${total}]"
+        fi
+
+        echo "${prefix} ${message}"
     }
 fi
 

@@ -1,0 +1,72 @@
+# LyreBirdAudio Stream Manager systemd Service
+# Manages FFmpeg audio streams for MediaMTX RTSP server
+#
+# Installation:
+#   sudo cp config/mediamtx-audio.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable mediamtx-audio
+#   sudo systemctl start mediamtx-audio
+#
+# Note: Requires mediamtx.service to be running first
+
+[Unit]
+Description=LyreBirdAudio Stream Manager
+Documentation=https://github.com/tomtom215/LyreBirdAudio
+After=network.target mediamtx.service sound.target
+Wants=mediamtx.service
+PartOf=mediamtx.service
+
+# Wait for audio subsystem
+After=alsa-restore.service
+Wants=alsa-restore.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/mediamtx-stream-manager.sh start
+ExecStop=/usr/local/bin/mediamtx-stream-manager.sh stop
+ExecReload=/usr/local/bin/mediamtx-stream-manager.sh reload
+
+# Working directory
+WorkingDirectory=/var/lib/lyrebird
+
+# User/Group (uncomment to run as non-root)
+# User=mediamtx
+# Group=mediamtx
+
+# Restart policy for 24/7 operation
+Restart=always
+RestartSec=10
+RestartPreventExitStatus=SIGTERM SIGINT
+
+# Watchdog support for automatic recovery
+# Service must notify systemd within this interval or will be restarted
+WatchdogSec=120
+
+# Give time for graceful shutdown
+TimeoutStopSec=30
+
+# Limit restart frequency (max 5 restarts in 300 seconds)
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+# Environment
+Environment=LYREBIRD_WATCHDOG_ENABLED=true
+Environment=LYREBIRD_WATCHDOG_INTERVAL=30
+
+# Optional: increase file descriptor limit for many streams
+LimitNOFILE=65535
+
+# Security hardening (optional, uncomment as needed)
+# NoNewPrivileges=yes
+# ProtectSystem=strict
+# ProtectHome=yes
+# PrivateTmp=yes
+# ReadWritePaths=/var/log/lyrebird /var/lib/lyrebird /etc/mediamtx
+
+# Logging
+StandardOutput=append:/var/log/lyrebird/stream-manager.log
+StandardError=append:/var/log/lyrebird/stream-manager.log
+SyslogIdentifier=lyrebird-audio
+
+[Install]
+WantedBy=multi-user.target

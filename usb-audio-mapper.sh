@@ -217,6 +217,14 @@ is_valid_usb_path() {
     # Check if path contains expected USB path components
     if [[ "$path" == *"usb"* ]] && [[ "$path" == *":"* ]]; then
         return 0
+    # Match USB port path format: [bus]-[port](.[hub_port])*
+    # Examples: "1-2", "1-2.3", "usb-1-2.3.4", "3-1.4.2"
+    # Format breakdown:
+    #   - (usb-)? : Optional "usb-" prefix
+    #   - [0-9]+  : Bus number (e.g., "1", "3")
+    #   - -       : Separator
+    #   - [0-9]+  : Root port number (e.g., "2")
+    #   - (\.[0-9]+)* : Zero or more hub port suffixes (e.g., ".3", ".3.4")
     elif [[ "$path" =~ ^(usb-)?[0-9]+-[0-9]+(\.[0-9]+)*$ ]]; then
         return 0
     elif [[ "$path" == *"-"* ]]; then
@@ -257,6 +265,7 @@ get_usb_physical_port() {
         [ ! -d "$device" ] && continue
 
         # Only check directories with USB port naming pattern
+        # Pattern: [bus]-[port](.[hub_port])* e.g., "1-2", "1-2.3", "3-1.4.2"
         local basename
         basename=$(basename "$device")
         [[ "$basename" =~ ^[0-9]+-[0-9]+(\.[0-9]+)*$ ]] || continue
@@ -504,6 +513,9 @@ get_detailed_card_info() {
     if [ -f "${card_dir}/usbid" ]; then
         local usbid
         usbid=$(cat "${card_dir}/usbid" 2>/dev/null) || true
+        # Match USB vendor:product ID format (4 hex digits : 4 hex digits)
+        # Example: "1234:5678" where 1234=vendor ID, 5678=product ID
+        # BASH_REMATCH[1] = vendor ID, BASH_REMATCH[2] = product ID
         if [[ "$usbid" =~ ([0-9a-fA-F]{4}):([0-9a-fA-F]{4}) ]]; then
             vendor_id="${BASH_REMATCH[1]}"
             product_id="${BASH_REMATCH[2]}"
@@ -512,10 +524,19 @@ get_detailed_card_info() {
     fi
 
     # Get USB path from cards file
+    # /proc/asound/cards format example:
+    #  0 [Device         ]: USB-Audio - USB PnP Sound Device
+    #                       C-Media at usb-0000:00:14.0-2, full speed
     local card_usb_path=""
     local cards_output
     if cards_output=$(cat "$PROC_ASOUND_CARDS" 2>&1); then
         while IFS= read -r line; do
+            # Match line starting with optional spaces, card number, then "at usb-..."
+            # Pattern breakdown:
+            #   ^\ *      : Start of line, optional leading spaces
+            #   $card_num : The card number we're looking for
+            #   \ .*at\   : Any text followed by " at "
+            #   (usb-[^ ,]+) : Capture "usb-" followed by non-space, non-comma chars
             if [[ "$line" =~ ^\ *$card_num\ .*at\ (usb-[^ ,]+) ]]; then
                 card_usb_path="${BASH_REMATCH[1]}"
                 debug "Found USB path: $card_usb_path"
@@ -788,7 +809,11 @@ interactive_mapping() {
         error_exit "No USB device found at position $usb_num."
     fi
 
-    # Extract vendor and product IDs
+    # Extract vendor and product IDs from lsusb output
+    # lsusb format: "Bus 001 Device 005: ID 0d8c:0014 C-Media Electronics, Inc."
+    # Pattern matches "ID " followed by vendor:product (4 hex chars each)
+    # BASH_REMATCH[1] = vendor ID (e.g., "0d8c")
+    # BASH_REMATCH[2] = product ID (e.g., "0014")
     local vendor_id=""
     local product_id=""
     if [[ "$usb_line" =~ ID\ ([0-9a-fA-F]{4}):([0-9a-fA-F]{4}) ]]; then
@@ -798,7 +823,11 @@ interactive_mapping() {
         error_exit "Could not extract vendor and product IDs from: $usb_line"
     fi
 
-    # Extract bus and device numbers
+    # Extract bus and device numbers from lsusb output
+    # lsusb format: "Bus 001 Device 005: ID 0d8c:0014 ..."
+    # Pattern matches "Bus XXX Device XXX" where XXX is exactly 3 digits
+    # BASH_REMATCH[1] = bus number (e.g., "001")
+    # BASH_REMATCH[2] = device number (e.g., "005")
     local bus_num=""
     local dev_num=""
     local physical_port=""
@@ -849,7 +878,15 @@ interactive_mapping() {
         info "Using auto-generated name: $friendly_name"
     fi
 
-    # Validate friendly name
+    # Validate friendly name format
+    # Pattern: ^[a-z][a-z0-9-]{0,31}$
+    # Requirements:
+    #   ^[a-z]      : Must start with a lowercase letter (a-z)
+    #   [a-z0-9-]   : Followed by lowercase letters, digits, or hyphens
+    #   {0,31}      : Between 0 and 31 additional chars (total max 32)
+    #   $           : End of string
+    # Valid examples: "mic1", "usb-audio-1", "birdsong-recorder"
+    # Invalid: "1mic" (starts with digit), "USB-MIC" (uppercase), "mic_1" (underscore)
     if ! [[ "$friendly_name" =~ ^[a-z][a-z0-9-]{0,31}$ ]]; then
         error_exit "Invalid friendly name. Must start with lowercase letter, max $MAX_NAME_LENGTH chars, use only lowercase letters, numbers, and hyphens."
     fi
