@@ -169,7 +169,7 @@ Each component maintains its own version:
 |-----------|-----------------|
 | lyrebird-orchestrator.sh | 2.1.2 |
 | lyrebird-stream-manager.sh | 1.4.3 |
-| lyrebird-updater.sh | 1.5.1 |
+| lyrebird-updater.sh | 1.6.0 |
 | usb-audio-mapper.sh | 1.2.1 |
 | lyrebird-diagnostics.sh | 1.0.2 |
 | install_mediamtx.sh | 2.0.1 |

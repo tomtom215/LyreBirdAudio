@@ -7,9 +7,16 @@
 # Copyright: Tom F and LyreBirdAudio contributors
 # License: Apache 2.0
 #
-# Version: 1.5.1 - Self-Update Syntax Validation
+# Version: 1.6.0 - Post-Update Migrations
 #
-# NEW in v1.5.1:
+# NEW in v1.6.0:
+#   - Automatic post-update migrations for breaking changes
+#   - Handles script renames (mediamtx-stream-manager.sh -> lyrebird-stream-manager.sh)
+#   - Updates systemd services, cron jobs, and /usr/local/bin installations
+#   - Log file migration with backward-compatible symlinks
+#   - Manual migration via: ./lyrebird-updater.sh --migrate
+#
+# v1.5.1 features:
 #   - Pre-exec syntax validation for self-updates
 #   - Protection against broken script deployment
 #   - Enhanced error reporting for syntax failures
@@ -70,7 +77,7 @@ SCRIPT_NAME="$(basename "${BASH_SOURCE[0]}")"
 readonly SCRIPT_NAME
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly SCRIPT_DIR
-readonly VERSION="1.5.1"
+readonly VERSION="1.6.0"
 readonly LOCKFILE="${SCRIPT_DIR}/.lyrebird-updater.lock"
 
 # Repository configuration
@@ -110,6 +117,12 @@ readonly SERVICE_SCRIPT="lyrebird-stream-manager.sh"
 readonly SERVICE_UPDATE_MARKER="/run/lyrebird-service-update.marker"
 readonly SERVICE_STOP_TIMEOUT=30
 readonly SERVICE_START_TIMEOUT=10
+
+# Migration configuration
+readonly MIGRATION_MARKER_DIR="/var/lib/lyrebird/migrations"
+readonly OLD_STREAM_MANAGER="mediamtx-stream-manager.sh"
+readonly OLD_STREAM_MANAGER_LOG="/var/log/mediamtx-stream-manager.log"
+readonly NEW_STREAM_MANAGER_LOG="/var/log/lyrebird-stream-manager.log"
 
 # Colors for output (using tput for portability)
 if command -v tput >/dev/null 2>&1 && [[ -t 1 ]]; then
@@ -956,6 +969,158 @@ post_checkout_service_update() {
 
     log_success "Service update completed successfully"
     return 0
+}
+
+################################################################################
+# Migration Handler (Post-Checkout)
+################################################################################
+
+# Run migrations after successful update
+# Migrations are idempotent and track completion via marker files
+run_post_update_migrations() {
+    log_step "Checking for pending migrations..."
+
+    # Ensure migration marker directory exists
+    if [[ ! -d "$MIGRATION_MARKER_DIR" ]]; then
+        mkdir -p "$MIGRATION_MARKER_DIR" 2>/dev/null || {
+            log_warn "Could not create migration marker directory: $MIGRATION_MARKER_DIR"
+            log_warn "Migrations may re-run on next update"
+        }
+    fi
+
+    local migrations_run=0
+
+    # Migration: mediamtx-stream-manager.sh -> lyrebird-stream-manager.sh rename
+    if ! migration_stream_manager_rename; then
+        log_warn "Stream manager rename migration encountered issues"
+        # Don't fail the update for migration issues
+    else
+        ((migrations_run++)) || true
+    fi
+
+    if [[ $migrations_run -gt 0 ]]; then
+        log_success "Migrations completed: $migrations_run"
+    else
+        log_debug "No pending migrations"
+    fi
+
+    return 0
+}
+
+# Migration: Handle mediamtx-stream-manager.sh -> lyrebird-stream-manager.sh rename
+# This migration:
+#   1. Updates systemd service file if it references the old script name
+#   2. Removes old script from /usr/local/bin if present
+#   3. Installs new script to /usr/local/bin
+#   4. Creates symlink from old log to new log for continuity
+#   5. Updates cron job if present
+migration_stream_manager_rename() {
+    local marker_file="${MIGRATION_MARKER_DIR}/stream-manager-rename-v1"
+
+    # Check if migration already completed
+    if [[ -f "$marker_file" ]]; then
+        log_debug "Migration 'stream-manager-rename' already completed"
+        return 0
+    fi
+
+    log_step "Running migration: stream-manager-rename..."
+
+    local changes_made=0
+    local errors=0
+
+    # 1. Check and update systemd service file
+    if [[ -f "$SERVICE_FILE" ]]; then
+        if grep -q "$OLD_STREAM_MANAGER" "$SERVICE_FILE" 2>/dev/null; then
+            log_info "  Updating systemd service file..."
+            if sed -i "s|${OLD_STREAM_MANAGER}|${SERVICE_SCRIPT}|g" "$SERVICE_FILE" 2>/dev/null; then
+                log_success "  Updated service file references"
+                ((changes_made++))
+            else
+                log_warn "  Could not update service file (permission denied?)"
+                ((errors++))
+            fi
+        fi
+    fi
+
+    # 2. Handle /usr/local/bin installation
+    local old_bin="/usr/local/bin/${OLD_STREAM_MANAGER}"
+    local new_bin="/usr/local/bin/${SERVICE_SCRIPT}"
+
+    if [[ -f "$old_bin" ]] || [[ -L "$old_bin" ]]; then
+        log_info "  Removing old script from /usr/local/bin..."
+        if rm -f "$old_bin" 2>/dev/null; then
+            log_success "  Removed $old_bin"
+            ((changes_made++))
+        else
+            log_warn "  Could not remove $old_bin (permission denied?)"
+            ((errors++))
+        fi
+    fi
+
+    # Install new script if we have it and it's not already there
+    if [[ -f "./${SERVICE_SCRIPT}" ]] && [[ ! -f "$new_bin" ]]; then
+        log_info "  Installing new script to /usr/local/bin..."
+        if cp "./${SERVICE_SCRIPT}" "$new_bin" && chmod +x "$new_bin" 2>/dev/null; then
+            log_success "  Installed $new_bin"
+            ((changes_made++))
+        else
+            log_warn "  Could not install to /usr/local/bin (permission denied?)"
+            ((errors++))
+        fi
+    fi
+
+    # 3. Handle log file migration (create symlink for continuity)
+    if [[ -f "$OLD_STREAM_MANAGER_LOG" ]] && [[ ! -L "$OLD_STREAM_MANAGER_LOG" ]]; then
+        log_info "  Migrating log file..."
+        # Move old log to new location, create symlink back
+        if mv "$OLD_STREAM_MANAGER_LOG" "$NEW_STREAM_MANAGER_LOG" 2>/dev/null; then
+            if ln -sf "$NEW_STREAM_MANAGER_LOG" "$OLD_STREAM_MANAGER_LOG" 2>/dev/null; then
+                log_success "  Log file migrated with backward-compatible symlink"
+                ((changes_made++))
+            else
+                log_warn "  Could not create backward-compatible symlink"
+            fi
+        else
+            log_warn "  Could not migrate log file (permission denied?)"
+            ((errors++))
+        fi
+    fi
+
+    # 4. Update cron job if present
+    if [[ -f "$SERVICE_CRON_FILE" ]]; then
+        if grep -q "$OLD_STREAM_MANAGER" "$SERVICE_CRON_FILE" 2>/dev/null; then
+            log_info "  Updating cron job..."
+            if sed -i "s|${OLD_STREAM_MANAGER}|${SERVICE_SCRIPT}|g" "$SERVICE_CRON_FILE" 2>/dev/null; then
+                log_success "  Updated cron job references"
+                ((changes_made++))
+            else
+                log_warn "  Could not update cron job (permission denied?)"
+                ((errors++))
+            fi
+        fi
+    fi
+
+    # 5. Reload systemd if we made service changes
+    if [[ $changes_made -gt 0 ]] && [[ -f "$SERVICE_FILE" ]]; then
+        log_info "  Reloading systemd daemon..."
+        systemctl daemon-reload 2>/dev/null || log_warn "  Could not reload systemd"
+    fi
+
+    # Mark migration complete if no critical errors
+    if [[ $errors -eq 0 ]]; then
+        echo "$(date -Iseconds)" > "$marker_file" 2>/dev/null || true
+        if [[ $changes_made -gt 0 ]]; then
+            log_success "Migration 'stream-manager-rename' completed ($changes_made changes)"
+        else
+            log_debug "Migration 'stream-manager-rename' - no changes needed"
+            echo "$(date -Iseconds) - no changes needed" > "$marker_file" 2>/dev/null || true
+        fi
+        return 0
+    else
+        log_warn "Migration 'stream-manager-rename' completed with $errors errors"
+        log_warn "Some manual steps may be required (see documentation)"
+        return 1
+    fi
 }
 
 ################################################################################
@@ -1931,6 +2096,9 @@ switch_version_safe() {
     # Remove service update marker on success
     rm -f "$SERVICE_UPDATE_MARKER"
 
+    # Run post-update migrations (handles breaking changes like renames)
+    run_post_update_migrations
+
     # Restore stashed changes (if not self-updating)
     if [[ -n "${TRANSACTION_STATE[stash_hash]}" ]]; then
         echo
@@ -2835,6 +3003,14 @@ main() {
             --list | -l)
                 fetch_updates_safe || true
                 list_available_releases
+                exit "$E_SUCCESS"
+                ;;
+
+            --migrate)
+                echo
+                echo "${BOLD}=== Running Migrations ===${NC}"
+                echo
+                run_post_update_migrations
                 exit "$E_SUCCESS"
                 ;;
 
