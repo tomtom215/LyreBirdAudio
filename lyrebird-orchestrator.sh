@@ -33,7 +33,7 @@
 #   - Configuration validation against hardware capabilities
 #   - Enhanced USB menu with comprehensive device configuration workflow
 #   - Support for mediamtx-stream-manager v1.4.1 friendly name feature
-#   
+#
 #   SECURITY & RELIABILITY ENHANCEMENTS:
 #   - TOCTOU race condition protection in log file handling
 #   - Comprehensive EOF/stdin handling across all interactive menus
@@ -47,7 +47,7 @@
 #   - Absolute paths for all system commands
 #   - Enhanced updater integration with proper privilege management
 #   - Improved initialization robustness and error recovery
-#   
+#
 #   COMPATIBILITY:
 #   - Maintains full backward compatibility with v2.0.1
 #   - All existing workflows and integrations preserved
@@ -59,7 +59,7 @@ set -euo pipefail
 # ============================================================================
 
 # Require Bash 4.0+ for associative array support
-if (( BASH_VERSINFO[0] < 4 )); then
+if ((BASH_VERSINFO[0] < 4)); then
     echo "ERROR: This script requires Bash 4.0 or later (found: ${BASH_VERSION})" >&2
     echo >&2
     echo "Your current Bash version does not support associative arrays." >&2
@@ -97,11 +97,11 @@ get_script_dir() {
     local source="${BASH_SOURCE[0]}"
     local max_depth=20
     local depth=0
-    
+
     # Resolve symlinks with depth limit to prevent infinite loops
-    while [[ -L "$source" ]] && (( depth < max_depth )); do
+    while [[ -L "$source" ]] && ((depth < max_depth)); do
         local link_target
-        
+
         # Prefer readlink -f for atomic resolution if available
         if link_target="$(readlink -f "$source" 2>/dev/null)" && [[ -n "$link_target" ]]; then
             source="$link_target"
@@ -114,23 +114,23 @@ get_script_dir() {
             [[ $next_source != /* ]] && next_source="$dir/$next_source"
             source="$next_source"
         fi
-        
-        (( depth++ ))
+
+        ((depth++))
     done
-    
+
     # Final safety validation
-    if (( depth >= max_depth )); then
+    if ((depth >= max_depth)); then
         echo "ERROR: Symlink resolution depth exceeded (possible circular symlink)" >&2
         echo "/dev/null"
-        return 0  # Return 0 to avoid triggering set -e
+        return 0 # Return 0 to avoid triggering set -e
     fi
-    
+
     if [[ ! -f "$source" ]]; then
         echo "ERROR: Resolved script path does not exist: $source" >&2
         echo "/dev/null"
-        return 0  # Return 0 to avoid triggering set -e
+        return 0 # Return 0 to avoid triggering set -e
     fi
-    
+
     dirname "$source"
 }
 
@@ -149,18 +149,18 @@ fi
 validate_log_path() {
     local path="$1"
     local default="$2"
-    
+
     # Reject empty or unset path
     if [[ -z "$path" ]]; then
         echo "$default"
         return 0
     fi
-    
+
     # Security checks
-    if [[ "$path" != /* ]] || \
-       [[ "$path" != /var/log/* ]] || \
-       [[ "$path" == *".."* ]] || \
-       ! [[ "$path" =~ ^/var/log/[a-zA-Z0-9_./-]+$ ]]; then
+    if [[ "$path" != /* ]] \
+        || [[ "$path" != /var/log/* ]] \
+        || [[ "$path" == *".."* ]] \
+        || ! [[ "$path" =~ ^/var/log/[a-zA-Z0-9_./-]+$ ]]; then
         echo "$default"
         # Log warning only if log function exists (during initialization it may not)
         if declare -f log >/dev/null 2>&1; then
@@ -168,7 +168,7 @@ validate_log_path() {
         fi
         return 0
     fi
-    
+
     echo "$path"
     return 0
 }
@@ -226,14 +226,14 @@ fi
 
 # Global state variables
 declare -A SCRIPT_PATHS=()
-declare -A SCRIPT_CHECKSUMS=()  # SHA256 checksums for script integrity verification
+declare -A SCRIPT_CHECKSUMS=() # SHA256 checksums for script integrity verification
 LAST_ERROR=""
 MEDIAMTX_INSTALLED=false
 MEDIAMTX_RUNNING=false
 MEDIAMTX_VERSION="unknown"
 USB_DEVICES_MAPPED=false
 ACTIVE_STREAMS=0
-CHILD_PID=""  # Track current child process for proper signal handling and cleanup
+CHILD_PID="" # Track current child process for proper signal handling and cleanup
 
 # ============================================================================
 # Utility Functions
@@ -246,8 +246,8 @@ log() {
     local message="$*"
     local timestamp
     timestamp="$(date '+%Y-%m-%d %H:%M:%S')"
-    
-    echo "[${timestamp}] [${level}] ${message}" >> "${LOG_FILE}" 2>/dev/null || true
+
+    echo "[${timestamp}] [${level}] ${message}" >>"${LOG_FILE}" 2>/dev/null || true
 }
 
 # Output functions with consistent formatting
@@ -295,10 +295,10 @@ command_exists() {
 initialize_logging() {
     local default_log="/var/log/lyrebird-orchestrator.log"
     local log_candidate
-    
+
     # Use environment variable if set, otherwise default
     log_candidate=$(validate_log_path "${ORCHESTRATOR_LOG_FILE:-}" "$default_log")
-    
+
     # Attempt to create log file with race condition protection
     if [[ -w "$(dirname "$log_candidate")" ]]; then
         # Verify path is a regular file (not symlink, device, etc.)
@@ -310,7 +310,7 @@ initialize_logging() {
                 log_candidate="/tmp/lyrebird-orchestrator-$$.log"
             fi
         fi
-        
+
         # Attempt to create/write to log file
         if touch "$log_candidate" 2>/dev/null && [[ -w "$log_candidate" ]]; then
             LOG_FILE="$log_candidate"
@@ -324,7 +324,7 @@ initialize_logging() {
         LOG_FILE="/tmp/lyrebird-orchestrator-$$.log"
         touch "$LOG_FILE" 2>/dev/null || LOG_FILE="/dev/null"
     fi
-    
+
     if [[ "$LOG_FILE" != "/dev/null" ]]; then
         # Simple log rotation: if log exceeds 1MB, rotate to .1 backup
         if [[ -f "$LOG_FILE" ]] && [[ $(stat -f%z "$LOG_FILE" 2>/dev/null || stat -c%s "$LOG_FILE" 2>/dev/null || echo 0) -gt 1048576 ]]; then
@@ -333,9 +333,9 @@ initialize_logging() {
             touch "$LOG_FILE" 2>/dev/null || true
         fi
     fi
-    
+
     readonly LOG_FILE
-    
+
     log "INFO" "=== Orchestrator Started (v${SCRIPT_VERSION}) ==="
     log "INFO" "Running as: $(whoami)"
     log "INFO" "Log file: ${LOG_FILE}"
@@ -362,13 +362,13 @@ check_terminal() {
 check_dependencies() {
     local missing=()
     local deps=("pgrep" "grep" "awk" "sed")
-    
+
     for cmd in "${deps[@]}"; do
         if ! command_exists "$cmd"; then
             missing+=("$cmd")
         fi
     done
-    
+
     if [[ ${#missing[@]} -gt 0 ]]; then
         error "Missing required dependencies: ${missing[*]}"
         echo
@@ -381,20 +381,20 @@ check_dependencies() {
 # Find and validate all external scripts, computing SHA256 checksums for integrity verification
 find_external_scripts() {
     local all_found=true
-    
+
     log "INFO" "Searching for external scripts in: ${SCRIPT_DIR}"
-    
+
     for key in "${!EXTERNAL_SCRIPTS[@]}"; do
         local script_name="${EXTERNAL_SCRIPTS[$key]}"
         local script_path="${SCRIPT_DIR}/${script_name}"
-        
+
         if [[ ! -f "$script_path" ]]; then
             error "Required script not found: ${script_name}"
             log "ERROR" "Missing script: ${script_path}"
             all_found=false
             continue
         fi
-        
+
         if [[ ! -x "$script_path" ]]; then
             warning "Script not executable: ${script_name}"
             info "Attempting to make executable..."
@@ -408,9 +408,9 @@ find_external_scripts() {
                 continue
             fi
         fi
-        
+
         SCRIPT_PATHS["$key"]="$script_path"
-        
+
         # Compute and store SHA256 checksum for integrity verification
         if command_exists sha256sum; then
             local checksum
@@ -420,10 +420,10 @@ find_external_scripts() {
                 log "DEBUG" "Checksum for ${script_name}: ${checksum}"
             fi
         fi
-        
+
         log "INFO" "Found: ${script_name} -> ${script_path}"
     done
-    
+
     if [[ "$all_found" == "false" ]]; then
         echo
         error "Some required scripts are missing"
@@ -432,7 +432,7 @@ find_external_scripts() {
         log "ERROR" "Script discovery failed"
         return 1
     fi
-    
+
     success "All required scripts found and validated"
     return 0
 }
@@ -441,7 +441,7 @@ find_external_scripts() {
 extract_script_version() {
     local script_path="$1"
     local version="unknown"
-    
+
     # Try multiple patterns to find version
     # Pattern 1: readonly VERSION="x.y.z"
     if version=$(grep -m1 '^readonly VERSION=' "$script_path" 2>/dev/null | sed -E 's/.*VERSION="?([0-9]+\.[0-9]+\.[0-9]+)"?.*/\1/'); then
@@ -450,7 +450,7 @@ extract_script_version() {
             return
         fi
     fi
-    
+
     # Pattern 2: Version: x.y.z
     if version=$(grep -m1 '^# Version:' "$script_path" 2>/dev/null | sed -E 's/.*Version:[[:space:]]*([0-9]+\.[0-9]+\.[0-9]+).*/\1/'); then
         if [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
@@ -458,7 +458,7 @@ extract_script_version() {
             return
         fi
     fi
-    
+
     # Pattern 3: SCRIPT_VERSION="x.y.z"
     if version=$(grep -m1 'SCRIPT_VERSION=' "$script_path" 2>/dev/null | sed -E 's/.*SCRIPT_VERSION="?([0-9]+\.[0-9]+\.[0-9]+)"?.*/\1/'); then
         if [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
@@ -466,24 +466,24 @@ extract_script_version() {
             return
         fi
     fi
-    
+
     echo "$version"
 }
 
 validate_script_versions() {
     local all_valid=true
-    
+
     for key in "${!SCRIPT_PATHS[@]}"; do
         local script_path="${SCRIPT_PATHS[$key]}"
         local detected_version
         detected_version="$(extract_script_version "$script_path")"
-        
+
         if [[ "$detected_version" == "unknown" ]]; then
             log "WARN" "Could not determine version for ${key}"
             all_valid=false
         fi
     done
-    
+
     # Return proper exit code based on validation result
     if [[ "$all_valid" == "true" ]]; then
         return 0
@@ -498,11 +498,11 @@ validate_script_versions() {
 
 refresh_system_state() {
     log "DEBUG" "Refreshing system state"
-    
+
     # Check MediaMTX installation
     if command_exists mediamtx || [[ -f /usr/local/bin/mediamtx ]]; then
         MEDIAMTX_INSTALLED=true
-        
+
         # Try to get version
         if command_exists mediamtx; then
             MEDIAMTX_VERSION=$(mediamtx --version 2>&1 | grep -oE 'v?[0-9]+\.[0-9]+\.[0-9]+' | head -1 || echo "unknown")
@@ -513,20 +513,20 @@ refresh_system_state() {
         MEDIAMTX_INSTALLED=false
         MEDIAMTX_VERSION="not installed"
     fi
-    
+
     # Check if MediaMTX is running
     if pgrep -x mediamtx >/dev/null 2>&1; then
         MEDIAMTX_RUNNING=true
     else
         MEDIAMTX_RUNNING=false
     fi
-    
+
     # Count active streams with DoS prevention (limit to reasonable maximum)
     ACTIVE_STREAMS=0
-    
+
     if pgrep -x ffmpeg >/dev/null 2>&1; then
         local raw_count
-        
+
         # Use efficient pgrep -c if available, otherwise limit output before counting
         if command_exists pgrep && pgrep --help 2>&1 | grep -q -- '-c'; then
             # Modern pgrep supports -c for efficient counting
@@ -536,31 +536,31 @@ refresh_system_state() {
             # head -n 1001 ensures we never process more than 1001 PIDs
             raw_count=$(pgrep -x ffmpeg 2>/dev/null | head -n 1001 | wc -l)
         fi
-        
+
         # Validate count with overflow protection
         # First check string length to prevent overflow in arithmetic operations
         if [[ ! "$raw_count" =~ ^[0-9]{1,7}$ ]]; then
             # Not a valid number or too large (>9,999,999) - could cause overflow
             log "WARN" "Invalid or oversized stream count: '${raw_count:0:20}'"
             ACTIVE_STREAMS=0
-        elif (( raw_count > 0 && raw_count <= 1000 )); then
+        elif ((raw_count > 0 && raw_count <= 1000)); then
             ACTIVE_STREAMS=$raw_count
-        elif (( raw_count > 1000 )); then
+        elif ((raw_count > 1000)); then
             log "ERROR" "Excessive stream count detected: $raw_count (capping at 1000)"
             log "ERROR" "System may be under attack or experiencing runaway processes"
-            ACTIVE_STREAMS=1000  # Cap at reasonable limit for display
+            ACTIVE_STREAMS=1000 # Cap at reasonable limit for display
         else
             ACTIVE_STREAMS=0
         fi
     fi
-    
+
     # Check if USB devices are mapped
     if [[ -f "$UDEV_RULES" ]] && [[ -s "$UDEV_RULES" ]]; then
         USB_DEVICES_MAPPED=true
     else
         USB_DEVICES_MAPPED=false
     fi
-    
+
     log "DEBUG" "State: MediaMTX=${MEDIAMTX_INSTALLED}, Running=${MEDIAMTX_RUNNING}, Streams=${ACTIVE_STREAMS}, USB=${USB_DEVICES_MAPPED}"
 }
 
@@ -573,23 +573,23 @@ execute_script() {
     local script_key="$1"
     shift
     local args=("$@")
-    
+
     if [[ ! -v "SCRIPT_PATHS[$script_key]" ]]; then
         error "Unknown script key: ${script_key}"
         LAST_ERROR="Script not found: ${script_key}"
         return 1
     fi
-    
+
     local script_path="${SCRIPT_PATHS[$script_key]}"
     local script_name
     script_name="$(basename "$script_path")"
-    
+
     # Verify script integrity before execution (TOCTOU protection)
     if [[ -v "SCRIPT_CHECKSUMS[$script_key]" ]] && command_exists sha256sum; then
         local expected="${SCRIPT_CHECKSUMS[$script_key]}"
         local actual
         actual="$(sha256sum "$script_path" 2>/dev/null | awk '{print $1}')"
-        
+
         if [[ "$actual" != "$expected" ]]; then
             error "SECURITY: Script modified since validation"
             log "ERROR" "Integrity check failed: $script_path"
@@ -599,30 +599,30 @@ execute_script() {
             return 1
         fi
     fi
-    
+
     log "INFO" "Executing: ${script_name} ${args[*]}"
-    
+
     # Drop privileges when calling updater to avoid root warning
     # The updater should run as the original user, not root
     if [[ "$script_key" == "updater" ]] && [[ -n "${SUDO_USER:-}" ]] && [[ "${SUDO_USER}" != "root" ]]; then
         log "DEBUG" "Dropping privileges to user ${SUDO_USER} for updater execution"
-        
+
         # Validate SUDO_USER is a real system user
         if ! id "$SUDO_USER" >/dev/null 2>&1; then
             error "Invalid SUDO_USER: $SUDO_USER - refusing to drop privileges"
             LAST_ERROR="Invalid SUDO_USER: $SUDO_USER"
             return 1
         fi
-        
+
         # Determine user's home directory safely without eval
         local user_home
-        user_home="$(getent passwd "$SUDO_USER" 2>/dev/null | cut -d: -f6)" || \
-        user_home="$(cd ~"$SUDO_USER" 2>/dev/null && pwd)" || {
+        user_home="$(getent passwd "$SUDO_USER" 2>/dev/null | cut -d: -f6)" \
+            || user_home="$(cd ~"$SUDO_USER" 2>/dev/null && pwd)" || {
             error "Cannot determine home for $SUDO_USER"
             LAST_ERROR="Cannot determine home for $SUDO_USER"
             return 1
         }
-        
+
         # Execute with privilege drop, tracking child PID for signal handling
         sudo -u "$SUDO_USER" env -i \
             HOME="$user_home" \
@@ -630,9 +630,9 @@ execute_script() {
             LOGNAME="$SUDO_USER" \
             USER="$SUDO_USER" \
             "${script_path}" "${args[@]}" &
-        
+
         CHILD_PID=$!
-        
+
         if wait $CHILD_PID; then
             CHILD_PID=""
             log "INFO" "${script_name} completed successfully (privilege-dropped)"
@@ -646,18 +646,18 @@ execute_script() {
             return 1
         fi
     fi
-    
+
     # Special handling for diagnostics script with child process tracking
     # Diagnostics uses exit codes: 0=success, 1=warnings, 2=failures
     # We should NOT show error messages for warnings (exit code 1)
     if [[ "$script_key" == "diagnostics" ]]; then
         "${script_path}" "${args[@]}" &
         CHILD_PID=$!
-        
+
         wait $CHILD_PID
         local exit_code=$?
         CHILD_PID=""
-        
+
         case ${exit_code} in
             "${E_DIAG_SUCCESS}")
                 log "INFO" "${script_name} completed successfully (all checks passed)"
@@ -679,11 +679,11 @@ execute_script() {
                 ;;
         esac
     fi
-    
+
     # All other scripts execute as root with child process tracking
     "${script_path}" "${args[@]}" &
     CHILD_PID=$!
-    
+
     if wait $CHILD_PID; then
         CHILD_PID=""
         log "INFO" "${script_name} completed successfully"
@@ -704,11 +704,11 @@ execute_script() {
 
 display_header() {
     local clear_screen="${1:-}"
-    
+
     if [[ "$clear_screen" == "clear" ]]; then
         clear
     fi
-    
+
     echo "================================================================"
     echo " LyreBirdAudio - Orchestrator v${SCRIPT_VERSION}"
     echo "================================================================"
@@ -743,22 +743,22 @@ display_error() {
 get_primary_ip() {
     # Try to get primary IP address
     local primary_ip
-    
+
     # Try ip command first
     if command_exists ip; then
         primary_ip=$(ip -4 route get 1.1.1.1 2>/dev/null | grep -oP 'src \K\S+' || echo "")
     fi
-    
+
     # Fallback to hostname command
     if [[ -z "$primary_ip" ]] && command_exists hostname; then
         primary_ip=$(hostname -I 2>/dev/null | awk '{print $1}')
     fi
-    
+
     # Final fallback
     if [[ -z "$primary_ip" ]]; then
         primary_ip="<server-ip>"
     fi
-    
+
     echo "$primary_ip"
 }
 
@@ -773,7 +773,7 @@ menu_main() {
         echo
         display_status
         display_error
-        
+
         echo -e "${BOLD}Menu Options:${NC}"
         echo "  1) Quick Setup Wizard"
         echo "  2) MediaMTX Installation & Updates"
@@ -784,7 +784,7 @@ menu_main() {
         echo "  7) Logs & Status"
         echo "  0) Exit"
         echo
-        
+
         # Check read status for EOF or error (stdin closed)
         if ! read -rp "Select option: " choice; then
             echo
@@ -792,10 +792,10 @@ menu_main() {
             log "INFO" "Main menu exited due to EOF"
             exit 0
         fi
-        
+
         # Normalize input (remove whitespace)
         choice="${choice//[[:space:]]/}"
-        
+
         case "$choice" in
             1) menu_quick_setup ;;
             2) menu_mediamtx ;;
@@ -804,7 +804,7 @@ menu_main() {
             5) menu_diagnostics ;;
             6) menu_versions ;;
             7) menu_logs_status ;;
-            0) 
+            0)
                 echo
                 info "Exiting orchestrator"
                 log "INFO" "Orchestrator exited normally"
@@ -815,7 +815,7 @@ menu_main() {
                 sleep 1
                 ;;
         esac
-        
+
         # Clear last error after each menu cycle
         LAST_ERROR=""
     done
@@ -831,7 +831,7 @@ menu_quick_setup() {
     echo "  3. Start audio streaming"
     echo "  4. Run quick diagnostics"
     echo
-    
+
     # Handle EOF / stdin closed
     if ! read -rp "Continue with quick setup? (y/n): " -n 1; then
         echo
@@ -839,12 +839,12 @@ menu_quick_setup() {
         log "INFO" "Quick setup aborted due to EOF"
         return
     fi
-    flush_stdin  # Consume trailing newline from -n 1 read
+    flush_stdin # Consume trailing newline from -n 1 read
     echo
     if [[ ! "$REPLY" =~ ^[Yy]$ ]]; then
         return
     fi
-    
+
     # Step 1: Install MediaMTX
     echo
     echo -e "${BOLD}Step 1/4: Installing MediaMTX...${NC}"
@@ -858,9 +858,9 @@ menu_quick_setup() {
         refresh_system_state
         return
     fi
-    
+
     refresh_system_state
-    
+
     # Step 2: Map USB devices
     echo
     echo -e "${BOLD}Step 2/4: Mapping USB audio devices...${NC}"
@@ -868,7 +868,7 @@ menu_quick_setup() {
     info "The USB mapper will open in interactive mode"
     info "Follow the prompts to map your audio devices"
     echo
-    
+
     # Handle EOF / stdin closed
     if ! read -rp "Continue? (y/n): " -n 1; then
         echo
@@ -877,7 +877,7 @@ menu_quick_setup() {
         refresh_system_state
         return
     fi
-    flush_stdin  # CRITICAL: Consume trailing newline before usb_mapper reads stdin
+    flush_stdin # CRITICAL: Consume trailing newline before usb_mapper reads stdin
 
     if execute_script "usb_mapper"; then
         success "USB devices mapped successfully"
@@ -885,26 +885,26 @@ menu_quick_setup() {
         warning "USB mapping incomplete or skipped"
         info "You can map devices later from: Main Menu -> USB Device Management"
     fi
-    
+
     refresh_system_state
-    
+
     echo
     info "USB devices are now mapped to stable /dev/snd/by-usb-port/ paths"
     info "A reboot is recommended for udev rules to take full effect"
     echo
-    
+
     # Handle EOF / stdin closed
     if ! read -rp "Reboot now? (y/n): " -n 1; then
         echo
         info "Input stream closed - continuing without reboot"
         log "INFO" "Reboot prompt aborted due to EOF"
     else
-        flush_stdin  # Consume trailing newline from -n 1 read
+        flush_stdin # Consume trailing newline from -n 1 read
         echo
         if [[ "$REPLY" =~ ^[Yy]$ ]]; then
             info "System will reboot now. Run this script again after reboot to continue setup."
             sleep 2
-            /sbin/reboot  # Use absolute path for security
+            /sbin/reboot # Use absolute path for security
             exit 0
         fi
     fi
@@ -913,7 +913,7 @@ menu_quick_setup() {
     info "Continuing setup without reboot..."
     info "Note: If streams fail to start, a reboot may be required"
     echo
-    
+
     # Handle EOF / stdin closed
     if ! read -rp "Continue? (y/n): " -n 1; then
         echo
@@ -921,7 +921,7 @@ menu_quick_setup() {
         log "INFO" "Setup continuation aborted due to EOF"
         return
     fi
-    flush_stdin  # Consume trailing newline from -n 1 read
+    flush_stdin # Consume trailing newline from -n 1 read
     echo
     if [[ ! "$REPLY" =~ ^[Yy]$ ]]; then
         return
@@ -944,16 +944,16 @@ menu_quick_setup() {
         info "  * Check stream status: Streaming Control -> View Status"
         info "  * Run diagnostics: System Diagnostics -> Full Diagnostics"
     fi
-    
+
     # Step 4: Quick diagnostics
     echo
     echo -e "${BOLD}Step 4/4: Running quick diagnostics...${NC}"
     echo
-    
+
     # Handle diagnostics exit codes properly (0=success, 1=warnings, 2=failures)
     local diag_result=0
     execute_script "diagnostics" "quick" || diag_result=$?
-    
+
     case ${diag_result} in
         "${E_DIAG_SUCCESS}")
             success "Quick diagnostics completed - all checks passed"
@@ -970,12 +970,12 @@ menu_quick_setup() {
             error "Diagnostics failed unexpectedly"
             ;;
     esac
-    
+
     echo
     success "Quick setup complete!"
     echo
-    
-    if [[ "$MEDIAMTX_RUNNING" == "true" ]] && (( ACTIVE_STREAMS > 0 )); then
+
+    if [[ "$MEDIAMTX_RUNNING" == "true" ]] && ((ACTIVE_STREAMS > 0)); then
         echo "+ Your RTSP streams are now available!"
         echo
         info "Stream URLs follow this format:"
@@ -989,10 +989,10 @@ menu_quick_setup() {
         info "Your system may require a reboot before streams become available."
         info "After reboot, start streams from: Main Menu -> Audio Streaming Control"
     fi
-    
+
     echo
     pause
-    
+
     refresh_system_state
 }
 
@@ -1003,7 +1003,7 @@ menu_mediamtx() {
         echo
         display_status
         display_error
-        
+
         echo -e "${BOLD}Installation Options:${NC}"
         echo "  1) Install MediaMTX (Fresh Install)"
         echo "  2) Update MediaMTX"
@@ -1012,7 +1012,7 @@ menu_mediamtx() {
         echo "  5) Check Installation Status"
         echo "  0) Back to Main Menu"
         echo
-        
+
         # Check read status for EOF or error (stdin closed)
         if ! read -rp "Select option: " choice; then
             echo
@@ -1020,10 +1020,10 @@ menu_mediamtx() {
             log "INFO" "MediaMTX menu exited due to EOF"
             return
         fi
-        
+
         # Normalize input (remove whitespace)
         choice="${choice//[[:space:]]/}"
-        
+
         case "$choice" in
             1)
                 echo
@@ -1052,7 +1052,7 @@ menu_mediamtx() {
                     pause
                     continue
                 fi
-                flush_stdin  # Consume trailing newline from -n 1 read
+                flush_stdin # Consume trailing newline from -n 1 read
                 echo
                 if [[ "$REPLY" =~ ^[Yy]$ ]]; then
                     # Use -f (force) flag with install to reinstall
@@ -1073,7 +1073,7 @@ menu_mediamtx() {
                     pause
                     continue
                 fi
-                flush_stdin  # Consume trailing newline from -n 1 read
+                flush_stdin # Consume trailing newline from -n 1 read
                 echo
                 if [[ "$REPLY" =~ ^[Yy]$ ]]; then
                     execute_script "installer" uninstall || true
@@ -1120,7 +1120,7 @@ menu_usb_devices() {
         echo
         display_status
         display_error
-        
+
         echo -e "${BOLD}USB Device Options:${NC}"
         echo "  1) Map USB Audio Devices (Interactive)"
         echo "  2) Test Device Mapping (Dry-run)"
@@ -1132,7 +1132,7 @@ menu_usb_devices() {
         echo "  8) Reload udev Rules"
         echo "  0) Back to Main Menu"
         echo
-        
+
         # Check read status for EOF or error (stdin closed)
         if ! read -rp "Select option: " choice; then
             echo
@@ -1140,10 +1140,10 @@ menu_usb_devices() {
             log "INFO" "USB device menu exited due to EOF"
             return
         fi
-        
+
         # Normalize input (remove whitespace)
         choice="${choice//[[:space:]]/}"
-        
+
         case "$choice" in
             1)
                 echo
@@ -1187,16 +1187,16 @@ menu_usb_devices() {
                 echo "  2) Show specific device capabilities"
                 echo "  0) Cancel"
                 echo
-                
+
                 if ! read -rp "Select operation: " cap_choice; then
                     echo
                     warning "Input stream closed - operation cancelled"
                     pause
                     continue
                 fi
-                
+
                 cap_choice="${cap_choice//[[:space:]]/}"
-                
+
                 case "$cap_choice" in
                     1)
                         echo
@@ -1214,10 +1214,10 @@ menu_usb_devices() {
                             pause
                             continue
                         fi
-                        
+
                         # Sanitize and validate input
                         card_num="${card_num//[[:space:]]/}"
-                        
+
                         if [[ "$card_num" =~ ^[0-9]+$ ]]; then
                             echo
                             echo "Capabilities for card $card_num:"
@@ -1229,8 +1229,7 @@ menu_usb_devices() {
                         fi
                         pause
                         ;;
-                    0)
-                        ;;
+                    0) ;;
                     *)
                         error "Invalid operation"
                         sleep 1
@@ -1249,24 +1248,24 @@ menu_usb_devices() {
                 echo "  normal - Balanced quality (128-256k bitrate, 48kHz preferred)"
                 echo "  high   - Maximum quality (160-320k bitrate, 96-192kHz if supported)"
                 echo
-                
+
                 if ! read -rp "Select quality tier (low/normal/high) [normal]: " quality; then
                     echo
                     warning "Input stream closed - operation cancelled"
                     pause
                     continue
                 fi
-                
+
                 quality="${quality:-normal}"
-                
+
                 if [[ ! "$quality" =~ ^(low|normal|high)$ ]]; then
                     error "Invalid quality tier: $quality"
                     pause
                     continue
                 fi
-                
+
                 echo
-                
+
                 # Check if config exists
                 local config_file="/etc/mediamtx/audio-devices.conf"
                 if [[ -f "$config_file" ]]; then
@@ -1278,14 +1277,14 @@ menu_usb_devices() {
                         pause
                         continue
                     fi
-                    flush_stdin  # Consume trailing newline from -n 1 read
+                    flush_stdin # Consume trailing newline from -n 1 read
                     echo
                     if [[ ! "$REPLY" =~ ^[Yy]$ ]]; then
                         info "Operation cancelled"
                         pause
                         continue
                     fi
-                    
+
                     # User confirmed overwrite - use force flag
                     echo
                     info "Generating configuration with $quality quality (overwrite mode)..."
@@ -1310,7 +1309,7 @@ menu_usb_devices() {
                         error "Failed to generate configuration"
                     fi
                 fi
-                
+
                 echo
                 pause
                 ;;
@@ -1339,13 +1338,13 @@ menu_usb_devices() {
                     pause
                     continue
                 fi
-                flush_stdin  # Consume trailing newline from -n 1 read
+                flush_stdin # Consume trailing newline from -n 1 read
                 echo
                 if [[ "$REPLY" =~ ^[Yy]$ ]]; then
                     if [[ -f "$UDEV_RULES" ]]; then
-                        if rm -f "$UDEV_RULES" && \
-                           udevadm control --reload-rules && \
-                           udevadm trigger; then
+                        if rm -f "$UDEV_RULES" \
+                            && udevadm control --reload-rules \
+                            && udevadm trigger; then
                             success "Device mappings removed"
                             refresh_system_state
                         else
@@ -1388,7 +1387,7 @@ menu_streaming() {
         echo
         display_status
         display_error
-        
+
         echo -e "${BOLD}Streaming Options:${NC}"
         echo "  1) Start All Streams"
         echo "  2) Stop All Streams"
@@ -1398,7 +1397,7 @@ menu_streaming() {
         echo "  6) Monitor Stream Health"
         echo "  0) Back to Main Menu"
         echo
-        
+
         # Check read status for EOF or error (stdin closed)
         if ! read -rp "Select option: " choice; then
             echo
@@ -1406,10 +1405,10 @@ menu_streaming() {
             log "INFO" "Streaming control menu exited due to EOF"
             return
         fi
-        
+
         # Normalize input (remove whitespace)
         choice="${choice//[[:space:]]/}"
-        
+
         case "$choice" in
             1)
                 echo
@@ -1430,7 +1429,7 @@ menu_streaming() {
                     pause
                     continue
                 fi
-                flush_stdin  # Consume trailing newline from -n 1 read
+                flush_stdin # Consume trailing newline from -n 1 read
                 echo
                 if [[ "$REPLY" =~ ^[Yy]$ ]]; then
                     echo
@@ -1500,7 +1499,7 @@ menu_diagnostics() {
         echo
         display_status
         display_error
-        
+
         echo -e "${BOLD}Diagnostic Options:${NC}"
         echo "  1) Quick Diagnostics (Fast)"
         echo "  2) Full System Diagnostics"
@@ -1508,7 +1507,7 @@ menu_diagnostics() {
         echo "  4) Export Diagnostic Report"
         echo "  0) Back to Main Menu"
         echo
-        
+
         # Check read status for EOF or error (stdin closed)
         if ! read -rp "Select option: " choice; then
             echo
@@ -1516,20 +1515,20 @@ menu_diagnostics() {
             log "INFO" "Diagnostics menu exited due to EOF"
             return
         fi
-        
+
         # Normalize input (remove whitespace)
         choice="${choice//[[:space:]]/}"
-        
+
         case "$choice" in
             1)
                 echo
                 echo "Running quick diagnostics..."
                 echo "================================================================"
-                
+
                 # Handle diagnostics exit codes properly (0=success, 1=warnings, 2=failures)
                 local diag_result=0
                 execute_script "diagnostics" "quick" || diag_result=$?
-                
+
                 case ${diag_result} in
                     "${E_DIAG_SUCCESS}")
                         success "Quick diagnostics completed - all checks passed"
@@ -1541,7 +1540,7 @@ menu_diagnostics() {
                         error "Quick diagnostics detected failures"
                         ;;
                 esac
-                
+
                 echo "================================================================"
                 pause
                 ;;
@@ -1549,10 +1548,10 @@ menu_diagnostics() {
                 echo
                 echo "Running full system diagnostics..."
                 echo "================================================================"
-                
+
                 local diag_result=0
                 execute_script "diagnostics" || diag_result=$?
-                
+
                 case ${diag_result} in
                     "${E_DIAG_SUCCESS}")
                         success "Full diagnostics completed - all checks passed"
@@ -1564,7 +1563,7 @@ menu_diagnostics() {
                         error "Full diagnostics detected failures"
                         ;;
                 esac
-                
+
                 echo "================================================================"
                 pause
                 ;;
@@ -1572,10 +1571,10 @@ menu_diagnostics() {
                 echo
                 echo "Running verbose diagnostics..."
                 echo "================================================================"
-                
+
                 local diag_result=0
                 execute_script "diagnostics" "verbose" || diag_result=$?
-                
+
                 case ${diag_result} in
                     "${E_DIAG_SUCCESS}")
                         success "Verbose diagnostics completed - all checks passed"
@@ -1587,7 +1586,7 @@ menu_diagnostics() {
                         error "Verbose diagnostics detected failures"
                         ;;
                 esac
-                
+
                 echo "================================================================"
                 pause
                 ;;
@@ -1611,7 +1610,7 @@ menu_diagnostics() {
                     echo "Host: $(hostname)"
                     echo "================================================================"
                     echo
-                } > "${export_file}"
+                } >"${export_file}"
 
                 # Run full diagnostics, capturing output
                 local diag_result=0
@@ -1652,20 +1651,20 @@ menu_versions() {
         echo
         display_status
         display_error
-        
+
         echo -e "${BOLD}Version Options:${NC}"
         echo "  1) Launch Update Manager (Interactive)"
         echo "  2) Show Component Versions"
         echo "  0) Back to Main Menu"
         echo
-        
+
         info "The update manager provides:"
         info "  * Interactive update workflow with safety checks"
         info "  * Automatic backup and rollback capability"
         info "  * Component-by-component update selection"
         info "  * Git repository integration for updates"
         echo
-        
+
         # Check read status for EOF or error (stdin closed)
         if ! read -rp "Select option: " choice; then
             echo
@@ -1673,10 +1672,10 @@ menu_versions() {
             log "INFO" "Version management menu exited due to EOF"
             return
         fi
-        
+
         # Normalize input (remove whitespace)
         choice="${choice//[[:space:]]/}"
-        
+
         case "$choice" in
             1)
                 echo
@@ -1693,7 +1692,7 @@ menu_versions() {
                 echo "================================================================"
                 echo "Orchestrator:  ${SCRIPT_VERSION}"
                 echo
-                
+
                 for key in "${!SCRIPT_PATHS[@]}"; do
                     local script_path="${SCRIPT_PATHS[$key]}"
                     local script_name
@@ -1702,7 +1701,7 @@ menu_versions() {
                     version="$(extract_script_version "$script_path")"
                     printf "%-25s %s\n" "${script_name}:" "${version}"
                 done
-                
+
                 echo
                 if [[ "$MEDIAMTX_INSTALLED" == "true" ]]; then
                     echo "MediaMTX:      ${MEDIAMTX_VERSION}"
@@ -1730,7 +1729,7 @@ menu_logs_status() {
         echo
         display_status
         display_error
-        
+
         echo -e "${BOLD}View Options:${NC}"
         echo "  1) View MediaMTX Log (Last 50 lines)"
         echo "  2) View Orchestrator Log"
@@ -1739,7 +1738,7 @@ menu_logs_status() {
         echo "  5) Quick System Health Check"
         echo "  0) Back to Main Menu"
         echo
-        
+
         # Check read status for EOF or error (stdin closed)
         if ! read -rp "Select option: " choice; then
             echo
@@ -1747,10 +1746,10 @@ menu_logs_status() {
             log "INFO" "Logs & status menu exited due to EOF"
             return
         fi
-        
+
         # Normalize input (remove whitespace)
         choice="${choice//[[:space:]]/}"
-        
+
         case "$choice" in
             1)
                 echo
@@ -1823,11 +1822,11 @@ menu_logs_status() {
                 echo
                 info "Running quick diagnostic summary..."
                 echo "================================================================"
-                
+
                 # Handle diagnostics exit codes properly (0=success, 1=warnings, 2=failures)
                 local diag_result=0
                 execute_script "diagnostics" "quick" || diag_result=$?
-                
+
                 case ${diag_result} in
                     "${E_DIAG_SUCCESS}")
                         success "System health check passed"
@@ -1841,7 +1840,7 @@ menu_logs_status() {
                         info "Run full diagnostics for details: Main Menu -> System Diagnostics"
                         ;;
                 esac
-                
+
                 echo "================================================================"
                 pause
                 ;;
@@ -1861,7 +1860,7 @@ menu_logs_status() {
 # ============================================================================
 
 show_help() {
-    cat << 'EOF'
+    cat <<'EOF'
 LyreBirdAudio Orchestrator - Unified Management Interface
 
 Usage: sudo ./lyrebird-orchestrator.sh [OPTIONS]
@@ -1900,10 +1899,10 @@ show_version() {
 main() {
     # Handle command line arguments before root check
     case "${1:-}" in
-        -h|--help)
+        -h | --help)
             show_help
             ;;
-        -v|--version)
+        -v | --version)
             show_version
             ;;
         "")
@@ -1920,45 +1919,45 @@ main() {
     check_root
     check_terminal
     check_dependencies
-    
+
     # Setup cleanup handler for graceful termination
     cleanup() {
         log "INFO" "Orchestrator terminated by signal"
-        
+
         # Terminate child process if running
         if [[ -n "${CHILD_PID:-}" ]]; then
             log "INFO" "Terminating child process: $CHILD_PID"
-            
+
             # Try graceful termination first
             kill -TERM "$CHILD_PID" 2>/dev/null || true
-            
+
             # Wait briefly for graceful shutdown
             sleep 1
-            
+
             # Force kill if still running
             if kill -0 "$CHILD_PID" 2>/dev/null; then
                 log "WARN" "Child process did not terminate gracefully, forcing"
                 kill -KILL "$CHILD_PID" 2>/dev/null || true
             fi
-            
+
             CHILD_PID=""
         fi
-        
+
         # Remove temp files if any
         if [[ -n "${LOG_FILE:-}" && "$LOG_FILE" == /tmp/* && -f "$LOG_FILE" ]]; then
             rm -f "$LOG_FILE"
         fi
     }
     trap cleanup EXIT SIGINT SIGTERM
-    
+
     # Initialize logging with rotation and security
     initialize_logging
-    
+
     # Find and validate external scripts
     if ! find_external_scripts; then
         exit ${E_SCRIPT_NOT_FOUND}
     fi
-    
+
     # Log detected versions
     log "INFO" "=== Detected Script Versions ==="
     for key in "${!SCRIPT_PATHS[@]}"; do
@@ -1970,15 +1969,15 @@ main() {
         log "INFO" "${script_name}: ${detected_version}"
     done
     log "INFO" "=== End Version Detection ==="
-    
+
     # Validate script versions (warnings logged, non-blocking)
     if ! validate_script_versions; then
         log "WARN" "Version detection completed with warnings (non-blocking)"
     fi
-    
+
     # Initial system state detection
     refresh_system_state
-    
+
     # Start main menu
     menu_main
 }

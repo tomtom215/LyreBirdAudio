@@ -66,7 +66,7 @@ readonly _LYREBIRD_COMMON_LOADED=true
 #=============================================================================
 
 # Require Bash 4.0+ for associative arrays
-if (( BASH_VERSINFO[0] < 4 )); then
+if ((BASH_VERSINFO[0] < 4)); then
     echo "ERROR: lyrebird-common.sh requires Bash 4.0+ (found: ${BASH_VERSION})" >&2
     return 1 2>/dev/null || exit 1
 fi
@@ -264,7 +264,7 @@ _lyrebird_log_to_file() {
     log_dir="$(dirname "${LOG_FILE}" 2>/dev/null)" || return 0
 
     if [[ -w "${LOG_FILE}" ]] || [[ -w "${log_dir}" ]]; then
-        echo "[$(lyrebird_timestamp)] [${level}] ${message}" >> "${LOG_FILE}" 2>/dev/null || true
+        echo "[$(lyrebird_timestamp)] [${level}] ${message}" >>"${LOG_FILE}" 2>/dev/null || true
     fi
 }
 
@@ -324,7 +324,7 @@ if ! declare -f log &>/dev/null; then
             INFO)
                 log_info "$message"
                 ;;
-            WARN|WARNING)
+            WARN | WARNING)
                 log_warn "$message"
                 ;;
             ERROR)
@@ -460,7 +460,7 @@ if ! declare -f get_file_size &>/dev/null; then
         fi
 
         # Fallback: wc (always works)
-        wc -c < "${filepath}" 2>/dev/null | tr -d ' ' || echo 0
+        wc -c <"${filepath}" 2>/dev/null | tr -d ' ' || echo 0
     }
 fi
 
