@@ -4,7 +4,7 @@ This document records significant architectural decisions made during the develo
 
 ## ADR-001: Bash as Primary Implementation Language
 
-**Date**: 2024
+**Date**: April 2025
 **Status**: Accepted
 
 ### Context
@@ -30,7 +30,7 @@ Use Bash (4.0+) as the primary implementation language for all scripts.
 
 ## ADR-002: MediaMTX as RTSP Server
 
-**Date**: 2024
+**Date**: April 2025
 **Status**: Accepted
 
 ### Context
@@ -55,7 +55,7 @@ Use MediaMTX (formerly rtsp-simple-server) as the RTSP streaming server.
 
 ## ADR-003: FFmpeg for Audio Transcoding
 
-**Date**: 2024
+**Date**: April 2025
 **Status**: Accepted
 
 ### Context
@@ -79,7 +79,7 @@ Use FFmpeg as the audio capture and transcoding pipeline.
 
 ## ADR-004: Shared Library Pattern (lyrebird-common.sh)
 
-**Date**: 2024
+**Date**: April 2025
 **Status**: Accepted
 
 ### Context
@@ -103,7 +103,7 @@ Create a shared library (`lyrebird-common.sh`) that scripts can source.
 
 ## ADR-005: Atomic File Operations
 
-**Date**: 2024
+**Date**: April 2025
 **Status**: Accepted
 
 ### Context
@@ -126,7 +126,7 @@ Use atomic file operations: write to `.tmp` file, then `mv` to final location.
 
 ## ADR-006: USB Device Persistence via udev
 
-**Date**: 2024
+**Date**: April 2025
 **Status**: Accepted
 
 ### Context
@@ -149,7 +149,7 @@ Use udev rules to create persistent symlinks based on USB topology (bus/port pat
 
 ## ADR-007: Webhook-Based Alerting
 
-**Date**: 2024
+**Date**: April 2025
 **Status**: Accepted
 
 ### Context
@@ -173,7 +173,7 @@ Implement webhook-based alerting with support for Discord, Slack, Pushover, and 
 
 ## ADR-008: Prometheus Metrics Format
 
-**Date**: 2024
+**Date**: April 2025
 **Status**: Accepted
 
 ### Context
@@ -197,7 +197,7 @@ Export metrics in Prometheus/OpenMetrics text format.
 
 ## ADR-009: Lockfile-Based Concurrency Control
 
-**Date**: 2024
+**Date**: April 2025
 **Status**: Accepted
 
 ### Context
@@ -220,7 +220,7 @@ Use lockfiles with timeout and stale lock detection.
 
 ## ADR-010: Signal Handler Pattern
 
-**Date**: 2024
+**Date**: April 2025
 **Status**: Accepted
 
 ### Context

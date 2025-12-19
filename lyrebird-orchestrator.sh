@@ -252,11 +252,11 @@ log() {
 
 # Output functions with consistent formatting
 success() {
-    echo -e "${GREEN}✓${NC} $*"
+    echo -e "${GREEN}[OK]${NC} $*"
 }
 
 error() {
-    echo -e "${RED}✗${NC} $*"
+    echo -e "${RED}[ERROR]${NC} $*"
 }
 
 warning() {
@@ -264,7 +264,7 @@ warning() {
 }
 
 info() {
-    echo -e "${CYAN}→${NC} $*"
+    echo -e "${CYAN}[INFO]${NC} $*"
 }
 
 pause() {

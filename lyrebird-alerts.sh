@@ -149,16 +149,7 @@ declare -A ALERT_COLORS=(
     [critical]=15548997 # Red
 )
 
-# Emoji for each level (with text fallbacks for non-Unicode terminals)
-# Set LYREBIRD_ALERT_NO_EMOJI=true to use text-only prefixes
-declare -A ALERT_EMOJI=(
-    [info]="ℹ️"
-    [warning]="⚠️"
-    [error]="❌"
-    [critical]="🚨"
-)
-
-# Text fallback prefixes (used when LYREBIRD_ALERT_NO_EMOJI=true)
+# Text prefixes for each alert level
 declare -A ALERT_PREFIX=(
     [info]="[INFO]"
     [warning]="[WARN]"
@@ -166,14 +157,10 @@ declare -A ALERT_PREFIX=(
     [critical]="[CRITICAL]"
 )
 
-# Get appropriate alert prefix (emoji or text)
+# Get alert prefix for level
 get_alert_prefix() {
     local level="$1"
-    if [[ "${LYREBIRD_ALERT_NO_EMOJI:-false}" == "true" ]]; then
-        echo "${ALERT_PREFIX[$level]:-[INFO]}"
-    else
-        echo "${ALERT_EMOJI[$level]:-ℹ️}"
-    fi
+    echo "${ALERT_PREFIX[$level]:-[INFO]}"
 }
 
 #=============================================================================

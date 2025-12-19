@@ -680,9 +680,9 @@ if ! declare -f lyrebird_with_spinner &>/dev/null; then
         "$@" || exit_code=$?
 
         if ((exit_code == 0)); then
-            lyrebird_spinner_stop "✓ ${message} - Done"
+            lyrebird_spinner_stop "[OK] ${message} - Done"
         else
-            lyrebird_spinner_stop "✗ ${message} - Failed"
+            lyrebird_spinner_stop "[FAIL] ${message} - Failed"
         fi
 
         return "$exit_code"

@@ -64,7 +64,7 @@ brew install shellcheck bats-core
 ```bash
 # Check all scripts pass syntax validation
 for script in *.sh; do
-    bash -n "$script" && echo "✓ $script"
+    bash -n "$script" && echo "[OK] $script"
 done
 
 # Run ShellCheck on all scripts
