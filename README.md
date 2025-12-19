@@ -1433,6 +1433,7 @@ This modular design prevents duplicate business logic and ensures maintainabilit
 | install_mediamtx.sh | 2.0.1 | MediaMTX installation/upgrade |
 | lyrebird-metrics.sh | 1.0.0 | Prometheus metrics export |
 | lyrebird-storage.sh | 1.0.0 | Storage management & cleanup |
+| lyrebird-alerts.sh | 1.0.0 | Webhook alerting system |
 
 ### Configuration Files
 
