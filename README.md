@@ -1426,11 +1426,22 @@ This modular design prevents duplicate business logic and ensures maintainabilit
 |--------|---------|---------|
 | lyrebird-orchestrator.sh | 2.1.2 | Unified management interface |
 | lyrebird-updater.sh | 1.5.1 | Version management with rollback |
-| mediamtx-stream-manager.sh | 1.4.1 | Stream lifecycle management |
+| mediamtx-stream-manager.sh | 1.4.2 | Stream lifecycle management |
 | usb-audio-mapper.sh | 1.2.1 | USB device persistence via udev |
 | lyrebird-mic-check.sh | 1.0.0 | Hardware capability detection |
 | lyrebird-diagnostics.sh | 1.0.2 | System diagnostics |
 | install_mediamtx.sh | 2.0.1 | MediaMTX installation/upgrade |
+| lyrebird-metrics.sh | 1.0.0 | Prometheus metrics export |
+| lyrebird-storage.sh | 1.0.0 | Storage management & cleanup |
+
+### Configuration Files
+
+| File | Purpose |
+|------|---------|
+| `config/mediamtx.service` | systemd service for MediaMTX |
+| `config/mediamtx-audio.service` | systemd service for stream manager (with watchdog) |
+| `config/lyrebird-logrotate.conf` | Log rotation configuration |
+| `docs/SECURITY.md` | Security configuration guide (optional features) |
 
 ### Orchestrator (lyrebird-orchestrator.sh)
 
