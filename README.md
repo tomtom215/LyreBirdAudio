@@ -32,6 +32,8 @@ If you are using it in a cool or interesting way or at a large scale, please tel
 - [Architecture & Design](#architecture--design)
 - [Component Reference](#component-reference)
 - [Advanced Topics](#advanced-topics)
+- [Security Hardening](#security-hardening)
+- [Recovery Procedures](#recovery-procedures)
 - [Uninstallation & Cleanup](#uninstallation--cleanup)
 - [Development & Contributing](#development--contributing)
 - [License & Credits](#license--credits)
@@ -1929,6 +1931,160 @@ sudo ./usb-audio-mapper.sh --test
 
 ---
 
+## Security Hardening
+
+### Default Security Posture
+
+LyreBirdAudio is designed with security in mind:
+
+- **No Hardcoded Credentials**: All authentication is delegated to MediaMTX
+- **Restrictive Permissions**: Configuration files are mode 640, state directories 750
+- **Service User Isolation**: MediaMTX runs as dedicated `mediamtx` user
+- **systemd Hardening**: NoNewPrivileges, PrivateTmp, ProtectSystem enabled
+- **Input Validation**: All user inputs are sanitized to prevent injection
+- **Safe Temporary Files**: Uses `mktemp` for secure temp file creation
+- **Download Verification**: SHA256 checksums verify downloaded binaries
+
+### Network Security
+
+**Default Configuration Warning**: By default, RTSP streams are accessible without authentication. For production deployments in sensitive environments:
+
+**1. Enable MediaMTX Authentication:**
+```yaml
+# Edit /etc/mediamtx/mediamtx.yml
+authMethod: internal
+authInternalUsers:
+  - user: myuser
+    pass: mypassword
+    permissions:
+      - action: read
+        path: ""
+```
+
+**2. Firewall Configuration:**
+```bash
+# Allow only specific IPs to access streams
+sudo ufw allow from 192.168.1.0/24 to any port 8554 proto tcp
+sudo ufw allow from 192.168.1.0/24 to any port 9997 proto tcp
+
+# Or block external access entirely (local only)
+sudo ufw deny 8554
+sudo ufw deny 9997
+```
+
+**3. Bind to Specific Interface:**
+```yaml
+# In /etc/mediamtx/mediamtx.yml
+rtspAddress: 192.168.1.100:8554  # Instead of :8554 (all interfaces)
+apiAddress: 127.0.0.1:9997       # Localhost only for API
+```
+
+### Library Integrity Verification
+
+For high-security deployments, enable library checksum verification:
+
+```bash
+# Generate hash of lyrebird-common.sh
+HASH=$(sha256sum lyrebird-common.sh | cut -d' ' -f1)
+
+# Set in environment or systemd service
+export LYREBIRD_COMMON_EXPECTED_HASH="$HASH"
+
+# Now sourcing will verify integrity before loading
+sudo ./mediamtx-stream-manager.sh start
+```
+
+### Recommendations for Field Deployments
+
+1. **Use VPN**: Connect remote devices through VPN rather than exposing RTSP directly
+2. **Disable API Access**: If not needed, disable the MediaMTX API endpoint
+3. **Audit Logs Regularly**: Check `/var/log/lyrebird/mediamtx-audio.log` for anomalies
+4. **Keep Updated**: Run `lyrebird-updater.sh` monthly to get security fixes
+5. **Physical Security**: Secure physical access to prevent USB device tampering
+
+---
+
+## Recovery Procedures
+
+### Stream Not Starting
+
+**Quick Recovery:**
+```bash
+# Check service status
+sudo ./mediamtx-stream-manager.sh status
+
+# Force restart
+sudo ./mediamtx-stream-manager.sh restart
+
+# If that fails, force stop and clean start
+sudo ./mediamtx-stream-manager.sh force-stop
+sudo ./mediamtx-stream-manager.sh start
+```
+
+### Device Not Found After Reboot
+
+```bash
+# Re-scan and remap USB devices
+sudo ./usb-audio-mapper.sh --rescan
+
+# Reload udev rules
+sudo udevadm control --reload-rules
+sudo udevadm trigger
+
+# Verify device appears
+ls -la /dev/snd/by-usb-port/
+```
+
+### Complete System Recovery
+
+If the system is in an unknown state:
+
+```bash
+# 1. Stop everything
+sudo systemctl stop mediamtx-audio 2>/dev/null || true
+sudo ./mediamtx-stream-manager.sh force-stop
+
+# 2. Clean up stale files
+sudo rm -f /run/mediamtx-audio.*
+sudo rm -f /var/lib/mediamtx-ffmpeg/*.pid
+
+# 3. Verify MediaMTX installation
+sudo ./install_mediamtx.sh status
+# If corrupted: sudo ./install_mediamtx.sh update
+
+# 4. Verify device mapping
+sudo ./usb-audio-mapper.sh --test
+
+# 5. Run full diagnostics
+sudo ./lyrebird-diagnostics.sh full
+
+# 6. Fresh start
+sudo ./mediamtx-stream-manager.sh start
+```
+
+### Rollback After Failed Update
+
+```bash
+# List available versions
+./lyrebird-updater.sh --history
+
+# Rollback to previous version
+./lyrebird-updater.sh --rollback
+
+# Or rollback to specific version
+./lyrebird-updater.sh --rollback v1.3.0
+```
+
+### Emergency Field Recovery (No Internet)
+
+If you're in the field without internet access:
+
+1. **Use local backups**: Keep a USB drive with known-good configuration
+2. **Config backup location**: `/etc/mediamtx/audio-devices.conf.bak`
+3. **Restore config**: `sudo cp /etc/mediamtx/audio-devices.conf.bak /etc/mediamtx/audio-devices.conf`
+4. **Restart service**: `sudo systemctl restart mediamtx-audio`
+
+---
 
 ## Uninstallation & Cleanup
 
