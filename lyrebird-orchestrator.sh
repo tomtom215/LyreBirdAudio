@@ -8,10 +8,16 @@
 # Copyright: Tom F and LyreBirdAudio contributors
 # License: Apache 2.0
 #
-# Version: 2.1.1
+# Version: 2.1.2
 # Description: Production-grade orchestrator providing unified access to all
 #              LyreBirdAudio components with comprehensive functionality,
 #              intuitive navigation, and robust error handling.
+#
+# v2.1.2 Integration Fixes:
+#   - Fixed: MediaMTX reinstall now correctly uses '-f install' instead of
+#            non-existent 'reinstall' command
+#   - Fixed: Diagnostic export now works (was calling non-existent 'export' command)
+#   - Added: Proper diagnostic export with timestamped file output to /tmp/
 #
 # v2.1.1 UI/UX Improvements:
 #   - Fixed: Stream URLs menu option now correctly calls 'status' command
@@ -71,7 +77,7 @@ fi
 # Constants and Configuration
 # ============================================================================
 
-readonly SCRIPT_VERSION="2.1.1"
+readonly SCRIPT_VERSION="2.1.2"
 
 # Initialize constants safely (separate declaration from assignment to catch errors)
 SCRIPT_NAME=""
@@ -1041,7 +1047,8 @@ menu_mediamtx() {
                 flush_stdin  # Consume trailing newline from -n 1 read
                 echo
                 if [[ "$REPLY" =~ ^[Yy]$ ]]; then
-                    execute_script "installer" reinstall || true
+                    # Use -f (force) flag with install to reinstall
+                    execute_script "installer" -f install || true
                     echo
                     refresh_system_state
                 fi
@@ -1580,7 +1587,41 @@ menu_diagnostics() {
                 echo
                 info "Exporting diagnostic report..."
                 echo
-                execute_script "diagnostics" "export" || true
+
+                # Generate timestamped export file
+                local export_dir="/tmp"
+                local export_file="${export_dir}/lyrebird-diagnostics-$(date +%Y%m%d-%H%M%S).txt"
+
+                info "Running full diagnostics and saving to: ${export_file}"
+                echo
+
+                # Run diagnostics with output to both terminal and file
+                {
+                    echo "LyreBirdAudio Diagnostic Report"
+                    echo "Generated: $(date)"
+                    echo "Host: $(hostname)"
+                    echo "================================================================"
+                    echo
+                } > "${export_file}"
+
+                # Run full diagnostics, capturing output
+                local diag_result=0
+                "${SCRIPT_PATHS[diagnostics]}" "full" 2>&1 | tee -a "${export_file}" || diag_result=$?
+
+                echo
+                if [[ -f "${export_file}" ]]; then
+                    local file_size
+                    file_size=$(stat -c%s "${export_file}" 2>/dev/null || stat -f%z "${export_file}" 2>/dev/null || echo "unknown")
+                    success "Diagnostic report exported to: ${export_file}"
+                    info "File size: ${file_size} bytes"
+                    echo
+                    info "To share this report:"
+                    info "  cat ${export_file}"
+                    info "  or copy to another location"
+                else
+                    error "Failed to create export file"
+                fi
+
                 echo
                 pause
                 ;;
