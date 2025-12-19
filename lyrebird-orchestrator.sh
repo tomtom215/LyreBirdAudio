@@ -255,6 +255,14 @@ pause() {
     fi
 }
 
+# Flush any remaining characters from stdin buffer
+# CRITICAL: Must be called after 'read -n 1' to consume trailing newline
+# Without this, child scripts may read leftover input causing validation failures
+flush_stdin() {
+    # Read and discard any remaining input with a tiny timeout
+    read -r -t 0.001 -n 10000 _ 2>/dev/null || true
+}
+
 command_exists() {
     command -v "$1" >/dev/null 2>&1
 }
@@ -798,6 +806,7 @@ menu_quick_setup() {
         log "INFO" "Quick setup aborted due to EOF"
         return
     fi
+    flush_stdin  # Consume trailing newline from -n 1 read
     echo
     if [[ ! "$REPLY" =~ ^[Yy]$ ]]; then
         return
@@ -835,7 +844,8 @@ menu_quick_setup() {
         refresh_system_state
         return
     fi
-    
+    flush_stdin  # CRITICAL: Consume trailing newline before usb_mapper reads stdin
+
     if execute_script "usb_mapper"; then
         success "USB devices mapped successfully"
     else
@@ -856,6 +866,7 @@ menu_quick_setup() {
         info "Input stream closed - continuing without reboot"
         log "INFO" "Reboot prompt aborted due to EOF"
     else
+        flush_stdin  # Consume trailing newline from -n 1 read
         echo
         if [[ "$REPLY" =~ ^[Yy]$ ]]; then
             info "System will reboot now. Run this script again after reboot to continue setup."
@@ -864,7 +875,7 @@ menu_quick_setup() {
             exit 0
         fi
     fi
-    
+
     echo
     info "Continuing setup without reboot..."
     info "Note: If streams fail to start, a reboot may be required"
@@ -877,11 +888,12 @@ menu_quick_setup() {
         log "INFO" "Setup continuation aborted due to EOF"
         return
     fi
+    flush_stdin  # Consume trailing newline from -n 1 read
     echo
     if [[ ! "$REPLY" =~ ^[Yy]$ ]]; then
         return
     fi
-    
+
     # Step 3: Start streams
     echo
     echo -e "${BOLD}Step 3/4: Starting audio streams...${NC}"
@@ -1007,6 +1019,7 @@ menu_mediamtx() {
                     pause
                     continue
                 fi
+                flush_stdin  # Consume trailing newline from -n 1 read
                 echo
                 if [[ "$REPLY" =~ ^[Yy]$ ]]; then
                     execute_script "installer" reinstall || true
@@ -1026,6 +1039,7 @@ menu_mediamtx() {
                     pause
                     continue
                 fi
+                flush_stdin  # Consume trailing newline from -n 1 read
                 echo
                 if [[ "$REPLY" =~ ^[Yy]$ ]]; then
                     execute_script "installer" uninstall || true
@@ -1230,6 +1244,7 @@ menu_usb_devices() {
                         pause
                         continue
                     fi
+                    flush_stdin  # Consume trailing newline from -n 1 read
                     echo
                     if [[ ! "$REPLY" =~ ^[Yy]$ ]]; then
                         info "Operation cancelled"
@@ -1290,6 +1305,7 @@ menu_usb_devices() {
                     pause
                     continue
                 fi
+                flush_stdin  # Consume trailing newline from -n 1 read
                 echo
                 if [[ "$REPLY" =~ ^[Yy]$ ]]; then
                     if [[ -f "$UDEV_RULES" ]]; then
@@ -1380,6 +1396,7 @@ menu_streaming() {
                     pause
                     continue
                 fi
+                flush_stdin  # Consume trailing newline from -n 1 read
                 echo
                 if [[ "$REPLY" =~ ^[Yy]$ ]]; then
                     echo

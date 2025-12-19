@@ -1406,15 +1406,23 @@ confirm_action() {
     local prompt="$1"
     local default="${2:-N}"
     local response
-    
+
     if [[ "$default" == "Y" ]]; then
-        read -r -p "${prompt} [Y/n] " response
+        if ! read -r -p "${prompt} [Y/n] " response; then
+            # EOF - return false for safety
+            echo
+            return 1
+        fi
         response="${response:-Y}"
     else
-        read -r -p "${prompt} [y/N] " response
+        if ! read -r -p "${prompt} [y/N] " response; then
+            # EOF - return false for safety
+            echo
+            return 1
+        fi
         response="${response:-N}"
     fi
-    
+
     [[ "$response" =~ ^[Yy]$ ]]
 }
 
@@ -1422,8 +1430,12 @@ confirm_action() {
 confirm_destructive_action() {
     local prompt="$1"
     local response
-    
-    read -r -p "${prompt} " response
+
+    if ! read -r -p "${prompt} " response; then
+        # EOF - return false for safety
+        echo
+        return 1
+    fi
     [[ "$response" == "yes" ]]
 }
 

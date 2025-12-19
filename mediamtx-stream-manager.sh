@@ -360,12 +360,9 @@ verify_cleanup_complete() {
             fi
         fi
     done
-    if [[ "$nullglob_state" == "on" ]]; then
-        shopt -s nullglob
-    else
-        shopt -u nullglob
-    fi
-    
+    # Restore nullglob only if it was originally off (avoids redundant shopt -s)
+    [[ "$nullglob_state" == "off" ]] && shopt -u nullglob
+
     if [[ $stale_pids -gt 0 ]]; then
         log WARN "Cleaned $stale_pids stale PID files"
         ((issues_found++))
@@ -1507,14 +1504,10 @@ cleanup_stale_processes() {
     rm -f "${CLEANUP_MARKER}"
     rm -f "${RESTART_MARKER}"
     rm -f "${CONFIG_LOCK_FILE}"
-    
-    # Restore nullglob state correctly for both on/off
-    if [[ "$nullglob_state" == "on" ]]; then
-        shopt -s nullglob
-    else
-        shopt -u nullglob
-    fi
-    
+
+    # Restore nullglob only if it was originally off (avoids redundant shopt -s)
+    [[ "$nullglob_state" == "off" ]] && shopt -u nullglob
+
     log INFO "Cleanup completed"
 }
 
@@ -2827,14 +2820,10 @@ stop_all_ffmpeg_streams() {
             stop_ffmpeg_stream "$stream_path"
         fi
     done
-    
-    # Restore nullglob state correctly for both on/off
-    if [[ "$nullglob_state" == "on" ]]; then
-        shopt -s nullglob
-    else
-        shopt -u nullglob
-    fi
-    
+
+    # Restore nullglob only if it was originally off (avoids redundant shopt -s)
+    [[ "$nullglob_state" == "off" ]] && shopt -u nullglob
+
     pkill -f "^ffmpeg.*rtsp://${MEDIAMTX_HOST}:8554" 2>/dev/null || true
 }
 
