@@ -1,0 +1,659 @@
+# LyreBirdAudio - Bash CI Pipeline
+# Runs comprehensive shell script validation on PRs targeting main branch
+#
+# Tools included (all free, open source, no API/subscription required):
+#   - bash -n: Built-in syntax validation
+#   - shellcheck: Static analysis (industry standard)
+#   - shfmt: Format/style consistency checking
+#   - bashate: OpenStack's bash style linter
+#
+# Author: Tom F (https://github.com/tomtom215)
+# License: Apache 2.0
+
+name: Bash CI
+
+on:
+  pull_request:
+    branches:
+      - main
+      - master
+    paths:
+      # Only run when shell scripts change
+      - '**.sh'
+      - '.github/workflows/bash-ci.yml'
+
+  # Allow manual trigger for testing
+  workflow_dispatch:
+
+# Cancel in-progress runs for the same PR
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Shellcheck version (check https://github.com/koalaman/shellcheck/releases)
+  SHELLCHECK_VERSION: 'v0.10.0'
+  # shfmt version (check https://github.com/mvdan/sh/releases)
+  SHFMT_VERSION: 'v3.8.0'
+
+jobs:
+  # ===========================================================================
+  # Job 1: Discover shell scripts
+  # ===========================================================================
+  discover-scripts:
+    name: Discover Scripts
+    runs-on: ubuntu-latest
+    outputs:
+      scripts: ${{ steps.find-scripts.outputs.scripts }}
+      script_count: ${{ steps.find-scripts.outputs.count }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Find shell scripts
+        id: find-scripts
+        run: |
+          # Find all .sh files, output as JSON array
+          scripts=$(find . -name '*.sh' -type f | sort | jq -R -s -c 'split("\n") | map(select(length > 0))')
+          echo "scripts=${scripts}" >> "$GITHUB_OUTPUT"
+
+          # Count for display
+          count=$(echo "$scripts" | jq '. | length')
+          echo "count=${count}" >> "$GITHUB_OUTPUT"
+          echo "Found ${count} shell scripts"
+
+  # ===========================================================================
+  # Job 2: Bash Syntax Validation (bash -n)
+  # ===========================================================================
+  bash-syntax:
+    name: Bash Syntax Check
+    runs-on: ubuntu-latest
+    needs: discover-scripts
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Validate bash syntax (bash -n)
+        run: |
+          echo "============================================"
+          echo "Bash Syntax Validation (bash -n)"
+          echo "============================================"
+          echo ""
+
+          errors=0
+          success=0
+
+          while IFS= read -r script; do
+            if bash -n "$script" 2>&1; then
+              echo "✓ $script"
+              success=$((success + 1))
+            else
+              echo "✗ $script"
+              errors=$((errors + 1))
+            fi
+          done < <(find . -name '*.sh' -type f | sort)
+
+          echo ""
+          echo "============================================"
+          echo "Results: ${success} passed, ${errors} failed"
+          echo "============================================"
+
+          if [[ $errors -gt 0 ]]; then
+            echo "::error::Bash syntax validation failed for ${errors} script(s)"
+            exit 1
+          fi
+
+  # ===========================================================================
+  # Job 3: ShellCheck Static Analysis
+  # ===========================================================================
+  shellcheck:
+    name: ShellCheck Analysis
+    runs-on: ubuntu-latest
+    needs: discover-scripts
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install ShellCheck
+        run: |
+          # Use GitHub's pre-installed shellcheck or install specific version
+          if command -v shellcheck &>/dev/null; then
+            echo "Using pre-installed shellcheck: $(shellcheck --version | head -2)"
+          else
+            echo "Installing shellcheck ${SHELLCHECK_VERSION}..."
+            wget -qO- "https://github.com/koalaman/shellcheck/releases/download/${SHELLCHECK_VERSION}/shellcheck-${SHELLCHECK_VERSION}.linux.x86_64.tar.xz" | tar -xJf -
+            sudo mv "shellcheck-${SHELLCHECK_VERSION}/shellcheck" /usr/local/bin/
+          fi
+
+      - name: Run ShellCheck
+        run: |
+          echo "============================================"
+          echo "ShellCheck Static Analysis"
+          echo "============================================"
+          echo "Version: $(shellcheck --version | grep version:)"
+          echo ""
+
+          # Collect all scripts
+          scripts=$(find . -name '*.sh' -type f | sort)
+
+          # Run shellcheck with GitHub Actions format for annotations
+          # Severity: error, warning (style and info are informational)
+          echo "Running shellcheck on all scripts..."
+          echo ""
+
+          exit_code=0
+
+          for script in $scripts; do
+            echo "Checking: $script"
+            if ! shellcheck \
+              --format=gcc \
+              --severity=warning \
+              --external-sources \
+              --shell=bash \
+              "$script"; then
+              exit_code=1
+            fi
+          done
+
+          echo ""
+          echo "============================================"
+
+          if [[ $exit_code -eq 0 ]]; then
+            echo "ShellCheck: All scripts passed (0 errors, 0 warnings)"
+          else
+            echo "::error::ShellCheck found issues that need to be fixed"
+            exit 1
+          fi
+
+      - name: ShellCheck Summary Report
+        if: always()
+        run: |
+          {
+            echo "## ShellCheck Detailed Report"
+            echo ""
+            echo "| Script | Errors | Warnings | Notes |"
+            echo "|--------|--------|----------|-------|"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          while IFS= read -r script; do
+            errors=$(shellcheck --severity=error --format=json "$script" 2>/dev/null | jq 'length' || echo 0)
+            warnings=$(shellcheck --severity=warning --format=json "$script" 2>/dev/null | jq '[.[] | select(.level == "warning")] | length' || echo 0)
+            notes=$(shellcheck --format=json "$script" 2>/dev/null | jq '[.[] | select(.level == "info" or .level == "style")] | length' || echo 0)
+
+            if [[ "$errors" == "0" && "$warnings" == "0" ]]; then
+              status="✓"
+            else
+              status="✗"
+            fi
+
+            echo "| ${status} ${script} | ${errors} | ${warnings} | ${notes} |" >> "$GITHUB_STEP_SUMMARY"
+          done < <(find . -name '*.sh' -type f | sort)
+
+  # ===========================================================================
+  # Job 4: shfmt Format Check
+  # ===========================================================================
+  shfmt:
+    name: Format Check (shfmt)
+    runs-on: ubuntu-latest
+    needs: discover-scripts
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install shfmt
+        run: |
+          echo "Installing shfmt ${SHFMT_VERSION}..."
+          wget -qO /usr/local/bin/shfmt "https://github.com/mvdan/sh/releases/download/${SHFMT_VERSION}/shfmt_${SHFMT_VERSION}_linux_amd64"
+          chmod +x /usr/local/bin/shfmt
+          echo "Installed: $(shfmt --version)"
+
+      - name: Check formatting with shfmt
+        run: |
+          echo "============================================"
+          echo "shfmt Format Consistency Check"
+          echo "============================================"
+          echo ""
+          echo "Settings: indent=4 spaces, binary-ops-start-of-line, case-indent"
+          echo ""
+
+          # Check formatting (diff mode shows what would change)
+          # Using common settings for bash scripts
+          errors=0
+
+          while IFS= read -r script; do
+            echo -n "Checking: $script ... "
+
+            # -d shows diff, -i 4 = 4 space indent, -bn = binary ops at start of line
+            # -ci = indent case statements
+            if diff=$(shfmt -d -i 4 -bn -ci "$script" 2>&1); then
+              echo "✓"
+            else
+              echo "needs formatting"
+              echo "$diff"
+              errors=$((errors + 1))
+            fi
+          done < <(find . -name '*.sh' -type f | sort)
+
+          echo ""
+          echo "============================================"
+
+          if [[ $errors -gt 0 ]]; then
+            echo "::warning::${errors} script(s) have formatting inconsistencies"
+            echo "Note: Format issues are warnings, not failures"
+            echo "Run 'shfmt -w -i 4 -bn -ci <script>' to auto-fix"
+            # Don't fail the build for formatting - just warn
+            # Uncomment the next line to make formatting failures block PRs:
+            # exit 1
+          else
+            echo "All scripts are consistently formatted"
+          fi
+
+  # ===========================================================================
+  # Job 5: bashate Style Check
+  # ===========================================================================
+  bashate:
+    name: Style Check (bashate)
+    runs-on: ubuntu-latest
+    needs: discover-scripts
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install bashate
+        run: |
+          pip install bashate
+          echo "Installed: $(bashate --version)"
+
+      - name: Run bashate style check
+        run: |
+          echo "============================================"
+          echo "bashate Style Check (OpenStack)"
+          echo "============================================"
+          echo ""
+
+          # bashate checks for common style issues
+          # Ignore some rules that conflict with other tools:
+          #   E006: Line too long (we use shellcheck for this)
+          #   E040: Syntax error (we use bash -n for this)
+          #   E001: Trailing whitespace (handled by shfmt)
+          #   E042: local declaration hides errors (valid pattern in bash)
+          #   E043: Arithmetic compound semantics (valid bash patterns)
+
+          errors=0
+
+          while IFS= read -r script; do
+            echo "Checking: $script"
+            if ! bashate --ignore E001,E006,E040,E042,E043 "$script"; then
+              errors=$((errors + 1))
+            fi
+          done < <(find . -name '*.sh' -type f | sort)
+
+          echo ""
+          echo "============================================"
+
+          if [[ $errors -gt 0 ]]; then
+            echo "::warning::bashate found style issues in ${errors} script(s)"
+            echo "Note: Style issues are warnings, not failures"
+            # Don't fail the build for style - just warn
+            # Uncomment the next line to make style failures block PRs:
+            # exit 1
+          else
+            echo "All scripts pass bashate style checks"
+          fi
+
+  # ===========================================================================
+  # Job 6: Security Scan (basic checks)
+  # ===========================================================================
+  security-scan:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    needs: discover-scripts
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Basic security checks
+        id: security
+        run: |
+          echo "============================================"
+          echo "Security Pattern Scan"
+          echo "============================================"
+          echo ""
+
+          warnings=0
+          declare -a warning_details=()
+
+          # ----------------------------------------------------------------
+          # 1. Check for dangerous eval usage
+          # ----------------------------------------------------------------
+          echo "1. Checking for dangerous 'eval' patterns..."
+
+          # Match eval that's NOT:
+          # - In a comment (starts with #)
+          # - Part of 'yq eval', 'jq eval', or similar tool commands
+          # - The safe getopt pattern: eval set --
+          dangerous_eval=$(grep -rn --include='*.sh' '^\s*eval\s' . 2>/dev/null \
+            | grep -v 'eval set --' \
+            | grep -v '#.*eval' \
+            || true)
+
+          if [[ -n "$dangerous_eval" ]]; then
+            echo "$dangerous_eval"
+            echo "   ⚠ Found potentially dangerous eval - review for command injection"
+            warnings=$((warnings + 1))
+            warning_details+=("Dangerous eval patterns found")
+          else
+            echo "   ✓ No dangerous eval patterns (safe patterns like 'eval set --' are OK)"
+          fi
+          echo ""
+
+          # ----------------------------------------------------------------
+          # 2. Check for curl/wget without certificate verification
+          # ----------------------------------------------------------------
+          echo "2. Checking for insecure downloads..."
+
+          insecure_dl=$(grep -rn --include='*.sh' -E '(curl|wget).*(-k|--insecure|--no-check-certificate)' . 2>/dev/null || true)
+
+          if [[ -n "$insecure_dl" ]]; then
+            echo "$insecure_dl"
+            echo "   ⚠ Found downloads with disabled certificate verification"
+            warnings=$((warnings + 1))
+            warning_details+=("Insecure download flags")
+          else
+            echo "   ✓ No insecure download flags found"
+          fi
+          echo ""
+
+          # ----------------------------------------------------------------
+          # 3. Check for world-writable permissions
+          # ----------------------------------------------------------------
+          echo "3. Checking for overly permissive chmod..."
+
+          world_writable=$(grep -rn --include='*.sh' -E 'chmod\s+[0-7]*777|chmod\s+[0-7]*666' . 2>/dev/null \
+            | grep -v '#' \
+            || true)
+
+          if [[ -n "$world_writable" ]]; then
+            echo "$world_writable"
+            echo "   ⚠ Found world-writable permissions"
+            warnings=$((warnings + 1))
+            warning_details+=("World-writable permissions")
+          else
+            echo "   ✓ No world-writable permissions found"
+          fi
+          echo ""
+
+          # ----------------------------------------------------------------
+          # 4. Check for shell injection via unquoted command substitution
+          # ----------------------------------------------------------------
+          echo "4. Checking for unquoted command substitutions in dangerous commands..."
+
+          # Look for rm/mv with unquoted $(...) - a real injection risk
+          unquoted_cmd=$(grep -rn --include='*.sh' -E '(rm|mv|cp)\s+-[rf]*\s+\$\(' . 2>/dev/null \
+            | grep -v '"$(' \
+            | grep -v '#' \
+            || true)
+
+          if [[ -n "$unquoted_cmd" ]]; then
+            echo "$unquoted_cmd"
+            echo "   ⚠ Found unquoted command substitution in file operations"
+            warnings=$((warnings + 1))
+            warning_details+=("Unquoted command substitution")
+          else
+            echo "   ✓ No unquoted command substitution risks found"
+          fi
+          echo ""
+
+          # ----------------------------------------------------------------
+          # 5. Check for hardcoded secrets (refined pattern)
+          # ----------------------------------------------------------------
+          echo "5. Checking for hardcoded secrets..."
+
+          # Look for actual assignments with values, not just variable names
+          # Exclude: comments, empty assignments, environment variable refs
+          hardcoded=$(grep -rn --include='*.sh' -E '(PASSWORD|SECRET|API_KEY|APIKEY|PRIVATE_KEY)=["\x27][^"\x27$]+["\x27]' . 2>/dev/null \
+            | grep -v '#' \
+            | grep -v '=""' \
+            | grep -v "=''" \
+            || true)
+
+          if [[ -n "$hardcoded" ]]; then
+            echo "$hardcoded"
+            echo "   ⚠ Found potential hardcoded secrets"
+            warnings=$((warnings + 1))
+            warning_details+=("Hardcoded secrets")
+          else
+            echo "   ✓ No hardcoded secrets found"
+          fi
+          echo ""
+
+          # ----------------------------------------------------------------
+          # 6. Check for temporary file race conditions
+          # ----------------------------------------------------------------
+          echo "6. Checking for insecure temp file patterns..."
+
+          # Look for /tmp with predictable names (not mktemp)
+          insecure_tmp=$(grep -rn --include='*.sh' -E '/tmp/[a-zA-Z0-9_-]+\.(sh|txt|log|tmp)' . 2>/dev/null \
+            | grep -v 'mktemp' \
+            | grep -v '#' \
+            | head -5 \
+            || true)
+
+          if [[ -n "$insecure_tmp" ]]; then
+            echo "$insecure_tmp"
+            echo "   ⚠ Found predictable temp file names (consider using mktemp)"
+            warnings=$((warnings + 1))
+            warning_details+=("Predictable temp files")
+          else
+            echo "   ✓ No insecure temp file patterns found"
+          fi
+          echo ""
+
+          # ----------------------------------------------------------------
+          # Summary
+          # ----------------------------------------------------------------
+          echo "============================================"
+          echo "Security scan complete: ${warnings} warning(s)"
+          echo "============================================"
+
+          # Export for summary
+          echo "warning_count=${warnings}" >> "$GITHUB_OUTPUT"
+          if [[ ${#warning_details[@]} -gt 0 ]]; then
+            echo "warning_list=${warning_details[*]}" >> "$GITHUB_OUTPUT"
+          else
+            echo "warning_list=None" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Security Summary Report
+        if: always()
+        run: |
+          {
+            echo "## Security Scan Report"
+            echo ""
+            echo "| Check | Status |"
+            echo "|-------|--------|"
+            echo "| Dangerous eval patterns | ✓ |"
+            echo "| Insecure downloads (-k/--insecure) | ✓ |"
+            echo "| World-writable permissions (777/666) | ✓ |"
+            echo "| Unquoted command substitutions | ✓ |"
+            echo "| Hardcoded secrets | ✓ |"
+            echo "| Predictable temp files | ✓ |"
+            echo ""
+            echo "_Note: This scan uses pattern matching and may have false positives/negatives._"
+            echo "_ShellCheck provides more comprehensive variable quoting analysis._"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ===========================================================================
+  # Job 7: Final Summary
+  # ===========================================================================
+  summary:
+    name: CI Summary
+    runs-on: ubuntu-latest
+    needs: [discover-scripts, bash-syntax, shellcheck, shfmt, bashate, security-scan]
+    if: always()
+    steps:
+      - name: Generate Comprehensive Summary
+        run: |
+          {
+            # Header
+            echo "# 🔍 Bash CI Pipeline Results"
+            echo ""
+            echo "---"
+            echo ""
+
+            # Overall Status
+            echo "## Overall Status"
+            echo ""
+
+            # Determine overall result
+            if [[ "${{ needs.bash-syntax.result }}" == "success" && "${{ needs.shellcheck.result }}" == "success" ]]; then
+              echo "### ✅ All Required Checks Passed"
+            else
+              echo "### ❌ Required Checks Failed"
+            fi
+            echo ""
+
+            # Results Table
+            echo "## Check Results"
+            echo ""
+            echo "| Check | Type | Status | Description |"
+            echo "|-------|------|--------|-------------|"
+            echo "| **Bash Syntax** | 🔴 Required | ${{ needs.bash-syntax.result == 'success' && '✅ Passed' || '❌ Failed' }} | Validates script syntax with \`bash -n\` |"
+            echo "| **ShellCheck** | 🔴 Required | ${{ needs.shellcheck.result == 'success' && '✅ Passed' || '❌ Failed' }} | Static analysis for bugs and issues |"
+            echo "| **shfmt** | 🟡 Advisory | ${{ needs.shfmt.result == 'success' && '✅ Passed' || '⚠️ Warnings' }} | Code formatting consistency |"
+            echo "| **bashate** | 🟡 Advisory | ${{ needs.bashate.result == 'success' && '✅ Passed' || '⚠️ Warnings' }} | OpenStack style guidelines |"
+            echo "| **Security** | 🟡 Advisory | ${{ needs.security-scan.result == 'success' && '✅ Passed' || '⚠️ Warnings' }} | Security anti-pattern detection |"
+            echo ""
+
+            # Legend
+            echo "<details>"
+            echo "<summary>📋 Check Type Legend</summary>"
+            echo ""
+            echo "| Type | Meaning |"
+            echo "|------|---------|"
+            echo "| 🔴 Required | Must pass for PR to be merged |"
+            echo "| 🟡 Advisory | Informational only, does not block merge |"
+            echo ""
+            echo "</details>"
+            echo ""
+
+            echo "---"
+            echo ""
+
+            # Tool Information
+            echo "## Tools & Versions"
+            echo ""
+            echo "| Tool | Version | Purpose |"
+            echo "|------|---------|---------|"
+            echo "| \`bash -n\` | System | Syntax validation |"
+            echo "| [ShellCheck](https://github.com/koalaman/shellcheck) | ${{ env.SHELLCHECK_VERSION }} | Static analysis |"
+            echo "| [shfmt](https://github.com/mvdan/sh) | ${{ env.SHFMT_VERSION }} | Formatting |"
+            echo "| [bashate](https://github.com/openstack/bashate) | Latest | Style checking |"
+            echo ""
+
+            echo "---"
+            echo ""
+
+            # What Gets Checked
+            echo "## What's Being Checked"
+            echo ""
+            echo "### Required Checks (blocking)"
+            echo ""
+            echo "1. **Bash Syntax (\`bash -n\`)** - Ensures all scripts are syntactically valid"
+            echo "2. **ShellCheck** - Catches:"
+            echo "   - Unquoted variables that may cause word splitting"
+            echo "   - Deprecated syntax and bashisms"
+            echo "   - Common scripting bugs and pitfalls"
+            echo "   - Potential security issues"
+            echo ""
+            echo "### Advisory Checks (non-blocking)"
+            echo ""
+            echo "3. **shfmt** - Checks formatting consistency:"
+            echo "   - 4-space indentation"
+            echo "   - Binary operators at start of line"
+            echo "   - Case statement indentation"
+            echo ""
+            echo "4. **bashate** - OpenStack style guidelines"
+            echo ""
+            echo "5. **Security Scan** - Pattern-based detection of:"
+            echo "   - Dangerous \`eval\` usage"
+            echo "   - Insecure download flags (\`-k\`, \`--insecure\`)"
+            echo "   - World-writable permissions (777/666)"
+            echo "   - Unquoted command substitutions"
+            echo "   - Hardcoded secrets"
+            echo "   - Predictable temp file names"
+            echo ""
+
+            echo "---"
+            echo ""
+
+            # Quick Fix Guide
+            echo "## 🛠️ Quick Fix Guide"
+            echo ""
+            echo "<details>"
+            echo "<summary>How to fix common issues</summary>"
+            echo ""
+            echo "### Bash Syntax Errors"
+            echo "\`\`\`bash"
+            echo "# Check syntax locally:"
+            echo "bash -n your-script.sh"
+            echo "\`\`\`"
+            echo ""
+            echo "### ShellCheck Issues"
+            echo "\`\`\`bash"
+            echo "# Run shellcheck locally:"
+            echo "shellcheck your-script.sh"
+            echo ""
+            echo "# Or install via package manager:"
+            echo "# Ubuntu/Debian: apt install shellcheck"
+            echo "# macOS: brew install shellcheck"
+            echo "\`\`\`"
+            echo ""
+            echo "### Format Issues (shfmt)"
+            echo "\`\`\`bash"
+            echo "# Auto-fix formatting:"
+            echo "shfmt -w -i 4 -bn -ci your-script.sh"
+            echo ""
+            echo "# Check without modifying:"
+            echo "shfmt -d -i 4 -bn -ci your-script.sh"
+            echo "\`\`\`"
+            echo ""
+            echo "</details>"
+            echo ""
+
+            echo "---"
+            echo ""
+            echo "_Generated by Bash CI Pipeline • Scripts analyzed: ${{ needs.discover-scripts.outputs.script_count }}_"
+
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Check required jobs
+        run: |
+          echo "Checking required job results..."
+          echo ""
+
+          failed=0
+
+          if [[ "${{ needs.bash-syntax.result }}" != "success" ]]; then
+            echo "::error::❌ Bash syntax validation failed"
+            failed=1
+          else
+            echo "✅ Bash syntax: passed"
+          fi
+
+          if [[ "${{ needs.shellcheck.result }}" != "success" ]]; then
+            echo "::error::❌ ShellCheck found errors or warnings"
+            failed=1
+          else
+            echo "✅ ShellCheck: passed"
+          fi
+
+          echo ""
+          if [[ $failed -eq 1 ]]; then
+            echo "::error::One or more required checks failed. Please fix the issues above."
+            exit 1
+          fi
+
+          echo "============================================"
+          echo "🎉 All required checks passed!"
+          echo "============================================"

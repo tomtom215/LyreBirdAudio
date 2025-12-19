@@ -45,13 +45,21 @@ if [ -z "$BASH_VERSION" ]; then
 fi
 
 # Strict error handling and security
-export LC_ALL=C      # Ensure consistent sorting and string handling
-umask 077            # Secure file creation (owner-only by default)
+export LC_ALL=C # Ensure consistent sorting and string handling
+umask 077       # Secure file creation (owner-only by default)
 
-set -o errexit   # Exit on any command failure
-set -o pipefail  # Catch errors in pipes
-set -o nounset   # Exit if uninitialized variable is used
-set -o errtrace  # Inherit ERR trap in functions
+set -o errexit  # Exit on any command failure
+set -o pipefail # Catch errors in pipes
+set -o nounset  # Exit if uninitialized variable is used
+set -o errtrace # Inherit ERR trap in functions
+
+# Source shared library if available (backward compatible)
+# Provides: colors, logging, command_exists, compute_hash, exit codes
+# Falls back gracefully if library not present - all functions defined locally below
+_LYREBIRD_COMMON="${BASH_SOURCE[0]%/*}/lyrebird-common.sh"
+# shellcheck source=lyrebird-common.sh
+[[ -f "$_LYREBIRD_COMMON" ]] && source "$_LYREBIRD_COMMON" || true
+unset _LYREBIRD_COMMON
 
 ################################################################################
 # Constants and Configuration
@@ -135,7 +143,7 @@ fi
 
 # Debug mode
 DEBUG="${DEBUG:-false}"
-export DEBUG  # Export so child processes inherit
+export DEBUG # Export so child processes inherit
 
 # Repository state (populated and validated by functions)
 DEFAULT_BRANCH=""
@@ -143,7 +151,7 @@ CURRENT_VERSION=""
 CURRENT_BRANCH=""
 IS_DETACHED=false
 HAS_LOCAL_CHANGES=false
-GIT_STATE="unknown"  # clean, dirty, merge, rebase, revert, cherry-pick, bisect, sequencer
+GIT_STATE="unknown" # clean, dirty, merge, rebase, revert, cherry-pick, bisect, sequencer
 
 # Transaction state for rollback capability
 declare -A TRANSACTION_STATE=(
@@ -211,7 +219,7 @@ log_step() {
 
 acquire_lock() {
     local waited=0
-    
+
     # Verify SCRIPT_DIR is writable before attempting lock file operations
     if [[ ! -w "$SCRIPT_DIR" ]]; then
         log_error "Cannot write to script directory: $SCRIPT_DIR"
@@ -219,14 +227,14 @@ acquire_lock() {
         log_info "Permission denied or directory is read-only"
         return "$E_PERMISSION"
     fi
-    
+
     while true; do
         # ATOMIC OPERATION: mkdir fails if directory exists
         if mkdir "$LOCKFILE" 2>/dev/null; then
             # Write PID atomically using temp file + rename
             local pid_file="${LOCKFILE}/pid"
             local pid_tmp="${LOCKFILE}/pid.$$"
-            if echo "$$" > "$pid_tmp" 2>/dev/null && mv "$pid_tmp" "$pid_file" 2>/dev/null; then
+            if echo "$$" >"$pid_tmp" 2>/dev/null && mv "$pid_tmp" "$pid_file" 2>/dev/null; then
                 log_debug "Lock acquired (PID: $$)"
                 return 0
             else
@@ -259,7 +267,7 @@ acquire_lock() {
                 elif [[ -d "/proc/$lock_pid" ]]; then
                     # Process exists - verify it's actually lyrebird-updater (not PID recycling)
                     local proc_cmdline
-                    proc_cmdline=$(tr '\0' ' ' < "/proc/$lock_pid/cmdline" 2>/dev/null || echo "")
+                    proc_cmdline=$(tr '\0' ' ' <"/proc/$lock_pid/cmdline" 2>/dev/null || echo "")
                     if [[ -n "$proc_cmdline" ]] && [[ "$proc_cmdline" != *"lyrebird-updater"* ]]; then
                         log_warn "Stale lock: PID $lock_pid is now a different process"
                         rm -rf "$LOCKFILE" 2>/dev/null || true
@@ -289,7 +297,7 @@ release_lock() {
     if [[ -d "$LOCKFILE" ]]; then
         local lock_pid
         lock_pid=$(cat "${LOCKFILE}/pid" 2>/dev/null || echo "")
-        
+
         if [[ "$lock_pid" == "$$" ]]; then
             rm -rf "$LOCKFILE"
             log_debug "Lock released"
@@ -306,7 +314,7 @@ release_lock() {
 # Detect if systemd service is installed and capture its state
 detect_systemd_service() {
     log_debug "Detecting systemd service installation..."
-    
+
     # Reset state
     SERVICE_STATE[installed]=false
     SERVICE_STATE[was_running]=false
@@ -317,38 +325,38 @@ detect_systemd_service() {
     SERVICE_STATE[backup_service_file]=""
     SERVICE_STATE[backup_cron_file]=""
     SERVICE_CUSTOM_ENV=()
-    
+
     # Check if service file exists
     if [[ ! -f "$SERVICE_FILE" ]]; then
         log_debug "No systemd service file found at: $SERVICE_FILE"
         return 1
     fi
-    
+
     SERVICE_STATE[installed]=true
     log_debug "Detected installed systemd service: $SERVICE_NAME"
-    
+
     # Check if service is running
     if systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null; then
         SERVICE_STATE[was_running]=true
         log_debug "Service is currently running"
     fi
-    
+
     # Check if service is enabled
     if systemctl is-enabled --quiet "$SERVICE_NAME" 2>/dev/null; then
         SERVICE_STATE[was_enabled]=true
         log_debug "Service is enabled for boot"
     fi
-    
+
     # Detect customizations
     detect_service_customizations
-    
+
     return 0
 }
 
 # Detect custom environment variables in service file
 detect_service_customizations() {
     local service_file="$SERVICE_FILE"
-    
+
     # Known default environment variables that the script generates
     local -A default_vars=(
         ["HOME"]="/root"
@@ -359,31 +367,31 @@ detect_service_customizations() {
         ["MULTIPLEX_STREAM_NAME"]="all_mics"
         ["INVOCATION_ID"]="systemd"
     )
-    
+
     # Extract Environment= lines from service file
     local env_lines
     env_lines=$(grep "^Environment=" "$service_file" 2>/dev/null || true)
-    
+
     if [[ -z "$env_lines" ]]; then
         log_debug "No environment variables found in service file"
         return 0
     fi
-    
+
     # Check each environment line for customizations
     while IFS= read -r line; do
         if [[ -z "$line" ]]; then
             continue
         fi
-        
+
         # Extract variable name and value
         # Format: Environment="VAR=value" or Environment=VAR=value
         local var_full="${line#Environment=}"
         var_full="${var_full#\"}"
         var_full="${var_full%\"}"
-        
+
         local var_name="${var_full%%=*}"
         local var_value="${var_full#*=}"
-        
+
         # Check if this is a customized value
         if [[ -n "${default_vars[$var_name]+isset}" ]]; then
             # Known variable - check if value differs from default
@@ -398,8 +406,8 @@ detect_service_customizations() {
             SERVICE_CUSTOM_ENV+=("$line")
             log_debug "Detected custom environment variable: $var_name=$var_value"
         fi
-    done <<< "$env_lines"
-    
+    done <<<"$env_lines"
+
     if [[ "${SERVICE_STATE[has_customizations]}" == "true" ]]; then
         log_debug "Found ${#SERVICE_CUSTOM_ENV[@]} custom environment variable(s)"
     fi
@@ -408,30 +416,30 @@ detect_service_customizations() {
 # Backup service and cron files for rollback
 backup_service_files() {
     log_debug "Backing up service files..."
-    
+
     local service_file="${SERVICE_STATE[service_file]}"
     local cron_file="${SERVICE_STATE[cron_file]}"
-    
+
     # Backup service file
     if [[ -f "$service_file" ]]; then
         local backup_service
         backup_service="$(mktemp "${service_file}.backup.XXXXXX")"
-        
+
         if ! cp -a "$service_file" "$backup_service" 2>/dev/null; then
             log_error "Failed to backup service file"
             rm -f "$backup_service" 2>/dev/null || true
             return 1
         fi
-        
+
         SERVICE_STATE[backup_service_file]="$backup_service"
         log_debug "Backed up service file to: $backup_service"
     fi
-    
+
     # Backup cron file if it exists
     if [[ -f "$cron_file" ]]; then
         local backup_cron
         backup_cron="$(mktemp "${cron_file}.backup.XXXXXX")"
-        
+
         if ! cp -a "$cron_file" "$backup_cron" 2>/dev/null; then
             log_warn "Failed to backup cron file (non-critical)"
             rm -f "$backup_cron" 2>/dev/null || true
@@ -441,7 +449,7 @@ backup_service_files() {
             log_debug "Backed up cron file to: $backup_cron"
         fi
     fi
-    
+
     return 0
 }
 
@@ -451,9 +459,9 @@ stop_service_safe() {
         log_debug "Service was not running, skipping stop"
         return 0
     fi
-    
+
     log_step "Stopping $SERVICE_NAME service..."
-    
+
     # Try graceful stop
     if systemctl stop "$SERVICE_NAME" 2>/dev/null; then
         # Wait for service to actually stop
@@ -462,7 +470,7 @@ stop_service_safe() {
             sleep 1
             ((elapsed++))
         done
-        
+
         if systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null; then
             log_warn "Service did not stop gracefully within ${SERVICE_STOP_TIMEOUT}s, forcing..."
             systemctl kill "$SERVICE_NAME" 2>/dev/null || true
@@ -476,13 +484,13 @@ stop_service_safe() {
         systemctl kill "$SERVICE_NAME" 2>/dev/null || true
         sleep 2
     fi
-    
+
     # Verify stopped
     if systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null; then
         log_error "Failed to stop service after force kill"
         return 1
     fi
-    
+
     log_success "Service stopped (forced)"
     return 0
 }
@@ -490,15 +498,15 @@ stop_service_safe() {
 # Reinstall service definition while preserving customizations
 reinstall_service_with_customizations() {
     local script_path="$1"
-    
+
     log_step "Reinstalling service definition..."
-    
+
     # Verify script exists and is executable
     if [[ ! -f "$script_path" ]]; then
         log_error "Service manager script not found: $script_path"
         return 1
     fi
-    
+
     if [[ ! -x "$script_path" ]]; then
         log_debug "Making script executable: $script_path"
         chmod +x "$script_path" 2>/dev/null || {
@@ -506,7 +514,7 @@ reinstall_service_with_customizations() {
             return 1
         }
     fi
-    
+
     # Call install command to regenerate service file
     # Capture output but suppress expected informational messages
     local install_output
@@ -517,66 +525,66 @@ reinstall_service_with_customizations() {
         fi
         return 1
     fi
-    
+
     log_success "Service definition reinstalled"
-    
+
     # If there were customizations, merge them back in
     if [[ "${SERVICE_STATE[has_customizations]}" == "true" ]]; then
         log_step "Restoring custom environment variables..."
-        
+
         local service_file="${SERVICE_STATE[service_file]}"
-        
+
         if [[ ! -f "$service_file" ]]; then
             log_error "Service file not found after reinstall: $service_file"
             return 1
         fi
-        
+
         # Create temporary file for merging
         local temp_service
         temp_service="$(mktemp)"
-        
+
         # Strategy: Insert custom env vars after the last Environment= line
         # This preserves the structure and ensures custom values override defaults
         local last_env_line_num
         last_env_line_num=$(grep -n "^Environment=" "$service_file" | tail -n1 | cut -d: -f1)
-        
+
         if [[ -z "$last_env_line_num" ]]; then
             # No Environment= lines found - insert after WorkingDirectory
             local working_dir_line
             working_dir_line=$(grep -n "^WorkingDirectory=" "$service_file" | tail -n1 | cut -d: -f1)
-            
+
             if [[ -n "$working_dir_line" ]]; then
                 # Insert after WorkingDirectory
-                head -n "$working_dir_line" "$service_file" > "$temp_service"
+                head -n "$working_dir_line" "$service_file" >"$temp_service"
                 for custom_env in "${SERVICE_CUSTOM_ENV[@]}"; do
-                    echo "$custom_env" >> "$temp_service"
+                    echo "$custom_env" >>"$temp_service"
                     log_debug "Restored: $custom_env"
                 done
-                tail -n +"$((working_dir_line + 1))" "$service_file" >> "$temp_service"
+                tail -n +"$((working_dir_line + 1))" "$service_file" >>"$temp_service"
             else
                 log_warn "Could not find insertion point for custom variables"
                 cp "$service_file" "$temp_service"
             fi
         else
             # Insert after last Environment= line
-            head -n "$last_env_line_num" "$service_file" > "$temp_service"
+            head -n "$last_env_line_num" "$service_file" >"$temp_service"
             for custom_env in "${SERVICE_CUSTOM_ENV[@]}"; do
-                echo "$custom_env" >> "$temp_service"
+                echo "$custom_env" >>"$temp_service"
                 log_debug "Restored: $custom_env"
             done
-            tail -n +"$((last_env_line_num + 1))" "$service_file" >> "$temp_service"
+            tail -n +"$((last_env_line_num + 1))" "$service_file" >>"$temp_service"
         fi
-        
+
         # Atomically replace service file
         if ! mv -f "$temp_service" "$service_file" 2>/dev/null; then
             log_error "Failed to restore customizations to service file"
             rm -f "$temp_service"
             return 1
         fi
-        
+
         log_success "Custom environment variables restored (${#SERVICE_CUSTOM_ENV[@]} variable(s))"
     fi
-    
+
     return 0
 }
 
@@ -586,9 +594,9 @@ start_service_safe() {
         log_debug "Service was not running before update, not starting"
         return 0
     fi
-    
+
     log_step "Starting $SERVICE_NAME service..."
-    
+
     # Start service
     local start_output
     if ! start_output=$(systemctl start "$SERVICE_NAME" 2>&1); then
@@ -600,14 +608,14 @@ start_service_safe() {
         log_info "Check logs: journalctl -u $SERVICE_NAME -n 50 --no-pager"
         return 1
     fi
-    
+
     # Wait for service to fully start
     local elapsed=0
     while ! systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null && [[ $elapsed -lt $SERVICE_START_TIMEOUT ]]; do
         sleep 1
         ((elapsed++))
     done
-    
+
     # Verify service is running
     if ! systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null; then
         log_error "Service failed to start within ${SERVICE_START_TIMEOUT}s"
@@ -615,7 +623,7 @@ start_service_safe() {
         log_info "Check logs: journalctl -u $SERVICE_NAME -n 50 --no-pager"
         return 1
     fi
-    
+
     log_success "Service started successfully"
     return 0
 }
@@ -623,14 +631,14 @@ start_service_safe() {
 # Restore service files from backup
 restore_service_from_backup() {
     log_warn "Restoring service files from backup..."
-    
+
     local service_file="${SERVICE_STATE[service_file]}"
     local backup_service="${SERVICE_STATE[backup_service_file]}"
     local cron_file="${SERVICE_STATE[cron_file]}"
     local backup_cron="${SERVICE_STATE[backup_cron_file]}"
-    
+
     local restore_failed=false
-    
+
     # Restore service file
     if [[ -f "$backup_service" ]]; then
         if cp -a "$backup_service" "$service_file" 2>/dev/null; then
@@ -640,7 +648,7 @@ restore_service_from_backup() {
             restore_failed=true
         fi
     fi
-    
+
     # Restore cron file
     if [[ -f "$backup_cron" ]]; then
         if cp -a "$backup_cron" "$cron_file" 2>/dev/null; then
@@ -649,14 +657,14 @@ restore_service_from_backup() {
             log_warn "Failed to restore cron file from backup (non-critical)"
         fi
     fi
-    
+
     # Reload systemd to pick up restored service file
     systemctl daemon-reload 2>/dev/null || true
-    
+
     if [[ "$restore_failed" == "true" ]]; then
         return 1
     fi
-    
+
     log_info "Service files restored from backup"
     return 0
 }
@@ -664,15 +672,15 @@ restore_service_from_backup() {
 # Clean up backup files
 cleanup_service_backups() {
     log_debug "Cleaning up service backup files..."
-    
+
     local backup_service="${SERVICE_STATE[backup_service_file]}"
     local backup_cron="${SERVICE_STATE[backup_cron_file]}"
-    
+
     if [[ -f "$backup_service" ]]; then
         rm -f "$backup_service" 2>/dev/null || true
         log_debug "Removed service backup file"
     fi
-    
+
     if [[ -f "$backup_cron" ]]; then
         rm -f "$backup_cron" 2>/dev/null || true
         log_debug "Removed cron backup file"
@@ -682,13 +690,13 @@ cleanup_service_backups() {
 # Save service state to marker file for post-exec restoration
 save_service_state_to_marker() {
     log_debug "Saving service state to marker file..."
-    
+
     local marker="$SERVICE_UPDATE_MARKER"
     local temp_marker
     temp_marker="$(mktemp)"
-    
+
     # Write state as simple key=value format for easy sourcing
-    cat > "$temp_marker" << EOF
+    cat >"$temp_marker" <<EOF
 # Service update state - automatically generated
 INSTALLED=${SERVICE_STATE[installed]}
 WAS_RUNNING=${SERVICE_STATE[was_running]}
@@ -699,28 +707,28 @@ CRON_FILE=${SERVICE_STATE[cron_file]}
 BACKUP_SERVICE_FILE=${SERVICE_STATE[backup_service_file]}
 BACKUP_CRON_FILE=${SERVICE_STATE[backup_cron_file]}
 EOF
-    
+
     # Append custom environment lines with indices
     if [[ ${#SERVICE_CUSTOM_ENV[@]} -gt 0 ]]; then
-        echo "CUSTOM_ENV_COUNT=${#SERVICE_CUSTOM_ENV[@]}" >> "$temp_marker"
+        echo "CUSTOM_ENV_COUNT=${#SERVICE_CUSTOM_ENV[@]}" >>"$temp_marker"
         local i=0
         for env_line in "${SERVICE_CUSTOM_ENV[@]}"; do
             # Escape quotes for safe storage
             local escaped_line="${env_line//\"/\\\"}"
-            echo "CUSTOM_ENV_${i}=\"${escaped_line}\"" >> "$temp_marker"
+            echo "CUSTOM_ENV_${i}=\"${escaped_line}\"" >>"$temp_marker"
             ((i++))
         done
     else
-        echo "CUSTOM_ENV_COUNT=0" >> "$temp_marker"
+        echo "CUSTOM_ENV_COUNT=0" >>"$temp_marker"
     fi
-    
+
     # Atomic move with restricted permissions
     if ! mv -f "$temp_marker" "$marker" 2>/dev/null; then
         log_error "Failed to save service state marker"
         rm -f "$temp_marker"
         return 1
     fi
-    
+
     chmod 600 "$marker" 2>/dev/null || true
     log_debug "Service state saved to: $marker"
     return 0
@@ -729,25 +737,25 @@ EOF
 # Load service state from marker file
 load_service_state_from_marker() {
     local marker="$SERVICE_UPDATE_MARKER"
-    
+
     if [[ ! -f "$marker" ]]; then
         log_debug "No service state marker file found"
         return 1
     fi
-    
+
     log_debug "Loading service state from marker file..."
-    
+
     # Reset state
     SERVICE_STATE=()
     SERVICE_CUSTOM_ENV=()
-    
+
     # Source the marker file to load variables
     # shellcheck source=/dev/null
     source "$marker" 2>/dev/null || {
         log_error "Failed to load service state marker"
         return 1
     }
-    
+
     # Reconstruct SERVICE_STATE associative array
     SERVICE_STATE[installed]="${INSTALLED:-false}"
     SERVICE_STATE[was_running]="${WAS_RUNNING:-false}"
@@ -757,17 +765,17 @@ load_service_state_from_marker() {
     SERVICE_STATE[cron_file]="${CRON_FILE:-}"
     SERVICE_STATE[backup_service_file]="${BACKUP_SERVICE_FILE:-}"
     SERVICE_STATE[backup_cron_file]="${BACKUP_CRON_FILE:-}"
-    
+
     # Reconstruct SERVICE_CUSTOM_ENV array
     local custom_env_count="${CUSTOM_ENV_COUNT:-0}"
-    for ((i=0; i<custom_env_count; i++)); do
+    for ((i = 0; i < custom_env_count; i++)); do
         local var_name="CUSTOM_ENV_${i}"
         # Unescape quotes
         local env_value="${!var_name}"
         env_value="${env_value//\\\"/\"}"
         SERVICE_CUSTOM_ENV+=("$env_value")
     done
-    
+
     log_debug "Service state loaded: installed=${SERVICE_STATE[installed]}, was_running=${SERVICE_STATE[was_running]}, customizations=${SERVICE_STATE[has_customizations]}"
     return 0
 }
@@ -787,11 +795,11 @@ complete_pending_service_update() {
         log_debug "No pending service update found"
         return 0
     fi
-    
+
     echo
     log_info "Completing pending service update from previous operation..."
     echo
-    
+
     # Complete the service update
     if ! post_checkout_service_update; then
         log_error "Failed to complete pending service update"
@@ -799,10 +807,10 @@ complete_pending_service_update() {
         log_info "Try: systemctl status $SERVICE_NAME"
         return 1
     fi
-    
+
     # Remove marker on success
     rm -f "$SERVICE_UPDATE_MARKER"
-    
+
     echo
     log_success "Service update completed successfully"
     return 0
@@ -815,22 +823,22 @@ complete_pending_service_update() {
 # Handle service update preparation before git checkout
 handle_systemd_service_update() {
     local target_version="$1"
-    
+
     # Detect if service is installed
     if ! detect_systemd_service; then
         log_debug "No systemd service installed, skipping service update handling"
         return 0
     fi
-    
+
     log_info "Detected installed systemd service: $SERVICE_NAME"
-    
+
     # Show service status
     echo
     echo "${BOLD}Systemd Service Status:${NC}"
     echo "  Service file: ${SERVICE_STATE[service_file]}"
     echo "  Currently running: ${SERVICE_STATE[was_running]}"
     echo "  Enabled at boot: ${SERVICE_STATE[was_enabled]}"
-    
+
     if [[ "${SERVICE_STATE[has_customizations]}" == "true" ]]; then
         echo "  ${YELLOW}Custom environment variables: ${#SERVICE_CUSTOM_ENV[@]}${NC}"
         echo
@@ -841,11 +849,11 @@ handle_systemd_service_update() {
         echo
         log_info "These customizations will be preserved during the update"
     fi
-    
+
     echo
     log_info "The service will be stopped during the update and restarted afterwards"
     echo
-    
+
     # Confirm if customizations exist
     if [[ "${SERVICE_STATE[has_customizations]}" == "true" ]]; then
         if ! confirm_action "Continue with service update?"; then
@@ -854,13 +862,13 @@ handle_systemd_service_update() {
         fi
         echo
     fi
-    
+
     # Backup service files
     if ! backup_service_files; then
         log_error "Failed to backup service files"
         return "$E_GENERAL"
     fi
-    
+
     # Stop service if running
     if ! stop_service_safe; then
         log_error "Failed to stop service - cannot proceed with update"
@@ -868,7 +876,7 @@ handle_systemd_service_update() {
         cleanup_service_backups
         return "$E_GENERAL"
     fi
-    
+
     # Save state to marker file (for post-exec completion if updater restarts)
     if ! save_service_state_to_marker; then
         log_error "Failed to save service state"
@@ -879,7 +887,7 @@ handle_systemd_service_update() {
         cleanup_service_backups
         return "$E_GENERAL"
     fi
-    
+
     log_debug "Service update preparation completed"
     return 0
 }
@@ -891,20 +899,20 @@ handle_systemd_service_update() {
 # Complete service update after successful git checkout
 post_checkout_service_update() {
     local script_path="./${SERVICE_SCRIPT}"
-    
+
     # Verify service was installed
     if [[ "${SERVICE_STATE[installed]}" != "true" ]]; then
         log_debug "Service not installed, skipping post-checkout service update"
         return 0
     fi
-    
+
     # Check if service script exists in new version
     if [[ ! -f "$script_path" ]]; then
         log_error "Service script not found after checkout: $script_path"
         log_error "This indicates the service script was removed or renamed"
         return 1
     fi
-    
+
     # Check if the service script actually changed
     local script_changed=false
     if ! git diff --quiet "${TRANSACTION_STATE[original_head]}" HEAD -- "$script_path" 2>/dev/null; then
@@ -913,14 +921,14 @@ post_checkout_service_update() {
     else
         log_debug "Service script unchanged, skipping reinstallation"
     fi
-    
+
     # If script changed, reinstall service
     if [[ "$script_changed" == "true" ]]; then
         if ! reinstall_service_with_customizations "$script_path"; then
             log_error "Failed to reinstall service definition"
             return 1
         fi
-        
+
         # Reload systemd daemon to pick up new service definition
         log_step "Reloading systemd daemon..."
         if ! systemctl daemon-reload 2>&1 | grep -v "^$" | head -5; then
@@ -929,23 +937,23 @@ post_checkout_service_update() {
         fi
         log_success "Systemd daemon reloaded"
     fi
-    
+
     # Start service if it was running before
     if ! start_service_safe; then
         log_error "Service update failed - service did not start"
         log_warn "Attempting to restore service from backup..."
-        
+
         # Attempt rollback
         restore_service_from_backup
         systemctl daemon-reload 2>/dev/null || true
         systemctl start "$SERVICE_NAME" 2>/dev/null || true
-        
+
         return 1
     fi
-    
+
     # Success - cleanup backups
     cleanup_service_backups
-    
+
     log_success "Service update completed successfully"
     return 0
 }
@@ -957,24 +965,24 @@ post_checkout_service_update() {
 # shellcheck disable=SC2317  # Function invoked indirectly via cleanup
 cleanup() {
     local exit_code=$?
-    
+
     log_debug "Cleanup triggered (exit code: $exit_code)"
-    
+
     # CRITICAL: Disable traps to prevent recursion
     trap - EXIT INT TERM
-    
+
     # If we're in an active transaction and exiting with error, attempt rollback
     if [[ "${TRANSACTION_STATE[active]}" == "true" ]] && [[ $exit_code -ne 0 ]]; then
         log_error "Operation failed - attempting automatic rollback..."
         transaction_rollback
     fi
-    
+
     # Restore git configuration
     restore_git_config
-    
+
     # Release lock file
     release_lock
-    
+
     # Exit without re-triggering trap
     exit "$exit_code"
 }
@@ -989,29 +997,29 @@ trap 'log_error "Script interrupted by user"; exit $E_USER_ABORT' INT TERM
 
 save_git_config() {
     log_debug "Saving git configuration..."
-    
+
     # Save core.fileMode setting
     local current_filemode
     current_filemode=$(git config --local core.fileMode 2>/dev/null || echo "")
     ORIGINAL_GIT_CONFIG["core.fileMode"]="$current_filemode"
-    
+
     # Apply our temporary setting
     git config --local core.fileMode false 2>/dev/null || true
-    
+
     log_debug "Git config saved (core.fileMode: ${current_filemode:-<unset>})"
 }
 
 # shellcheck disable=SC2317  # Function invoked indirectly via cleanup
 restore_git_config() {
     log_debug "Restoring git configuration..."
-    
+
     # Restore core.fileMode
     if [[ -n "${ORIGINAL_GIT_CONFIG["core.fileMode"]:-}" ]]; then
         git config --local core.fileMode "${ORIGINAL_GIT_CONFIG["core.fileMode"]}" 2>/dev/null || true
     else
         git config --unset --local core.fileMode 2>/dev/null || true
     fi
-    
+
     log_debug "Git config restored"
 }
 
@@ -1021,13 +1029,13 @@ restore_git_config() {
 
 check_prerequisites() {
     log_debug "Checking prerequisites..."
-    
+
     # IMPORTANT: Warn if running with sudo or as root
     if [[ "${SUDO_USER:-}" != "" ]] || [[ "$EUID" -eq 0 ]]; then
         log_warn "[!]  WARNING: This script is running with root/sudo privileges"
         log_warn "This may change file ownership in the repository"
         echo
-        
+
         if [[ "${SUDO_USER:-}" != "" ]]; then
             log_info "You used: sudo ./lyrebird-updater.sh"
             log_info "This is usually NOT needed. Try running without sudo"
@@ -1035,14 +1043,14 @@ check_prerequisites() {
             log_warn "Running directly as root is not recommended"
         fi
         echo
-        
+
         if ! confirm_action "Continue anyway? (may modify file ownership)"; then
             log_error "Cancelled by user"
             return "$E_USER_ABORT"
         fi
         echo
     fi
-    
+
     # Check for git
     if ! command -v git >/dev/null 2>&1; then
         log_error "Git is not installed or not in PATH"
@@ -1052,66 +1060,66 @@ check_prerequisites() {
         log_info "  macOS:         brew install git"
         return "$E_PREREQUISITES"
     fi
-    
+
     # Check git version
     local git_version
     if ! git_version="$(git --version 2>/dev/null | awk '{print $3}')"; then
         log_error "Could not determine git version"
         return "$E_PREREQUISITES"
     fi
-    
+
     local git_major git_minor
     git_major="${git_version%%.*}"
     git_minor="${git_version#*.}"
     git_minor="${git_minor%%.*}"
-    
-    if [[ "$git_major" -lt "$MIN_GIT_MAJOR" ]] || \
-       [[ "$git_major" -eq "$MIN_GIT_MAJOR" && "$git_minor" -lt "$MIN_GIT_MINOR" ]]; then
+
+    if [[ "$git_major" -lt "$MIN_GIT_MAJOR" ]] \
+        || [[ "$git_major" -eq "$MIN_GIT_MAJOR" && "$git_minor" -lt "$MIN_GIT_MINOR" ]]; then
         log_error "Git version $git_version is too old (required: ${MIN_GIT_MAJOR}.${MIN_GIT_MINOR}+)"
         return "$E_PREREQUISITES"
     fi
-    
+
     log_debug "Git version: $git_version [OK]"
-    
+
     # Check bash version
     local bash_major="${BASH_VERSINFO[0]}"
     local bash_minor="${BASH_VERSINFO[1]}"
-    
-    if [[ "$bash_major" -lt "$MIN_BASH_MAJOR" ]] || \
-       [[ "$bash_major" -eq "$MIN_BASH_MAJOR" && "$bash_minor" -lt "$MIN_BASH_MINOR" ]]; then
+
+    if [[ "$bash_major" -lt "$MIN_BASH_MAJOR" ]] \
+        || [[ "$bash_major" -eq "$MIN_BASH_MAJOR" && "$bash_minor" -lt "$MIN_BASH_MINOR" ]]; then
         log_error "Bash version $bash_major.$bash_minor is too old (required: ${MIN_BASH_MAJOR}.${MIN_BASH_MINOR}+)"
         return "$E_PREREQUISITES"
     fi
-    
+
     log_debug "Bash version: $bash_major.$bash_minor [OK]"
-    
+
     # Check for required external utilities
     local required_utils=("awk" "sed" "grep" "tput")
     local missing_utils=()
-    
+
     for util in "${required_utils[@]}"; do
         if ! command -v "$util" >/dev/null 2>&1; then
             missing_utils+=("$util")
         fi
     done
-    
+
     if [[ ${#missing_utils[@]} -gt 0 ]]; then
         log_error "Required utilities not found: ${missing_utils[*]}"
         log_info "Please install these utilities and try again"
         return "$E_PREREQUISITES"
     fi
-    
+
     # Check for systemctl (for service management)
     if ! command -v systemctl >/dev/null 2>&1; then
         log_debug "systemctl not found - service update features will be limited"
     fi
-    
+
     # Check for stat (different syntax on different systems)
     if ! command -v stat >/dev/null 2>&1; then
         log_warn "Warning: 'stat' command not found"
         log_info "Some features may not work properly"
     fi
-    
+
     # Check for timeout (optional but recommended)
     if ! command -v timeout >/dev/null 2>&1; then
         # Try gtimeout on macOS
@@ -1124,7 +1132,7 @@ check_prerequisites() {
             log_debug "Note: 'timeout' command not available (fetch operations may hang)"
         fi
     fi
-    
+
     log_debug "All prerequisites checked [OK]"
     return 0
 }
@@ -1135,7 +1143,7 @@ check_prerequisites() {
 
 check_git_repository() {
     log_debug "Validating git repository..."
-    
+
     # Check if we're in a git repository
     if ! git rev-parse --git-dir >/dev/null 2>&1; then
         log_error "Not a git repository"
@@ -1147,7 +1155,7 @@ check_git_repository() {
         log_info "  3. Run:    ./$SCRIPT_NAME"
         return "$E_NOT_GIT_REPO"
     fi
-    
+
     # Verify remote is configured
     local origin_url
     if ! origin_url="$(git remote get-url origin 2>/dev/null)"; then
@@ -1155,7 +1163,7 @@ check_git_repository() {
         log_info "To fix: git remote add origin $REPO_URL"
         return "$E_NOT_GIT_REPO"
     fi
-    
+
     # Validate origin URL
     if [[ ! "$origin_url" =~ github\.com[:/]${REPO_OWNER}/${REPO_NAME} ]]; then
         log_warn "Remote 'origin' URL does not match expected repository"
@@ -1166,32 +1174,32 @@ check_git_repository() {
             return "$E_NOT_GIT_REPO"
         fi
     fi
-    
+
     # Check git permissions
     local git_dir
     if ! git_dir="$(git rev-parse --git-dir 2>/dev/null)"; then
         log_error "Could not determine .git directory location"
         return "$E_PERMISSION"
     fi
-    
+
     if [[ ! -w "$git_dir" ]]; then
         log_error "No write permission for git repository: $git_dir"
         log_info "To fix: sudo chown -R $USER:$USER $(git rev-parse --show-toplevel)"
         return "$E_PERMISSION"
     fi
-    
+
     # Check if git directory is owned by root (common issue)
     if [[ -e "$git_dir/config" ]] && command -v stat >/dev/null 2>&1; then
         local owner
         owner="$(stat -c %U "$git_dir/config" 2>/dev/null || stat -f %Su "$git_dir/config" 2>/dev/null || echo "$USER")"
-        
+
         if [[ "$owner" == "root" ]]; then
             log_error "Git repository files are owned by root"
             log_info "To fix: sudo chown -R $USER:$USER $(git rev-parse --show-toplevel)"
             return "$E_PERMISSION"
         fi
     fi
-    
+
     log_debug "Git repository validated [OK]"
     return 0
 }
@@ -1202,10 +1210,10 @@ check_git_repository() {
 
 detect_git_state() {
     log_debug "Detecting git state..."
-    
+
     local git_dir
     git_dir="$(git rev-parse --git-dir 2>/dev/null)"
-    
+
     # Check for ongoing operations (order matters - check most specific first)
     if [[ -f "$git_dir/MERGE_HEAD" ]]; then
         GIT_STATE="merge"
@@ -1232,10 +1240,10 @@ detect_git_state() {
         log_debug "Git state: sequencer operation in progress (interactive rebase/revert)"
         return 0
     fi
-    
+
     # Check for local changes
     check_local_changes
-    
+
     if [[ "$HAS_LOCAL_CHANGES" == "true" ]]; then
         GIT_STATE="dirty"
         log_debug "Git state: dirty (local modifications)"
@@ -1243,13 +1251,13 @@ detect_git_state() {
         GIT_STATE="clean"
         log_debug "Git state: clean"
     fi
-    
+
     return 0
 }
 
 validate_clean_state() {
     detect_git_state
-    
+
     case "$GIT_STATE" in
         merge)
             log_error "Git merge in progress"
@@ -1291,7 +1299,7 @@ validate_clean_state() {
             log_info "Check 'git status' for details"
             return "$E_BAD_STATE"
             ;;
-        clean|dirty)
+        clean | dirty)
             # These are valid states
             return 0
             ;;
@@ -1308,30 +1316,30 @@ validate_clean_state() {
 
 get_default_branch() {
     log_debug "Detecting default branch..."
-    
+
     # Special handling for git-flow: if both main and develop exist, develop is development branch
     local has_develop=false
     local has_main=false
     local remote_head=""
-    
+
     # Check what branches exist
     if git show-ref --verify --quiet refs/remotes/origin/develop 2>/dev/null; then
         has_develop=true
         log_debug "Found develop branch"
     fi
-    
+
     if git show-ref --verify --quiet refs/remotes/origin/main 2>/dev/null; then
         has_main=true
         log_debug "Found main branch"
     fi
-    
+
     # Git-flow pattern: both main and develop exist -> develop is development
     if [[ "$has_develop" == "true" && "$has_main" == "true" ]]; then
         log_debug "Git-flow detected (both main and develop exist) -> using develop as development branch"
         echo "develop"
         return 0
     fi
-    
+
     # Try to get remote HEAD (but only use if not in git-flow pattern)
     if remote_head="$(git ls-remote --symref origin HEAD 2>/dev/null | awk '/^ref:/ {sub(/refs\/heads\//, "", $2); print $2; exit}')"; then
         if [[ -n "$remote_head" ]]; then
@@ -1340,30 +1348,30 @@ get_default_branch() {
             return 0
         fi
     fi
-    
+
     log_debug "Remote HEAD detection failed, checking local branches..."
-    
+
     # Check for develop (single develop branch without main)
     if [[ "$has_develop" == "true" ]]; then
         log_debug "Default branch: develop (git-flow single)"
         echo "develop"
         return 0
     fi
-    
+
     # Check for main (GitHub modern)
     if [[ "$has_main" == "true" ]]; then
         log_debug "Default branch: main (GitHub)"
         echo "main"
         return 0
     fi
-    
+
     # Check for master (legacy)
     if git show-ref --verify --quiet refs/remotes/origin/master 2>/dev/null; then
         log_debug "Default branch: master (legacy)"
         echo "master"
         return 0
     fi
-    
+
     # Fallback
     log_debug "No standard branches found, using fallback: main"
     echo "main"
@@ -1372,7 +1380,7 @@ get_default_branch() {
 
 get_current_version() {
     log_debug "Getting current version..."
-    
+
     # Check if HEAD exists
     if ! git rev-parse --verify --quiet HEAD >/dev/null 2>&1; then
         CURRENT_VERSION="(empty repository)"
@@ -1380,50 +1388,50 @@ get_current_version() {
         IS_DETACHED=false
         return 0
     fi
-    
+
     # Get short commit hash
     CURRENT_VERSION="$(git rev-parse --short HEAD 2>/dev/null)"
-    
+
     # Check if detached HEAD
     if ! git symbolic-ref -q HEAD >/dev/null 2>&1; then
         IS_DETACHED=true
         CURRENT_BRANCH=""
-        
+
         # Try to get tag name
         local tag_name
         if tag_name="$(git describe --tags --exact-match HEAD 2>/dev/null)"; then
             CURRENT_VERSION="$tag_name"
         fi
-        
+
         log_debug "Viewing specific version: $CURRENT_VERSION"
     else
         IS_DETACHED=false
         CURRENT_BRANCH="$(git rev-parse --abbrev-ref HEAD 2>/dev/null)"
         log_debug "On branch $CURRENT_BRANCH at $CURRENT_VERSION"
     fi
-    
+
     return 0
 }
 
 check_local_changes() {
     log_debug "Checking for local changes..."
-    
+
     # Check if HEAD exists
     if ! git rev-parse --verify --quiet HEAD >/dev/null 2>&1; then
         HAS_LOCAL_CHANGES=false
         return 0
     fi
-    
+
     # Check for any changes
-    if ! git diff-index --quiet HEAD 2>/dev/null || \
-       git ls-files --others --exclude-standard 2>/dev/null | grep -q .; then
+    if ! git diff-index --quiet HEAD 2>/dev/null \
+        || git ls-files --others --exclude-standard 2>/dev/null | grep -q .; then
         HAS_LOCAL_CHANGES=true
         log_debug "Local modifications detected"
     else
         HAS_LOCAL_CHANGES=false
         log_debug "No local modifications"
     fi
-    
+
     return 0
 }
 
@@ -1474,25 +1482,25 @@ confirm_destructive_action() {
 
 transaction_begin() {
     local operation="$1"
-    
+
     if [[ "${TRANSACTION_STATE[active]}" == "true" ]]; then
         log_error "Transaction already active: ${TRANSACTION_STATE[operation]}"
         return "$E_GENERAL"
     fi
-    
+
     log_debug "Transaction begin: $operation"
-    
+
     # Save current state
     TRANSACTION_STATE[active]=true
     TRANSACTION_STATE[operation]="$operation"
     TRANSACTION_STATE[original_head]="$(git rev-parse HEAD 2>/dev/null || echo "")"
-    
+
     if ! git symbolic-ref -q HEAD >/dev/null 2>&1; then
-        TRANSACTION_STATE[original_ref]="HEAD"  # Detached
+        TRANSACTION_STATE[original_ref]="HEAD" # Detached
     else
         TRANSACTION_STATE[original_ref]="$(git rev-parse --abbrev-ref HEAD 2>/dev/null)"
     fi
-    
+
     return 0
 }
 
@@ -1501,31 +1509,31 @@ transaction_stash_changes() {
         log_error "No active transaction"
         return "$E_GENERAL"
     fi
-    
+
     log_debug "Creating transaction stash..."
-    
+
     # Use nanoseconds + random for better uniqueness
     local stash_nonce
     stash_nonce="$(date +%s.%N 2>/dev/null || date +%s)-$$-$RANDOM"
-    
+
     local stash_message
     stash_message="lyrebird-tx-${TRANSACTION_STATE[operation]}-${stash_nonce}"
-    
+
     if ! git stash push -u -m "$stash_message" >/dev/null 2>&1; then
         log_error "Failed to save your changes"
         return "$E_GENERAL"
     fi
-    
+
     # Verify stash was created and get its hash
     local stash_hash
     if ! stash_hash="$(git rev-parse 'stash@{0}' 2>/dev/null)"; then
         log_error "Failed to save your changes (couldn't verify save)"
         return "$E_GENERAL"
     fi
-    
+
     TRANSACTION_STATE[stash_hash]="$stash_hash"
     log_debug "Transaction stash created: $stash_hash"
-    
+
     return 0
 }
 
@@ -1534,16 +1542,16 @@ transaction_commit() {
         log_error "No active transaction"
         return "$E_GENERAL"
     fi
-    
+
     log_debug "Transaction commit: ${TRANSACTION_STATE[operation]}"
-    
+
     # Clear transaction state
     TRANSACTION_STATE[active]=false
     TRANSACTION_STATE[stash_hash]=""
     TRANSACTION_STATE[original_ref]=""
     TRANSACTION_STATE[original_head]=""
     TRANSACTION_STATE[operation]=""
-    
+
     return 0
 }
 
@@ -1552,16 +1560,16 @@ transaction_rollback() {
         log_debug "No active transaction to rollback"
         return 0
     fi
-    
+
     log_warn "Rolling back: ${TRANSACTION_STATE[operation]}"
-    
+
     # Disable traps during rollback to prevent recursion
     local original_exit_trap original_int_trap original_term_trap
     original_exit_trap="$(trap -p EXIT)"
     original_int_trap="$(trap -p INT)"
     original_term_trap="$(trap -p TERM)"
     trap - EXIT INT TERM
-    
+
     # Attempt to return to original ref
     if [[ -n "${TRANSACTION_STATE[original_ref]}" ]]; then
         log_debug "Restoring original ref: ${TRANSACTION_STATE[original_ref]}"
@@ -1573,15 +1581,15 @@ transaction_rollback() {
             fi
         fi
     fi
-    
+
     # Restore stashed changes if any
     if [[ -n "${TRANSACTION_STATE[stash_hash]}" ]]; then
         log_debug "Restoring saved changes: ${TRANSACTION_STATE[stash_hash]}"
-        
+
         # Find stash ref from hash
         local stash_ref
         stash_ref=$(git stash list --format="%gd %H" | grep "${TRANSACTION_STATE[stash_hash]}" | cut -d' ' -f1 || echo "")
-        
+
         if [[ -n "$stash_ref" ]]; then
             if git stash pop "$stash_ref" >/dev/null 2>&1; then
                 log_success "Your changes were restored"
@@ -1594,13 +1602,13 @@ transaction_rollback() {
             log_warn "Could not find your saved changes"
         fi
     fi
-    
+
     # Restore service files if update was in progress
     if [[ -f "$SERVICE_UPDATE_MARKER" ]]; then
         log_warn "Rolling back service update..."
         if load_service_state_from_marker; then
             restore_service_from_backup
-            
+
             # Reload systemd and attempt to restart service
             if [[ "${SERVICE_STATE[was_running]}" == "true" ]]; then
                 systemctl daemon-reload 2>/dev/null || true
@@ -1610,26 +1618,26 @@ transaction_rollback() {
                     log_info "Check: systemctl status $SERVICE_NAME"
                 }
             fi
-            
+
             cleanup_service_backups
         fi
         rm -f "$SERVICE_UPDATE_MARKER"
     fi
-    
+
     # Clear transaction state
     TRANSACTION_STATE[active]=false
     TRANSACTION_STATE[stash_hash]=""
     TRANSACTION_STATE[original_ref]=""
     TRANSACTION_STATE[original_head]=""
     TRANSACTION_STATE[operation]=""
-    
+
     # Restore traps
     eval "$original_exit_trap"
     eval "$original_int_trap"
     eval "$original_term_trap"
-    
+
     log_warn "Rollback complete"
-    
+
     return 0
 }
 
@@ -1639,17 +1647,17 @@ transaction_rollback() {
 
 fetch_updates_safe() {
     log_step "Checking for updates from GitHub..."
-    
+
     local attempt=1
     local fetch_output
     local fetch_succeeded=false
-    
+
     while [[ $attempt -le $FETCH_RETRIES ]]; do
         if [[ $attempt -gt 1 ]]; then
             log_info "Retry attempt $attempt of $FETCH_RETRIES (waiting ${FETCH_RETRY_DELAY}s...)"
             sleep "$FETCH_RETRY_DELAY"
         fi
-        
+
         # Try fetch with timeout if available
         if command -v timeout >/dev/null 2>&1; then
             if fetch_output=$(timeout "$FETCH_TIMEOUT" git fetch --all --tags --prune 2>&1); then
@@ -1663,34 +1671,34 @@ fetch_updates_safe() {
                 break
             fi
         fi
-        
+
         log_debug "Fetch attempt $attempt failed"
         attempt=$((attempt + 1))
     done
-    
+
     if [[ "$fetch_succeeded" != "true" ]]; then
         log_error "Failed to fetch updates after $FETCH_RETRIES attempts"
         log_error "Please check your internet connection"
         log_debug "Last error: $fetch_output"
         return "$E_NO_REMOTE"
     fi
-    
+
     # Update remote HEAD reference
     git remote set-head origin --auto >/dev/null 2>&1 || true
-    
+
     log_success "Updates fetched successfully"
     return 0
 }
 
 validate_version_exists() {
     local version="$1"
-    
+
     if [[ -z "$version" ]]; then
         return 1
     fi
-    
+
     log_debug "Validating version: $version"
-    
+
     # Check various ref types
     if git rev-parse --verify --quiet "refs/tags/$version" >/dev/null 2>&1; then
         log_debug "Found as tag: $version"
@@ -1705,45 +1713,45 @@ validate_version_exists() {
         log_debug "Found as commit: $version"
         return 0
     fi
-    
+
     log_debug "Version not found: $version"
     return 1
 }
 
 switch_version_safe() {
     local target_version="$1"
-    
+
     if [[ -z "$target_version" ]]; then
         log_error "No version specified"
         return "$E_GENERAL"
     fi
-    
+
     # Validate we're in a clean state for the operation
     if ! validate_clean_state; then
         return "$E_BAD_STATE"
     fi
-    
+
     # Validate target exists
     if ! validate_version_exists "$target_version"; then
         log_error "Version '$target_version' does not exist"
         log_info "Try running 'Check for Updates' first (option 4)"
         return "$E_GENERAL"
     fi
-    
+
     # Get current state
     get_current_version
-    
+
     # Check if already on this version
     if [[ "$CURRENT_VERSION" == "$target_version" ]]; then
         log_info "Already on version: $target_version"
         return 0
     fi
-    
+
     # Begin transaction
     if ! transaction_begin "switch to $target_version"; then
         return "$E_GENERAL"
     fi
-    
+
     # Handle local changes
     check_local_changes
     if [[ "$HAS_LOCAL_CHANGES" == "true" ]]; then
@@ -1751,14 +1759,14 @@ switch_version_safe() {
         log_warn "You have local modifications"
         echo
         git status --short 2>/dev/null | head -n 15
-        
+
         local total_changes
         total_changes=$(git status --short 2>/dev/null | wc -l)
         if [[ "$total_changes" -gt 15 ]]; then
             echo "  ... and $((total_changes - 15)) more files"
         fi
         echo
-        
+
         log_info "Your changes must be saved before switching versions"
         echo
         if ! confirm_action "Save your changes temporarily? (recommended)"; then
@@ -1766,15 +1774,15 @@ switch_version_safe() {
             transaction_rollback
             return "$E_USER_ABORT"
         fi
-        
+
         if ! transaction_stash_changes; then
             transaction_rollback
             return "$E_GENERAL"
         fi
-        
+
         log_success "Your changes have been saved and will be restored after the update"
     fi
-    
+
     # Handle systemd service update (pre-checkout)
     local service_update_result=0
     if handle_systemd_service_update "$target_version"; then
@@ -1791,7 +1799,7 @@ switch_version_safe() {
             return "$E_GENERAL"
         fi
     fi
-    
+
     # Check if script itself will be modified (self-update)
     local script_will_change=false
     if ! git diff --quiet HEAD "$target_version" -- "$SCRIPT_NAME" 2>/dev/null; then
@@ -1801,10 +1809,10 @@ switch_version_safe() {
         echo
         sleep 2
     fi
-    
+
     # Perform the checkout
     log_step "Switching to version: $target_version"
-    
+
     # Verify write permissions to working directory before checkout
     local repo_root
     repo_root="$(git rev-parse --show-toplevel 2>/dev/null)"
@@ -1813,14 +1821,14 @@ switch_version_safe() {
         transaction_rollback
         return "$E_GENERAL"
     fi
-    
+
     if [[ ! -w "$repo_root" ]]; then
         log_error "No write permission for working directory: $repo_root"
         log_info "To fix: sudo chown -R $USER:$USER $repo_root"
         transaction_rollback
         return "$E_PERMISSION"
     fi
-    
+
     local checkout_output
     if ! checkout_output=$(git checkout "$target_version" 2>&1); then
         log_error "Failed to switch to version: $target_version"
@@ -1828,29 +1836,29 @@ switch_version_safe() {
         transaction_rollback
         return "$E_GENERAL"
     fi
-    
+
     # Verify we actually switched to the target
     local new_head
     new_head="$(git rev-parse HEAD 2>/dev/null)"
     local target_head
     target_head="$(git rev-parse "$target_version" 2>/dev/null)"
-    
+
     if [[ "$new_head" != "$target_head" ]]; then
         log_error "Checkout completed but HEAD does not match target"
         log_error "This indicates a git state inconsistency"
         transaction_rollback
         return "$E_GENERAL"
     fi
-    
+
     log_success "Switched to version: $target_version"
-    
+
     # Set executable permissions on known scripts
     set_script_permissions
-    
+
     # Handle self-update scenario
     if [[ "$script_will_change" == "true" ]]; then
         log_info "Restarting with updated version..."
-        
+
         # Compute absolute path for robustness
         local script_path
         if command -v realpath >/dev/null 2>&1; then
@@ -1861,7 +1869,7 @@ switch_version_safe() {
             # Fallback to constructing absolute path
             script_path="${SCRIPT_DIR}/${SCRIPT_NAME}"
         fi
-        
+
         # Ensure script is executable
         if [[ ! -x "$script_path" ]]; then
             if ! chmod +x "$script_path" 2>/dev/null; then
@@ -1871,7 +1879,7 @@ switch_version_safe() {
                 return "$E_PERMISSION"
             fi
         fi
-        
+
         # CRITICAL: Validate syntax before committing transaction
         log_debug "Validating new script syntax..."
         if ! bash -n "$script_path" 2>/dev/null; then
@@ -1886,7 +1894,7 @@ switch_version_safe() {
             return "$E_GENERAL"
         fi
         log_debug "Syntax validation passed [OK]"
-        
+
         # Prepare restart arguments
         local restart_args=()
         if [[ -n "${TRANSACTION_STATE[stash_hash]}" ]]; then
@@ -1894,17 +1902,17 @@ switch_version_safe() {
         else
             restart_args=("--post-update-complete")
         fi
-        
+
         # NOW safe to commit transaction (syntax validated)
         transaction_commit
-        
+
         # Service update marker remains for post-exec completion
         # No need to cleanup - new script will handle it
-        
+
         # Replace this process with the new script
         # shellcheck disable=SC2093  # exec is intentional here for self-update
         exec "$script_path" "${restart_args[@]}"
-        
+
         # This line only reached if exec fails (kernel-level failure)
         log_error "Failed to restart with new version (exec failed)"
         log_error "This is a critical error - manual intervention required"
@@ -1912,25 +1920,25 @@ switch_version_safe() {
         log_error "Try running manually: $script_path"
         exit "$E_GENERAL"
     fi
-    
+
     # Complete service update (post-checkout)
     if ! post_checkout_service_update; then
         log_error "Service update failed after checkout"
         transaction_rollback
         return "$E_GENERAL"
     fi
-    
+
     # Remove service update marker on success
     rm -f "$SERVICE_UPDATE_MARKER"
-    
+
     # Restore stashed changes (if not self-updating)
     if [[ -n "${TRANSACTION_STATE[stash_hash]}" ]]; then
         echo
         log_step "Restoring your saved changes..."
-        
+
         local stash_ref
         stash_ref=$(git stash list --format="%gd %H" | grep "${TRANSACTION_STATE[stash_hash]}" | cut -d' ' -f1 || echo "")
-        
+
         if [[ -z "$stash_ref" ]]; then
             log_warn "Could not find your saved changes"
             log_info "Your changes may have been lost (stash hash: ${TRANSACTION_STATE[stash_hash]})"
@@ -1952,39 +1960,39 @@ switch_version_safe() {
             fi
         fi
     fi
-    
+
     # Commit transaction
     transaction_commit
-    
+
     # Update state
     get_current_version
     check_local_changes
-    
+
     echo
     log_success "Version switch complete!"
-    
+
     return 0
 }
 
 reset_to_clean_state() {
     local target="$1"
-    
+
     if [[ -z "$target" ]]; then
         log_error "No target specified for reset"
         return "$E_GENERAL"
     fi
-    
+
     # Validate we're not in a bad state
     if ! validate_clean_state; then
         return "$E_BAD_STATE"
     fi
-    
+
     # Validate target exists
     if ! git rev-parse --verify --quiet "$target" >/dev/null 2>&1; then
         log_error "Target '$target' does not exist"
         return "$E_GENERAL"
     fi
-    
+
     # Show what will be deleted before confirmation
     echo
     log_warn "WARNING: This action CANNOT be undone!"
@@ -1995,41 +2003,41 @@ reset_to_clean_state() {
     echo
     log_warn "Reset target: $target"
     echo
-    
+
     # Require explicit "yes" confirmation
     if ! confirm_destructive_action "Type 'yes' (case-sensitive) to confirm reset, or anything else to cancel: "; then
         log_info "Reset cancelled"
         return 0
     fi
-    
+
     log_step "Resetting to clean state: $target"
-    
+
     # Perform reset
     if ! git reset --hard "$target" >/dev/null 2>&1; then
         log_error "Failed to reset to $target"
         return "$E_GENERAL"
     fi
-    
+
     # Clean untracked files
     if ! git clean -fd >/dev/null 2>&1; then
         log_warn "Could not remove all untracked files"
     fi
-    
+
     log_success "Reset complete. Your changes are gone. Repository is clean."
-    
+
     # Set script permissions
     set_script_permissions
-    
+
     # Update state
     get_current_version
     check_local_changes
-    
+
     return 0
 }
 
 set_script_permissions() {
     log_debug "Setting executable permissions on scripts..."
-    
+
     local scripts=(
         "install_mediamtx.sh"
         "lyrebird-orchestrator.sh"
@@ -2037,7 +2045,7 @@ set_script_permissions() {
         "mediamtx-stream-manager.sh"
         "usb-audio-mapper.sh"
     )
-    
+
     for script in "${scripts[@]}"; do
         if [[ -f "$script" ]]; then
             if ! chmod +x "$script" 2>/dev/null; then
@@ -2046,7 +2054,7 @@ set_script_permissions() {
             fi
         fi
     done
-    
+
     return 0
 }
 
@@ -2056,25 +2064,25 @@ set_script_permissions() {
 
 list_available_releases() {
     AVAILABLE_VERSIONS=()
-    
+
     echo
     echo "${BOLD}=== Available Versions ===${NC}"
     echo
-    
+
     # List stable releases (tags)
     echo "${BOLD}Stable Releases (numbered versions, tested and stable):${NC}"
-    
+
     if git tag -l 'v*' --sort=-creatordate | head -n "$TAG_LIST_LIMIT" | grep -q .; then
         local counter=1
         while IFS= read -r tag; do
             local tag_date
             tag_date=$(git log -1 --format=%ai "$tag" 2>/dev/null | cut -d' ' -f1 || echo "unknown")
             printf "  %2d) %-15s (created: %s)\n" "$counter" "$tag" "$tag_date"
-            
+
             AVAILABLE_VERSIONS+=("$tag")
             ((counter++))
         done < <(git tag -l 'v*' --sort=-creatordate | head -n "$TAG_LIST_LIMIT")
-        
+
         local tag_count
         tag_count=$(git tag -l 'v*' | wc -l)
         if [[ "$tag_count" -gt "$TAG_LIST_LIMIT" ]]; then
@@ -2083,16 +2091,16 @@ list_available_releases() {
     else
         echo "  (no stable releases found)"
     fi
-    
+
     echo
     echo "${BOLD}Development & Feature Branches (select any to switch):${NC}"
     echo "  The '${DEFAULT_BRANCH}' branch is where active development happens."
     echo
-    
+
     local branch_counter=$((${#AVAILABLE_VERSIONS[@]} + 1))
     local git_branches
     git_branches=$(git branch -r | grep -v HEAD | sed 's/origin\///' | sed 's/^[[:space:]]*//')
-    
+
     if [[ -n "$git_branches" ]]; then
         while IFS= read -r branch; do
             if [[ "$branch" == "$DEFAULT_BRANCH" ]]; then
@@ -2102,11 +2110,11 @@ list_available_releases() {
             fi
             AVAILABLE_VERSIONS+=("$branch")
             ((branch_counter++))
-        done <<< "$git_branches"
+        done <<<"$git_branches"
     else
         echo "  (no development branches found)"
     fi
-    
+
     echo
     echo "${CYAN}Tip: You can also enter any commit hash or branch name directly${NC}"
     echo
@@ -2118,10 +2126,10 @@ select_version_interactive() {
         log_warn "Could not fetch updates - using cached information"
         echo
     fi
-    
+
     # Show available versions
     list_available_releases
-    
+
     echo "You can enter:"
     echo "  - A number from the list (e.g., 1, 5)"
     echo "  - A tag directly (e.g., v1.2.0)"
@@ -2130,18 +2138,18 @@ select_version_interactive() {
     echo "  - Press Enter to cancel"
     echo
     read -r -p "Your selection: " selection
-    
+
     if [[ -z "$selection" ]]; then
         log_info "Selection cancelled"
         return 0
     fi
-    
+
     local target_version=""
-    
+
     # Check if input is a number
     if [[ "$selection" =~ ^[0-9]+$ ]]; then
         local index=$((selection - 1))
-        
+
         if [[ "$index" -ge 0 ]] && [[ "$index" -lt "${#AVAILABLE_VERSIONS[@]}" ]]; then
             target_version="${AVAILABLE_VERSIONS[$index]}"
             log_info "Selected: $target_version"
@@ -2157,53 +2165,53 @@ select_version_interactive() {
             log_error "Only alphanumeric characters, dots, underscores, slashes, and hyphens are allowed"
             return "$E_GENERAL"
         fi
-        
+
         target_version="$selection"
     fi
-    
+
     # Additional validation - verify version exists
     if ! validate_version_exists "$target_version"; then
         log_error "Version '$target_version' does not exist"
         log_info "Try running 'Check for Updates' first (option 4)"
         return "$E_GENERAL"
     fi
-    
+
     switch_version_safe "$target_version"
 }
 
 switch_to_latest_stable() {
     log_step "Finding latest stable release..."
-    
+
     # Fetch first
     if ! fetch_updates_safe; then
         log_warn "Using cached version information"
     fi
-    
+
     # Get latest tag by creation date
     local latest_tag
     if ! latest_tag="$(git tag -l 'v*' --sort=-creatordate | head -n 1)"; then
         log_error "No stable releases found"
         return "$E_GENERAL"
     fi
-    
+
     if [[ -z "$latest_tag" ]]; then
         log_error "No version tags found in repository"
         log_info "The repository may not have any releases yet"
         return "$E_GENERAL"
     fi
-    
+
     log_info "Latest stable release: $latest_tag"
     switch_version_safe "$latest_tag"
 }
 
 switch_to_development() {
     log_step "Switching to development version..."
-    
+
     # Fetch first
     if ! fetch_updates_safe; then
         log_warn "Using cached version information"
     fi
-    
+
     switch_version_safe "$DEFAULT_BRANCH"
 }
 
@@ -2215,17 +2223,17 @@ show_status() {
     get_current_version
     check_local_changes
     detect_git_state
-    
+
     echo
     echo "${BOLD}=== Repository Status ===${NC}"
     echo
-    
+
     # Current position
     if [[ "$IS_DETACHED" == "true" ]]; then
         echo "${BOLD}Current State:${NC}"
         echo "  Status:     ${YELLOW}Viewing a Specific Release (not on a branch)${NC}"
         echo "  Version:    ${BOLD}$CURRENT_VERSION${NC}"
-        
+
         local tags_here
         tags_here=$(git tag --points-at HEAD 2>/dev/null | tr '\n' ' ')
         if [[ -n "$tags_here" ]]; then
@@ -2235,27 +2243,27 @@ show_status() {
         echo "${BOLD}Current Branch:${NC}"
         echo "  Branch:     ${BOLD}$CURRENT_BRANCH${NC}"
         echo "  Commit:     ${BOLD}$CURRENT_VERSION${NC}"
-        
+
         # Show branch type
         if [[ "$CURRENT_BRANCH" == "$DEFAULT_BRANCH" ]]; then
             echo "  Type:       ${CYAN}Development (where new features are added)${NC}"
         else
             echo "  Type:       Feature/Release branch"
         fi
-        
+
         # Check if on a tag
         local current_tag
         current_tag=$(git describe --exact-match --tags HEAD 2>/dev/null || echo "")
         if [[ -n "$current_tag" ]]; then
             echo "  Tag:        ${GREEN}$current_tag${NC}"
         fi
-        
+
         # Show relationship to remote
         if git show-ref --verify --quiet "refs/remotes/origin/$CURRENT_BRANCH" 2>/dev/null; then
             local ahead behind
             ahead=$(git rev-list --count "origin/$CURRENT_BRANCH..HEAD" 2>/dev/null || echo "0")
             behind=$(git rev-list --count "HEAD..origin/$CURRENT_BRANCH" 2>/dev/null || echo "0")
-            
+
             if [[ "$ahead" -gt 0 ]] && [[ "$behind" -gt 0 ]]; then
                 echo "  Remote:     ${YELLOW}Diverged ($ahead ahead, $behind behind)${NC}"
             elif [[ "$ahead" -gt 0 ]]; then
@@ -2269,10 +2277,10 @@ show_status() {
             echo "  Remote:     ${YELLOW}No remote tracking${NC}"
         fi
     fi
-    
+
     echo
     echo "${BOLD}Working Directory:${NC}"
-    
+
     case "$GIT_STATE" in
         clean)
             echo "  Status:     ${GREEN}Ready (no local modifications)${NC}"
@@ -2283,64 +2291,64 @@ show_status() {
             echo "  File Status Legend:  M=modified  A=added  D=deleted  ?=untracked"
             echo
             git status --short | head -n 10 | sed 's/^/    /'
-            
+
             local change_count
             change_count=$(git status --short | wc -l)
             if [[ "$change_count" -gt 10 ]]; then
                 echo "    ... and $((change_count - 10)) more"
             fi
             ;;
-        merge|rebase|revert|cherry-pick|bisect|sequencer)
+        merge | rebase | revert | cherry-pick | bisect | sequencer)
             echo "  Status:     ${RED}${GIT_STATE^^} IN PROGRESS${NC}"
             ;;
     esac
-    
+
     echo
     echo "${BOLD}Repository Info:${NC}"
-    
+
     local repo_remote
     repo_remote=$(git remote get-url origin 2>/dev/null || echo "none")
     echo "  Remote:     $repo_remote"
-    
+
     local last_fetch="never"
     if [[ -f ".git/FETCH_HEAD" ]] && command -v stat >/dev/null 2>&1; then
-        last_fetch=$(stat -c %y ".git/FETCH_HEAD" 2>/dev/null | cut -d'.' -f1 || \
-                    stat -f %Sm ".git/FETCH_HEAD" 2>/dev/null || echo "unknown")
+        last_fetch=$(stat -c %y ".git/FETCH_HEAD" 2>/dev/null | cut -d'.' -f1 \
+            || stat -f %Sm ".git/FETCH_HEAD" 2>/dev/null || echo "unknown")
         # Ensure last_fetch is not empty
         [[ -z "$last_fetch" ]] && last_fetch="unknown"
     fi
     echo "  Last fetch: $last_fetch"
-    
+
     # Show systemd service status if installed
     if [[ -f "$SERVICE_FILE" ]]; then
         echo
         echo "${BOLD}Systemd Service:${NC}"
         echo "  Service:    $SERVICE_NAME"
-        
+
         if systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null; then
             echo "  Status:     ${GREEN}Running${NC}"
         else
             echo "  Status:     ${YELLOW}Stopped${NC}"
         fi
-        
+
         if systemctl is-enabled --quiet "$SERVICE_NAME" 2>/dev/null; then
             echo "  Enabled:    ${GREEN}Yes${NC}"
         else
             echo "  Enabled:    ${YELLOW}No${NC}"
         fi
     fi
-    
+
     echo
 }
 
 show_startup_diagnostics() {
     get_current_version
     check_local_changes
-    
+
     echo
     echo "${BOLD}=== LyreBirdAudio Version Manager v${VERSION} ===${NC}"
     echo
-    
+
     # Current version
     if [[ "$IS_DETACHED" == "true" ]]; then
         echo "Current:  ${YELLOW}Viewing Release: ${BOLD}$CURRENT_VERSION${NC}${YELLOW} (not tracking a branch)${NC}"
@@ -2351,16 +2359,16 @@ show_startup_diagnostics() {
             echo "Current:  ${CYAN}Branch ${BOLD}$CURRENT_BRANCH${NC} @ $CURRENT_VERSION"
         fi
     fi
-    
+
     if [[ "$HAS_LOCAL_CHANGES" == "true" ]]; then
         echo "Changes:  ${YELLOW}You have local modifications${NC}"
     else
         echo "Changes:  ${GREEN}Clean working directory${NC}"
     fi
-    
+
     echo
     log_step "Checking for updates..."
-    
+
     # Quick fetch (with short timeout)
     local fetch_ok=false
     if command -v timeout >/dev/null 2>&1; then
@@ -2372,21 +2380,21 @@ show_startup_diagnostics() {
             fetch_ok=true
         fi
     fi
-    
+
     if [[ "$fetch_ok" == "true" ]]; then
         echo "          ${GREEN}[OK]${NC} Connected to GitHub"
     else
         echo "          ${YELLOW}!${NC} Could not connect (using cached data)"
     fi
-    
+
     # Check for stable releases
     local latest_tag
     latest_tag="$(git tag -l 'v*' --sort=-creatordate 2>/dev/null | head -n 1)"
-    
+
     if [[ -n "$latest_tag" ]]; then
         local current_tag
         current_tag="$(git describe --exact-match --tags HEAD 2>/dev/null || echo "")"
-        
+
         if [[ -n "$current_tag" ]] && [[ "$current_tag" == "$latest_tag" ]]; then
             echo "Stable:   ${GREEN}You're on latest: $latest_tag${NC}"
         else
@@ -2394,12 +2402,12 @@ show_startup_diagnostics() {
             echo "          ${CYAN}^ Select option 1 to update${NC}"
         fi
     fi
-    
+
     # Check development branch
     if [[ "$IS_DETACHED" == "false" ]]; then
         local behind
         behind=$(git rev-list --count "HEAD..origin/$CURRENT_BRANCH" 2>/dev/null || echo "0")
-        
+
         if [[ "$behind" -gt 0 ]]; then
             echo "Dev:      ${YELLOW}$behind commit(s) behind origin/$CURRENT_BRANCH${NC}"
             echo "          ${CYAN}^ Select option 2 to update${NC}"
@@ -2407,9 +2415,9 @@ show_startup_diagnostics() {
             echo "Dev:      ${GREEN}Up to date with origin/$CURRENT_BRANCH${NC}"
         fi
     fi
-    
+
     echo
-    
+
     # Only prompt if stdin is a terminal
     if [[ -t 0 ]]; then
         read -r -p "Press Enter to continue..."
@@ -2423,8 +2431,8 @@ show_startup_diagnostics() {
 show_help() {
     # Get default branch dynamically
     local help_default_branch="${DEFAULT_BRANCH:-develop}"
-    
-    cat << EOF
+
+    cat <<EOF
 
 ================================================================================
    LyreBirdAudio Version Manager - Help Guide
@@ -2546,14 +2554,14 @@ main_menu() {
     while true; do
         get_current_version
         check_local_changes
-        
+
         clear
         echo
         echo "${BOLD}+---------------------------------------------------------+${NC}"
         echo "${BOLD}|     LyreBirdAudio - Version Manager v${VERSION}      |${NC}"
         echo "${BOLD}+---------------------------------------------------------+${NC}"
         echo
-        
+
         # Status header
         if [[ "$IS_DETACHED" == "true" ]]; then
             echo "  Current:  ${YELLOW}$CURRENT_VERSION${NC}"
@@ -2564,13 +2572,13 @@ main_menu() {
                 echo "  Current:  ${CYAN}$CURRENT_BRANCH${NC} @ ${BOLD}$CURRENT_VERSION${NC}"
             fi
         fi
-        
+
         if [[ "$HAS_LOCAL_CHANGES" == "true" ]]; then
             echo "  Changes:  ${YELLOW}Has local modifications${NC}"
         else
             echo "  Changes:  ${GREEN}None${NC}"
         fi
-        
+
         # Show service status if installed
         if [[ -f "$SERVICE_FILE" ]]; then
             if systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null; then
@@ -2579,7 +2587,7 @@ main_menu() {
                 echo "  Service:  ${YELLOW}Stopped${NC}"
             fi
         fi
-        
+
         echo
         echo "${BOLD}=== UPDATE ===${NC}"
         echo "  ${BOLD}1${NC}) Switch to Latest Stable Release"
@@ -2599,7 +2607,7 @@ main_menu() {
         echo "  ${BOLD}H${NC}) Help  |  ${BOLD}Q${NC}) Quit"
         echo
         read -r -p "Select [1-6, H, Q]: " choice
-        
+
         case "$choice" in
             1)
                 switch_to_latest_stable
@@ -2626,11 +2634,11 @@ main_menu() {
             6)
                 reset_menu
                 ;;
-            h|H)
+            h | H)
                 show_help
                 read -r -p "Press Enter to continue..."
                 ;;
-            q|Q)
+            q | Q)
                 echo
                 log_info "Thank you for using LyreBirdAudio Version Manager"
                 return 0
@@ -2657,7 +2665,7 @@ reset_menu() {
         echo "  ${BOLD}C${NC}) Cancel"
         echo
         read -r -p "Select [1-3, C]: " choice
-        
+
         case "$choice" in
             1)
                 get_current_version
@@ -2691,11 +2699,11 @@ reset_menu() {
                 if ! fetch_updates_safe; then
                     log_warn "Using cached information"
                 fi
-                
+
                 list_available_releases
                 echo
                 read -r -p "Enter version to reset to: " version
-                
+
                 if [[ -z "$version" ]]; then
                     log_info "Cancelled"
                 elif ! validate_version_exists "$version"; then
@@ -2706,7 +2714,7 @@ reset_menu() {
                 read -r -p "Press Enter to continue..."
                 return 0
                 ;;
-            c|C)
+            c | C)
                 log_info "Cancelled"
                 read -r -p "Press Enter to continue..."
                 return 0
@@ -2729,29 +2737,29 @@ main() {
         log_error "Failed to change to script directory: $SCRIPT_DIR"
         exit "$E_GENERAL"
     fi
-    
+
     # Check prerequisites
     if ! check_prerequisites; then
         exit "$E_PREREQUISITES"
     fi
-    
+
     # Acquire lock
     if ! acquire_lock; then
         exit "$E_LOCKED"
     fi
-    
+
     # Validate git repository
     if ! check_git_repository; then
         exit "$E_NOT_GIT_REPO"
     fi
-    
+
     # Save and configure git settings
     save_git_config
-    
+
     # Detect default branch (CRITICAL: Must be done early and consistently used)
     DEFAULT_BRANCH="$(get_default_branch)"
     log_debug "Default branch: $DEFAULT_BRANCH"
-    
+
     # Handle command line arguments
     if [[ $# -gt 0 ]]; then
         case "$1" in
@@ -2760,15 +2768,15 @@ main() {
                     log_error "Missing stash hash argument"
                     exit "$E_GENERAL"
                 fi
-                
+
                 echo
                 log_success "Updater has been updated!"
                 log_step "Restoring your saved changes..."
-                
+
                 local stash_hash="$2"
                 local stash_ref
                 stash_ref=$(git stash list --format="%gd %H" | grep "$stash_hash" | cut -d' ' -f1 || echo "")
-                
+
                 if [[ -n "$stash_ref" ]]; then
                     if git stash pop "$stash_ref" >/dev/null 2>&1; then
                         log_success "Changes restored successfully"
@@ -2780,7 +2788,7 @@ main() {
                 else
                     log_warn "Could not find your saved changes"
                 fi
-                
+
                 # Check for pending service update
                 if check_pending_service_update; then
                     if ! complete_pending_service_update; then
@@ -2788,15 +2796,15 @@ main() {
                         log_info "You may need to manually check the service status"
                     fi
                 fi
-                
+
                 echo
                 read -r -p "Press Enter to continue..."
                 ;;
-                
+
             --post-update-complete)
                 echo
                 log_success "Updater has been updated successfully!"
-                
+
                 # Check for pending service update
                 if check_pending_service_update; then
                     if ! complete_pending_service_update; then
@@ -2804,32 +2812,32 @@ main() {
                         log_info "You may need to manually check the service status"
                     fi
                 fi
-                
+
                 echo
                 read -r -p "Press Enter to continue..."
                 ;;
-                
-            --version|-v)
+
+            --version | -v)
                 echo "LyreBirdAudio Version Manager v${VERSION}"
                 exit "$E_SUCCESS"
                 ;;
-                
-            --help|-h)
+
+            --help | -h)
                 show_help
                 exit "$E_SUCCESS"
                 ;;
-                
-            --status|-s)
+
+            --status | -s)
                 show_status
                 exit "$E_SUCCESS"
                 ;;
-                
-            --list|-l)
+
+            --list | -l)
                 fetch_updates_safe || true
                 list_available_releases
                 exit "$E_SUCCESS"
                 ;;
-                
+
             *)
                 log_error "Unknown option: $1"
                 echo "Try '$SCRIPT_NAME --help' for more information"
@@ -2837,7 +2845,7 @@ main() {
                 ;;
         esac
     fi
-    
+
     # Check for pending service update (in case of abnormal termination)
     if check_pending_service_update; then
         log_warn "Detected incomplete service update from previous run"
@@ -2851,13 +2859,13 @@ main() {
         fi
         echo
     fi
-    
+
     # Show startup diagnostics
     show_startup_diagnostics
-    
+
     # Run interactive menu
     main_menu
-    
+
     exit "$E_SUCCESS"
 }
 

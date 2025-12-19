@@ -100,6 +100,14 @@
 #   lyrebird-mic-check.sh --format=json      # JSON output
 set -euo pipefail
 
+# Source shared library if available (backward compatible)
+# Provides: colors, logging, command_exists, compute_hash, exit codes
+# Falls back gracefully if library not present - all functions defined locally below
+_LYREBIRD_COMMON="${BASH_SOURCE[0]%/*}/lyrebird-common.sh"
+# shellcheck source=lyrebird-common.sh
+[[ -f "$_LYREBIRD_COMMON" ]] && source "$_LYREBIRD_COMMON" || true
+unset _LYREBIRD_COMMON
+
 # Version
 readonly VERSION="1.0.0"
 SCRIPT_NAME="$(basename "${BASH_SOURCE[0]}")"
@@ -117,13 +125,13 @@ CONFIG_DIR="${MEDIAMTX_CONFIG_DIR:-${DEFAULT_CONFIG_DIR}}"
 MODE_GENERATE=false
 MODE_VALIDATE=false
 MODE_FORCE=false
-MODE_NO_BACKUP=false  # Explicitly disable backup (backup is default)
+MODE_NO_BACKUP=false # Explicitly disable backup (backup is default)
 MODE_RESTORE=false
 MODE_LIST_BACKUPS=false
 MODE_QUIET=false
 OUTPUT_FORMAT="text"
 SPECIFIC_CARD=""
-RESTORE_TIMESTAMP=""  # For --restore with specific timestamp
+RESTORE_TIMESTAMP="" # For --restore with specific timestamp
 
 # Quality tier for configuration generation (default: normal)
 QUALITY_TIER="normal"
@@ -199,17 +207,17 @@ TEMP_CONFIG_FILE=""
 # Cleanup function for signal handling and normal exit
 cleanup() {
     local exit_code=$?
-    
+
     # Remove temporary config file if it exists
     if [[ -n "${TEMP_CONFIG_FILE:-}" ]] && [[ -f "$TEMP_CONFIG_FILE" ]]; then
         rm -f "$TEMP_CONFIG_FILE"
     fi
-    
+
     # If interrupted during config generation, log the interruption
     if [[ $exit_code -eq 130 ]]; then
         log_error "Operation interrupted by user"
     fi
-    
+
     exit $exit_code
 }
 
@@ -239,7 +247,7 @@ log_warn() {
 
 # Show usage information
 show_usage() {
-    cat << EOF
+    cat <<EOF
 Usage: $SCRIPT_NAME [OPTIONS] [CARD_NUMBER]
 
 Detect USB microphone hardware capabilities and generate MediaMTX configuration.
@@ -354,7 +362,7 @@ EOF
 
 # Show version information
 show_version() {
-    cat << EOF
+    cat <<EOF
 $SCRIPT_NAME version $VERSION
 Part of LyreBirdAudio - RTSP Audio Streaming Suite
 
@@ -395,33 +403,33 @@ EOF
 sanitize_device_name() {
     local name="$1"
     local sanitized
-    
+
     # Security: Reject suspicious patterns
     if [[ "$name" =~ \.\. ]] || [[ "$name" =~ [/$] ]] || [[ "$name" =~ ^- ]]; then
         log_warn "Device name contains suspicious characters, using fallback"
         printf 'unknown_device_%s\n' "$(date +%s)"
         return
     fi
-    
+
     # Limit length to prevent DoS
     if [[ ${#name} -gt 64 ]]; then
         name="${name:0:64}"
         log_warn "Device name truncated to 64 characters"
     fi
-    
+
     # Replace non-alphanumeric with underscore, preserve case
     sanitized=$(printf '%s' "$name" | sed 's/[^a-zA-Z0-9]/_/g; s/__*/_/g; s/^_//; s/_$//')
-    
+
     # Ensure it doesn't start with a number (lowercase prefix)
     if [[ "$sanitized" =~ ^[0-9] ]]; then
         sanitized="dev_${sanitized}"
     fi
-    
+
     # Fallback if empty (lowercase)
     if [[ -z "$sanitized" ]]; then
         sanitized="unknown_device_$(date +%s)"
     fi
-    
+
     printf '%s\n' "$sanitized"
 }
 
@@ -438,7 +446,7 @@ sanitize_device_name() {
 #   Logs warning if adapter is detected
 check_usb_audio_adapter() {
     local usb_id="$1"
-    
+
     if [[ -n "${USB_AUDIO_ADAPTERS[$usb_id]:-}" ]]; then
         local adapter_name="${USB_AUDIO_ADAPTERS[$usb_id]}"
         log_warn "Detected USB audio adapter chip: $adapter_name"
@@ -450,7 +458,7 @@ check_usb_audio_adapter() {
         log_warn "  Consider testing: arecord -f cd -d 5 /tmp/test.wav"
         return 0
     fi
-    
+
     # Heuristic: Generic USB Audio devices may also be adapters
     # This is less certain, so we provide a softer warning
     return 1
@@ -476,27 +484,27 @@ check_usb_audio_adapter() {
 # Side Effects: None (read-only)
 is_device_busy() {
     local card_num="$1"
-    
+
     # hw_params file only exists when device is open and configured
     # Check all PCM devices and substreams for this card
     if [[ -d "/proc/asound/card${card_num}" ]]; then
         local hw_params_found=false
-        
+
         # Check all pcm devices (pcm0p, pcm0c, pcm1p, pcm1c, etc.)
         local card_base_dir="/proc/asound/card${card_num}"
         for pcm_dir in "$card_base_dir"/pcm*; do
             [[ -d "$pcm_dir" ]] || continue
-            
+
             # Check all substreams
             for sub_dir in "$pcm_dir"/sub*; do
                 [[ -d "$sub_dir" ]] || continue
-                
+
                 # If hw_params exists and is not empty, device is configured
                 if [[ -f "$sub_dir/hw_params" ]] && [[ -s "$sub_dir/hw_params" ]]; then
                     hw_params_found=true
                     break 2
                 fi
-                
+
                 # Check device status (open but not configured)
                 if [[ -f "$sub_dir/status" ]]; then
                     local status
@@ -508,11 +516,11 @@ is_device_busy() {
                 fi
             done
         done
-        
+
         if [[ "$hw_params_found" = true ]]; then
             return 0
         fi
-        
+
         # Additional check: fuser on device files (if fuser is available)
         # Check all capture device files, not just D0c
         if command -v fuser >/dev/null 2>&1; then
@@ -524,7 +532,7 @@ is_device_busy() {
             done
         fi
     fi
-    
+
     return 1
 }
 
@@ -550,37 +558,37 @@ is_device_busy() {
 # Side Effects: None (read-only)
 get_device_info() {
     local card_num="$1"
-    
+
     # Validate card exists
     local card_dir="/proc/asound/card${card_num}"
     if [[ ! -d "$card_dir" ]]; then
         log_error "Card $card_num not found"
         return 1
     fi
-    
+
     # Verify this is a USB device
     if [[ ! -f "$card_dir/usbid" ]]; then
         log_error "Card $card_num is not a USB device"
         return 1
     fi
-    
+
     # Read USB ID
     local usb_id=""
     if [[ -f "$card_dir/usbid" ]]; then
         usb_id=$(cat "$card_dir/usbid" 2>/dev/null || echo "")
     fi
-    
+
     # Read device name from id file (short name)
     local device_name=""
     if [[ -f "$card_dir/id" ]]; then
         device_name=$(cat "$card_dir/id" 2>/dev/null || echo "")
     fi
-    
+
     # Fallback to card number if no name
     if [[ -z "$device_name" ]]; then
         device_name="card${card_num}"
     fi
-    
+
     # Read full device ID from usbmixer (if available)
     local device_id=""
     local device_id_path=""
@@ -588,7 +596,7 @@ get_device_info() {
         # Parse usbmixer for device ID
         device_id=$(grep -m1 "USB Mixer" "$card_dir/usbmixer" 2>/dev/null | sed 's/.*: //' || echo "")
     fi
-    
+
     # Try to find device ID path from /dev/snd/by-id/
     # This provides persistent naming independent of card number
     if [[ -d "/dev/snd/by-id" ]]; then
@@ -603,14 +611,14 @@ get_device_info() {
             fi
         done
     fi
-    
+
     # Output device information
     printf 'card_number=%s\n' "$card_num"
     printf 'device_name=%s\n' "$device_name"
     [[ -n "$device_id" ]] && printf 'device_id=%s\n' "$device_id"
     [[ -n "$device_id_path" ]] && printf 'device_id_path=%s\n' "$device_id_path"
     [[ -n "$usb_id" ]] && printf 'usb_id=%s\n' "$usb_id"
-    
+
     return 0
 }
 
@@ -636,49 +644,49 @@ get_device_info() {
 # Side Effects: None (read-only)
 parse_stream_file() {
     local stream_file="$1"
-    local stream_type="$2"  # "Playback" or "Capture"
-    
+    local stream_type="$2" # "Playback" or "Capture"
+
     [[ -f "$stream_file" ]] || return 1
-    
+
     local in_target_section=false
     local in_altset=false
     local formats=()
     local channels=()
     local rates=()
-    
+
     while IFS= read -r line || [[ -n "$line" ]]; do
         # Detect section start (Playback: or Capture:)
         if [[ "$line" =~ ^[[:space:]]*${stream_type}: ]]; then
             in_target_section=true
             continue
         fi
-        
+
         # Exit if we hit another top-level section
         if [[ "$in_target_section" = true ]] && [[ "$line" =~ ^[A-Z][a-z]+: ]]; then
             if [[ ! "$line" =~ ^[[:space:]] ]]; then
                 break
             fi
         fi
-        
+
         if [[ "$in_target_section" = false ]]; then
             continue
         fi
-        
+
         # Parse altset start
         if [[ "$line" =~ ^[[:space:]]+Altset[[:space:]]([0-9]+) ]]; then
             in_altset=true
             continue
         fi
-        
+
         # Parse format line
         if [[ "$in_altset" = true ]] && [[ "$line" =~ ^[[:space:]]+Format:[[:space:]](.+)$ ]]; then
             local format="${BASH_REMATCH[1]}"
-            format="${format%%[[:space:]]*}"  # Take first word only
+            format="${format%%[[:space:]]*}" # Take first word only
             if [[ -n "$format" ]] && [[ ! " ${formats[*]} " == *" ${format} "* ]]; then
                 formats+=("$format")
             fi
         fi
-        
+
         # Parse channels line
         if [[ "$in_altset" = true ]] && [[ "$line" =~ ^[[:space:]]+Channels:[[:space:]]([0-9]+) ]]; then
             local channel="${BASH_REMATCH[1]}"
@@ -686,16 +694,16 @@ parse_stream_file() {
                 channels+=("$channel")
             fi
         fi
-        
+
         # Parse rates line (can be ranges or discrete values)
         if [[ "$in_altset" = true ]] && [[ "$line" =~ ^[[:space:]]+Rates:[[:space:]](.+)$ ]]; then
             local rates_str="${BASH_REMATCH[1]}"
-            
+
             # Handle range format: 8000 - 96000 (continuous)
             if [[ "$rates_str" =~ ([0-9]+)[[:space:]]*-[[:space:]]([0-9]+)[[:space:]]*\(continuous\) ]]; then
                 local min_rate="${BASH_REMATCH[1]}"
                 local max_rate="${BASH_REMATCH[2]}"
-                
+
                 # Validate range
                 if [[ $min_rate -ge $max_rate ]]; then
                     log_warn "Invalid continuous rate range: $min_rate-$max_rate (min >= max)"
@@ -711,7 +719,7 @@ parse_stream_file() {
                             fi
                         fi
                     done
-                    
+
                     # Warn if range is suspiciously large
                     if [[ $((max_rate / min_rate)) -gt 100 ]]; then
                         log_warn "Suspiciously large rate range: $min_rate-$max_rate"
@@ -719,7 +727,7 @@ parse_stream_file() {
                 fi
             else
                 # Handle discrete rates: 44100, 48000
-                IFS=',' read -ra rate_array <<< "$rates_str"
+                IFS=',' read -ra rate_array <<<"$rates_str"
                 for rate in "${rate_array[@]}"; do
                     # Strip whitespace and non-numeric characters
                     rate="${rate//[^0-9]/}"
@@ -729,9 +737,9 @@ parse_stream_file() {
                 done
             fi
         fi
-        
-    done < "$stream_file"
-    
+
+    done <"$stream_file"
+
     # Output results if we found any capabilities
     if [[ ${#formats[@]} -gt 0 ]] || [[ ${#channels[@]} -gt 0 ]] || [[ ${#rates[@]} -gt 0 ]]; then
         [[ ${#formats[@]} -gt 0 ]] && printf 'formats=%s\n' "${formats[*]}"
@@ -739,7 +747,7 @@ parse_stream_file() {
         [[ ${#rates[@]} -gt 0 ]] && printf 'rates=%s\n' "${rates[*]}"
         return 0
     fi
-    
+
     return 1
 }
 
@@ -776,27 +784,27 @@ parse_stream_file() {
 # Side Effects: None (read-only operations only)
 detect_device_capabilities() {
     local card_num="$1"
-    
+
     # Validate card number
     if [[ ! "$card_num" =~ ^[0-9]+$ ]]; then
         log_error "Invalid card number: $card_num"
         return 1
     fi
-    
+
     local card_dir="/proc/asound/card${card_num}"
-    
+
     # Verify card exists
     if [[ ! -d "$card_dir" ]]; then
         log_error "Card $card_num not found"
         return 1
     fi
-    
+
     # Verify this is a USB device
     if [[ ! -f "$card_dir/usbid" ]]; then
         log_error "Card $card_num is not a USB device"
         return 1
     fi
-    
+
     # Check for USB audio adapter chips
     local usb_id=""
     if [[ -f "$card_dir/usbid" ]]; then
@@ -805,52 +813,52 @@ detect_device_capabilities() {
             check_usb_audio_adapter "$usb_id"
         fi
     fi
-    
+
     # Check if device is currently busy
     local busy=false
     if is_device_busy "$card_num"; then
         busy=true
     fi
-    
+
     # Aggregate capabilities from all stream files
     local all_formats=()
     local all_channels=()
     local all_rates=()
     local has_capture=false
     local has_playback=false
-    
+
     # Parse all stream files for this card
     for stream_file in "$card_dir"/stream*; do
         [[ -f "$stream_file" ]] || continue
-        
+
         # Parse capture capabilities
         local capture_output
         if capture_output=$(parse_stream_file "$stream_file" "Capture" 2>/dev/null); then
             has_capture=true
-            
+
             # Extract and merge formats
             if [[ "$capture_output" =~ formats=([^$'\n']*) ]]; then
-                IFS=' ' read -ra formats <<< "${BASH_REMATCH[1]}"
+                IFS=' ' read -ra formats <<<"${BASH_REMATCH[1]}"
                 for fmt in "${formats[@]}"; do
                     if [[ ! " ${all_formats[*]} " == *" ${fmt} "* ]]; then
                         all_formats+=("$fmt")
                     fi
                 done
             fi
-            
+
             # Extract and merge channels
             if [[ "$capture_output" =~ channels=([^$'\n']*) ]]; then
-                IFS=' ' read -ra channels <<< "${BASH_REMATCH[1]}"
+                IFS=' ' read -ra channels <<<"${BASH_REMATCH[1]}"
                 for ch in "${channels[@]}"; do
                     if [[ ! " ${all_channels[*]} " == *" ${ch} "* ]]; then
                         all_channels+=("$ch")
                     fi
                 done
             fi
-            
+
             # Extract and merge rates
             if [[ "$capture_output" =~ rates=([^$'\n']*) ]]; then
-                IFS=' ' read -ra rates <<< "${BASH_REMATCH[1]}"
+                IFS=' ' read -ra rates <<<"${BASH_REMATCH[1]}"
                 for rate in "${rates[@]}"; do
                     if [[ ! " ${all_rates[*]} " == *" ${rate} "* ]]; then
                         all_rates+=("$rate")
@@ -858,19 +866,19 @@ detect_device_capabilities() {
                 done
             fi
         fi
-        
+
         # Parse playback capabilities
         if parse_stream_file "$stream_file" "Playback" >/dev/null 2>&1; then
             has_playback=true
         fi
     done
-    
+
     # If no capabilities found, fail
     if [[ ${#all_formats[@]} -eq 0 ]] && [[ ${#all_channels[@]} -eq 0 ]] && [[ ${#all_rates[@]} -eq 0 ]]; then
         log_error "No capabilities found for card $card_num"
         return 1
     fi
-    
+
     # Derive bit depths from formats
     local all_bit_depths=()
     for format in "${all_formats[@]}"; do
@@ -881,7 +889,7 @@ detect_device_capabilities() {
             fi
         fi
     done
-    
+
     # Validate channels (must have at least one non-zero channel)
     if [[ ${#all_channels[@]} -gt 0 ]]; then
         local max_channels
@@ -891,7 +899,7 @@ detect_device_capabilities() {
             return 1
         fi
     fi
-    
+
     # Sort numeric arrays
     if [[ ${#all_channels[@]} -gt 0 ]]; then
         mapfile -t all_channels < <(printf '%s\n' "${all_channels[@]}" | sort -n)
@@ -902,26 +910,26 @@ detect_device_capabilities() {
     if [[ ${#all_bit_depths[@]} -gt 0 ]]; then
         mapfile -t all_bit_depths < <(printf '%s\n' "${all_bit_depths[@]}" | sort -n)
     fi
-    
+
     # Output structured results
     printf 'is_usb=true\n'
     printf 'is_busy=%s\n' "$busy"
-    
+
     [[ ${#all_formats[@]} -gt 0 ]] && printf 'formats=%s\n' "${all_formats[*]}"
     [[ ${#all_bit_depths[@]} -gt 0 ]] && printf 'bit_depths=%s\n' "${all_bit_depths[*]}"
     [[ ${#all_channels[@]} -gt 0 ]] && printf 'channels=%s\n' "${all_channels[*]}"
     [[ ${#all_rates[@]} -gt 0 ]] && printf 'sample_rates=%s\n' "${all_rates[*]}"
-    
+
     printf 'capture_capable=%s\n' "$has_capture"
     printf 'playback_capable=%s\n' "$has_playback"
-    
+
     # Calculate all possible PCM bit rates
     # PCM bit rate = sample_rate * bit_depth * channels (in bits per second)
     # We output in kbps for readability
     local all_pcm_bitrates=()
     if [[ ${#all_rates[@]} -gt 0 ]] && [[ ${#all_bit_depths[@]} -gt 0 ]] && [[ ${#all_channels[@]} -gt 0 ]]; then
-        declare -A bitrate_map  # Use associative array to ensure uniqueness
-        
+        declare -A bitrate_map # Use associative array to ensure uniqueness
+
         for rate in "${all_rates[@]}"; do
             for depth in "${all_bit_depths[@]}"; do
                 for ch in "${all_channels[@]}"; do
@@ -932,23 +940,23 @@ detect_device_capabilities() {
                 done
             done
         done
-        
+
         # Extract unique bitrates and sort numerically
         for bitrate in "${!bitrate_map[@]}"; do
             all_pcm_bitrates+=("$bitrate")
         done
         mapfile -t all_pcm_bitrates < <(printf '%s\n' "${all_pcm_bitrates[@]}" | sort -n)
     fi
-    
+
     [[ ${#all_pcm_bitrates[@]} -gt 0 ]] && printf 'pcm_bitrates_kbps=%s\n' "${all_pcm_bitrates[*]}"
-    
+
     # Calculate suggested encoder bitrates based on quality tiers
     # These are Opus/AAC encoder bitrates, not PCM bitrates
     if [[ ${#all_rates[@]} -gt 0 ]] && [[ ${#all_channels[@]} -gt 0 ]]; then
         # Get highest sample rate and channel count
         local max_rate="${all_rates[-1]}"
         local max_channels="${all_channels[-1]}"
-        
+
         # Calculate encoder bitrates for each quality tier
         for tier in low normal high; do
             local enc_bitrate
@@ -956,7 +964,7 @@ detect_device_capabilities() {
             printf 'encoder_bitrate_%s=%s\n' "$tier" "$enc_bitrate"
         done
     fi
-    
+
     return 0
 }
 
@@ -974,7 +982,7 @@ calculate_encoder_bitrate() {
     local rate="$1"
     local ch="$2"
     local tier="$3"
-    
+
     # Determine bitrate based on tier and characteristics
     case "$tier" in
         low)
@@ -1037,37 +1045,37 @@ calculate_encoder_bitrate() {
 # Side Effects: None (read-only)
 list_all_usb_devices() {
     local found_devices=false
-    
+
     # Scan all sound cards
     for card_dir in /proc/asound/card[0-9]*; do
         [[ -d "$card_dir" ]] || continue
-        
+
         local card_num="${card_dir##*/card}"
-        
+
         # Skip non-USB devices
         [[ -f "$card_dir/usbid" ]] || continue
-        
+
         found_devices=true
-        
+
         # Get device info
         local device_info
         if ! device_info=$(get_device_info "$card_num"); then
             log_warn "Could not get info for card $card_num (see error above)"
             continue
         fi
-        
+
         # Extract device name for header
         local device_name="Unknown"
         if [[ "$device_info" =~ device_name=([^$'\n']*) ]]; then
             device_name="${BASH_REMATCH[1]}"
         fi
-        
+
         # Print header
         echo "=== Card $card_num: $device_name ==="
-        
+
         # Print device info
         echo "$device_info"
-        
+
         # Get and print capabilities
         local caps
         if caps=$(detect_device_capabilities "$card_num"); then
@@ -1075,10 +1083,10 @@ list_all_usb_devices() {
         else
             log_warn "Could not detect capabilities for card $card_num (see error above)"
         fi
-        
+
         echo ""
     done
-    
+
     if [[ "$found_devices" != true ]]; then
         log_error "No USB audio devices found"
         log_info "Check:"
@@ -1087,7 +1095,7 @@ list_all_usb_devices() {
         log_info "  - /proc/asound exists"
         return 1
     fi
-    
+
     return 0
 }
 
@@ -1107,14 +1115,14 @@ declare -gA PARSED_CAPS
 #   Populates global PARSED_CAPS associative array
 parse_capabilities() {
     local caps="$1"
-    
+
     # Clear previous values
     PARSED_CAPS=()
-    
+
     # Parse each line
     while IFS='=' read -r key value || [[ -n "$key" ]]; do
         [[ -n "$key" ]] && PARSED_CAPS["$key"]="$value"
-    done <<< "$caps"
+    done <<<"$caps"
 }
 
 # Determine optimal settings based on hardware capabilities and quality tier
@@ -1129,19 +1137,19 @@ parse_capabilities() {
 #   PARSED_CAPS array must be populated
 determine_optimal_settings() {
     local tier="$1"
-    
+
     # Get available capabilities
     local hw_rates="${PARSED_CAPS[sample_rates]:-}"
     local hw_channels="${PARSED_CAPS[channels]:-}"
-    
+
     if [[ -z "$hw_rates" ]] || [[ -z "$hw_channels" ]]; then
         log_error "No hardware capabilities available"
         return 1
     fi
-    
+
     # Parse rates and channels into arrays
-    IFS=' ' read -ra rate_array <<< "$hw_rates"
-    IFS=' ' read -ra channel_array <<< "$hw_channels"
+    IFS=' ' read -ra rate_array <<<"$hw_rates"
+    IFS=' ' read -ra channel_array <<<"$hw_channels"
 
     # Validate arrays have content (bounds check)
     if [[ ${#rate_array[@]} -eq 0 ]]; then
@@ -1201,7 +1209,7 @@ determine_optimal_settings() {
             else
                 optimal_rate=$max_rate
             fi
-            
+
             # Verify our target rate is actually supported
             if [[ ! " ${hw_rates} " == *" ${optimal_rate} "* ]]; then
                 optimal_rate=$max_rate
@@ -1211,7 +1219,7 @@ determine_optimal_settings() {
             optimal_rate=48000
             ;;
     esac
-    
+
     # Determine optimal channels based on tier
     local optimal_channels
     case "$tier" in
@@ -1223,7 +1231,7 @@ determine_optimal_settings() {
                 optimal_channels=$max_channels
             fi
             ;;
-        normal|high)
+        normal | high)
             # Prefer stereo if available
             if [[ $max_channels -ge 2 ]]; then
                 optimal_channels=2
@@ -1235,11 +1243,11 @@ determine_optimal_settings() {
             optimal_channels=2
             ;;
     esac
-    
+
     # Calculate encoder bitrate
     local enc_bitrate
     enc_bitrate=$(calculate_encoder_bitrate "$optimal_rate" "$optimal_channels" "$tier")
-    
+
     printf '%s %s %s\n' "$optimal_rate" "$optimal_channels" "$enc_bitrate"
 }
 
@@ -1260,44 +1268,44 @@ create_config_backup() {
     if [[ ! -f "$CONFIG_FILE" ]]; then
         return 0
     fi
-    
+
     local backup_file
     backup_file="${CONFIG_FILE}.backup.$(date +%Y%m%d_%H%M%S)"
-    
+
     # Security check: Ensure backup file doesn't exist (prevent symlink attacks)
     if [[ -e "$backup_file" ]] || [[ -L "$backup_file" ]]; then
         log_error "Backup file already exists or is a symlink: $backup_file"
         return 1
     fi
-    
+
     # Create temp file for atomic write
     local temp_backup
     temp_backup=$(mktemp "${backup_file}.XXXXXXXXXX" 2>/dev/null) || {
         log_error "Failed to create temporary backup file"
         return 1
     }
-    
+
     # Copy with permissions preserved
     if ! cp -p "$CONFIG_FILE" "$temp_backup"; then
         rm -f "$temp_backup"
         log_error "Failed to create backup copy"
         return 1
     fi
-    
+
     # Set restrictive permissions before atomic move
     if ! chmod 600 "$temp_backup" 2>/dev/null; then
         rm -f "$temp_backup"
         log_error "Failed to set backup file permissions"
         return 1
     fi
-    
+
     # Atomic move
     if ! mv -f "$temp_backup" "$backup_file"; then
         rm -f "$temp_backup"
         log_error "Failed to finalize backup file"
         return 1
     fi
-    
+
     log_info "Configuration backup created: $backup_file"
     return 0
 }
@@ -1315,43 +1323,43 @@ create_config_backup() {
 list_config_backups() {
     log_info "Available Configuration Backups:"
     log_info "================================"
-    
+
     local backups_found=false
-    
+
     # Find all backup files sorted by timestamp (newest first)
     local backup_files=()
     while IFS= read -r -d '' file; do
         backup_files+=("$file")
     done < <(find "$(dirname "$CONFIG_FILE")" -maxdepth 1 -name "$(basename "$CONFIG_FILE").backup.*" -type f -print0 2>/dev/null | sort -rz)
-    
+
     if [[ ${#backup_files[@]} -eq 0 ]]; then
         log_info "No backups found"
         return 1
     fi
-    
+
     for backup_file in "${backup_files[@]}"; do
         backups_found=true
-        
+
         # Extract timestamp from filename
         local timestamp
         timestamp=$(basename "$backup_file" | sed 's/.*\.backup\.//')
-        
+
         # Get file size and modification time
         local size
         size=$(du -h "$backup_file" 2>/dev/null | cut -f1)
         local mod_time
         mod_time=$(stat -c '%y' "$backup_file" 2>/dev/null | cut -d'.' -f1)
-        
+
         printf '  %s - %s (%s)\n' "$timestamp" "$mod_time" "$size"
     done
-    
+
     if [[ "$backups_found" = true ]]; then
         echo ""
         log_info "To restore a backup:"
         log_info "  $SCRIPT_NAME --restore [TIMESTAMP]"
         log_info "  Example: $SCRIPT_NAME --restore $(basename "${backup_files[0]}" | sed 's/.*\.backup\.//')"
     fi
-    
+
     return 0
 }
 
@@ -1369,20 +1377,20 @@ list_config_backups() {
 #   Overwrites CONFIG_FILE with backup
 restore_config_backup() {
     local target_timestamp="$1"
-    
+
     # Find available backups
     local backup_files=()
     while IFS= read -r -d '' file; do
         backup_files+=("$file")
     done < <(find "$(dirname "$CONFIG_FILE")" -maxdepth 1 -name "$(basename "$CONFIG_FILE").backup.*" -type f -print0 2>/dev/null | sort -rz)
-    
+
     if [[ ${#backup_files[@]} -eq 0 ]]; then
         log_error "No backup files found"
         return 1
     fi
-    
+
     local selected_backup=""
-    
+
     # If timestamp provided, find matching backup
     if [[ -n "$target_timestamp" ]]; then
         # Validate timestamp format (YYYYMMDD_HHMMSS)
@@ -1391,7 +1399,7 @@ restore_config_backup() {
             log_error "Expected format: YYYYMMDD_HHMMSS (e.g., 20251111_123456)"
             return 1
         fi
-        
+
         # Validate timestamp sanity (reasonable date range)
         local year="${target_timestamp:0:4}"
         local year_num=$((10#$year))
@@ -1399,7 +1407,7 @@ restore_config_backup() {
             log_error "Timestamp year out of reasonable range: $year"
             return 1
         fi
-        
+
         local backup_file="${CONFIG_FILE}.backup.${target_timestamp}"
         if [[ ! -f "$backup_file" ]]; then
             log_error "Backup not found: $backup_file"
@@ -1407,26 +1415,26 @@ restore_config_backup() {
             list_config_backups
             return 1
         fi
-        
+
         # Security: Verify backup is a regular file, not a symlink
         if [[ -L "$backup_file" ]]; then
             log_error "Backup file is a symlink (security violation): $backup_file"
             log_error "Refusing to restore potentially malicious file"
             return 1
         fi
-        
+
         # Verify file is readable
         if [[ ! -r "$backup_file" ]]; then
             log_error "Backup file is not readable: $backup_file"
             return 1
         fi
-        
+
         selected_backup="$backup_file"
     else
         # Interactive selection
         log_info "Available backups (newest first):"
         log_info "================================="
-        
+
         local i=1
         for backup_file in "${backup_files[@]}"; do
             local timestamp
@@ -1435,47 +1443,47 @@ restore_config_backup() {
             size=$(du -h "$backup_file" 2>/dev/null | cut -f1)
             local mod_time
             mod_time=$(stat -c '%y' "$backup_file" 2>/dev/null | cut -d'.' -f1)
-            
+
             printf '  %d) %s - %s (%s)\n' "$i" "$timestamp" "$mod_time" "$size"
             ((i++))
         done
-        
+
         echo ""
         read -r -p "Select backup to restore (1-${#backup_files[@]}, 0 to cancel): " selection
-        
+
         if [[ "$selection" == "0" ]]; then
             log_info "Restore cancelled by user"
             return 0
         fi
-        
+
         if [[ ! "$selection" =~ ^[0-9]+$ ]] || [[ $selection -lt 1 ]] || [[ $selection -gt ${#backup_files[@]} ]]; then
             log_error "Invalid selection: $selection"
             return 1
         fi
-        
+
         selected_backup="${backup_files[$((selection - 1))]}"
-        
+
         # Security: Verify selected backup is a regular file, not a symlink
         if [[ -L "$selected_backup" ]]; then
             log_error "Selected backup is a symlink (security violation): $selected_backup"
             log_error "Refusing to restore potentially malicious file"
             return 1
         fi
-        
+
         # Verify file is readable
         if [[ ! -r "$selected_backup" ]]; then
             log_error "Backup file is not readable: $selected_backup"
             return 1
         fi
     fi
-    
+
     # Confirm restore
     log_info ""
     log_info "This will restore configuration from:"
     log_info "  $(basename "$selected_backup")"
     log_info "  to: $CONFIG_FILE"
     log_info ""
-    
+
     if [[ "$MODE_FORCE" != true ]]; then
         read -r -p "Continue with restore? (y/N): " confirm
         if [[ ! "$confirm" =~ ^[Yy] ]]; then
@@ -1483,31 +1491,31 @@ restore_config_backup() {
             return 0
         fi
     fi
-    
+
     # Perform restore using temp file for atomic operation
     local temp_restore
     temp_restore=$(mktemp "${CONFIG_FILE}.restore.XXXXXXXXXX" 2>/dev/null) || {
         log_error "Failed to create temporary file"
         return 2
     }
-    
+
     # Copy backup to temp file
     if ! cp -p "$selected_backup" "$temp_restore"; then
         rm -f "$temp_restore"
         log_error "Failed to copy backup file"
         return 2
     fi
-    
+
     # Atomic move
     if ! mv -f "$temp_restore" "$CONFIG_FILE"; then
         rm -f "$temp_restore"
         log_error "Failed to restore configuration"
         return 2
     fi
-    
+
     log_info "Configuration restored successfully from: $(basename "$selected_backup")"
     log_info "Restart service to apply changes: sudo systemctl restart mediamtx-stream-manager"
-    
+
     return 0
 }
 
@@ -1518,7 +1526,7 @@ check_root_access() {
         log_error "Run with: sudo $SCRIPT_NAME [your options]"
         return 1
     fi
-    
+
     # Verify config directory exists or can be created
     if [[ ! -d "$CONFIG_DIR" ]]; then
         if ! mkdir -p "$CONFIG_DIR" 2>/dev/null; then
@@ -1527,14 +1535,14 @@ check_root_access() {
             return 1
         fi
     fi
-    
+
     # Verify we can write to config directory
     if [[ ! -w "$CONFIG_DIR" ]]; then
         log_error "Cannot write to config directory: $CONFIG_DIR"
         log_error "Check permissions or run with sudo"
         return 1
     fi
-    
+
     return 0
 }
 
@@ -1548,16 +1556,16 @@ check_root_access() {
 #   1 = Insufficient space
 check_disk_space() {
     local required_kb="$1"
-    
+
     local available_kb
     available_kb=$(df --output=avail "$CONFIG_DIR" | tail -1)
-    
+
     if [[ $available_kb -lt $required_kb ]]; then
         log_error "Insufficient disk space in $CONFIG_DIR"
         log_error "Required: ~$((required_kb / 1024)) MB, Available: $((available_kb / 1024)) MB"
         return 1
     fi
-    
+
     return 0
 }
 
@@ -1571,31 +1579,31 @@ check_disk_space() {
 #   1 = Configuration is invalid
 validate_generated_config() {
     local config_file="$1"
-    
+
     # Check file exists
     if [[ ! -f "$config_file" ]]; then
         log_error "Config file does not exist: $config_file"
         return 1
     fi
-    
+
     # Check syntax (bash -n)
     if ! bash -n "$config_file" 2>/dev/null; then
         log_error "Generated config has syntax errors"
         return 1
     fi
-    
+
     # Check for device definitions
     if ! grep -qE '^DEVICE_.*=' "$config_file"; then
         log_error "Generated config contains no device definitions"
         return 1
     fi
-    
+
     # Check file is not empty
     if [[ ! -s "$config_file" ]]; then
         log_error "Generated config is empty"
         return 1
     fi
-    
+
     return 0
 }
 
@@ -1619,29 +1627,29 @@ generate_config() {
     log_info "Generating MediaMTX audio device configuration..."
     log_info "Quality tier: $QUALITY_TIER"
     echo ""
-    
+
     # Check root access if needed
     if ! check_root_access; then
         return 2
     fi
-    
+
     # Check disk space (require 100KB)
     if ! check_disk_space 100; then
         return 2
     fi
-    
+
     # Check if config already exists and handle overwrite
     if [[ -f "$CONFIG_FILE" ]] && [[ "$MODE_FORCE" != true ]]; then
         log_warn "Configuration file already exists: $CONFIG_FILE"
         log_info "Use --force to overwrite (automatic backup will be created)"
         read -r -p "Overwrite existing configuration? (y/N): " confirm
-        
+
         if [[ ! "$confirm" =~ ^[Yy] ]]; then
             log_info "Configuration generation cancelled"
             return 0
         fi
     fi
-    
+
     # Create backup unless disabled
     if [[ "$MODE_NO_BACKUP" != true ]]; then
         if ! create_config_backup; then
@@ -1649,15 +1657,15 @@ generate_config() {
             return 2
         fi
     fi
-    
+
     # Create temp config file for atomic write
     TEMP_CONFIG_FILE=$(mktemp "${CONFIG_FILE}.XXXXXXXXXX" 2>/dev/null) || {
         log_error "Failed to create temporary config file"
         return 2
     }
-    
+
     # Write config header
-    cat > "$TEMP_CONFIG_FILE" << EOF
+    cat >"$TEMP_CONFIG_FILE" <<EOF
 # MediaMTX USB Audio Device Configuration
 # Generated by $SCRIPT_NAME version $VERSION
 # Generated: $(date '+%Y-%m-%d %H:%M:%S')
@@ -1689,24 +1697,24 @@ DEFAULT_BITRATE=128k
 # ============================================================================
 
 EOF
-    
+
     local devices_found=0
     local devices_configured=0
     local devices_skipped=0
-    
+
     # Scan all USB audio devices
     for card_dir in /proc/asound/card[0-9]*; do
         [[ -d "$card_dir" ]] || continue
-        
+
         local card_num="${card_dir##*/card}"
-        
+
         # Skip non-USB devices
         [[ -f "$card_dir/usbid" ]] || continue
-        
+
         ((devices_found++))
-        
+
         log_info "Processing card $card_num..."
-        
+
         # Get device info
         local device_info
         if ! device_info=$(get_device_info "$card_num" 2>/dev/null); then
@@ -1714,17 +1722,17 @@ EOF
             ((devices_skipped++))
             continue
         fi
-        
+
         # Extract device name
         local device_name=""
         if [[ "$device_info" =~ device_name=([^$'\n']*) ]]; then
             device_name="${BASH_REMATCH[1]}"
         fi
-        
+
         if [[ -z "$device_name" ]]; then
             device_name="card${card_num}"
         fi
-        
+
         # Get capabilities
         local caps
         if ! caps=$(detect_device_capabilities "$card_num" 2>/dev/null); then
@@ -1732,17 +1740,17 @@ EOF
             ((devices_skipped++))
             continue
         fi
-        
+
         # Parse capabilities
         parse_capabilities "$caps"
-        
+
         # Check if device supports capture
         if [[ "${PARSED_CAPS[capture_capable]:-false}" != "true" ]]; then
             log_warn "Card $card_num does not support audio capture - skipping"
             ((devices_skipped++))
             continue
         fi
-        
+
         # Determine optimal settings
         local optimal_settings
         if ! optimal_settings=$(determine_optimal_settings "$QUALITY_TIER"); then
@@ -1750,16 +1758,16 @@ EOF
             ((devices_skipped++))
             continue
         fi
-        
+
         # Parse optimal settings
-        IFS=' ' read -r optimal_rate optimal_channels enc_bitrate <<< "$optimal_settings"
-        
+        IFS=' ' read -r optimal_rate optimal_channels enc_bitrate <<<"$optimal_settings"
+
         # Sanitize device name for config variables
         local safe_name
         safe_name=$(sanitize_device_name "$device_name")
-        
+
         # Write device configuration
-        cat >> "$TEMP_CONFIG_FILE" << EOF
+        cat >>"$TEMP_CONFIG_FILE" <<EOF
 # Device: $device_name (Card $card_num)
 # Hardware capabilities:
 #   Sample rates: ${PARSED_CAPS[sample_rates]:-unknown}
@@ -1771,25 +1779,25 @@ DEVICE_${safe_name}_CHANNELS=$optimal_channels
 DEVICE_${safe_name}_BITRATE=${enc_bitrate}k
 
 EOF
-        
+
         ((devices_configured++))
         log_info "  Configured: $device_name"
         log_info "    Sample rate: $optimal_rate Hz"
         log_info "    Channels: $optimal_channels"
         log_info "    Encoder bitrate: ${enc_bitrate}k"
     done
-    
+
     echo ""
     log_info "Configuration Generation Summary:"
     log_info "  Devices found: $devices_found"
     log_info "  Devices configured: $devices_configured"
     log_info "  Devices skipped: $devices_skipped"
-    
+
     # Check if any devices were configured
     if [[ $devices_configured -eq 0 ]]; then
         rm -f "$TEMP_CONFIG_FILE"
         TEMP_CONFIG_FILE=""
-        
+
         if [[ $devices_found -eq 0 ]]; then
             log_error "No USB audio devices found"
             log_info "Check: lsusb | grep -i audio"
@@ -1800,7 +1808,7 @@ EOF
             return 1
         fi
     fi
-    
+
     # Validate generated config
     if ! validate_generated_config "$TEMP_CONFIG_FILE"; then
         rm -f "$TEMP_CONFIG_FILE"
@@ -1808,7 +1816,7 @@ EOF
         log_error "Generated configuration failed validation"
         return 2
     fi
-    
+
     # Atomic move to final location
     if ! mv -f "$TEMP_CONFIG_FILE" "$CONFIG_FILE"; then
         rm -f "$TEMP_CONFIG_FILE"
@@ -1816,12 +1824,12 @@ EOF
         log_error "Failed to write configuration file: $CONFIG_FILE"
         return 2
     fi
-    
+
     TEMP_CONFIG_FILE=""
-    
+
     # Set permissions
     chmod 644 "$CONFIG_FILE" 2>/dev/null || log_warn "Could not set permissions on config file"
-    
+
     log_info ""
     log_info "Configuration generated successfully: $CONFIG_FILE"
     log_info ""
@@ -1830,7 +1838,7 @@ EOF
     log_info "  2. Adjust parameters if needed"
     log_info "  3. Restart service: sudo systemctl restart mediamtx-stream-manager"
     log_info "  4. Verify streams: $SCRIPT_NAME --validate"
-    
+
     return 0
 }
 
@@ -1851,14 +1859,14 @@ get_config_value() {
     local safe_name="$1"
     local device_id_safe="$2"
     local param="$3"
-    
+
     # Try friendly name first
     local var_name="DEVICE_${safe_name}_${param}"
     if [[ -n "${!var_name:-}" ]]; then
         echo "${!var_name}"
         return 0
     fi
-    
+
     # Try full device ID if provided
     if [[ -n "$device_id_safe" ]]; then
         var_name="DEVICE_${device_id_safe}_${param}"
@@ -1867,27 +1875,27 @@ get_config_value() {
             return 0
         fi
     fi
-    
+
     echo "not configured"
 }
 
 # Validate existing configuration against hardware
 validate_config() {
     log_info "Validating configuration against hardware..."
-    
+
     # Check if config file exists
     if [[ ! -f "$CONFIG_FILE" ]]; then
         log_error "Configuration file not found: $CONFIG_FILE"
         log_info "Generate config first: $SCRIPT_NAME --generate-config"
         return 2
     fi
-    
+
     # Source the config file
     if ! grep -qE '^DEVICE_.*=' "$CONFIG_FILE" 2>/dev/null; then
         log_warn "No device configuration found in: $CONFIG_FILE"
         return 0
     fi
-    
+
     # Security check before sourcing
     if [[ $(stat -c %a "$CONFIG_FILE") != "644" ]] && [[ $(stat -c %a "$CONFIG_FILE") != "600" ]]; then
         log_warn "Config file has unusual permissions: $(stat -c %a "$CONFIG_FILE")"
@@ -1904,7 +1912,7 @@ validate_config() {
     trap 'rm -f "$config_tmp" 2>/dev/null' RETURN
 
     # Atomically copy config file content
-    if ! cat "$CONFIG_FILE" > "$config_tmp" 2>/dev/null; then
+    if ! cat "$CONFIG_FILE" >"$config_tmp" 2>/dev/null; then
         log_error "Failed to copy config file for validation"
         rm -f "$config_tmp" 2>/dev/null
         return 2
@@ -1924,57 +1932,57 @@ validate_config() {
     # shellcheck source=/dev/null
     source "$config_tmp"
     rm -f "$config_tmp" 2>/dev/null
-    
+
     local validation_failed=false
     local devices_checked=0
-    
+
     # Check each USB device
     for card_dir in /proc/asound/card[0-9]*; do
         [[ -d "$card_dir" ]] || continue
-        
+
         local card_num="${card_dir##*/card}"
-        
+
         # Skip non-USB devices
         [[ -f "$card_dir/usbid" ]] || continue
-        
+
         ((devices_checked++))
-        
+
         # Get device info
         local device_info
         if ! device_info=$(get_device_info "$card_num"); then
             log_warn "Could not get info for card $card_num (see error above)"
             continue
         fi
-        
+
         # Extract device name
         local device_name=""
         if [[ "$device_info" =~ device_name=([^$'\n']*) ]]; then
             device_name="${BASH_REMATCH[1]}"
         fi
-        
+
         if [[ -z "$device_name" ]]; then
             device_name="card${card_num}"
         fi
-        
+
         # Extract device ID path (for full device ID config format)
         local device_id_path=""
         if [[ "$device_info" =~ device_id_path=([^$'\n']*) ]]; then
             device_id_path="${BASH_REMATCH[1]}"
         fi
-        
+
         # Get capabilities
         local caps
         if ! caps=$(detect_device_capabilities "$card_num"); then
             log_warn "Could not detect capabilities for card $card_num (see error above)"
             continue
         fi
-        
+
         parse_capabilities "$caps"
-        
+
         # Sanitize device name for config lookup (friendly name, lowercase)
         local safe_name
         safe_name=$(sanitize_device_name "$device_name")
-        
+
         # Sanitize device ID path for config lookup (full ID, UPPERCASE for compatibility)
         # NOTE: This MUST match mediamtx-stream-manager.sh format exactly:
         #   - Strip "usb-" prefix
@@ -1990,19 +1998,19 @@ validate_config() {
             # Add USB_ prefix back in uppercase
             device_id_safe="USB_${device_id_safe}"
         fi
-        
+
         # Check configured values against capabilities
         log_info ""
         log_info "Device: $device_name (Card $card_num)"
         if [[ -n "$device_id_path" ]]; then
             log_info "  Device ID: $device_id_path"
         fi
-        
+
         # Check sample rate using both naming formats
         local config_rate
         config_rate=$(get_config_value "$safe_name" "$device_id_safe" "SAMPLE_RATE")
         local hw_rates="${PARSED_CAPS[sample_rates]:-unknown}"
-        
+
         if [[ "$config_rate" != "not configured" ]]; then
             if [[ "$hw_rates" =~ (^| )${config_rate}( |$) ]]; then
                 log_info "  ${CHECK_PASS} Sample rate: ${config_rate} Hz (supported)"
@@ -2014,17 +2022,17 @@ validate_config() {
         else
             log_info "  ${CHECK_INFO} Sample rate: not configured (will use default: 48000 Hz)"
         fi
-        
+
         # Check channels using both naming formats
         local config_channels
         config_channels=$(get_config_value "$safe_name" "$device_id_safe" "CHANNELS")
         local hw_channels="${PARSED_CAPS[channels]:-unknown}"
-        
+
         if [[ "$config_channels" != "not configured" ]]; then
             # Get maximum supported channels
             local max_channels
             max_channels=$(echo "$hw_channels" | tr ' ' '\n' | sort -n | tail -1)
-            
+
             # Allow any channel count <= max (e.g., mono on stereo device is valid)
             if [[ "$config_channels" =~ ^[0-9]+$ ]] && [[ $config_channels -le $max_channels ]] && [[ $config_channels -ge 1 ]]; then
                 log_info "  ${CHECK_PASS} Channels: ${config_channels} (hardware supports up to ${max_channels})"
@@ -2036,23 +2044,23 @@ validate_config() {
         else
             log_info "  ${CHECK_INFO} Channels: not configured (will use default: 2)"
         fi
-        
+
         # Check bitrate (informational only, cannot validate encoder bitrate against hardware)
         local config_bitrate
         config_bitrate=$(get_config_value "$safe_name" "$device_id_safe" "BITRATE")
-        
+
         if [[ "$config_bitrate" != "not configured" ]]; then
             log_info "  ${CHECK_INFO} Encoder bitrate: ${config_bitrate} (encoder setting, not validated)"
         else
             log_info "  ${CHECK_INFO} Encoder bitrate: not configured (will use default: 128k)"
         fi
     done
-    
+
     if [[ $devices_checked -eq 0 ]]; then
         log_warn "No USB audio devices found to validate"
         return 0
     fi
-    
+
     echo ""
     if [[ "$validation_failed" = true ]]; then
         log_error "Validation FAILED - configuration has mismatches"
@@ -2072,14 +2080,14 @@ parse_arguments() {
     # Use getopt for robust argument parsing
     local temp
     temp=$(getopt -o 'hgfVq' --long 'help,version,generate-config,force,no-backup,quality:,validate,quiet,format:,list-backups,restore::' -n "$SCRIPT_NAME" -- "$@") || return 1
-    
+
     # Standard getopt pattern: eval is safe here because getopt properly quotes output
     eval set -- "$temp"
-    
+
     # Process arguments
     while true; do
         case "$1" in
-            -h|--help)
+            -h | --help)
                 show_usage
                 exit 0
                 ;;
@@ -2087,11 +2095,11 @@ parse_arguments() {
                 show_version
                 exit 0
                 ;;
-            -g|--generate-config)
+            -g | --generate-config)
                 MODE_GENERATE=true
                 shift
                 ;;
-            -f|--force)
+            -f | --force)
                 MODE_FORCE=true
                 shift
                 ;;
@@ -2099,11 +2107,11 @@ parse_arguments() {
                 MODE_NO_BACKUP=true
                 shift
                 ;;
-            -V|--validate)
+            -V | --validate)
                 MODE_VALIDATE=true
                 shift
                 ;;
-            -q|--quiet)
+            -q | --quiet)
                 MODE_QUIET=true
                 shift
                 ;;
@@ -2139,7 +2147,7 @@ parse_arguments() {
                 ;;
         esac
     done
-    
+
     # Remaining argument is card number (optional)
     if [[ $# -gt 0 ]]; then
         SPECIFIC_CARD="$1"
@@ -2147,60 +2155,60 @@ parse_arguments() {
             log_error "Card number must be numeric: $SPECIFIC_CARD"
             return 1
         fi
-        
+
         # Validate card number range
         if [[ $SPECIFIC_CARD -lt 0 ]] || [[ $SPECIFIC_CARD -gt $ALSA_MAX_CARD_NUMBER ]]; then
             log_error "Card number must be 0-$ALSA_MAX_CARD_NUMBER: $SPECIFIC_CARD"
             return 1
         fi
     fi
-    
+
     # Validate combinations
     if [[ "$MODE_FORCE" = true ]] && [[ "$MODE_GENERATE" != true ]]; then
         log_error "--force requires --generate-config"
         return 1
     fi
-    
+
     if [[ "$MODE_NO_BACKUP" = true ]] && [[ "$MODE_GENERATE" != true ]]; then
         log_error "--no-backup requires --generate-config"
         return 1
     fi
-    
+
     # Count mutually exclusive primary modes
     local mode_count=0
     [[ "$MODE_GENERATE" = true ]] && ((mode_count++))
     [[ "$MODE_VALIDATE" = true ]] && ((mode_count++))
     [[ "$MODE_LIST_BACKUPS" = true ]] && ((mode_count++))
     [[ "$MODE_RESTORE" = true ]] && ((mode_count++))
-    
+
     if [[ $mode_count -gt 1 ]]; then
         log_error "Only one of --generate-config, --validate, --list-backups, or --restore can be used at a time"
         return 1
     fi
-    
+
     if [[ -n "$SPECIFIC_CARD" ]] && [[ $mode_count -gt 0 ]]; then
         log_error "Card number cannot be specified with operation modes"
         return 1
     fi
-    
+
     if [[ "$OUTPUT_FORMAT" != "text" ]] && [[ "$OUTPUT_FORMAT" != "json" ]]; then
         log_error "Invalid format: $OUTPUT_FORMAT (must be text or json)"
         return 1
     fi
-    
+
     # Validate quality tier
     if [[ "$QUALITY_TIER" != "low" ]] && [[ "$QUALITY_TIER" != "normal" ]] && [[ "$QUALITY_TIER" != "high" ]]; then
         log_error "Invalid quality tier: $QUALITY_TIER"
         log_error "Must be one of: low, normal, high"
         return 1
     fi
-    
+
     # Quality tier only valid with config generation
     if [[ "$QUALITY_TIER" != "normal" ]] && [[ "$MODE_GENERATE" != true ]]; then
         log_error "--quality requires --generate-config"
         return 1
     fi
-    
+
     return 0
 }
 
@@ -2214,14 +2222,14 @@ output_json() {
     local device_name=""
     local -a json_lines=()
     local in_device=false
-    
+
     echo "{"
     echo '  "devices": ['
-    
+
     while IFS='=' read -r key value || [[ -n "$key" ]]; do
         # Skip empty lines
         [[ -z "$key" ]] && continue
-        
+
         # Detect device headers
         if [[ "$key" =~ ^===.*Card.*===$ ]]; then
             # Close previous device object if exists
@@ -2231,15 +2239,15 @@ output_json() {
                     local last_idx=$((${#json_lines[@]} - 1))
                     json_lines[last_idx]="${json_lines[last_idx]%,}"
                 fi
-                
+
                 # Print accumulated lines
                 printf '%s\n' "${json_lines[@]}"
                 echo "    },"
             fi
-            
+
             in_device=true
             json_lines=()
-            
+
             # Extract device name from header
             device_name="${key#*: }"
             device_name="${device_name% ===}"
@@ -2247,11 +2255,11 @@ output_json() {
             json_lines+=("      \"_header\": \"$key\",")
             continue
         fi
-        
+
         if [[ "$in_device" = true ]]; then
             # Escape quotes in value
             value="${value//\"/\\\"}"
-            
+
             # Determine if value is numeric, boolean, or string
             if [[ "$value" =~ ^[0-9]+$ ]]; then
                 json_lines+=("      \"$key\": $value,")
@@ -2262,7 +2270,7 @@ output_json() {
             fi
         fi
     done
-    
+
     # Close last device object if exists
     if [[ "$in_device" = true ]]; then
         # Remove trailing comma from last line
@@ -2270,12 +2278,12 @@ output_json() {
             local last_idx=$((${#json_lines[@]} - 1))
             json_lines[last_idx]="${json_lines[last_idx]%,}"
         fi
-        
+
         # Print accumulated lines
         printf '%s\n' "${json_lines[@]}"
         echo "    }"
     fi
-    
+
     echo "  ]"
     echo "}"
 }
@@ -2292,12 +2300,12 @@ main() {
         log_info "Check: lsmod | grep snd"
         exit 1
     fi
-    
+
     # Parse arguments
     if ! parse_arguments "$@"; then
         exit 1
     fi
-    
+
     # Execute requested mode
     if [[ "$MODE_GENERATE" = true ]]; then
         # Config generation mode
@@ -2305,33 +2313,33 @@ main() {
             exit 2
         fi
         exit 0
-        
+
     elif [[ "$MODE_VALIDATE" = true ]]; then
         # Config validation mode
         if ! validate_config; then
             exit 2
         fi
         exit 0
-        
+
     elif [[ "$MODE_LIST_BACKUPS" = true ]]; then
         # List backups mode
         if ! list_config_backups; then
             exit 2
         fi
         exit 0
-        
+
     elif [[ "$MODE_RESTORE" = true ]]; then
         # Restore backup mode
         if ! restore_config_backup "$RESTORE_TIMESTAMP"; then
             exit 2
         fi
         exit 0
-        
+
     elif [[ -n "$SPECIFIC_CARD" ]]; then
         # Show specific card
         log_info "Detecting capabilities for card $SPECIFIC_CARD..."
         echo ""
-        
+
         if ! get_device_info "$SPECIFIC_CARD" 2>/dev/null; then
             log_error "Could not get device info for card $SPECIFIC_CARD"
             log_info "Available cards:"
@@ -2348,16 +2356,16 @@ main() {
             fi
             exit 1
         fi
-        
+
         echo ""
-        
+
         if ! detect_device_capabilities "$SPECIFIC_CARD" 2>/dev/null; then
             log_error "Could not detect capabilities for card $SPECIFIC_CARD"
             exit 1
         fi
-        
+
         exit 0
-        
+
     else
         # List all devices (default mode)
         if [[ "$OUTPUT_FORMAT" = "json" ]]; then
@@ -2372,18 +2380,18 @@ main() {
             log_info ""
             log_info "Found USB audio devices:"
             log_info ""
-            
+
             if ! list_all_usb_devices; then
                 exit 1
             fi
-            
+
             log_info ""
             log_info "Next steps:"
             log_info "  * Generate config: $SCRIPT_NAME -g"
             log_info "  * Show specific device: $SCRIPT_NAME <card_number>"
             log_info "  * Full help: $SCRIPT_NAME --help"
         fi
-        
+
         exit 0
     fi
 }
