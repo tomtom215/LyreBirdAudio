@@ -123,9 +123,53 @@ fi
 # Provides: colors, logging, command_exists, compute_hash, exit codes
 # Falls back gracefully if library not present - all functions defined locally below
 _LYREBIRD_COMMON="${BASH_SOURCE[0]%/*}/lyrebird-common.sh"
+
+# v1.4.2: Verify library integrity before sourcing (security hardening)
+# Set LYREBIRD_COMMON_EXPECTED_HASH to enable verification
+# To generate: sha256sum lyrebird-common.sh | cut -d' ' -f1
+_LYREBIRD_COMMON_EXPECTED_HASH="${LYREBIRD_COMMON_EXPECTED_HASH:-}"
+
+_verify_common_library() {
+    local lib_path="$1"
+    local expected_hash="$2"
+
+    # Skip verification if no expected hash provided (backward compatible)
+    [[ -z "$expected_hash" ]] && return 0
+
+    # Compute actual hash
+    local actual_hash=""
+    if command -v sha256sum >/dev/null 2>&1; then
+        actual_hash=$(sha256sum "$lib_path" 2>/dev/null | cut -d' ' -f1)
+    elif command -v shasum >/dev/null 2>&1; then
+        actual_hash=$(shasum -a 256 "$lib_path" 2>/dev/null | cut -d' ' -f1)
+    else
+        # No hash tool available, skip verification with warning
+        echo "[WARN] Cannot verify lyrebird-common.sh integrity (no sha256sum/shasum)" >&2
+        return 0
+    fi
+
+    if [[ "$actual_hash" != "$expected_hash" ]]; then
+        echo "[ERROR] lyrebird-common.sh integrity check failed!" >&2
+        echo "[ERROR] Expected: $expected_hash" >&2
+        echo "[ERROR] Actual:   $actual_hash" >&2
+        echo "[ERROR] The library may have been tampered with. Aborting." >&2
+        return 1
+    fi
+
+    return 0
+}
+
 # shellcheck source=lyrebird-common.sh
-[[ -f "$_LYREBIRD_COMMON" ]] && source "$_LYREBIRD_COMMON" || true
-unset _LYREBIRD_COMMON
+if [[ -f "$_LYREBIRD_COMMON" ]]; then
+    if _verify_common_library "$_LYREBIRD_COMMON" "$_LYREBIRD_COMMON_EXPECTED_HASH"; then
+        source "$_LYREBIRD_COMMON"
+    else
+        # Integrity check failed - exit for security
+        exit 1
+    fi
+fi
+unset _LYREBIRD_COMMON _LYREBIRD_COMMON_EXPECTED_HASH
+unset -f _verify_common_library
 
 # Constants
 readonly VERSION="1.4.2"
@@ -262,6 +306,12 @@ readonly AUDIO_RECORDING_SEGMENT_TIME="${AUDIO_RECORDING_SEGMENT_TIME:-300}" # 5
 readonly AUDIO_RECORDING_SEGMENTS="${AUDIO_RECORDING_SEGMENTS:-12}" # Keep last 12 segments (1 hour)
 readonly AUDIO_DISK_PERSIST="${AUDIO_DISK_PERSIST:-false}"          # Move segments to disk (SD card wear!)
 readonly AUDIO_DISK_PATH="${AUDIO_DISK_PATH:-/var/lib/mediamtx-ffmpeg/recordings}"
+
+# Audio level monitoring (detect dead/silent microphones)
+readonly AUDIO_LEVEL_CHECK_ENABLED="${AUDIO_LEVEL_CHECK_ENABLED:-true}"  # Enable silence detection
+readonly AUDIO_LEVEL_SAMPLE_DURATION="${AUDIO_LEVEL_SAMPLE_DURATION:-3}" # Seconds to sample for level check
+readonly AUDIO_SILENCE_THRESHOLD_DB="${AUDIO_SILENCE_THRESHOLD_DB:--60}" # dB below which is "silence"
+readonly AUDIO_SILENCE_WARN_DURATION="${AUDIO_SILENCE_WARN_DURATION:-60}" # Seconds of silence before warning
 
 # MediaMTX API version compatibility
 readonly MEDIAMTX_API_VERSION="${MEDIAMTX_API_VERSION:-auto}"       # auto, v3, v2, v1
@@ -1522,6 +1572,112 @@ check_alsa_device_available() {
     local device_path="/dev/snd/pcmC${card_num}D0c"
     if [[ ! -e "$device_path" ]]; then
         log DEBUG "Device node $device_path does not exist"
+        return 1
+    fi
+
+    return 0
+}
+
+# Check audio level for a device to detect dead/silent microphones
+# Uses FFmpeg's volumedetect filter to sample audio levels
+# Returns: 0 = audio detected, 1 = silence/dead mic, 2 = check failed
+check_audio_level() {
+    local card_num="$1"
+    local stream_name="${2:-unknown}"
+
+    if [[ "${AUDIO_LEVEL_CHECK_ENABLED}" != "true" ]]; then
+        return 0
+    fi
+
+    # Verify FFmpeg is available
+    if ! command_exists ffmpeg; then
+        log DEBUG "FFmpeg not available for audio level check"
+        return 0
+    fi
+
+    local audio_device="plughw:${card_num},0"
+    local sample_duration="${AUDIO_LEVEL_SAMPLE_DURATION}"
+    local silence_threshold="${AUDIO_SILENCE_THRESHOLD_DB}"
+
+    log DEBUG "Checking audio level for $stream_name (device: $audio_device)"
+
+    # Use FFmpeg to sample audio and detect volume
+    # -t limits duration, volumedetect filter outputs max/mean volume
+    local ffmpeg_output
+    ffmpeg_output=$(ffmpeg -f alsa -i "$audio_device" -t "$sample_duration" \
+        -af volumedetect -f null /dev/null 2>&1) || {
+        log DEBUG "FFmpeg audio level check failed for $stream_name"
+        return 2
+    }
+
+    # Parse max volume from output (format: "max_volume: -XX.X dB")
+    local max_volume
+    max_volume=$(echo "$ffmpeg_output" | grep -o "max_volume: [0-9.-]*" | grep -o "[0-9.-]*" | head -1)
+
+    if [[ -z "$max_volume" ]]; then
+        log DEBUG "Could not parse audio level for $stream_name"
+        return 2
+    fi
+
+    # Compare with threshold (both are negative dB values)
+    # Note: -30 dB is louder than -60 dB, so we check if max > threshold
+    local max_int="${max_volume%.*}"  # Remove decimal for integer comparison
+    local threshold_int="${silence_threshold%.*}"
+
+    if [[ $max_int -lt $threshold_int ]]; then
+        log WARN "Silence detected on $stream_name: max volume ${max_volume} dB (threshold: ${silence_threshold} dB)"
+
+        # Track silence duration
+        local silence_file="/run/mediamtx-silence-${stream_name}"
+        local silence_start
+        if [[ -f "$silence_file" ]]; then
+            silence_start=$(cat "$silence_file" 2>/dev/null || echo "0")
+        else
+            silence_start=$(date +%s)
+            echo "$silence_start" > "$silence_file" 2>/dev/null || true
+        fi
+
+        local now
+        now=$(date +%s)
+        local silence_duration=$((now - silence_start))
+
+        if [[ $silence_duration -ge ${AUDIO_SILENCE_WARN_DURATION} ]]; then
+            log ERROR "DEAD MIC: $stream_name has been silent for ${silence_duration}s (>${AUDIO_SILENCE_WARN_DURATION}s)"
+        fi
+
+        return 1
+    else
+        # Audio detected - clear silence tracking
+        rm -f "/run/mediamtx-silence-${stream_name}" 2>/dev/null || true
+        log DEBUG "Audio level OK for $stream_name: max volume ${max_volume} dB"
+        return 0
+    fi
+}
+
+# Check all streams for audio levels
+check_all_audio_levels() {
+    if [[ "${AUDIO_LEVEL_CHECK_ENABLED}" != "true" ]]; then
+        return 0
+    fi
+
+    local devices=()
+    readarray -t devices < <(detect_audio_devices 2>/dev/null) || return 0
+
+    local silent_count=0
+    for device_info in "${devices[@]}"; do
+        IFS=':' read -r device_name card_num <<<"$device_info"
+        [[ -z "$device_name" ]] || [[ -z "$card_num" ]] && continue
+
+        local stream_path
+        stream_path="$(generate_stream_path "$device_name" "$card_num" 2>/dev/null)" || continue
+
+        if ! check_audio_level "$card_num" "$stream_path"; then
+            ((silent_count++))
+        fi
+    done
+
+    if [[ $silent_count -gt 0 ]]; then
+        log WARN "Audio level check: $silent_count device(s) with silence detected"
         return 1
     fi
 

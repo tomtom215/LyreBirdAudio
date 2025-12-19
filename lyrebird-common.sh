@@ -237,11 +237,13 @@ fi
 # Timestamp Function
 #=============================================================================
 
-# Get current timestamp in standard format
+# Get current timestamp in standard format with timezone
 # Usage: lyrebird_timestamp
-# Returns: Timestamp string (YYYY-MM-DD HH:MM:SS)
+# Returns: Timestamp string (YYYY-MM-DD HH:MM:SS TZ)
+# v1.4.2: Added timezone indicator for multi-timezone deployments
 lyrebird_timestamp() {
-    date '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo "[UNKNOWN]"
+    # Include timezone abbreviation for clarity in logs
+    date '+%Y-%m-%d %H:%M:%S %Z' 2>/dev/null || echo "[UNKNOWN]"
 }
 
 #=============================================================================
