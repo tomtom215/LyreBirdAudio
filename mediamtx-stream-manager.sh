@@ -291,7 +291,7 @@ cleanup() {
 # Set trap for cleanup only in main script
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]] && [[ $$ -eq $BASHPID ]]; then
     trap cleanup EXIT INT TERM HUP QUIT
-    
+
     # Enhanced signal handlers
     # Only set custom handlers when NOT running under systemd
     if [[ -z "${INVOCATION_ID:-}" ]]; then
@@ -302,6 +302,35 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]] && [[ $$ -eq $BASHPID ]]; then
     fi
     # Note: When running under systemd (INVOCATION_ID is set), default signal handlers are used
 fi
+
+# Critical section protection - prevents signal handlers from interrupting
+# atomic operations like lock acquisition and PID file writes
+CRITICAL_SECTION_ACTIVE=false
+
+# Enter critical section - block HUP and USR1 signals to prevent corruption
+# Call this before lock acquisition, PID file writes, or config file operations
+enter_critical_section() {
+    if [[ "$CRITICAL_SECTION_ACTIVE" == "true" ]]; then
+        return 0  # Already in critical section
+    fi
+    CRITICAL_SECTION_ACTIVE=true
+    # Block signals that could interrupt critical operations
+    trap '' HUP USR1
+}
+
+# Exit critical section - restore signal handlers
+# Always call this after critical operations complete
+exit_critical_section() {
+    if [[ "$CRITICAL_SECTION_ACTIVE" != "true" ]]; then
+        return 0  # Not in critical section
+    fi
+    CRITICAL_SECTION_ACTIVE=false
+    # Restore signal handlers (only when not running under systemd)
+    if [[ -z "${INVOCATION_ID:-}" ]]; then
+        trap 'log INFO "Received SIGHUP, reloading configuration"; restart_mediamtx' HUP
+        trap 'log INFO "Received SIGUSR1, dumping status"; show_status >/dev/null 2>&1 || log INFO "Status dump completed"' USR1
+    fi
+}
 
 # Enhanced deferred cleanup handler with staleness check
 handle_deferred_cleanup() {
@@ -759,34 +788,61 @@ terminate_process_group() {
 }
 
 # Lock management with stale lock detection
+# Uses multiple verification methods to prevent PID recycling attacks
 is_lock_stale() {
     if [[ ! -f "${LOCK_FILE}" ]]; then
         return 1  # No lock file, not stale
     fi
-    
+
     # Check if lock file has a PID
     local lock_pid
     lock_pid="$(head -n1 "${LOCK_FILE}" 2>/dev/null | tr -d '[:space:]')"
-    
+
     if [[ -z "$lock_pid" ]] || ! [[ "$lock_pid" =~ ^[0-9]+$ ]]; then
         log WARN "Lock file exists but contains no valid PID"
         return 0  # Stale
     fi
-    
+
+    # Validate PID is in reasonable range (prevent injection/overflow)
+    if [[ ${#lock_pid} -gt 10 ]] || [[ "$lock_pid" -gt 4194304 ]]; then
+        log WARN "Lock file contains invalid PID: $lock_pid"
+        return 0  # Stale
+    fi
+
     # Check if the process is still running
     if ! kill -0 "$lock_pid" 2>/dev/null; then
         log WARN "Lock file PID $lock_pid is not running"
         return 0  # Stale
     fi
-    
-    # Check if the process is actually our script
-    local proc_cmd
-    proc_cmd="$(ps -p "$lock_pid" -o comm= 2>/dev/null || true)"
-    if [[ "$proc_cmd" != "bash" ]] && [[ "$proc_cmd" != "${SCRIPT_NAME}" ]]; then
-        log WARN "Lock file PID $lock_pid is not our script (found: $proc_cmd)"
+
+    # Robust PID verification: check /proc/PID/cmdline to prevent PID recycling
+    # This is more reliable than ps -p which could return stale data
+    if [[ -d "/proc/$lock_pid" ]]; then
+        local proc_cmdline
+        proc_cmdline=$(tr '\0' ' ' < "/proc/$lock_pid/cmdline" 2>/dev/null || echo "")
+        if [[ -n "$proc_cmdline" ]]; then
+            # Verify it's actually our script (check for script name in cmdline)
+            if [[ "$proc_cmdline" != *"mediamtx-stream-manager"* ]] && \
+               [[ "$proc_cmdline" != *"${SCRIPT_NAME}"* ]]; then
+                log WARN "Lock file PID $lock_pid is now a different process (PID recycled)"
+                log DEBUG "Found cmdline: ${proc_cmdline:0:100}"
+                return 0  # Stale - PID was recycled
+            fi
+        fi
+    else
+        # /proc entry doesn't exist but kill -0 succeeded - race condition or zombie
+        log WARN "Process $lock_pid exists but /proc entry missing"
         return 0  # Stale
     fi
-    
+
+    # Fallback: also check via ps for non-Linux systems
+    local proc_cmd
+    proc_cmd="$(ps -p "$lock_pid" -o comm= 2>/dev/null || true)"
+    if [[ -n "$proc_cmd" ]] && [[ "$proc_cmd" != "bash" ]] && [[ "$proc_cmd" != "${SCRIPT_NAME}" ]]; then
+        log WARN "Lock file PID $lock_pid command mismatch (found: $proc_cmd)"
+        return 0  # Stale
+    fi
+
     # Check lock file age
     local lock_age
     lock_age="$(( $(date +%s) - $(stat -c %Y "${LOCK_FILE}" 2>/dev/null || echo 0) ))"
@@ -797,7 +853,7 @@ is_lock_stale() {
             return 0  # Consider stale for start/restart
         fi
     fi
-    
+
     return 1  # Not stale
 }
 
@@ -834,45 +890,51 @@ is_lock_stale() {
 acquire_lock() {
     local timeout="${1:-${LOCK_ACQUISITION_TIMEOUT}}"
     local force="${2:-false}"
-    
+
+    # Enter critical section to prevent signal handlers from interrupting lock operations
+    enter_critical_section
+
     # Always close existing FD before reuse
     if [[ ${MAIN_LOCK_FD} -gt 2 ]]; then
         exec {MAIN_LOCK_FD}>&- 2>/dev/null || true
     fi
     MAIN_LOCK_FD=-1
-    
+
     # Create lock directory if it doesn't exist
     local lock_dir
     lock_dir="$(dirname "${LOCK_FILE}")"
     if [[ ! -d "$lock_dir" ]]; then
         mkdir -p "$lock_dir" 2>/dev/null || {
             log ERROR "Cannot create lock directory: $lock_dir"
+            exit_critical_section
             return 1
         }
     fi
-    
+
     # Check for stale lock
     if is_lock_stale; then
         log INFO "Removing stale lock file"
         rm -f "${LOCK_FILE}"
     fi
-    
+
     # Open lock file and get file descriptor
     {
         exec {MAIN_LOCK_FD}>"${LOCK_FILE}" 2>/dev/null
     } || {
         log ERROR "Cannot create lock file ${LOCK_FILE}"
         MAIN_LOCK_FD=-1
+        exit_critical_section
         return 1
     }
-    
+
     # Validate FD is valid (> 2)
     if [[ ${MAIN_LOCK_FD} -le 2 ]]; then
         log ERROR "Invalid lock file descriptor: ${MAIN_LOCK_FD}"
         MAIN_LOCK_FD=-1
+        exit_critical_section
         return 1
     fi
-    
+
     # Try to acquire lock
     if ! flock -w "$timeout" "${MAIN_LOCK_FD}"; then
         # Enhanced error handling for FD closure failure
@@ -880,7 +942,8 @@ acquire_lock() {
             log WARN "Failed to close lock FD properly during acquisition failure"
         fi
         MAIN_LOCK_FD=-1
-        
+
+        exit_critical_section
         if [[ "$force" == "true" ]]; then
             log WARN "Failed to acquire lock, forcing due to force flag"
             return 0  # Continue anyway
@@ -889,10 +952,13 @@ acquire_lock() {
             return 1
         fi
     fi
-    
+
     # Write our PID to the lock file
     echo "$$" >&"${MAIN_LOCK_FD}" || true
-    
+
+    # Exit critical section - lock is acquired, safe to allow signals again
+    exit_critical_section
+
     log DEBUG "Acquired lock (PID: $$, FD: ${MAIN_LOCK_FD})"
     return 0
 }

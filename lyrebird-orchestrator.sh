@@ -517,15 +517,19 @@ refresh_system_state() {
             raw_count=$(pgrep -x ffmpeg 2>/dev/null | head -n 1001 | wc -l)
         fi
         
-        # Validate count and apply reasonable upper limit
-        if [[ "$raw_count" =~ ^[0-9]+$ ]] && (( raw_count > 0 && raw_count <= 1000 )); then
+        # Validate count with overflow protection
+        # First check string length to prevent overflow in arithmetic operations
+        if [[ ! "$raw_count" =~ ^[0-9]{1,7}$ ]]; then
+            # Not a valid number or too large (>9,999,999) - could cause overflow
+            log "WARN" "Invalid or oversized stream count: '${raw_count:0:20}'"
+            ACTIVE_STREAMS=0
+        elif (( raw_count > 0 && raw_count <= 1000 )); then
             ACTIVE_STREAMS=$raw_count
-        elif [[ "$raw_count" =~ ^[0-9]+$ ]] && (( raw_count > 1000 )); then
+        elif (( raw_count > 1000 )); then
             log "ERROR" "Excessive stream count detected: $raw_count (capping at 1000)"
             log "ERROR" "System may be under attack or experiencing runaway processes"
             ACTIVE_STREAMS=1000  # Cap at reasonable limit for display
         else
-            log "WARN" "Invalid stream count: '$raw_count'"
             ACTIVE_STREAMS=0
         fi
     fi
