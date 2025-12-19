@@ -126,8 +126,11 @@ LYREBIRD_NTFY_SERVER="${LYREBIRD_NTFY_SERVER:-https://ntfy.sh}"
 
 # shellcheck disable=SC2034  # These constants are exported for use by other scripts
 readonly ALERT_LEVEL_INFO="info"
+# shellcheck disable=SC2034
 readonly ALERT_LEVEL_WARNING="warning"
+# shellcheck disable=SC2034
 readonly ALERT_LEVEL_ERROR="error"
+# shellcheck disable=SC2034
 readonly ALERT_LEVEL_CRITICAL="critical"
 
 # Colors for each level (for Discord/Slack)
