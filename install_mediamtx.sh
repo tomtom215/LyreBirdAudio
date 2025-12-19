@@ -29,6 +29,14 @@ set -euo pipefail
 set -o errtrace
 set -o functrace
 
+# Source shared library if available (backward compatible)
+# Provides: colors, logging, command_exists, compute_hash, exit codes
+# Falls back gracefully if library not present - all functions defined locally below
+_LYREBIRD_COMMON="${BASH_SOURCE[0]%/*}/lyrebird-common.sh"
+# shellcheck source=lyrebird-common.sh
+[[ -f "$_LYREBIRD_COMMON" ]] && source "$_LYREBIRD_COMMON" || true
+unset _LYREBIRD_COMMON
+
 # Script metadata
 readonly SCRIPT_VERSION="2.0.1"
 

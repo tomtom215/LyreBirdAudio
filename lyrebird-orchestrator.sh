@@ -73,6 +73,14 @@ if (( BASH_VERSINFO[0] < 4 )); then
     exit 1
 fi
 
+# Source shared library if available (backward compatible)
+# Provides: colors, logging, command_exists, compute_hash, exit codes
+# Falls back gracefully if library not present - all functions defined locally below
+_LYREBIRD_COMMON="${BASH_SOURCE[0]%/*}/lyrebird-common.sh"
+# shellcheck source=lyrebird-common.sh
+[[ -f "$_LYREBIRD_COMMON" ]] && source "$_LYREBIRD_COMMON" || true
+unset _LYREBIRD_COMMON
+
 # ============================================================================
 # Constants and Configuration
 # ============================================================================

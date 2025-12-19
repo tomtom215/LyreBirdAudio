@@ -20,6 +20,14 @@
 # Set bash pipefail for better error handling
 set -o pipefail
 
+# Source shared library if available (backward compatible)
+# Provides: colors, logging, command_exists, compute_hash, exit codes
+# Falls back gracefully if library not present - all functions defined locally below
+_LYREBIRD_COMMON="$(cd "$(dirname "$0")" && pwd)/lyrebird-common.sh"
+# shellcheck source=lyrebird-common.sh
+[[ -f "$_LYREBIRD_COMMON" ]] && source "$_LYREBIRD_COMMON" || true
+unset _LYREBIRD_COMMON
+
 # Constants
 readonly SCRIPT_NAME="$(basename "$0")"
 readonly SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
