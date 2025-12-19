@@ -1730,6 +1730,7 @@ mediamtx_delete_path_config() {
 
 # List all active paths (runtime state)
 # Usage: mediamtx_list_paths [itemsPerPage] [page]
+# shellcheck disable=SC2120  # Optional parameters with defaults
 mediamtx_list_paths() {
     local items_per_page="${1:-1000}"
     local page="${2:-0}"
@@ -1789,6 +1790,7 @@ mediamtx_get_rtsp_conn() {
 # -----------------------------------------------------------------------------
 
 # List all RTSP sessions
+# shellcheck disable=SC2120  # Optional parameters with defaults
 mediamtx_list_rtsp_sessions() {
     local items_per_page="${1:-1000}"
     local page="${2:-0}"
@@ -1829,6 +1831,7 @@ mediamtx_get_rtsps_conn() {
 # -----------------------------------------------------------------------------
 
 # List all RTSPS sessions
+# shellcheck disable=SC2120  # Optional parameters with defaults
 mediamtx_list_rtsps_sessions() {
     local items_per_page="${1:-1000}"
     local page="${2:-0}"
@@ -1852,6 +1855,7 @@ mediamtx_kick_rtsps_session() {
 # -----------------------------------------------------------------------------
 
 # List all RTMP connections
+# shellcheck disable=SC2120  # Optional parameters with defaults
 mediamtx_list_rtmp_conns() {
     local items_per_page="${1:-1000}"
     local page="${2:-0}"
@@ -1898,6 +1902,7 @@ mediamtx_kick_rtmps_conn() {
 # -----------------------------------------------------------------------------
 
 # List all SRT connections
+# shellcheck disable=SC2120  # Optional parameters with defaults
 mediamtx_list_srt_conns() {
     local items_per_page="${1:-1000}"
     local page="${2:-0}"
@@ -1921,6 +1926,7 @@ mediamtx_kick_srt_conn() {
 # -----------------------------------------------------------------------------
 
 # List all WebRTC sessions
+# shellcheck disable=SC2120  # Optional parameters with defaults
 mediamtx_list_webrtc_sessions() {
     local items_per_page="${1:-1000}"
     local page="${2:-0}"
