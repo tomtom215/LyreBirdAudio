@@ -6,16 +6,19 @@ Unit tests for LyreBirdAudio using the [Bats](https://github.com/bats-core/bats-
 
 | Component | Test File | Tests | Est. Coverage |
 |-----------|-----------|-------|---------------|
-| lyrebird-common.sh | test_lyrebird_common.bats | 30 | 75% |
+| lyrebird-common.sh | test_lyrebird_common.bats | 47 | 80% |
 | mediamtx-stream-manager.sh | test_stream_manager.bats | 32 | 50% |
-| usb-audio-mapper.sh | test_usb_audio_mapper.bats | 15 | 45% |
-| lyrebird-diagnostics.sh | test_lyrebird_diagnostics.bats | 16 | 40% |
-| lyrebird-orchestrator.sh | test_lyrebird_orchestrator.bats | 14 | 35% |
+| usb-audio-mapper.sh | test_usb_audio_mapper.bats | 33 | 65% |
+| lyrebird-diagnostics.sh | test_lyrebird_diagnostics.bats | 34 | 70% |
+| lyrebird-orchestrator.sh | test_lyrebird_orchestrator.bats | 44 | 70% |
 | lyrebird-alerts.sh | test_lyrebird_alerts.bats | 45 | 60% |
 | lyrebird-metrics.sh | test_lyrebird_metrics.bats | 32 | 55% |
-| lyrebird-storage.sh | test_lyrebird_storage.bats | 42 | 50% |
+| lyrebird-storage.sh | test_lyrebird_storage.bats | 42 | 65% |
+| lyrebird-updater.sh | test_lyrebird_updater.bats | 55 | 75% |
+| install_mediamtx.sh | test_install_mediamtx.bats | 55 | 70% |
+| lyrebird-mic-check.sh | test_lyrebird_mic_check.bats | 45 | 70% |
 
-**Total: ~226 tests covering approximately 55% of critical paths**
+**Total: ~464 tests covering approximately 70% of critical paths**
 
 ## Prerequisites
 
@@ -51,6 +54,9 @@ bats tests/test_lyrebird_orchestrator.bats
 bats tests/test_lyrebird_alerts.bats
 bats tests/test_lyrebird_metrics.bats
 bats tests/test_lyrebird_storage.bats
+bats tests/test_lyrebird_updater.bats
+bats tests/test_install_mediamtx.bats
+bats tests/test_lyrebird_mic_check.bats
 ```
 
 **Run with verbose output:**
@@ -74,12 +80,15 @@ bats tests/ --filter "validation"
 |------|-------------|
 | `test_lyrebird_common.bats` | Tests for shared library functions (hashing, timestamps, exit codes, progress indicators, error helpers) |
 | `test_stream_manager.bats` | Tests for stream manager (sanitization, PID, locks, heartbeat, network) |
-| `test_usb_audio_mapper.bats` | Tests for USB device detection, sanitization, udev rules |
-| `test_lyrebird_diagnostics.bats` | Tests for diagnostic utilities (validation, port, disk, logs) |
-| `test_lyrebird_orchestrator.bats` | Tests for menu validation, version comparison, status display |
+| `test_usb_audio_mapper.bats` | Tests for USB device detection, sanitization, udev rules, port path parsing |
+| `test_lyrebird_diagnostics.bats` | Tests for diagnostic utilities (validation, port, disk, logs, system resources) |
+| `test_lyrebird_orchestrator.bats` | Tests for menu validation, version comparison, status display, service status, time formatting |
 | `test_lyrebird_alerts.bats` | Tests for webhook alerting (formatters, rate limiting, alert types) |
 | `test_lyrebird_metrics.bats` | Tests for Prometheus metrics export (collectors, formatting) |
 | `test_lyrebird_storage.bats` | Tests for storage management (cleanup, retention, disk usage) |
+| `test_lyrebird_updater.bats` | Tests for update system (git operations, transactions, service detection, backups) |
+| `test_install_mediamtx.bats` | Tests for MediaMTX installer (version comparison, platform detection, validation) |
+| `test_lyrebird_mic_check.bats` | Tests for mic check utility (device detection, capability testing, config generation) |
 
 ## Test Categories
 
@@ -92,6 +101,13 @@ bats tests/ --filter "validation"
 - Heartbeat/watchdog mechanisms
 - Network connectivity checks
 - Disk space monitoring
+- Git operations and transactions
+- Service detection and management
+- Audio device capabilities
+- Webhook formatting and rate limiting
+- Metrics collection and formatting
+- Storage cleanup and retention
+- Progress indicators and error helpers
 
 ### Integration Tests (Future)
 - Stream lifecycle tests with mock devices

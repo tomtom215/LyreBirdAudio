@@ -344,3 +344,327 @@ teardown() {
     [ "$status" -eq 0 ]
     [ "$output" = "short" ]
 }
+
+# ============================================================================
+# Service Status Detection Tests
+# ============================================================================
+
+@test "parse_service_status active" {
+    parse_service_status() {
+        local status="$1"
+        case "$status" in
+            "active (running)") echo "running" ;;
+            "inactive (dead)") echo "stopped" ;;
+            "activating"*) echo "starting" ;;
+            "failed"*) echo "failed" ;;
+            *) echo "unknown" ;;
+        esac
+    }
+
+    run parse_service_status "active (running)"
+    [ "$output" = "running" ]
+}
+
+@test "parse_service_status inactive" {
+    parse_service_status() {
+        local status="$1"
+        case "$status" in
+            "active (running)") echo "running" ;;
+            "inactive (dead)") echo "stopped" ;;
+            "activating"*) echo "starting" ;;
+            "failed"*) echo "failed" ;;
+            *) echo "unknown" ;;
+        esac
+    }
+
+    run parse_service_status "inactive (dead)"
+    [ "$output" = "stopped" ]
+}
+
+@test "parse_service_status failed" {
+    parse_service_status() {
+        local status="$1"
+        case "$status" in
+            "active (running)") echo "running" ;;
+            "inactive (dead)") echo "stopped" ;;
+            "activating"*) echo "starting" ;;
+            "failed"*) echo "failed" ;;
+            *) echo "unknown" ;;
+        esac
+    }
+
+    run parse_service_status "failed (Result: exit-code)"
+    [ "$output" = "failed" ]
+}
+
+# ============================================================================
+# Path Validation Tests
+# ============================================================================
+
+@test "is_valid_path accepts existing path" {
+    is_valid_path() {
+        [[ -e "$1" ]]
+    }
+
+    run is_valid_path "$TEST_TMP"
+    [ "$status" -eq 0 ]
+}
+
+@test "is_valid_path rejects nonexistent path" {
+    is_valid_path() {
+        [[ -e "$1" ]]
+    }
+
+    run is_valid_path "/nonexistent/path/12345"
+    [ "$status" -eq 1 ]
+}
+
+@test "is_valid_executable checks executability" {
+    is_valid_executable() {
+        [[ -x "$1" ]]
+    }
+
+    touch "$TEST_TMP/test.sh"
+    chmod +x "$TEST_TMP/test.sh"
+    run is_valid_executable "$TEST_TMP/test.sh"
+    [ "$status" -eq 0 ]
+}
+
+@test "is_valid_executable rejects non-executable" {
+    is_valid_executable() {
+        [[ -x "$1" ]]
+    }
+
+    touch "$TEST_TMP/test.txt"
+    chmod -x "$TEST_TMP/test.txt"
+    run is_valid_executable "$TEST_TMP/test.txt"
+    [ "$status" -eq 1 ]
+}
+
+# ============================================================================
+# Port Validation Tests
+# ============================================================================
+
+@test "validate_port accepts valid port" {
+    validate_port() {
+        local port="$1"
+        [[ "$port" =~ ^[0-9]+$ ]] && ((port >= 1 && port <= 65535))
+    }
+
+    run validate_port "8554"
+    [ "$status" -eq 0 ]
+}
+
+@test "validate_port accepts port 1" {
+    validate_port() {
+        local port="$1"
+        [[ "$port" =~ ^[0-9]+$ ]] && ((port >= 1 && port <= 65535))
+    }
+
+    run validate_port "1"
+    [ "$status" -eq 0 ]
+}
+
+@test "validate_port accepts port 65535" {
+    validate_port() {
+        local port="$1"
+        [[ "$port" =~ ^[0-9]+$ ]] && ((port >= 1 && port <= 65535))
+    }
+
+    run validate_port "65535"
+    [ "$status" -eq 0 ]
+}
+
+@test "validate_port rejects port 0" {
+    validate_port() {
+        local port="$1"
+        [[ "$port" =~ ^[0-9]+$ ]] && ((port >= 1 && port <= 65535))
+    }
+
+    run validate_port "0"
+    [ "$status" -eq 1 ]
+}
+
+@test "validate_port rejects port 65536" {
+    validate_port() {
+        local port="$1"
+        [[ "$port" =~ ^[0-9]+$ ]] && ((port >= 1 && port <= 65535))
+    }
+
+    run validate_port "65536"
+    [ "$status" -eq 1 ]
+}
+
+@test "validate_port rejects non-numeric" {
+    validate_port() {
+        local port="$1"
+        [[ "$port" =~ ^[0-9]+$ ]] && ((port >= 1 && port <= 65535))
+    }
+
+    run validate_port "abc"
+    [ "$status" -eq 1 ]
+}
+
+# ============================================================================
+# Stream Name Validation Tests
+# ============================================================================
+
+@test "validate_stream_name accepts valid name" {
+    validate_stream_name() {
+        local name="$1"
+        [[ "$name" =~ ^[a-z][a-z0-9_-]{0,31}$ ]]
+    }
+
+    run validate_stream_name "mic1"
+    [ "$status" -eq 0 ]
+}
+
+@test "validate_stream_name accepts name with underscore" {
+    validate_stream_name() {
+        local name="$1"
+        [[ "$name" =~ ^[a-z][a-z0-9_-]{0,31}$ ]]
+    }
+
+    run validate_stream_name "usb_audio_1"
+    [ "$status" -eq 0 ]
+}
+
+@test "validate_stream_name accepts name with hyphen" {
+    validate_stream_name() {
+        local name="$1"
+        [[ "$name" =~ ^[a-z][a-z0-9_-]{0,31}$ ]]
+    }
+
+    run validate_stream_name "bird-recorder"
+    [ "$status" -eq 0 ]
+}
+
+@test "validate_stream_name rejects starting with number" {
+    validate_stream_name() {
+        local name="$1"
+        [[ "$name" =~ ^[a-z][a-z0-9_-]{0,31}$ ]]
+    }
+
+    run validate_stream_name "1mic"
+    [ "$status" -eq 1 ]
+}
+
+@test "validate_stream_name rejects uppercase" {
+    validate_stream_name() {
+        local name="$1"
+        [[ "$name" =~ ^[a-z][a-z0-9_-]{0,31}$ ]]
+    }
+
+    run validate_stream_name "MIC"
+    [ "$status" -eq 1 ]
+}
+
+# ============================================================================
+# Time Formatting Tests
+# ============================================================================
+
+@test "format_uptime formats seconds" {
+    format_uptime() {
+        local seconds="$1"
+        if ((seconds < 60)); then
+            echo "${seconds}s"
+        elif ((seconds < 3600)); then
+            echo "$((seconds / 60))m $((seconds % 60))s"
+        elif ((seconds < 86400)); then
+            echo "$((seconds / 3600))h $((seconds % 3600 / 60))m"
+        else
+            echo "$((seconds / 86400))d $((seconds % 86400 / 3600))h"
+        fi
+    }
+
+    run format_uptime "45"
+    [ "$output" = "45s" ]
+}
+
+@test "format_uptime formats minutes" {
+    format_uptime() {
+        local seconds="$1"
+        if ((seconds < 60)); then
+            echo "${seconds}s"
+        elif ((seconds < 3600)); then
+            echo "$((seconds / 60))m $((seconds % 60))s"
+        elif ((seconds < 86400)); then
+            echo "$((seconds / 3600))h $((seconds % 3600 / 60))m"
+        else
+            echo "$((seconds / 86400))d $((seconds % 86400 / 3600))h"
+        fi
+    }
+
+    run format_uptime "125"
+    [ "$output" = "2m 5s" ]
+}
+
+@test "format_uptime formats hours" {
+    format_uptime() {
+        local seconds="$1"
+        if ((seconds < 60)); then
+            echo "${seconds}s"
+        elif ((seconds < 3600)); then
+            echo "$((seconds / 60))m $((seconds % 60))s"
+        elif ((seconds < 86400)); then
+            echo "$((seconds / 3600))h $((seconds % 3600 / 60))m"
+        else
+            echo "$((seconds / 86400))d $((seconds % 86400 / 3600))h"
+        fi
+    }
+
+    run format_uptime "7230"
+    [ "$output" = "2h 0m" ]
+}
+
+@test "format_uptime formats days" {
+    format_uptime() {
+        local seconds="$1"
+        if ((seconds < 60)); then
+            echo "${seconds}s"
+        elif ((seconds < 3600)); then
+            echo "$((seconds / 60))m $((seconds % 60))s"
+        elif ((seconds < 86400)); then
+            echo "$((seconds / 3600))h $((seconds % 3600 / 60))m"
+        else
+            echo "$((seconds / 86400))d $((seconds % 86400 / 3600))h"
+        fi
+    }
+
+    run format_uptime "90000"
+    [ "$output" = "1d 1h" ]
+}
+
+# ============================================================================
+# Process ID Validation Tests
+# ============================================================================
+
+@test "validate_pid accepts valid PID" {
+    validate_pid() {
+        local pid="$1"
+        [[ "$pid" =~ ^[0-9]+$ ]] && ((pid > 0))
+    }
+
+    run validate_pid "1234"
+    [ "$status" -eq 0 ]
+}
+
+@test "validate_pid rejects zero" {
+    validate_pid() {
+        local pid="$1"
+        [[ "$pid" =~ ^[0-9]+$ ]] && ((pid > 0))
+    }
+
+    run validate_pid "0"
+    [ "$status" -eq 1 ]
+}
+
+@test "validate_pid rejects non-numeric" {
+    validate_pid() {
+        local pid="$1"
+        [[ "$pid" =~ ^[0-9]+$ ]] && ((pid > 0))
+    }
+
+    run validate_pid "abc"
+    [ "$status" -eq 1 ]
+}

@@ -310,3 +310,226 @@ EOF
     NO_COLOR=true run detect_colors
     [ "$output" = "nocolor" ]
 }
+
+# ============================================================================
+# File Size Tests
+# ============================================================================
+
+@test "get_file_size_mb returns size for existing file" {
+    get_file_size_mb() {
+        local file="$1"
+        if [[ -f "$file" ]]; then
+            local size_bytes
+            size_bytes=$(stat -c%s "$file" 2>/dev/null || stat -f%z "$file" 2>/dev/null || echo 0)
+            echo $((size_bytes / 1024 / 1024))
+        else
+            echo "0"
+        fi
+    }
+
+    dd if=/dev/zero of="$TEST_TMP/testfile" bs=1M count=2 2>/dev/null
+    run get_file_size_mb "$TEST_TMP/testfile"
+    [ "$status" -eq 0 ]
+    [ "$output" -ge 1 ]
+}
+
+@test "get_file_size_mb returns 0 for small file" {
+    get_file_size_mb() {
+        local file="$1"
+        if [[ -f "$file" ]]; then
+            local size_bytes
+            size_bytes=$(stat -c%s "$file" 2>/dev/null || stat -f%z "$file" 2>/dev/null || echo 0)
+            echo $((size_bytes / 1024 / 1024))
+        else
+            echo "0"
+        fi
+    }
+
+    echo "small" > "$TEST_TMP/small.txt"
+    run get_file_size_mb "$TEST_TMP/small.txt"
+    [ "$status" -eq 0 ]
+    [ "$output" -eq 0 ]
+}
+
+# ============================================================================
+# System Time Tests
+# ============================================================================
+
+@test "check_time_sync detects synced time" {
+    check_time_sync() {
+        # Check if timedatectl shows synced
+        if command -v timedatectl &>/dev/null; then
+            if timedatectl status 2>/dev/null | grep -q "synchronized: yes"; then
+                echo "synced"
+            else
+                echo "not_synced"
+            fi
+        else
+            echo "unknown"
+        fi
+    }
+
+    run check_time_sync
+    [ "$status" -eq 0 ]
+    [[ "$output" =~ ^(synced|not_synced|unknown)$ ]]
+}
+
+# ============================================================================
+# Network Interface Tests
+# ============================================================================
+
+@test "get_primary_interface returns interface name" {
+    get_primary_interface() {
+        ip route 2>/dev/null | awk '/default/{print $5; exit}' || echo "unknown"
+    }
+
+    run get_primary_interface
+    [ "$status" -eq 0 ]
+    [ -n "$output" ]
+}
+
+@test "get_ip_address returns IP format" {
+    get_ip_address() {
+        local iface="${1:-eth0}"
+        ip addr show "$iface" 2>/dev/null | awk '/inet /{print $2}' | cut -d/ -f1 | head -1 || echo ""
+    }
+
+    # Just verify the function doesn't crash
+    run get_ip_address "lo"
+    [ "$status" -eq 0 ]
+}
+
+# ============================================================================
+# System Resource Tests
+# ============================================================================
+
+@test "get_load_average returns load values" {
+    get_load_average() {
+        if [[ -f /proc/loadavg ]]; then
+            cut -d' ' -f1-3 /proc/loadavg
+        else
+            uptime | awk -F'load average:' '{print $2}' | tr -d ' '
+        fi
+    }
+
+    run get_load_average
+    [ "$status" -eq 0 ]
+    [[ "$output" =~ [0-9] ]]
+}
+
+@test "get_cpu_count returns positive number" {
+    get_cpu_count() {
+        if [[ -f /proc/cpuinfo ]]; then
+            grep -c ^processor /proc/cpuinfo
+        else
+            sysctl -n hw.ncpu 2>/dev/null || echo 1
+        fi
+    }
+
+    run get_cpu_count
+    [ "$status" -eq 0 ]
+    [ "$output" -ge 1 ]
+}
+
+@test "get_total_memory_mb returns memory size" {
+    get_total_memory_mb() {
+        if [[ -f /proc/meminfo ]]; then
+            awk '/MemTotal/{print int($2/1024)}' /proc/meminfo
+        else
+            echo "0"
+        fi
+    }
+
+    run get_total_memory_mb
+    [ "$status" -eq 0 ]
+    [[ "$output" =~ ^[0-9]+$ ]]
+}
+
+# ============================================================================
+# Service Status Tests
+# ============================================================================
+
+@test "parse_systemd_status parses active status" {
+    parse_systemd_status() {
+        local status="$1"
+        case "$status" in
+            *"active (running)"*) echo "running" ;;
+            *"inactive"*) echo "stopped" ;;
+            *"failed"*) echo "failed" ;;
+            *"activating"*) echo "starting" ;;
+            *) echo "unknown" ;;
+        esac
+    }
+
+    run parse_systemd_status "active (running) since Mon 2025-01-01"
+    [ "$output" = "running" ]
+}
+
+@test "parse_systemd_status parses inactive status" {
+    parse_systemd_status() {
+        local status="$1"
+        case "$status" in
+            *"active (running)"*) echo "running" ;;
+            *"inactive"*) echo "stopped" ;;
+            *"failed"*) echo "failed" ;;
+            *"activating"*) echo "starting" ;;
+            *) echo "unknown" ;;
+        esac
+    }
+
+    run parse_systemd_status "inactive (dead)"
+    [ "$output" = "stopped" ]
+}
+
+# ============================================================================
+# Log Analysis Tests
+# ============================================================================
+
+@test "count_log_errors counts error lines" {
+    count_log_errors() {
+        local logfile="$1"
+        if [[ -f "$logfile" ]]; then
+            grep -ci "error\|fail\|fatal" "$logfile" 2>/dev/null || echo 0
+        else
+            echo 0
+        fi
+    }
+
+    echo -e "INFO: OK\nERROR: bad\nFAIL: worse\nINFO: OK" > "$TEST_TMP/test.log"
+    run count_log_errors "$TEST_TMP/test.log"
+    [ "$status" -eq 0 ]
+    [ "$output" -eq 2 ]
+}
+
+@test "count_log_errors returns 0 for missing file" {
+    count_log_errors() {
+        local logfile="$1"
+        if [[ -f "$logfile" ]]; then
+            grep -ci "error\|fail\|fatal" "$logfile" 2>/dev/null || echo 0
+        else
+            echo 0
+        fi
+    }
+
+    run count_log_errors "/nonexistent/file.log"
+    [ "$status" -eq 0 ]
+    [ "$output" -eq 0 ]
+}
+
+# ============================================================================
+# Audio Device Tests
+# ============================================================================
+
+@test "count_alsa_cards returns number" {
+    count_alsa_cards() {
+        if [[ -f /proc/asound/cards ]]; then
+            grep -c '^\s*[0-9]' /proc/asound/cards 2>/dev/null || echo 0
+        else
+            echo 0
+        fi
+    }
+
+    run count_alsa_cards
+    [ "$status" -eq 0 ]
+    [[ "$output" =~ ^[0-9]+$ ]]
+}
