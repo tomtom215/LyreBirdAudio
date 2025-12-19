@@ -109,6 +109,13 @@ LYREBIRD_ALERT_RETRIES="${LYREBIRD_ALERT_RETRIES:-3}"
 LYREBIRD_HOSTNAME="${LYREBIRD_HOSTNAME:-$(hostname -s 2>/dev/null || echo 'unknown')}"
 LYREBIRD_LOCATION="${LYREBIRD_LOCATION:-}"
 
+# Validate timeout bounds (5-120 seconds)
+if [[ "$LYREBIRD_ALERT_TIMEOUT" -lt 5 ]]; then
+    LYREBIRD_ALERT_TIMEOUT=5
+elif [[ "$LYREBIRD_ALERT_TIMEOUT" -gt 120 ]]; then
+    LYREBIRD_ALERT_TIMEOUT=120
+fi
+
 # Additional webhook URLs (space-separated)
 LYREBIRD_WEBHOOK_URLS="${LYREBIRD_WEBHOOK_URLS:-}"
 
@@ -172,6 +179,26 @@ readonly ALERT_TYPE_CUSTOM="custom"
 #=============================================================================
 # Helper Functions
 #=============================================================================
+
+# URL-encode a string (handles all special characters)
+url_encode() {
+    local string="$1"
+    # Use jq if available, otherwise fall back to printf-based encoding
+    if command -v jq &>/dev/null; then
+        printf '%s' "$string" | jq -sRr @uri
+    else
+        # Fallback: encode using printf with hex conversion
+        local length="${#string}"
+        local i char
+        for ((i = 0; i < length; i++)); do
+            char="${string:i:1}"
+            case "$char" in
+                [a-zA-Z0-9.~_-]) printf '%s' "$char" ;;
+                *) printf '%%%02X' "'$char" ;;
+            esac
+        done
+    fi
+}
 
 # Load configuration file if it exists
 load_config() {
@@ -416,12 +443,13 @@ format_pushover() {
         *) priority="0" ;;
     esac
 
-    # URL-encode message (simple version)
-    message="${message// /%20}"
-    title="${title// /%20}"
+    # Properly URL-encode message and title (handles &, =, and all special chars)
+    local encoded_message encoded_title
+    encoded_message=$(url_encode "$message")
+    encoded_title=$(url_encode "$title")
 
     # Return form-encoded data
-    echo "token=${LYREBIRD_PUSHOVER_TOKEN}&user=${LYREBIRD_PUSHOVER_USER}&title=${title}&message=${message}&priority=${priority}"
+    echo "token=${LYREBIRD_PUSHOVER_TOKEN}&user=${LYREBIRD_PUSHOVER_USER}&title=${encoded_title}&message=${encoded_message}&priority=${priority}"
 }
 
 #=============================================================================
@@ -488,9 +516,9 @@ send_webhook() {
             return 0
         fi
 
-        # Retry with backoff
+        # Retry with backoff and jitter (prevents thundering herd)
         if ((attempt < retries)); then
-            local delay=$((attempt * 2))
+            local delay=$(( (attempt * 2) + (RANDOM % 3) ))
             log_debug "Webhook failed, retrying in ${delay}s..."
             sleep "$delay"
         fi
@@ -993,8 +1021,7 @@ cmd_test() {
         echo "Failed to send test alert. Check your configuration."
         return 1
     fi
-
-    LYREBIRD_ALERT_ENABLED="$was_enabled"
+    # Note: was_enabled restoration removed - unreachable after return statements
 }
 
 #=============================================================================

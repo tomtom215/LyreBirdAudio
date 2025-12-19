@@ -1426,7 +1426,7 @@ This modular design prevents duplicate business logic and ensures maintainabilit
 |--------|---------|---------|
 | lyrebird-orchestrator.sh | 2.1.2 | Unified management interface |
 | lyrebird-updater.sh | 1.5.1 | Version management with rollback |
-| mediamtx-stream-manager.sh | 1.4.2 | Stream lifecycle management |
+| mediamtx-stream-manager.sh | 1.4.3 | Stream lifecycle management |
 | usb-audio-mapper.sh | 1.2.1 | USB device persistence via udev |
 | lyrebird-mic-check.sh | 1.0.0 | Hardware capability detection |
 | lyrebird-diagnostics.sh | 1.0.2 | System diagnostics |

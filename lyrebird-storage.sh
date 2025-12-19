@@ -41,24 +41,80 @@ readonly MEDIAMTX_LOG="${MEDIAMTX_LOG:-/var/log/mediamtx.out}"
 readonly TEMP_DIR="${LYREBIRD_TEMP_DIR:-/tmp}"
 readonly BUFFER_DIR="${LYREBIRD_BUFFER_DIR:-/dev/shm/lyrebird-buffer}"
 
-# Retention policies (in days)
-readonly RECORDING_RETENTION_DAYS="${RECORDING_RETENTION_DAYS:-30}"
-readonly LOG_RETENTION_DAYS="${LOG_RETENTION_DAYS:-7}"
-readonly TEMP_RETENTION_HOURS="${TEMP_RETENTION_HOURS:-24}"
+# Retention policies (in days) - must be positive integers
+_rec_ret=${RECORDING_RETENTION_DAYS:-30}
+_log_ret=${LOG_RETENTION_DAYS:-7}
+_tmp_ret=${TEMP_RETENTION_HOURS:-24}
 
-# Disk thresholds (percentage)
-readonly DISK_WARNING_PERCENT="${DISK_WARNING_PERCENT:-80}"
-readonly DISK_CRITICAL_PERCENT="${DISK_CRITICAL_PERCENT:-90}"
-readonly DISK_EMERGENCY_PERCENT="${DISK_EMERGENCY_PERCENT:-95}"
+# Ensure retention values are positive (minimum 1)
+(( _rec_ret < 1 )) && _rec_ret=1
+(( _log_ret < 1 )) && _log_ret=1
+(( _tmp_ret < 1 )) && _tmp_ret=1
 
-# Minimum free space (MB)
-readonly MIN_FREE_SPACE_MB="${MIN_FREE_SPACE_MB:-500}"
+readonly RECORDING_RETENTION_DAYS="$_rec_ret"
+readonly LOG_RETENTION_DAYS="$_log_ret"
+readonly TEMP_RETENTION_HOURS="$_tmp_ret"
+unset _rec_ret _log_ret _tmp_ret
+
+# Disk thresholds (percentage) - validate bounds 0-100
+_disk_warning=${DISK_WARNING_PERCENT:-80}
+_disk_critical=${DISK_CRITICAL_PERCENT:-90}
+_disk_emergency=${DISK_EMERGENCY_PERCENT:-95}
+
+# Clamp percentage values to valid range
+(( _disk_warning < 0 )) && _disk_warning=0
+(( _disk_warning > 100 )) && _disk_warning=100
+(( _disk_critical < 0 )) && _disk_critical=0
+(( _disk_critical > 100 )) && _disk_critical=100
+(( _disk_emergency < 0 )) && _disk_emergency=0
+(( _disk_emergency > 100 )) && _disk_emergency=100
+
+readonly DISK_WARNING_PERCENT="$_disk_warning"
+readonly DISK_CRITICAL_PERCENT="$_disk_critical"
+readonly DISK_EMERGENCY_PERCENT="$_disk_emergency"
+unset _disk_warning _disk_critical _disk_emergency
+
+# Minimum free space (MB) - must be positive
+_min_free=${MIN_FREE_SPACE_MB:-500}
+(( _min_free < 0 )) && _min_free=0
+readonly MIN_FREE_SPACE_MB="$_min_free"
+unset _min_free
 
 # Log file size limits (bytes)
 readonly MAX_LOG_SIZE="${MAX_LOG_SIZE:-104857600}"  # 100MB
 
 # Dry run mode (set to true to see what would be deleted)
 DRY_RUN="${DRY_RUN:-false}"
+
+# ============================================================================
+# Safety Validation
+# ============================================================================
+
+# Validate that a path is under allowed parent directories for deletion
+# This prevents accidental deletion of system files if misconfigured
+validate_safe_path() {
+    local path="$1"
+    local allowed_parents=("/dev/shm" "/tmp" "/var/tmp" "/run")
+
+    # Resolve to absolute path
+    local resolved_path
+    resolved_path=$(realpath -m "$path" 2>/dev/null) || resolved_path="$path"
+
+    for parent in "${allowed_parents[@]}"; do
+        if [[ "$resolved_path" == "$parent"* ]]; then
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+# Validate BUFFER_DIR at startup
+if [[ -n "${BUFFER_DIR:-}" ]] && ! validate_safe_path "$BUFFER_DIR"; then
+    echo "ERROR: BUFFER_DIR '$BUFFER_DIR' is not under allowed directories (/dev/shm, /tmp, /var/tmp, /run)" >&2
+    echo "This is a safety check to prevent accidental deletion of system files." >&2
+    exit 1
+fi
 
 # ============================================================================
 # Helper Functions
@@ -228,6 +284,10 @@ cleanup_temp() {
 truncate_large_logs() {
     log_info "Checking for oversized log files"
 
+    # Clean up any stale .tmp files from interrupted previous runs
+    find "$(dirname "$MEDIAMTX_LOG")" -name "*.tmp" -mmin +5 -delete 2>/dev/null || true
+    [[ -d "$LOG_DIR" ]] && find "$LOG_DIR" -name "*.tmp" -mmin +5 -delete 2>/dev/null || true
+
     # Check MediaMTX log
     if [[ -f "$MEDIAMTX_LOG" ]]; then
         local size
@@ -287,8 +347,10 @@ emergency_cleanup() {
     # Clear temp directory
     find "$TEMP_DIR" -maxdepth 1 -name "lyrebird-*" -type f -delete 2>/dev/null || true
 
-    # Clear buffer directory
-    [[ -d "$BUFFER_DIR" ]] && rm -rf "${BUFFER_DIR:?}"/* 2>/dev/null || true
+    # Clear buffer directory (with safety validation)
+    if [[ -d "$BUFFER_DIR" ]] && validate_safe_path "$BUFFER_DIR"; then
+        rm -rf "${BUFFER_DIR:?}"/* 2>/dev/null || true
+    fi
 }
 
 # ============================================================================

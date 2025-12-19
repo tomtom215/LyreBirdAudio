@@ -133,6 +133,8 @@ collect_mediamtx_metrics() {
             if [[ -n "$start_time_ticks" ]] && [[ -f "/proc/uptime" ]]; then
                 local clk_tck
                 clk_tck=$(getconf CLK_TCK 2>/dev/null || echo 100)
+                # Guard against division by zero
+                [[ "$clk_tck" -eq 0 ]] && clk_tck=100
                 local uptime_sec
                 uptime_sec=$(awk '{print int($1)}' /proc/uptime)
                 local proc_age=$((uptime_sec - (start_time_ticks / clk_tck)))
@@ -484,6 +486,19 @@ generate_all_metrics() {
 # Simple HTTP server using netcat (for basic metrics serving)
 serve_metrics() {
     local port="${1:-9100}"
+    local nc_pid=""
+
+    # Cleanup function to kill any lingering nc processes
+    cleanup_server() {
+        log "Shutting down metrics server..."
+        [[ -n "$nc_pid" ]] && kill "$nc_pid" 2>/dev/null || true
+        # Kill any orphaned nc processes on our port
+        pkill -f "nc.*-l.*$port" 2>/dev/null || true
+        exit 0
+    }
+
+    # Set up signal handlers for graceful shutdown
+    trap cleanup_server EXIT INT TERM
 
     if ! has_command nc && ! has_command netcat; then
         log "ERROR: nc (netcat) required for --serve mode"
