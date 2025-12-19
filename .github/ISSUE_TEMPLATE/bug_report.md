@@ -23,7 +23,7 @@ A clear and concise description of what the bug is.
 
 **Component Versions** (from orchestrator or script headers):
 - lyrebird-orchestrator.sh:
-- mediamtx-stream-manager.sh:
+- lyrebird-stream-manager.sh:
 - Other affected scripts:
 
 **Hardware:**
@@ -58,7 +58,7 @@ Paste any error messages here
 <summary>Stream Manager Log</summary>
 
 ```
-sudo tail -50 /var/log/mediamtx-stream-manager.log
+sudo tail -50 /var/log/lyrebird-stream-manager.log
 ```
 
 </details>

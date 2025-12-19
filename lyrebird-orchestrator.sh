@@ -32,7 +32,7 @@
 #   - Configuration generation with quality tiers (low/normal/high)
 #   - Configuration validation against hardware capabilities
 #   - Enhanced USB menu with comprehensive device configuration workflow
-#   - Support for mediamtx-stream-manager v1.4.1 friendly name feature
+#   - Support for lyrebird-stream-manager v1.4.1 friendly name feature
 #
 #   SECURITY & RELIABILITY ENHANCEMENTS:
 #   - TOCTOU race condition protection in log file handling
@@ -176,7 +176,7 @@ validate_log_path() {
 # External script paths
 declare -A EXTERNAL_SCRIPTS=(
     ["installer"]="install_mediamtx.sh"
-    ["stream_manager"]="mediamtx-stream-manager.sh"
+    ["stream_manager"]="lyrebird-stream-manager.sh"
     ["usb_mapper"]="usb-audio-mapper.sh"
     ["mic_check"]="lyrebird-mic-check.sh"
     ["updater"]="lyrebird-updater.sh"
@@ -1785,7 +1785,7 @@ menu_logs_status() {
                 echo
                 echo "Stream Manager Log (last 50 lines):"
                 echo "================================================================"
-                local stream_mgr_log="/var/log/mediamtx-stream-manager.log"
+                local stream_mgr_log="/var/log/lyrebird-stream-manager.log"
                 if [[ -f "$stream_mgr_log" ]]; then
                     tail -n 50 "$stream_mgr_log" 2>/dev/null || echo "Cannot read log file"
                 else

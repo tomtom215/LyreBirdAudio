@@ -168,7 +168,7 @@ Each component maintains its own version:
 | Component | Current Version |
 |-----------|-----------------|
 | lyrebird-orchestrator.sh | 2.1.2 |
-| mediamtx-stream-manager.sh | 1.4.2 |
+| lyrebird-stream-manager.sh | 1.4.3 |
 | lyrebird-updater.sh | 1.5.1 |
 | usb-audio-mapper.sh | 1.2.1 |
 | lyrebird-diagnostics.sh | 1.0.2 |

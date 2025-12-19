@@ -552,16 +552,16 @@ find_stream_manager() {
     fi
 
     # Check in current script directory first
-    if [[ -x "${SCRIPT_DIR}/mediamtx-stream-manager.sh" ]]; then
-        STREAM_MANAGER_PATH="${SCRIPT_DIR}/mediamtx-stream-manager.sh"
+    if [[ -x "${SCRIPT_DIR}/lyrebird-stream-manager.sh" ]]; then
+        STREAM_MANAGER_PATH="${SCRIPT_DIR}/lyrebird-stream-manager.sh"
         echo "${STREAM_MANAGER_PATH}"
         return 0
     fi
 
     # Check common installation paths
     local common_paths=(
-        "/usr/local/bin/mediamtx-stream-manager"
-        "/opt/lyrebird/mediamtx-stream-manager.sh"
+        "/usr/local/bin/lyrebird-stream-manager.sh"
+        "/opt/lyrebird/lyrebird-stream-manager.sh"
     )
 
     local path
@@ -576,7 +576,7 @@ find_stream_manager() {
     # Check for user home directories
     if [[ -d "/home" ]]; then
         while IFS= read -r -d '' home_dir; do
-            local user_manager="${home_dir}/LyreBirdAudio/mediamtx-stream-manager.sh"
+            local user_manager="${home_dir}/LyreBirdAudio/lyrebird-stream-manager.sh"
             if [[ -x "${user_manager}" ]]; then
                 STREAM_MANAGER_PATH="${user_manager}"
                 echo "${STREAM_MANAGER_PATH}"
@@ -586,8 +586,8 @@ find_stream_manager() {
     fi
 
     # Try to find via PATH
-    if command -v mediamtx-stream-manager.sh >/dev/null 2>&1; then
-        STREAM_MANAGER_PATH="$(command -v mediamtx-stream-manager.sh)"
+    if command -v lyrebird-stream-manager.sh >/dev/null 2>&1; then
+        STREAM_MANAGER_PATH="$(command -v lyrebird-stream-manager.sh)"
         echo "${STREAM_MANAGER_PATH}"
         return 0
     fi
@@ -652,7 +652,7 @@ get_stream_manager_status() {
 
     # Fallback: check if process is running (works for all init systems)
     if command -v pgrep >/dev/null 2>&1; then
-        if pgrep -f "mediamtx-stream-manager.sh" >/dev/null 2>&1; then
+        if pgrep -f "lyrebird-stream-manager.sh" >/dev/null 2>&1; then
             echo "running"
             return
         fi
@@ -1637,7 +1637,7 @@ check_project_info() {
 check_project_files() {
     print_section "2b. PROJECT FILES & GIT STATUS"
 
-    local scripts=("lyrebird-orchestrator.sh" "lyrebird-updater.sh" "mediamtx-stream-manager.sh" "usb-audio-mapper.sh")
+    local scripts=("lyrebird-orchestrator.sh" "lyrebird-updater.sh" "lyrebird-stream-manager.sh" "usb-audio-mapper.sh")
     for script in "${scripts[@]}"; do
         local script_path
         script_path=$(command -v "${script}" 2>/dev/null || echo "${SCRIPT_DIR}/${script}")

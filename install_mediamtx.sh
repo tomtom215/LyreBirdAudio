@@ -904,9 +904,9 @@ detect_management_mode() {
 
 find_stream_manager() {
     local locations=(
-        "./mediamtx-stream-manager.sh"
-        "${SCRIPT_DIR}/mediamtx-stream-manager.sh"
-        "/usr/local/bin/mediamtx-stream-manager.sh"
+        "./lyrebird-stream-manager.sh"
+        "${SCRIPT_DIR}/lyrebird-stream-manager.sh"
+        "/usr/local/bin/lyrebird-stream-manager.sh"
     )
 
     local location
@@ -1736,7 +1736,7 @@ show_post_update_guidance() {
         stream-manager)
             echo ""
             echo "Quick Commands:"
-            echo "  • Status: sudo ./mediamtx-stream-manager.sh status"
+            echo "  • Status: sudo ./lyrebird-stream-manager.sh status"
             echo "  • Logs:   tail -f /var/lib/mediamtx-ffmpeg/*.log"
             ;;
     esac

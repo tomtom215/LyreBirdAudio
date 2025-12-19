@@ -66,7 +66,7 @@
 #     1. Map USB devices to friendly names (USB soundcard mapper)
 #     2. Install MediaMTX streaming server (install_mediamtx.sh)
 #     3. Detect capabilities and generate config (lyrebird-mic-check.sh -g)
-#     4. Start streaming service (mediamtx-stream-manager.sh)
+#     4. Start streaming service (lyrebird-stream-manager.sh)
 #     5. Validate configuration (lyrebird-mic-check.sh -V)
 #
 # USAGE:
@@ -349,7 +349,7 @@ INTEGRATION:
     1. Run USB soundcard mapper (maps devices to friendly names)
     2. Install MediaMTX (install_mediamtx.sh)
     3. Generate config: $SCRIPT_NAME -g
-    4. Start service: mediamtx-stream-manager.sh
+    4. Start service: lyrebird-stream-manager.sh
 
 EXIT CODES:
   0 - Success
@@ -375,10 +375,10 @@ EOF
 # Sanitize device name for use in configuration variables
 #
 # CRITICAL: This function MUST produce identical output to the sanitize_device_name()
-# function in mediamtx-stream-manager.sh (lines 1642-1656). Any deviation will cause
+# function in lyrebird-stream-manager.sh (lines 1642-1656). Any deviation will cause
 # configuration variable lookup failures.
 #
-# Transformation rules (must match mediamtx-stream-manager.sh):
+# Transformation rules (must match lyrebird-stream-manager.sh):
 # 1. DO NOT strip USB prefixes (usb-audio-, usb_audio_)
 # 2. DO NOT convert to uppercase (preserve original case)
 # 3. Replace non-alphanumeric characters with underscore
@@ -1514,7 +1514,7 @@ restore_config_backup() {
     fi
 
     log_info "Configuration restored successfully from: $(basename "$selected_backup")"
-    log_info "Restart service to apply changes: sudo systemctl restart mediamtx-stream-manager"
+    log_info "Restart service to apply changes: sudo systemctl restart lyrebird-stream-manager"
 
     return 0
 }
@@ -1671,7 +1671,7 @@ generate_config() {
 # Generated: $(date '+%Y-%m-%d %H:%M:%S')
 # Quality Tier: $QUALITY_TIER
 #
-# This file is sourced by mediamtx-stream-manager.sh to configure
+# This file is sourced by lyrebird-stream-manager.sh to configure
 # per-device audio capture parameters.
 #
 # Configuration Format:
@@ -1836,7 +1836,7 @@ EOF
     log_info "Next steps:"
     log_info "  1. Review config: cat $CONFIG_FILE"
     log_info "  2. Adjust parameters if needed"
-    log_info "  3. Restart service: sudo systemctl restart mediamtx-stream-manager"
+    log_info "  3. Restart service: sudo systemctl restart lyrebird-stream-manager"
     log_info "  4. Verify streams: $SCRIPT_NAME --validate"
 
     return 0
@@ -1984,7 +1984,7 @@ validate_config() {
         safe_name=$(sanitize_device_name "$device_name")
 
         # Sanitize device ID path for config lookup (full ID, UPPERCASE for compatibility)
-        # NOTE: This MUST match mediamtx-stream-manager.sh format exactly:
+        # NOTE: This MUST match lyrebird-stream-manager.sh format exactly:
         #   - Strip "usb-" prefix
         #   - Replace non-alphanumeric with underscore
         #   - Convert to UPPERCASE

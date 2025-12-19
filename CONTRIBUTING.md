@@ -434,7 +434,7 @@ Include the following in your bug report:
 
 4. **Relevant Logs** (last 50 lines):
    ```bash
-   tail -50 /var/log/mediamtx-stream-manager.log
+   tail -50 /var/log/lyrebird-stream-manager.log
    ```
 
 5. **Steps to Reproduce**:

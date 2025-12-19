@@ -1,5 +1,5 @@
 #!/bin/bash
-# mediamtx-stream-manager.sh - Automatic MediaMTX audio stream configuration
+# lyrebird-stream-manager.sh - Automatic MediaMTX audio stream configuration
 # Part of LyreBirdAudio - RTSP Audio Streaming Suite
 # https://github.com/tomtom215/LyreBirdAudio
 #
@@ -220,7 +220,7 @@ readonly LOCK_FILE="${MEDIAMTX_LOCK_FILE:-/run/mediamtx-audio.lock}"
 # - NOT deleted on timeout failure (avoids race conditions)
 # - Separate monitor lock (/run/mediamtx-monitor.lock) used by cron
 #   to avoid contention with service lock during start/stop operations
-readonly LOG_FILE="${MEDIAMTX_LOG_FILE:-/var/log/mediamtx-stream-manager.log}"
+readonly LOG_FILE="${MEDIAMTX_LOG_FILE:-/var/log/lyrebird-stream-manager.log}"
 readonly MEDIAMTX_LOG_FILE="${MEDIAMTX_LOG_FILE:-/var/log/mediamtx.out}"
 readonly MEDIAMTX_BIN="${MEDIAMTX_BINARY:-/usr/local/bin/mediamtx}"
 readonly MEDIAMTX_HOST="${MEDIAMTX_HOST:-localhost}"
@@ -979,7 +979,7 @@ is_lock_stale() {
         proc_cmdline=$(tr '\0' ' ' <"/proc/$lock_pid/cmdline" 2>/dev/null || echo "")
         if [[ -n "$proc_cmdline" ]]; then
             # Verify it's actually our script (check for script name in cmdline)
-            if [[ "$proc_cmdline" != *"mediamtx-stream-manager"* ]] \
+            if [[ "$proc_cmdline" != *"lyrebird-stream-manager"* ]] \
                 && [[ "$proc_cmdline" != *"${SCRIPT_NAME}"* ]]; then
                 log WARN "Lock file PID $lock_pid is now a different process (PID recycled)"
                 log DEBUG "Found cmdline: ${proc_cmdline:0:100}"
@@ -4869,23 +4869,23 @@ Configuration files:
 
 Multiplex Mode Usage:
     Individual mode (default):
-        sudo ./mediamtx-stream-manager.sh start
+        sudo ./lyrebird-stream-manager.sh start
         Creates separate RTSP streams for each USB microphone
-    
+
     Multiplex mode - Mix audio (amix):
-        sudo ./mediamtx-stream-manager.sh -m multiplex -f amix start
+        sudo ./lyrebird-stream-manager.sh -m multiplex -f amix start
         # Or use default filter (amix)
-        sudo ./mediamtx-stream-manager.sh -m multiplex start
+        sudo ./lyrebird-stream-manager.sh -m multiplex start
         Mixes all microphones into a single audio stream
         Output: rtsp://localhost:8554/${MULTIPLEX_STREAM_NAME}
-    
+
     Multiplex mode - Separate channels (amerge):
-        sudo ./mediamtx-stream-manager.sh -m multiplex -f amerge start
+        sudo ./lyrebird-stream-manager.sh -m multiplex -f amerge start
         Merges all microphones keeping channels separate
         Output: Single stream with (num_devices * channels_per_device) total channels
-    
+
     Custom stream name:
-        sudo ./mediamtx-stream-manager.sh -m multiplex -f amix -n studio start
+        sudo ./lyrebird-stream-manager.sh -m multiplex -f amix -n studio start
         Output: rtsp://localhost:8554/studio
 
 

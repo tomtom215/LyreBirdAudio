@@ -106,7 +106,7 @@ readonly TAG_LIST_LIMIT=20
 readonly SERVICE_NAME="mediamtx-audio"
 readonly SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
 readonly SERVICE_CRON_FILE="/etc/cron.d/mediamtx-monitor"
-readonly SERVICE_SCRIPT="mediamtx-stream-manager.sh"
+readonly SERVICE_SCRIPT="lyrebird-stream-manager.sh"
 readonly SERVICE_UPDATE_MARKER="/run/lyrebird-service-update.marker"
 readonly SERVICE_STOP_TIMEOUT=30
 readonly SERVICE_START_TIMEOUT=10
@@ -2042,7 +2042,7 @@ set_script_permissions() {
         "install_mediamtx.sh"
         "lyrebird-orchestrator.sh"
         "lyrebird-updater.sh"
-        "mediamtx-stream-manager.sh"
+        "lyrebird-stream-manager.sh"
         "usb-audio-mapper.sh"
     )
 

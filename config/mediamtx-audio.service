@@ -22,9 +22,9 @@ Wants=alsa-restore.service
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/mediamtx-stream-manager.sh start
-ExecStop=/usr/local/bin/mediamtx-stream-manager.sh stop
-ExecReload=/usr/local/bin/mediamtx-stream-manager.sh reload
+ExecStart=/usr/local/bin/lyrebird-stream-manager.sh start
+ExecStop=/usr/local/bin/lyrebird-stream-manager.sh stop
+ExecReload=/usr/local/bin/lyrebird-stream-manager.sh reload
 
 # Working directory
 WorkingDirectory=/var/lib/lyrebird

@@ -206,7 +206,7 @@ These diagrams show how LyreBirdAudio components work together to transform USB 
           |       * Built-in upgrade support (v1.15.0+)
           |       * Atomic installation with rollback
           |
-          +----> mediamtx-stream-manager.sh
+          +----> lyrebird-stream-manager.sh
           |       * FFmpeg process lifecycle management
           |       * Stream health monitoring via API
           |       * Automatic recovery with exponential backoff
@@ -367,10 +367,10 @@ sudo ./usb-audio-mapper.sh
 sudo ./lyrebird-mic-check.sh -g
 
 # 4. Start streams
-sudo ./mediamtx-stream-manager.sh start
+sudo ./lyrebird-stream-manager.sh start
 
 # Optional: Install as systemd service
-sudo ./mediamtx-stream-manager.sh install
+sudo ./lyrebird-stream-manager.sh install
 sudo systemctl enable mediamtx-audio
 ```
 
@@ -381,7 +381,7 @@ sudo systemctl enable mediamtx-audio
 sudo ./lyrebird-diagnostics.sh quick
 
 # View stream status
-./mediamtx-stream-manager.sh status
+./lyrebird-stream-manager.sh status
 
 # Access your streams
 # rtsp://your-ip:8554/device-name
@@ -411,16 +411,16 @@ vlc rtsp://localhost:8554/Device_1
 
 ```bash
 # Start all streams
-sudo ./mediamtx-stream-manager.sh start
+sudo ./lyrebird-stream-manager.sh start
 
 # Stop all streams
-sudo ./mediamtx-stream-manager.sh stop
+sudo ./lyrebird-stream-manager.sh stop
 
 # Restart streams
-sudo ./mediamtx-stream-manager.sh restart
+sudo ./lyrebird-stream-manager.sh restart
 
 # Check status
-./mediamtx-stream-manager.sh status
+./lyrebird-stream-manager.sh status
 ```
 
 ### Using the Orchestrator
@@ -471,7 +471,7 @@ sudo ./lyrebird-diagnostics.sh quick
 sudo ./lyrebird-diagnostics.sh full
 
 # Enable automatic monitoring (cron)
-sudo ./mediamtx-stream-manager.sh install  # Creates cron job
+sudo ./lyrebird-stream-manager.sh install  # Creates cron job
 ```
 
 ---
@@ -543,7 +543,7 @@ sudo ./lyrebird-mic-check.sh -V
 | `/run/mediamtx-audio.lock` | Stream manager lock file |
 | `/var/lib/mediamtx-ffmpeg/` | FFmpeg PID files and wrapper scripts |
 | `/var/log/mediamtx.out` | MediaMTX output log |
-| `/var/log/mediamtx-stream-manager.log` | Stream manager log |
+| `/var/log/lyrebird-stream-manager.log` | Stream manager log |
 | `/var/log/lyrebird/` | FFmpeg per-device logs |
 | `/var/log/lyrebird-orchestrator.log` | Orchestrator log |
 | `/var/log/lyrebird-diagnostics.log` | Diagnostics log |
@@ -623,10 +623,10 @@ export DEBUG=1  # Enable debug output for all scripts
 **Example usage:**
 ```bash
 # Use custom log location
-FFMPEG_LOG_DIR=/mnt/storage/logs ./mediamtx-stream-manager.sh start
+FFMPEG_LOG_DIR=/mnt/storage/logs ./lyrebird-stream-manager.sh start
 
 # Increase startup delay for slow USB devices
-STREAM_STARTUP_DELAY=20 ./mediamtx-stream-manager.sh start
+STREAM_STARTUP_DELAY=20 ./lyrebird-stream-manager.sh start
 ```
 
 ### Multiplex Streaming
@@ -639,7 +639,7 @@ Combine multiple microphones into a single RTSP stream using FFmpeg audio filter
 
 ```bash
 # Mix all devices into one stereo stream
-sudo ./mediamtx-stream-manager.sh -m multiplex -f amix start
+sudo ./lyrebird-stream-manager.sh -m multiplex -f amix start
 ```
 
 **How it works:**
@@ -669,7 +669,7 @@ https://ffmpeg.org/ffmpeg-filters.html#amix
 
 ```bash
 # Merge channels while keeping them separate
-sudo ./mediamtx-stream-manager.sh -m multiplex -f amerge start
+sudo ./lyrebird-stream-manager.sh -m multiplex -f amerge start
 ```
 
 **How it works:**
@@ -698,7 +698,7 @@ https://ffmpeg.org/ffmpeg-filters.html#amerge-1
 
 ```bash
 # Use a custom name instead of default "all_mics"
-sudo ./mediamtx-stream-manager.sh -m multiplex -n studio start
+sudo ./lyrebird-stream-manager.sh -m multiplex -n studio start
 # Output: rtsp://host:8554/studio
 ```
 
@@ -730,7 +730,7 @@ sudo ./mediamtx-stream-manager.sh -m multiplex -n studio start
 LyreBirdAudio supports three MediaMTX management modes:
 
 1. **Stream Manager Mode** (Recommended for audio streaming)
-   - Managed by `mediamtx-stream-manager.sh`
+   - Managed by `lyrebird-stream-manager.sh`
    - Automatic FFmpeg process management
    - Stream health monitoring and recovery
    - Start/stop/restart via stream manager commands
@@ -754,7 +754,7 @@ The orchestrator and stream manager automatically detect and use the appropriate
 
 ```bash
 # Install stream manager systemd service
-sudo ./mediamtx-stream-manager.sh install
+sudo ./lyrebird-stream-manager.sh install
 
 # Or use MediaMTX systemd service directly
 sudo systemctl enable mediamtx
@@ -803,7 +803,7 @@ Format explanation:
 sudo ./lyrebird-diagnostics.sh quick
 
 # Check specific components
-./mediamtx-stream-manager.sh status
+./lyrebird-stream-manager.sh status
 ./lyrebird-mic-check.sh
 ```
 
@@ -831,15 +831,15 @@ sudo reboot
 
 ```bash
 # Check logs
-sudo tail -f /var/log/mediamtx-stream-manager.log
+sudo tail -f /var/log/lyrebird-stream-manager.log
 sudo tail -f /var/log/lyrebird/*.log
 
 # Validate configuration
 sudo ./lyrebird-mic-check.sh -V
 
 # Force restart
-sudo ./mediamtx-stream-manager.sh force-stop
-sudo ./mediamtx-stream-manager.sh start
+sudo ./lyrebird-stream-manager.sh force-stop
+sudo ./lyrebird-stream-manager.sh start
 
 # Check for device conflicts
 sudo lsof /dev/snd/*
@@ -900,7 +900,7 @@ sudo systemctl restart mediamtx
 
 **Diagnosis:**
 ```bash
-sudo ./mediamtx-stream-manager.sh monitor
+sudo ./lyrebird-stream-manager.sh monitor
 top -p $(pgrep -f ffmpeg | tr '\n' ',')
 ```
 
@@ -948,13 +948,13 @@ git stash list
 **Enable Verbose Logging:**
 ```bash
 export DEBUG=1
-sudo ./mediamtx-stream-manager.sh start
+sudo ./lyrebird-stream-manager.sh start
 ```
 
 **Check All Logs:**
 ```bash
 sudo tail -f /var/log/mediamtx.out
-sudo tail -f /var/log/mediamtx-stream-manager.log
+sudo tail -f /var/log/lyrebird-stream-manager.log
 sudo tail -f /var/log/lyrebird/*.log
 ```
 
@@ -972,14 +972,14 @@ ffplay -i rtsp://localhost:8554/Device_1 -loglevel debug
 **Check System Resources:**
 ```bash
 sudo ./lyrebird-diagnostics.sh full
-sudo ./mediamtx-stream-manager.sh monitor
+sudo ./lyrebird-stream-manager.sh monitor
 ```
 
 ### Log Locations
 
 **Service logs:**
 - MediaMTX: `/var/log/mediamtx.out`
-- Stream Manager: `/var/log/mediamtx-stream-manager.log`
+- Stream Manager: `/var/log/lyrebird-stream-manager.log`
 - Orchestrator: `/var/log/lyrebird-orchestrator.log`
 - Diagnostics: `/var/log/lyrebird-diagnostics.log`
 
@@ -1007,7 +1007,7 @@ sudo ./lyrebird-diagnostics.sh full > diagnostics.txt 2>&1
 # 2. Collect logs
 tar -czf lyrebird-logs-$(date +%Y%m%d).tar.gz \
   /var/log/mediamtx.out \
-  /var/log/mediamtx-stream-manager.log \
+  /var/log/lyrebird-stream-manager.log \
   /var/log/lyrebird/*.log \
   /etc/mediamtx/audio-devices.conf \
   /etc/udev/rules.d/99-usb-soundcards.rules
@@ -1136,12 +1136,12 @@ The orchestrator integrates diagnostics into multiple workflows:
 
 4. Monitor resource usage:
    ```bash
-   sudo ./mediamtx-stream-manager.sh monitor
+   sudo ./lyrebird-stream-manager.sh monitor
    ```
 
 5. Check logs regularly:
    ```bash
-   sudo tail -f /var/log/mediamtx-stream-manager.log
+   sudo tail -f /var/log/lyrebird-stream-manager.log
    ```
 
 ---
@@ -1282,7 +1282,7 @@ DEVICE_USB_MICROPHONE_2_CODEC=opus
 ### Resource Management
 
 **CPU Usage:**
-- Monitor with: `sudo ./mediamtx-stream-manager.sh monitor`
+- Monitor with: `sudo ./lyrebird-stream-manager.sh monitor`
 - Warning threshold: 20% per stream
 - Critical threshold: 40% per stream
 - Optimization: Lower sample rate or bitrate
@@ -1355,7 +1355,7 @@ sudo ./lyrebird-mic-check.sh -g --quality=low
 ```bash
 # Automated monitoring via cron (installed with systemd service)
 # Configured at: /etc/cron.d/mediamtx-monitor
-*/5 * * * * root /path/to/mediamtx-stream-manager.sh monitor
+*/5 * * * * root /path/to/lyrebird-stream-manager.sh monitor
 ```
 
 **Log Rotation:**
@@ -1426,7 +1426,7 @@ This modular design prevents duplicate business logic and ensures maintainabilit
 |--------|---------|---------|
 | lyrebird-orchestrator.sh | 2.1.2 | Unified management interface |
 | lyrebird-updater.sh | 1.5.1 | Version management with rollback |
-| mediamtx-stream-manager.sh | 1.4.3 | Stream lifecycle management |
+| lyrebird-stream-manager.sh | 1.4.3 | Stream lifecycle management |
 | usb-audio-mapper.sh | 1.2.1 | USB device persistence via udev |
 | lyrebird-mic-check.sh | 1.0.0 | Hardware capability detection |
 | lyrebird-diagnostics.sh | 1.0.2 | System diagnostics |
@@ -1515,29 +1515,29 @@ sudo ./lyrebird-updater.sh
 
 ---
 
-### Stream Manager (mediamtx-stream-manager.sh)
+### Stream Manager (lyrebird-stream-manager.sh)
 
 **Purpose:** Automatic stream configuration and lifecycle management
 
 **Usage:**
 ```bash
 # Individual streams
-sudo ./mediamtx-stream-manager.sh start
+sudo ./lyrebird-stream-manager.sh start
 
 # Multiplex mode
-sudo ./mediamtx-stream-manager.sh -m multiplex -f amix start
+sudo ./lyrebird-stream-manager.sh -m multiplex -f amix start
 
 # Monitor health (cron)
-sudo ./mediamtx-stream-manager.sh monitor
+sudo ./lyrebird-stream-manager.sh monitor
 
 # Check status
-sudo ./mediamtx-stream-manager.sh status
+sudo ./lyrebird-stream-manager.sh status
 
 # View configuration
-sudo ./mediamtx-stream-manager.sh config
+sudo ./lyrebird-stream-manager.sh config
 
 # Install systemd service
-sudo ./mediamtx-stream-manager.sh install
+sudo ./lyrebird-stream-manager.sh install
 ```
 
 **Configuration:** `/etc/mediamtx/audio-devices.conf`
@@ -1566,19 +1566,19 @@ sudo ./mediamtx-stream-manager.sh install
 
 **Individual Mode** (default):
 ```bash
-sudo ./mediamtx-stream-manager.sh start
+sudo ./lyrebird-stream-manager.sh start
 # Creates: rtsp://host:8554/device1, rtsp://host:8554/device2, etc.
 ```
 
 **Multiplex Mode with Audio Mixing**:
 ```bash
-sudo ./mediamtx-stream-manager.sh -m multiplex -f amix start
+sudo ./lyrebird-stream-manager.sh -m multiplex -f amix start
 # Creates: rtsp://host:8554/all_mics (mixed audio)
 ```
 
 **Multiplex Mode with Channel Separation**:
 ```bash
-sudo ./mediamtx-stream-manager.sh -m multiplex -f amerge start
+sudo ./lyrebird-stream-manager.sh -m multiplex -f amerge start
 # Creates: rtsp://host:8554/all_mics (separate channels)
 ```
 
@@ -1613,7 +1613,7 @@ sudo ./mediamtx-stream-manager.sh -m multiplex -f amerge start
 **Installation:**
 ```bash
 # Install as systemd service (one-time setup)
-sudo ./mediamtx-stream-manager.sh install
+sudo ./lyrebird-stream-manager.sh install
 
 # Enable automatic startup on boot
 sudo systemctl enable mediamtx-audio
@@ -2032,9 +2032,9 @@ LOG_DIR="/var/log/lyrebird"
 # Auto-restart on USB disconnect
 
 while true; do
-    if ! ./mediamtx-stream-manager.sh status | grep -q "running"; then
+    if ! ./lyrebird-stream-manager.sh status | grep -q "running"; then
         echo "Streams down, restarting..."
-        sudo ./mediamtx-stream-manager.sh restart
+        sudo ./lyrebird-stream-manager.sh restart
     fi
     sleep 30
 done
@@ -2065,7 +2065,7 @@ Format: Device-specific settings override defaults
 
 After editing, restart streams:
 ```bash
-sudo ./mediamtx-stream-manager.sh restart
+sudo ./lyrebird-stream-manager.sh restart
 ```
 
 ### MediaMTX Configuration
@@ -2082,7 +2082,7 @@ Validate configuration:
 
 Apply changes:
 ```bash
-sudo ./mediamtx-stream-manager.sh restart
+sudo ./lyrebird-stream-manager.sh restart
 ```
 
 ### Backup and Restore
@@ -2098,7 +2098,7 @@ sudo tar -czf lyrebird-backup-$(date +%Y%m%d).tar.gz \
 sudo tar -xzf lyrebird-backup-20250101.tar.gz -C /
 sudo udevadm control --reload-rules
 sudo udevadm trigger
-sudo ./mediamtx-stream-manager.sh restart
+sudo ./lyrebird-stream-manager.sh restart
 ```
 
 ### Debug Mode
@@ -2108,7 +2108,7 @@ Enable debug output for all scripts:
 export DEBUG=1
 
 # Now run any command
-sudo ./mediamtx-stream-manager.sh status
+sudo ./lyrebird-stream-manager.sh status
 sudo ./usb-audio-mapper.sh --test
 ```
 
@@ -2174,7 +2174,7 @@ HASH=$(sha256sum lyrebird-common.sh | cut -d' ' -f1)
 export LYREBIRD_COMMON_EXPECTED_HASH="$HASH"
 
 # Now sourcing will verify integrity before loading
-sudo ./mediamtx-stream-manager.sh start
+sudo ./lyrebird-stream-manager.sh start
 ```
 
 ### Recommendations for Field Deployments
@@ -2194,14 +2194,14 @@ sudo ./mediamtx-stream-manager.sh start
 **Quick Recovery:**
 ```bash
 # Check service status
-sudo ./mediamtx-stream-manager.sh status
+sudo ./lyrebird-stream-manager.sh status
 
 # Force restart
-sudo ./mediamtx-stream-manager.sh restart
+sudo ./lyrebird-stream-manager.sh restart
 
 # If that fails, force stop and clean start
-sudo ./mediamtx-stream-manager.sh force-stop
-sudo ./mediamtx-stream-manager.sh start
+sudo ./lyrebird-stream-manager.sh force-stop
+sudo ./lyrebird-stream-manager.sh start
 ```
 
 ### Device Not Found After Reboot
@@ -2225,7 +2225,7 @@ If the system is in an unknown state:
 ```bash
 # 1. Stop everything
 sudo systemctl stop mediamtx-audio 2>/dev/null || true
-sudo ./mediamtx-stream-manager.sh force-stop
+sudo ./lyrebird-stream-manager.sh force-stop
 
 # 2. Clean up stale files
 sudo rm -f /run/mediamtx-audio.*
@@ -2242,7 +2242,7 @@ sudo ./usb-audio-mapper.sh --test
 sudo ./lyrebird-diagnostics.sh full
 
 # 6. Fresh start
-sudo ./mediamtx-stream-manager.sh start
+sudo ./lyrebird-stream-manager.sh start
 ```
 
 ### Rollback After Failed Update
@@ -2278,7 +2278,7 @@ To completely remove LyreBirdAudio and all components:
 **1. Stop all streams and services:**
 ```bash
 # Stop streaming service
-sudo ./mediamtx-stream-manager.sh stop
+sudo ./lyrebird-stream-manager.sh stop
 
 # Stop systemd service if enabled
 sudo systemctl stop mediamtx-audio
@@ -2347,7 +2347,7 @@ sudo rm -rf /var/lib/mediamtx/
 ```bash
 # Remove logs
 sudo rm -f /var/log/mediamtx.out
-sudo rm -f /var/log/mediamtx-stream-manager.log
+sudo rm -f /var/log/lyrebird-stream-manager.log
 sudo rm -rf /var/log/lyrebird/
 
 # Remove logrotate configuration
@@ -2368,12 +2368,12 @@ rm -rf /path/to/LyreBirdAudio
 **Reset to clean state (keep MediaMTX):**
 ```bash
 # Stop streams but keep MediaMTX installed
-sudo ./mediamtx-stream-manager.sh stop
+sudo ./lyrebird-stream-manager.sh stop
 
 # Remove only stream-related files
 sudo rm -rf /var/lib/mediamtx-ffmpeg/
 sudo rm -f /run/mediamtx-audio.*
-sudo rm -f /var/log/mediamtx-stream-manager.log
+sudo rm -f /var/log/lyrebird-stream-manager.log
 ```
 
 **Remove only device mappings:**

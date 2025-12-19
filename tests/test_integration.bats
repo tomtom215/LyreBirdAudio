@@ -60,7 +60,7 @@ DEVICE_test_device="/dev/null"
 EOF
 
     # Start stream manager in test mode
-    run timeout 5 "$PROJECT_ROOT/mediamtx-stream-manager.sh" --config-dir "$TEST_CONFIG_DIR" status
+    run timeout 5 "$PROJECT_ROOT/lyrebird-stream-manager.sh" --config-dir "$TEST_CONFIG_DIR" status
 
     # Verify it runs without crashing
     [[ "$status" -eq 0 ]] || [[ "$status" -eq 1 ]]  # 0=running, 1=not running (both valid)
@@ -74,7 +74,7 @@ EOF
 DEVICE_nonexistent="/dev/nonexistent-device-12345"
 EOF
 
-    run "$PROJECT_ROOT/mediamtx-stream-manager.sh" --config-dir "$TEST_CONFIG_DIR" start
+    run "$PROJECT_ROOT/lyrebird-stream-manager.sh" --config-dir "$TEST_CONFIG_DIR" start
 
     # Should fail gracefully, not crash
     [[ "$status" -ne 0 ]]
