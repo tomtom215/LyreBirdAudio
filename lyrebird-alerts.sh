@@ -131,7 +131,8 @@ LYREBIRD_NTFY_SERVER="${LYREBIRD_NTFY_SERVER:-https://ntfy.sh}"
 # Alert Levels
 #=============================================================================
 
-# shellcheck disable=SC2034  # These constants are exported for use by other scripts
+# Alert level constants - SC2034: These are exported for use by sourcing scripts
+# shellcheck disable=SC2034
 readonly ALERT_LEVEL_INFO="info"
 # shellcheck disable=SC2034
 readonly ALERT_LEVEL_WARNING="warning"
@@ -197,6 +198,17 @@ url_encode() {
                 *) printf '%%%02X' "'$char" ;;
             esac
         done
+    fi
+}
+
+# Mask sensitive URLs for safe debug output (shows first 30 chars + ***)
+mask_url() {
+    local url="$1"
+    local visible_len=30
+    if [[ ${#url} -gt $visible_len ]]; then
+        echo "${url:0:$visible_len}***"
+    else
+        echo "$url"
     fi
 }
 
@@ -467,7 +479,7 @@ send_webhook() {
 
     while ((attempt < retries)); do
         ((attempt++))
-        log_debug "Sending webhook (attempt ${attempt}/${retries}): ${webhook_url}"
+        log_debug "Sending webhook (attempt ${attempt}/${retries}): $(mask_url "$webhook_url")"
 
         local http_code
         local curl_args=(-s -w '%{http_code}' -o /dev/null --connect-timeout "$timeout" --max-time "$((timeout * 2))")
@@ -619,6 +631,8 @@ send_alert() {
     if $any_success; then
         # Update rate limit only on success
         update_rate_limit "$alert_hash"
+        # Clean up old state files periodically
+        cleanup_state
         return 0
     else
         return 3

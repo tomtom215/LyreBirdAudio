@@ -17,8 +17,8 @@
 #          - Enhanced error handling and validation
 #          - Added comprehensive exception handling
 
-# Set bash pipefail for better error handling
-set -o pipefail
+# Set strict mode for better error handling
+set -euo pipefail
 
 # Source shared library if available (backward compatible)
 # Provides: colors, logging, command_exists, compute_hash, exit codes

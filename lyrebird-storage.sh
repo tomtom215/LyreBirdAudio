@@ -38,6 +38,7 @@ readonly SCRIPT_NAME
 readonly RECORDING_DIR="${LYREBIRD_RECORDING_DIR:-/var/lib/mediamtx-ffmpeg/recordings}"
 readonly LOG_DIR="${LYREBIRD_LOG_DIR:-/var/log/lyrebird}"
 readonly MEDIAMTX_LOG="${MEDIAMTX_LOG:-/var/log/mediamtx.out}"
+readonly MEDIAMTX_LOG_DIR="${MEDIAMTX_LOG%/*}"  # Directory containing MediaMTX log
 readonly TEMP_DIR="${LYREBIRD_TEMP_DIR:-/tmp}"
 readonly BUFFER_DIR="${LYREBIRD_BUFFER_DIR:-/dev/shm/lyrebird-buffer}"
 
@@ -131,6 +132,22 @@ log_warn() { log WARN "$@"; }
 log_error() { log ERROR "$@"; }
 log_debug() { [[ "${DEBUG:-false}" == "true" ]] && log DEBUG "$@" || true; }
 
+# ============================================================================
+# Signal Handling
+# ============================================================================
+
+# Cleanup function for graceful shutdown
+_storage_cleanup() {
+    local exit_code=$?
+    log_debug "Storage script cleanup triggered (exit code: $exit_code)"
+    # Remove any temporary files we may have created
+    rm -f -- /tmp/lyrebird-storage-*.tmp 2>/dev/null || true
+    exit "$exit_code"
+}
+
+# Set up signal handlers for graceful shutdown
+trap _storage_cleanup EXIT INT TERM
+
 # Format bytes to human readable
 format_bytes() {
     local bytes="$1"
@@ -183,7 +200,7 @@ safe_delete() {
         log_info "[DRY RUN] Would delete ${desc}: $path"
     else
         log_debug "Deleting ${desc}: $path"
-        rm -rf "$path"
+        rm -rf -- "$path"
     fi
 }
 
@@ -237,14 +254,14 @@ cleanup_logs() {
     fi
 
     # Clean rotated MediaMTX logs
-    if [[ -d "$(dirname "$MEDIAMTX_LOG")" ]]; then
+    if [[ -d "$MEDIAMTX_LOG_DIR" ]]; then
         while IFS= read -r -d '' file; do
             local size
             size=$(stat -c%s "$file" 2>/dev/null || echo 0)
             safe_delete "$file" "mediamtx log"
             ((++count))
             ((freed_bytes += size))
-        done < <(find "$(dirname "$MEDIAMTX_LOG")" -type f -name "mediamtx*.out.*" -mtime "+${LOG_RETENTION_DAYS}" -print0 2>/dev/null)
+        done < <(find "$MEDIAMTX_LOG_DIR" -type f -name "mediamtx*.out.*" -mtime "+${LOG_RETENTION_DAYS}" -print0 2>/dev/null)
     fi
 
     log_info "Cleaned $count log file(s), freed $(format_bytes $freed_bytes)"
@@ -285,7 +302,7 @@ truncate_large_logs() {
     log_info "Checking for oversized log files"
 
     # Clean up any stale .tmp files from interrupted previous runs
-    find "$(dirname "$MEDIAMTX_LOG")" -name "*.tmp" -mmin +5 -delete 2>/dev/null || true
+    find "$MEDIAMTX_LOG_DIR" -name "*.tmp" -mmin +5 -delete 2>/dev/null || true
     [[ -d "$LOG_DIR" ]] && find "$LOG_DIR" -name "*.tmp" -mmin +5 -delete 2>/dev/null || true
 
     # Check MediaMTX log
@@ -342,7 +359,7 @@ emergency_cleanup() {
 
     # Delete all rotated logs
     find "$LOG_DIR" -name "*.gz" -delete 2>/dev/null || true
-    find "$(dirname "$MEDIAMTX_LOG")" -name "*.gz" -delete 2>/dev/null || true
+    find "$MEDIAMTX_LOG_DIR" -name "*.gz" -delete 2>/dev/null || true
 
     # Clear temp directory
     find "$TEMP_DIR" -maxdepth 1 -name "lyrebird-*" -type f -delete 2>/dev/null || true

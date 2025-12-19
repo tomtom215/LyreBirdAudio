@@ -31,7 +31,7 @@ readonly SCRIPT_NAME
 # Configuration
 readonly MEDIAMTX_API_HOST="${MEDIAMTX_HOST:-localhost}"
 readonly MEDIAMTX_API_PORT="${MEDIAMTX_API_PORT:-9997}"
-# shellcheck disable=SC2034  # Used by external scripts or for future features
+# shellcheck disable=SC2034  # Exported for use by install_mediamtx.sh and external scripts
 readonly MEDIAMTX_RTSP_PORT="${MEDIAMTX_PORT:-8554}"
 readonly HEARTBEAT_FILE="${HEARTBEAT_FILE:-/run/mediamtx-audio.heartbeat}"
 readonly PID_FILE="${PID_FILE:-/run/mediamtx-audio.pid}"
@@ -267,6 +267,25 @@ collect_system_metrics() {
     fi
 }
 
+# Helper function for API calls with retry for transient network failures
+# Usage: api_call_with_retry <url> [timeout] [retries]
+api_call_with_retry() {
+    local url="$1"
+    local timeout="${2:-5}"
+    local retries="${3:-2}"
+    local attempt=0
+    local result=""
+
+    while ((attempt < retries)); do
+        ((attempt++))
+        result=$(curl -s --connect-timeout "$timeout" "$url" 2>/dev/null) && break
+        # Brief pause before retry
+        ((attempt < retries)) && sleep 1
+    done
+
+    echo "$result"
+}
+
 # Collect MediaMTX API metrics (if available)
 # Enhanced in v1.1.0 with full MediaMTX v1.15.5 API coverage
 collect_api_metrics() {
@@ -276,10 +295,10 @@ collect_api_metrics() {
 
     local api_url="http://${MEDIAMTX_API_HOST}:${MEDIAMTX_API_PORT}"
 
-    # Check API availability and get instance info
+    # Check API availability and get instance info (with retry for transient failures)
     local api_up=0
     local info_json
-    info_json=$(curl -s --connect-timeout 2 "${api_url}/v3/info" 2>/dev/null)
+    info_json=$(api_call_with_retry "${api_url}/v3/info" 2 2)
     if [[ -n "$info_json" ]] && echo "$info_json" | grep -q '"version"'; then
         api_up=1
     fi
