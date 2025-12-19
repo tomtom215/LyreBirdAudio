@@ -1598,7 +1598,8 @@ menu_diagnostics() {
 
                 # Generate timestamped export file
                 local export_dir="/tmp"
-                local export_file="${export_dir}/lyrebird-diagnostics-$(date +%Y%m%d-%H%M%S).txt"
+                local export_file
+                export_file="${export_dir}/lyrebird-diagnostics-$(date +%Y%m%d-%H%M%S).txt"
 
                 info "Running full diagnostics and saving to: ${export_file}"
                 echo

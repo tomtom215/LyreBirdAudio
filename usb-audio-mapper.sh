@@ -29,8 +29,11 @@ _LYREBIRD_COMMON="$(cd "$(dirname "$0")" && pwd)/lyrebird-common.sh"
 unset _LYREBIRD_COMMON
 
 # Constants
-readonly SCRIPT_NAME="$(basename "$0")"
-readonly SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+SCRIPT_NAME="$(basename "$0")"
+readonly SCRIPT_NAME
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck disable=SC2034  # SCRIPT_DIR kept for external compatibility
+readonly SCRIPT_DIR
 readonly RULES_FILE="/etc/udev/rules.d/99-usb-soundcards.rules"
 readonly PROC_ASOUND_CARDS="/proc/asound/cards"
 readonly DEFAULT_DEBUG="false"
@@ -353,6 +356,7 @@ get_usb_physical_port() {
 get_platform_id_path() {
     local bus_num="${1:-}"
     local dev_num="${2:-}"
+    # shellcheck disable=SC2034  # Parameter kept for API compatibility (unused but preserved)
     local usb_path="${3:-}"
     local card_num="${4:-}"
     
