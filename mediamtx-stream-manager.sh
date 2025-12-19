@@ -251,10 +251,17 @@ readonly NETWORK_CHECK_TIMEOUT="${NETWORK_CHECK_TIMEOUT:-5}"        # Seconds
 readonly NETWORK_FAIL_THRESHOLD="${NETWORK_FAIL_THRESHOLD:-3}"      # Consecutive failures before alert
 
 # Audio buffering (memory-based with optional disk persistence)
-readonly AUDIO_BUFFER_ENABLED="${AUDIO_BUFFER_ENABLED:-false}"      # Enable memory ring buffer
-readonly AUDIO_BUFFER_SIZE_MB="${AUDIO_BUFFER_SIZE_MB:-64}"         # Memory buffer size per stream
-readonly AUDIO_BUFFER_DISK_PERSIST="${AUDIO_BUFFER_DISK_PERSIST:-false}" # Write buffer to disk
-readonly AUDIO_BUFFER_DISK_PATH="${AUDIO_BUFFER_DISK_PATH:-/var/lib/mediamtx-ffmpeg/buffer}"
+# Memory buffering is done via FFmpeg's rtbufsize option (no SD card wear)
+readonly AUDIO_BUFFER_ENABLED="${AUDIO_BUFFER_ENABLED:-true}"       # Enable enhanced memory buffering
+readonly AUDIO_BUFFER_SIZE_MB="${AUDIO_BUFFER_SIZE_MB:-64}"         # Memory buffer size per stream (MB)
+readonly AUDIO_RTBUFSIZE="${AUDIO_RTBUFSIZE:-33554432}"             # Real-time buffer size in bytes (32MB default)
+# Local recording (ring buffer) - writes audio to tmpfs or disk alongside streaming
+readonly AUDIO_LOCAL_RECORDING="${AUDIO_LOCAL_RECORDING:-false}"    # Enable local recording backup
+readonly AUDIO_RECORDING_PATH="${AUDIO_RECORDING_PATH:-/dev/shm/lyrebird-buffer}" # Default to tmpfs (RAM)
+readonly AUDIO_RECORDING_SEGMENT_TIME="${AUDIO_RECORDING_SEGMENT_TIME:-300}" # 5 min segments
+readonly AUDIO_RECORDING_SEGMENTS="${AUDIO_RECORDING_SEGMENTS:-12}" # Keep last 12 segments (1 hour)
+readonly AUDIO_DISK_PERSIST="${AUDIO_DISK_PERSIST:-false}"          # Move segments to disk (SD card wear!)
+readonly AUDIO_DISK_PATH="${AUDIO_DISK_PATH:-/var/lib/mediamtx-ffmpeg/recordings}"
 
 # MediaMTX API version compatibility
 readonly MEDIAMTX_API_VERSION="${MEDIAMTX_API_VERSION:-auto}"       # auto, v3, v2, v1
@@ -1108,6 +1115,29 @@ setup_directories() {
         touch "${LOG_FILE}"
         # Set log file permissions: rw-r--r-- (owner write, group/other read)
         chmod 644 "${LOG_FILE}"
+    fi
+
+    # v1.4.2: Setup audio recording buffer directories if local recording is enabled
+    if [[ "${AUDIO_LOCAL_RECORDING}" == "true" ]]; then
+        # Create recording directory (default is /dev/shm which is tmpfs/RAM)
+        if [[ ! -d "${AUDIO_RECORDING_PATH}" ]]; then
+            if mkdir -p "${AUDIO_RECORDING_PATH}" 2>/dev/null; then
+                chmod 755 "${AUDIO_RECORDING_PATH}"
+                log INFO "Created audio buffer directory: ${AUDIO_RECORDING_PATH}"
+            else
+                log WARN "Could not create audio buffer directory: ${AUDIO_RECORDING_PATH}"
+            fi
+        fi
+
+        # If disk persistence is enabled, create disk path
+        if [[ "${AUDIO_DISK_PERSIST}" == "true" ]] && [[ ! -d "${AUDIO_DISK_PATH}" ]]; then
+            if mkdir -p "${AUDIO_DISK_PATH}" 2>/dev/null; then
+                chmod 755 "${AUDIO_DISK_PATH}"
+                log INFO "Created disk recording directory: ${AUDIO_DISK_PATH}"
+            else
+                log WARN "Could not create disk recording directory: ${AUDIO_DISK_PATH}"
+            fi
+        fi
     fi
 
     # Setup MediaMTX log rotation if logrotate is available
@@ -3032,6 +3062,14 @@ WRAPPER_SUCCESS_DURATION=$WRAPPER_SUCCESS_DURATION
 RESTART_DELAY=$INITIAL_RESTART_DELAY
 FFMPEG_LOG_MAX_SIZE=$FFMPEG_LOG_MAX_SIZE
 
+# Audio buffering configuration
+AUDIO_BUFFER_ENABLED="${AUDIO_BUFFER_ENABLED}"
+AUDIO_RTBUFSIZE="${AUDIO_RTBUFSIZE}"
+AUDIO_LOCAL_RECORDING="${AUDIO_LOCAL_RECORDING}"
+AUDIO_RECORDING_PATH="${AUDIO_RECORDING_PATH}"
+AUDIO_RECORDING_SEGMENT_TIME="${AUDIO_RECORDING_SEGMENT_TIME}"
+AUDIO_RECORDING_SEGMENTS="${AUDIO_RECORDING_SEGMENTS}"
+
 FFMPEG_PID=""
 EOF
 
@@ -3085,9 +3123,9 @@ trap cleanup_wrapper EXIT INT TERM
 # Run FFmpeg with proper quoting
 run_ffmpeg() {
     local audio_device="plughw:${CARD_NUM},0"
-    
+
     log_message "Starting FFmpeg with device: $audio_device"
-    
+
     # Build command array to handle spaces properly
     local ffmpeg_cmd=(
         ffmpeg
@@ -3095,6 +3133,16 @@ run_ffmpeg() {
         -loglevel warning
         -analyzeduration "${ANALYZEDURATION}"
         -probesize "${PROBESIZE}"
+    )
+
+    # v1.4.2: Add memory buffering if enabled (reduces data loss on restart)
+    if [[ "${AUDIO_BUFFER_ENABLED}" == "true" ]]; then
+        ffmpeg_cmd+=(-rtbufsize "${AUDIO_RTBUFSIZE}")
+        log_message "Memory buffering enabled: ${AUDIO_RTBUFSIZE} bytes"
+    fi
+
+    # Add input options
+    ffmpeg_cmd+=(
         -f alsa
         -ar "${SAMPLE_RATE}"
         -ac "${CHANNELS}"
@@ -3102,29 +3150,46 @@ run_ffmpeg() {
         -i "${audio_device}"
         -af "aresample=async=1:first_pts=0"
     )
-    
+
     # Add codec options based on codec type
+    local codec_opts=()
     case "${CODEC}" in
         opus)
-            ffmpeg_cmd+=(-c:a libopus -b:a "${BITRATE}" -application audio) 
+            codec_opts=(-c:a libopus -b:a "${BITRATE}" -application audio)
             ;;
         aac)
-            ffmpeg_cmd+=(-c:a aac -b:a "${BITRATE}")
+            codec_opts=(-c:a aac -b:a "${BITRATE}")
             ;;
         mp3)
-            ffmpeg_cmd+=(-c:a libmp3lame -b:a "${BITRATE}")
+            codec_opts=(-c:a libmp3lame -b:a "${BITRATE}")
             ;;
         *)
-            ffmpeg_cmd+=(-c:a libopus -b:a "${BITRATE}")
+            codec_opts=(-c:a libopus -b:a "${BITRATE}")
             ;;
     esac
-    
-    # Add output options
-    ffmpeg_cmd+=(
-        -f rtsp
-        -rtsp_transport tcp
-        "rtsp://${MEDIAMTX_HOST}:8554/${STREAM_PATH}"
-    )
+
+    # v1.4.2: Add local recording if enabled (ring buffer in tmpfs/RAM)
+    if [[ "${AUDIO_LOCAL_RECORDING}" == "true" ]]; then
+        # Create recording directory (defaults to /dev/shm which is tmpfs/RAM)
+        mkdir -p "${AUDIO_RECORDING_PATH}/${STREAM_PATH}" 2>/dev/null || true
+
+        # Use tee muxer for simultaneous streaming and recording
+        ffmpeg_cmd+=("${codec_opts[@]}")
+        ffmpeg_cmd+=(
+            -f tee
+            -map 0:a
+            "[f=rtsp:rtsp_transport=tcp]rtsp://${MEDIAMTX_HOST}:8554/${STREAM_PATH}|[f=segment:segment_time=${AUDIO_RECORDING_SEGMENT_TIME}:segment_wrap=${AUDIO_RECORDING_SEGMENTS}:strftime=0]${AUDIO_RECORDING_PATH}/${STREAM_PATH}/audio_%03d.${CODEC}"
+        )
+        log_message "Local recording enabled: ${AUDIO_RECORDING_PATH}/${STREAM_PATH} (${AUDIO_RECORDING_SEGMENTS} x ${AUDIO_RECORDING_SEGMENT_TIME}s segments)"
+    else
+        # Standard output: stream only
+        ffmpeg_cmd+=("${codec_opts[@]}")
+        ffmpeg_cmd+=(
+            -f rtsp
+            -rtsp_transport tcp
+            "rtsp://${MEDIAMTX_HOST}:8554/${STREAM_PATH}"
+        )
+    fi
     
     # Rotate log if exceeds size limit to prevent disk exhaustion
     if [[ -f "${FFMPEG_LOG}" ]]; then
