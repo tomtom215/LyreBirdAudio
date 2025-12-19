@@ -215,12 +215,17 @@ detect_colors() {
             local colors
             colors="$(tput colors 2>/dev/null || echo 0)"
             if [[ "${colors}" -ge 8 ]]; then
-                RED="$(tput setaf 1)"
-                GREEN="$(tput setaf 2)"
-                YELLOW="$(tput setaf 3)"
-                CYAN="$(tput setaf 6)"
-                NC="$(tput sgr0)"
-                USE_COLOR=true
+                # Use explicit error suppression with empty fallbacks
+                # This prevents partial assignments if tput fails mid-way
+                RED="$(tput setaf 1 2>/dev/null)" || RED=""
+                GREEN="$(tput setaf 2 2>/dev/null)" || GREEN=""
+                YELLOW="$(tput setaf 3 2>/dev/null)" || YELLOW=""
+                CYAN="$(tput setaf 6 2>/dev/null)" || CYAN=""
+                NC="$(tput sgr0 2>/dev/null)" || NC=""
+                # Only enable color if all codes were set successfully
+                if [[ -n "$RED" ]] && [[ -n "$NC" ]]; then
+                    USE_COLOR=true
+                fi
             fi
         fi
     fi

@@ -47,7 +47,7 @@ Get streaming in 5 minutes:
 git clone https://github.com/tomtom215/LyreBirdAudio.git
 cd LyreBirdAudio
 
-# If you want to use a tagged release insted of the Main branch: Checkout latest stable release
+# If you want to use a tagged release instead of the Main branch: Checkout latest stable release
 git checkout $(git describe --tags --abbrev=0)
 
 chmod +x *.sh
@@ -60,9 +60,9 @@ sudo ./lyrebird-orchestrator.sh
 # rtsp://your-ip:8554/device-name
 ```
 
-That's it! The Orechestrator will act as a wizard that guides you through installation, device mapping, configuration, and stream startup.
+That's it! The Orchestrator will act as a wizard that guides you through installation, device mapping, configuration, and stream startup.
 
-**For Production Deployments:** Use tagged releases (shown above) for maximum stability. The main branch contains the latest features but may be work-in-progress. Tagged releases are normally tested for atleast 72 hours before releasing. Tests are performed on an Intel N100 mini-PC with 5 USB microphones running Ubuntu.
+**For Production Deployments:** Use tagged releases (shown above) for maximum stability. The main branch contains the latest features but may be work-in-progress. Tagged releases are normally tested for at least 72 hours before releasing. Tests are performed on an Intel N100 mini-PC with 5 USB microphones running Ubuntu.
 
 For manual installation, see [Installation](#installation).
 
@@ -241,6 +241,7 @@ These diagrams show how LyreBirdAudio components work together to transform USB 
                   * Resource constraint detection
                   * Quick/full/debug diagnostic modes
 ```
+
 ---
 
 ## System Requirements
@@ -591,6 +592,12 @@ DEFAULT_CHANNELS=2
 DEFAULT_CODEC=opus
 DEFAULT_BITRATE=128k
 DEFAULT_THREAD_QUEUE=8192
+DEFAULT_ANALYZEDURATION=5000000
+DEFAULT_PROBESIZE=5000000
+
+# API and logging
+MEDIAMTX_API_TIMEOUT=60
+MEDIAMTX_LOG_MAX_SIZE=52428800  # 50MB
 ```
 
 **Installer Configuration:**
@@ -1409,16 +1416,13 @@ This modular design prevents duplicate business logic and ensures maintainabilit
 
 ---
 
-
----
-
 ## Component Reference
 
 ### Quick Reference Table
 
 | Script | Version | Purpose |
 |--------|---------|---------|
-| lyrebird-orchestrator.sh | 2.1.0 | Unified management interface |
+| lyrebird-orchestrator.sh | 2.1.2 | Unified management interface |
 | lyrebird-updater.sh | 1.5.1 | Version management with rollback |
 | mediamtx-stream-manager.sh | 1.4.1 | Stream lifecycle management |
 | usb-audio-mapper.sh | 1.2.1 | USB device persistence via udev |
@@ -2216,7 +2220,7 @@ Include:
 
 **License:** Apache 2.0
 
-Copyright 2024 LyreBirdAudio Contributors
+Copyright 2024-2025 LyreBirdAudio Contributors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.

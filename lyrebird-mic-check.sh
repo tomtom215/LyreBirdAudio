@@ -1142,11 +1142,21 @@ determine_optimal_settings() {
     # Parse rates and channels into arrays
     IFS=' ' read -ra rate_array <<< "$hw_rates"
     IFS=' ' read -ra channel_array <<< "$hw_channels"
-    
-    # Get maximum capabilities
+
+    # Validate arrays have content (bounds check)
+    if [[ ${#rate_array[@]} -eq 0 ]]; then
+        log_error "No sample rates detected in hardware capabilities"
+        return 1
+    fi
+    if [[ ${#channel_array[@]} -eq 0 ]]; then
+        log_error "No channel counts detected in hardware capabilities"
+        return 1
+    fi
+
+    # Get maximum capabilities (safe - arrays validated above)
     local max_rate="${rate_array[-1]}"
     local max_channels="${channel_array[-1]}"
-    
+
     # Determine optimal sample rate based on tier
     local optimal_rate
     case "$tier" in
@@ -1882,18 +1892,38 @@ validate_config() {
     if [[ $(stat -c %a "$CONFIG_FILE") != "644" ]] && [[ $(stat -c %a "$CONFIG_FILE") != "600" ]]; then
         log_warn "Config file has unusual permissions: $(stat -c %a "$CONFIG_FILE")"
     fi
-    
-    # Validate config file syntax before sourcing
+
+    # TOCTOU-safe config sourcing: copy to temp, validate, and source atomically
+    # This prevents race conditions where file is modified between validation and sourcing
+    local config_tmp
+    config_tmp=$(mktemp "/tmp/lyrebird-config-validate.XXXXXX") || {
+        log_error "Failed to create temp file for config validation"
+        return 2
+    }
+    # Ensure cleanup on any exit path
+    trap 'rm -f "$config_tmp" 2>/dev/null' RETURN
+
+    # Atomically copy config file content
+    if ! cat "$CONFIG_FILE" > "$config_tmp" 2>/dev/null; then
+        log_error "Failed to copy config file for validation"
+        rm -f "$config_tmp" 2>/dev/null
+        return 2
+    fi
+
+    # Validate the copied config file syntax
     # This prevents command injection via malformed configuration
-    if ! bash -n "$CONFIG_FILE" 2>/dev/null; then
+    if ! bash -n "$config_tmp" 2>/dev/null; then
         log_error "Configuration file has syntax errors: $CONFIG_FILE"
         log_error "This may indicate file corruption or tampering"
         log_error "Refusing to source potentially malicious configuration"
+        rm -f "$config_tmp" 2>/dev/null
         return 2
     fi
-    
+
+    # Source the validated temp copy (same content we validated)
     # shellcheck source=/dev/null
-    source "$CONFIG_FILE"
+    source "$config_tmp"
+    rm -f "$config_tmp" 2>/dev/null
     
     local validation_failed=false
     local devices_checked=0

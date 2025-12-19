@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: GitHub Discussions
+    url: https://github.com/tomtom215/LyreBirdAudio/discussions
+    about: For general questions, ideas, and community discussion
+  - name: MediaMTX Documentation
+    url: https://github.com/bluenviron/mediamtx#documentation
+    about: For MediaMTX-specific questions and configuration

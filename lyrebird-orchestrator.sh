@@ -8,10 +8,22 @@
 # Copyright: Tom F and LyreBirdAudio contributors
 # License: Apache 2.0
 #
-# Version: 2.1.0
+# Version: 2.1.2
 # Description: Production-grade orchestrator providing unified access to all
 #              LyreBirdAudio components with comprehensive functionality,
 #              intuitive navigation, and robust error handling.
+#
+# v2.1.2 Integration Fixes:
+#   - Fixed: MediaMTX reinstall now correctly uses '-f install' instead of
+#            non-existent 'reinstall' command
+#   - Fixed: Diagnostic export now works (was calling non-existent 'export' command)
+#   - Added: Proper diagnostic export with timestamped file output to /tmp/
+#
+# v2.1.1 UI/UX Improvements:
+#   - Fixed: Stream URLs menu option now correctly calls 'status' command
+#   - Fixed: Status display no longer shows "MediaMTX:" on two lines
+#   - Added: Command line --help and --version flags
+#   - Improved: Status display combines version and running state on single line
 #
 # v2.1.0 Microphone Capability Detection & Enhanced Security:
 #   NEW FEATURES:
@@ -65,7 +77,7 @@ fi
 # Constants and Configuration
 # ============================================================================
 
-readonly SCRIPT_VERSION="2.1.0"
+readonly SCRIPT_VERSION="2.1.2"
 
 # Initialize constants safely (separate declaration from assignment to catch errors)
 SCRIPT_NAME=""
@@ -253,6 +265,14 @@ pause() {
         echo
         log "DEBUG" "Pause interrupted by EOF"
     fi
+}
+
+# Flush any remaining characters from stdin buffer
+# CRITICAL: Must be called after 'read -n 1' to consume trailing newline
+# Without this, child scripts may read leftover input causing validation failures
+flush_stdin() {
+    # Read and discard any remaining input with a tiny timeout
+    read -r -t 0.001 -n 10000 _ 2>/dev/null || true
 }
 
 command_exists() {
@@ -509,15 +529,19 @@ refresh_system_state() {
             raw_count=$(pgrep -x ffmpeg 2>/dev/null | head -n 1001 | wc -l)
         fi
         
-        # Validate count and apply reasonable upper limit
-        if [[ "$raw_count" =~ ^[0-9]+$ ]] && (( raw_count > 0 && raw_count <= 1000 )); then
+        # Validate count with overflow protection
+        # First check string length to prevent overflow in arithmetic operations
+        if [[ ! "$raw_count" =~ ^[0-9]{1,7}$ ]]; then
+            # Not a valid number or too large (>9,999,999) - could cause overflow
+            log "WARN" "Invalid or oversized stream count: '${raw_count:0:20}'"
+            ACTIVE_STREAMS=0
+        elif (( raw_count > 0 && raw_count <= 1000 )); then
             ACTIVE_STREAMS=$raw_count
-        elif [[ "$raw_count" =~ ^[0-9]+$ ]] && (( raw_count > 1000 )); then
+        elif (( raw_count > 1000 )); then
             log "ERROR" "Excessive stream count detected: $raw_count (capping at 1000)"
             log "ERROR" "System may be under attack or experiencing runaway processes"
             ACTIVE_STREAMS=1000  # Cap at reasonable limit for display
         else
-            log "WARN" "Invalid stream count: '$raw_count'"
             ACTIVE_STREAMS=0
         fi
     fi
@@ -685,8 +709,17 @@ display_header() {
 
 display_status() {
     echo -e "${BOLD}System Status:${NC}"
-    echo "  MediaMTX:       $(if [[ "$MEDIAMTX_INSTALLED" == "true" ]]; then echo "Installed (${MEDIAMTX_VERSION})"; else echo "Not installed"; fi)"
-    echo "  MediaMTX:       $(if [[ "$MEDIAMTX_RUNNING" == "true" ]]; then echo -e "${GREEN}Running${NC}"; else echo -e "${RED}Stopped${NC}"; fi)"
+    if [[ "$MEDIAMTX_INSTALLED" == "true" ]]; then
+        local running_status
+        if [[ "$MEDIAMTX_RUNNING" == "true" ]]; then
+            running_status="${GREEN}Running${NC}"
+        else
+            running_status="${RED}Stopped${NC}"
+        fi
+        echo -e "  MediaMTX:       Installed (${MEDIAMTX_VERSION}) - ${running_status}"
+    else
+        echo "  MediaMTX:       Not installed"
+    fi
     echo "  Active Streams: ${ACTIVE_STREAMS}"
     echo "  USB Devices:    $(if [[ "$USB_DEVICES_MAPPED" == "true" ]]; then echo "Mapped"; else echo "Not mapped"; fi)"
     echo
@@ -798,6 +831,7 @@ menu_quick_setup() {
         log "INFO" "Quick setup aborted due to EOF"
         return
     fi
+    flush_stdin  # Consume trailing newline from -n 1 read
     echo
     if [[ ! "$REPLY" =~ ^[Yy]$ ]]; then
         return
@@ -835,7 +869,8 @@ menu_quick_setup() {
         refresh_system_state
         return
     fi
-    
+    flush_stdin  # CRITICAL: Consume trailing newline before usb_mapper reads stdin
+
     if execute_script "usb_mapper"; then
         success "USB devices mapped successfully"
     else
@@ -856,6 +891,7 @@ menu_quick_setup() {
         info "Input stream closed - continuing without reboot"
         log "INFO" "Reboot prompt aborted due to EOF"
     else
+        flush_stdin  # Consume trailing newline from -n 1 read
         echo
         if [[ "$REPLY" =~ ^[Yy]$ ]]; then
             info "System will reboot now. Run this script again after reboot to continue setup."
@@ -864,7 +900,7 @@ menu_quick_setup() {
             exit 0
         fi
     fi
-    
+
     echo
     info "Continuing setup without reboot..."
     info "Note: If streams fail to start, a reboot may be required"
@@ -877,11 +913,12 @@ menu_quick_setup() {
         log "INFO" "Setup continuation aborted due to EOF"
         return
     fi
+    flush_stdin  # Consume trailing newline from -n 1 read
     echo
     if [[ ! "$REPLY" =~ ^[Yy]$ ]]; then
         return
     fi
-    
+
     # Step 3: Start streams
     echo
     echo -e "${BOLD}Step 3/4: Starting audio streams...${NC}"
@@ -1007,9 +1044,11 @@ menu_mediamtx() {
                     pause
                     continue
                 fi
+                flush_stdin  # Consume trailing newline from -n 1 read
                 echo
                 if [[ "$REPLY" =~ ^[Yy]$ ]]; then
-                    execute_script "installer" reinstall || true
+                    # Use -f (force) flag with install to reinstall
+                    execute_script "installer" -f install || true
                     echo
                     refresh_system_state
                 fi
@@ -1026,6 +1065,7 @@ menu_mediamtx() {
                     pause
                     continue
                 fi
+                flush_stdin  # Consume trailing newline from -n 1 read
                 echo
                 if [[ "$REPLY" =~ ^[Yy]$ ]]; then
                     execute_script "installer" uninstall || true
@@ -1230,6 +1270,7 @@ menu_usb_devices() {
                         pause
                         continue
                     fi
+                    flush_stdin  # Consume trailing newline from -n 1 read
                     echo
                     if [[ ! "$REPLY" =~ ^[Yy]$ ]]; then
                         info "Operation cancelled"
@@ -1290,6 +1331,7 @@ menu_usb_devices() {
                     pause
                     continue
                 fi
+                flush_stdin  # Consume trailing newline from -n 1 read
                 echo
                 if [[ "$REPLY" =~ ^[Yy]$ ]]; then
                     if [[ -f "$UDEV_RULES" ]]; then
@@ -1380,6 +1422,7 @@ menu_streaming() {
                     pause
                     continue
                 fi
+                flush_stdin  # Consume trailing newline from -n 1 read
                 echo
                 if [[ "$REPLY" =~ ^[Yy]$ ]]; then
                     echo
@@ -1417,8 +1460,8 @@ menu_streaming() {
                 echo
                 info "Your streams are available at:"
                 echo
-                execute_script "stream_manager" list || true
-                echo
+                # Use 'status' which displays stream URLs along with their status
+                execute_script "stream_manager" status || true
                 echo "================================================================"
                 pause
                 ;;
@@ -1544,7 +1587,41 @@ menu_diagnostics() {
                 echo
                 info "Exporting diagnostic report..."
                 echo
-                execute_script "diagnostics" "export" || true
+
+                # Generate timestamped export file
+                local export_dir="/tmp"
+                local export_file="${export_dir}/lyrebird-diagnostics-$(date +%Y%m%d-%H%M%S).txt"
+
+                info "Running full diagnostics and saving to: ${export_file}"
+                echo
+
+                # Run diagnostics with output to both terminal and file
+                {
+                    echo "LyreBirdAudio Diagnostic Report"
+                    echo "Generated: $(date)"
+                    echo "Host: $(hostname)"
+                    echo "================================================================"
+                    echo
+                } > "${export_file}"
+
+                # Run full diagnostics, capturing output
+                local diag_result=0
+                "${SCRIPT_PATHS[diagnostics]}" "full" 2>&1 | tee -a "${export_file}" || diag_result=$?
+
+                echo
+                if [[ -f "${export_file}" ]]; then
+                    local file_size
+                    file_size=$(stat -c%s "${export_file}" 2>/dev/null || stat -f%z "${export_file}" 2>/dev/null || echo "unknown")
+                    success "Diagnostic report exported to: ${export_file}"
+                    info "File size: ${file_size} bytes"
+                    echo
+                    info "To share this report:"
+                    info "  cat ${export_file}"
+                    info "  or copy to another location"
+                else
+                    error "Failed to create export file"
+                fi
+
                 echo
                 pause
                 ;;
@@ -1771,10 +1848,65 @@ menu_logs_status() {
 }
 
 # ============================================================================
+# Help Function
+# ============================================================================
+
+show_help() {
+    cat << 'EOF'
+LyreBirdAudio Orchestrator - Unified Management Interface
+
+Usage: sudo ./lyrebird-orchestrator.sh [OPTIONS]
+
+Options:
+  -h, --help      Show this help message and exit
+  -v, --version   Show version information and exit
+
+Description:
+  The orchestrator provides an interactive menu-driven interface for managing
+  all LyreBirdAudio components including MediaMTX installation, USB device
+  mapping, audio streaming, diagnostics, and version management.
+
+  This script must be run as root (use sudo).
+
+Quick Start:
+  1. Run: sudo ./lyrebird-orchestrator.sh
+  2. Select "Quick Setup Wizard" from the main menu
+  3. Follow the prompts to install MediaMTX, map devices, and start streaming
+
+For more information, see: https://github.com/tomtom215/LyreBirdAudio
+
+EOF
+    exit 0
+}
+
+show_version() {
+    echo "LyreBirdAudio Orchestrator v${SCRIPT_VERSION}"
+    exit 0
+}
+
+# ============================================================================
 # Main Function
 # ============================================================================
 
 main() {
+    # Handle command line arguments before root check
+    case "${1:-}" in
+        -h|--help)
+            show_help
+            ;;
+        -v|--version)
+            show_version
+            ;;
+        "")
+            # No arguments, continue to interactive mode
+            ;;
+        *)
+            echo "Unknown option: $1" >&2
+            echo "Use --help for usage information" >&2
+            exit 1
+            ;;
+    esac
+
     # Initial checks
     check_root
     check_terminal

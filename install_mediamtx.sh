@@ -492,7 +492,13 @@ version_compare() {
     # Returns 0 if v1 >= v2, 1 otherwise
     local v1="${1#v}"
     local v2="${2#v}"
-    
+
+    # Validate inputs - empty versions are an error
+    if [[ -z "$v1" ]] || [[ -z "$v2" ]]; then
+        log_error "version_compare: empty version string (v1='$v1', v2='$v2')"
+        return 1
+    fi
+
     # Require sort -V for reliable SemVer comparison (handles numeric pre-releases)
     if command -v sort &>/dev/null && sort --version 2>&1 | grep -q 'GNU\|BusyBox'; then
         if sort --help 2>&1 | grep -q -- '-V'; then

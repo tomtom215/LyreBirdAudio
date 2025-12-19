@@ -223,23 +223,52 @@ acquire_lock() {
     while true; do
         # ATOMIC OPERATION: mkdir fails if directory exists
         if mkdir "$LOCKFILE" 2>/dev/null; then
-            echo "$$" > "${LOCKFILE}/pid"
-            log_debug "Lock acquired (PID: $$)"
-            return 0
+            # Write PID atomically using temp file + rename
+            local pid_file="${LOCKFILE}/pid"
+            local pid_tmp="${LOCKFILE}/pid.$$"
+            if echo "$$" > "$pid_tmp" 2>/dev/null && mv "$pid_tmp" "$pid_file" 2>/dev/null; then
+                log_debug "Lock acquired (PID: $$)"
+                return 0
+            else
+                # Failed to write PID - clean up and retry
+                rm -rf "$LOCKFILE" 2>/dev/null
+                sleep 0.1
+                continue
+            fi
         fi
-        
+
         # Check if lock is stale (process no longer exists)
         if [[ -f "${LOCKFILE}/pid" ]]; then
             local lock_pid
             lock_pid=$(cat "${LOCKFILE}/pid" 2>/dev/null || echo "")
-            
-            if [[ -n "$lock_pid" ]] && ! kill -0 "$lock_pid" 2>/dev/null; then
-                log_warn "Removing stale lock from dead process $lock_pid"
-                rm -rf "$LOCKFILE"
-                continue
+
+            if [[ -n "$lock_pid" ]] && [[ "$lock_pid" =~ ^[0-9]+$ ]]; then
+                # Verify process is dead AND was actually our script (prevent PID recycling attack)
+                if ! kill -0 "$lock_pid" 2>/dev/null; then
+                    log_warn "Removing stale lock from dead process $lock_pid"
+                    # Atomically try to remove - if another process beats us, that's fine
+                    if rm -rf "$LOCKFILE" 2>/dev/null; then
+                        # Verify removal succeeded before retry
+                        if [[ ! -d "$LOCKFILE" ]]; then
+                            continue
+                        fi
+                    fi
+                    # Another process claimed lock between our check and removal - wait
+                    sleep 0.5
+                    continue
+                elif [[ -d "/proc/$lock_pid" ]]; then
+                    # Process exists - verify it's actually lyrebird-updater (not PID recycling)
+                    local proc_cmdline
+                    proc_cmdline=$(tr '\0' ' ' < "/proc/$lock_pid/cmdline" 2>/dev/null || echo "")
+                    if [[ -n "$proc_cmdline" ]] && [[ "$proc_cmdline" != *"lyrebird-updater"* ]]; then
+                        log_warn "Stale lock: PID $lock_pid is now a different process"
+                        rm -rf "$LOCKFILE" 2>/dev/null || true
+                        continue
+                    fi
+                fi
             fi
         fi
-        
+
         # Wait timeout
         if [[ $waited -ge $LOCK_MAX_WAIT ]]; then
             local lock_owner
@@ -248,7 +277,7 @@ acquire_lock() {
             log_error "If you're sure no other instance is running, remove: $LOCKFILE"
             return "$E_LOCKED"
         fi
-        
+
         [[ $waited -eq 0 ]] && log_info "Waiting for other instance to finish..."
         sleep 1
         ((waited++))
@@ -1406,15 +1435,23 @@ confirm_action() {
     local prompt="$1"
     local default="${2:-N}"
     local response
-    
+
     if [[ "$default" == "Y" ]]; then
-        read -r -p "${prompt} [Y/n] " response
+        if ! read -r -p "${prompt} [Y/n] " response; then
+            # EOF - return false for safety
+            echo
+            return 1
+        fi
         response="${response:-Y}"
     else
-        read -r -p "${prompt} [y/N] " response
+        if ! read -r -p "${prompt} [y/N] " response; then
+            # EOF - return false for safety
+            echo
+            return 1
+        fi
         response="${response:-N}"
     fi
-    
+
     [[ "$response" =~ ^[Yy]$ ]]
 }
 
@@ -1422,8 +1459,12 @@ confirm_action() {
 confirm_destructive_action() {
     local prompt="$1"
     local response
-    
-    read -r -p "${prompt} " response
+
+    if ! read -r -p "${prompt} " response; then
+        # EOF - return false for safety
+        echo
+        return 1
+    fi
     [[ "$response" == "yes" ]]
 }
 

@@ -844,10 +844,12 @@ interactive_mapping() {
     
     # Check existing rules
     check_existing_rules
-    
+
     # Create rules directory if needed
-    mkdir -p /etc/udev/rules.d/
-    
+    if ! mkdir -p /etc/udev/rules.d/ 2>/dev/null; then
+        error_exit "Cannot create udev rules directory /etc/udev/rules.d/ - check permissions"
+    fi
+
     printf 'Creating mapping rules...\n'
     
     # Generate rules
@@ -941,9 +943,11 @@ non_interactive_mapping() {
     
     # Create rule
     info "Creating rule for $device_name..."
-    
-    mkdir -p /etc/udev/rules.d/
-    
+
+    if ! mkdir -p /etc/udev/rules.d/ 2>/dev/null; then
+        error_exit "Cannot create udev rules directory /etc/udev/rules.d/ - check permissions"
+    fi
+
     # Generate rules
     local rules_content
     rules_content=$(generate_udev_rules "$vendor_id" "$product_id" "$friendly_name" "$device_name" "$simple_port" "$platform_id_path")
