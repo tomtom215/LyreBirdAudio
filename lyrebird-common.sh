@@ -117,6 +117,7 @@ _lyrebird_init_colors() {
         YELLOW=""
         BLUE=""
         CYAN=""
+        # shellcheck disable=SC2034  # BOLD is used by scripts that source this library
         BOLD=""
         NC=""
     fi
