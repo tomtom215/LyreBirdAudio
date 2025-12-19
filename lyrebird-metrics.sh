@@ -20,11 +20,11 @@
 # Integration with node_exporter:
 #   ./lyrebird-metrics.sh --file /var/lib/node_exporter/textfile_collector/lyrebird.prom
 #
-# Version: 1.0.0
+# Version: 1.1.0 - Enhanced MediaMTX API metrics coverage
 
 set -euo pipefail
 
-readonly VERSION="1.0.0"
+readonly VERSION="1.1.0"
 SCRIPT_NAME="$(basename "${BASH_SOURCE[0]}")"
 readonly SCRIPT_NAME
 
@@ -266,6 +266,7 @@ collect_system_metrics() {
 }
 
 # Collect MediaMTX API metrics (if available)
+# Enhanced in v1.1.0 with full MediaMTX v1.15.5 API coverage
 collect_api_metrics() {
     if ! has_command curl; then
         return
@@ -273,15 +274,30 @@ collect_api_metrics() {
 
     local api_url="http://${MEDIAMTX_API_HOST}:${MEDIAMTX_API_PORT}"
 
-    # Check API availability
+    # Check API availability and get instance info
     local api_up=0
-    if curl -s --connect-timeout 2 "${api_url}/v3/paths/list" >/dev/null 2>&1; then
+    local info_json
+    info_json=$(curl -s --connect-timeout 2 "${api_url}/v3/info" 2>/dev/null)
+    if [[ -n "$info_json" ]] && echo "$info_json" | grep -q '"version"'; then
         api_up=1
     fi
 
     emit_metric "api_up" "$api_up" "MediaMTX API reachable (1=up, 0=down)"
 
     if [[ $api_up -eq 1 ]]; then
+        # Extract version for info metric
+        local version
+        version=$(echo "$info_json" | grep -o '"version":"[^"]*"' | cut -d'"' -f4 || echo "unknown")
+        emit_metric "api_info" "1" "MediaMTX instance info" "gauge" "version=\"${version}\""
+
+        # Extract uptime (in nanoseconds, convert to seconds)
+        local uptime_ns
+        uptime_ns=$(echo "$info_json" | grep -o '"upTime":[0-9]*' | cut -d':' -f2 || echo "0")
+        if [[ -n "$uptime_ns" ]] && [[ "$uptime_ns" =~ ^[0-9]+$ ]]; then
+            local uptime_sec=$((uptime_ns / 1000000000))
+            emit_metric "api_uptime_seconds" "$uptime_sec" "MediaMTX uptime in seconds"
+        fi
+
         # Get path count from API
         local paths_json
         paths_json=$(curl -s --connect-timeout 5 "${api_url}/v3/paths/list" 2>/dev/null)
@@ -297,6 +313,97 @@ collect_api_metrics() {
             ready_count=$(echo "$paths_json" | grep -o '"ready":true' | wc -l)
             emit_metric "api_paths_ready" "$ready_count" "Paths with ready status"
         fi
+
+        # Collect RTSP session metrics
+        local rtsp_sessions_json
+        rtsp_sessions_json=$(curl -s --connect-timeout 5 "${api_url}/v3/rtspsessions/list" 2>/dev/null)
+        if [[ -n "$rtsp_sessions_json" ]]; then
+            local rtsp_session_count
+            rtsp_session_count=$(echo "$rtsp_sessions_json" | grep -o '"id"' | wc -l)
+            emit_metric "api_rtsp_sessions" "$rtsp_session_count" "Active RTSP sessions (listeners)"
+        fi
+
+        # Collect RTSP connection metrics
+        local rtsp_conns_json
+        rtsp_conns_json=$(curl -s --connect-timeout 5 "${api_url}/v3/rtspconns/list" 2>/dev/null)
+        if [[ -n "$rtsp_conns_json" ]]; then
+            local rtsp_conn_count
+            rtsp_conn_count=$(echo "$rtsp_conns_json" | grep -o '"id"' | wc -l)
+            emit_metric "api_rtsp_connections" "$rtsp_conn_count" "Active RTSP connections"
+        fi
+
+        # Collect RTSPS (secure) session metrics
+        local rtsps_sessions_json
+        rtsps_sessions_json=$(curl -s --connect-timeout 5 "${api_url}/v3/rtspssessions/list" 2>/dev/null)
+        if [[ -n "$rtsps_sessions_json" ]]; then
+            local rtsps_session_count
+            rtsps_session_count=$(echo "$rtsps_sessions_json" | grep -o '"id"' | wc -l)
+            emit_metric "api_rtsps_sessions" "$rtsps_session_count" "Active RTSPS sessions (secure)"
+        fi
+
+        # Collect RTMP connection metrics
+        local rtmp_conns_json
+        rtmp_conns_json=$(curl -s --connect-timeout 5 "${api_url}/v3/rtmpconns/list" 2>/dev/null)
+        if [[ -n "$rtmp_conns_json" ]]; then
+            local rtmp_conn_count
+            rtmp_conn_count=$(echo "$rtmp_conns_json" | grep -o '"id"' | wc -l)
+            emit_metric "api_rtmp_connections" "$rtmp_conn_count" "Active RTMP connections"
+        fi
+
+        # Collect RTMPS (secure) connection metrics
+        local rtmps_conns_json
+        rtmps_conns_json=$(curl -s --connect-timeout 5 "${api_url}/v3/rtmpsconns/list" 2>/dev/null)
+        if [[ -n "$rtmps_conns_json" ]]; then
+            local rtmps_conn_count
+            rtmps_conn_count=$(echo "$rtmps_conns_json" | grep -o '"id"' | wc -l)
+            emit_metric "api_rtmps_connections" "$rtmps_conn_count" "Active RTMPS connections (secure)"
+        fi
+
+        # Collect WebRTC session metrics
+        local webrtc_sessions_json
+        webrtc_sessions_json=$(curl -s --connect-timeout 5 "${api_url}/v3/webrtcsessions/list" 2>/dev/null)
+        if [[ -n "$webrtc_sessions_json" ]]; then
+            local webrtc_session_count
+            webrtc_session_count=$(echo "$webrtc_sessions_json" | grep -o '"id"' | wc -l)
+            emit_metric "api_webrtc_sessions" "$webrtc_session_count" "Active WebRTC sessions"
+        fi
+
+        # Collect SRT connection metrics
+        local srt_conns_json
+        srt_conns_json=$(curl -s --connect-timeout 5 "${api_url}/v3/srtconns/list" 2>/dev/null)
+        if [[ -n "$srt_conns_json" ]]; then
+            local srt_conn_count
+            srt_conn_count=$(echo "$srt_conns_json" | grep -o '"id"' | wc -l)
+            emit_metric "api_srt_connections" "$srt_conn_count" "Active SRT connections"
+        fi
+
+        # Collect HLS muxer metrics
+        local hls_muxers_json
+        hls_muxers_json=$(curl -s --connect-timeout 5 "${api_url}/v3/hlsmuxers/list" 2>/dev/null)
+        if [[ -n "$hls_muxers_json" ]]; then
+            local hls_muxer_count
+            hls_muxer_count=$(echo "$hls_muxers_json" | grep -o '"path"' | wc -l)
+            emit_metric "api_hls_muxers" "$hls_muxer_count" "Active HLS muxers"
+        fi
+
+        # Collect recording metrics
+        local recordings_json
+        recordings_json=$(curl -s --connect-timeout 5 "${api_url}/v3/recordings/list" 2>/dev/null)
+        if [[ -n "$recordings_json" ]]; then
+            local recording_count
+            recording_count=$(echo "$recordings_json" | grep -o '"name"' | wc -l)
+            emit_metric "api_recordings_total" "$recording_count" "Total recording paths"
+        fi
+
+        # Calculate total connections across all protocols
+        local total_connections=0
+        [[ "${rtsp_session_count:-0}" =~ ^[0-9]+$ ]] && total_connections=$((total_connections + rtsp_session_count))
+        [[ "${rtsps_session_count:-0}" =~ ^[0-9]+$ ]] && total_connections=$((total_connections + rtsps_session_count))
+        [[ "${rtmp_conn_count:-0}" =~ ^[0-9]+$ ]] && total_connections=$((total_connections + rtmp_conn_count))
+        [[ "${rtmps_conn_count:-0}" =~ ^[0-9]+$ ]] && total_connections=$((total_connections + rtmps_conn_count))
+        [[ "${webrtc_session_count:-0}" =~ ^[0-9]+$ ]] && total_connections=$((total_connections + webrtc_session_count))
+        [[ "${srt_conn_count:-0}" =~ ^[0-9]+$ ]] && total_connections=$((total_connections + srt_conn_count))
+        emit_metric "api_total_connections" "$total_connections" "Total active connections across all protocols"
     fi
 }
 

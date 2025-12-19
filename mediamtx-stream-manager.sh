@@ -10,10 +10,26 @@
 # This script automatically detects USB microphones and creates MediaMTX
 # configurations for continuous 24/7 RTSP audio streams.
 #
-# Version: 1.4.2 - Production reliability enhancements
+# Version: 1.4.3 - Complete MediaMTX API integration
 # Compatible with MediaMTX v1.15.0+
 #
 # Version History:
+# v1.4.3 - Complete MediaMTX v1.15.5 API integration
+#   API INTEGRATION:
+#   - Full REST API coverage for all MediaMTX v1.15.5 endpoints
+#   - Instance info endpoint (/v3/info) for version and uptime
+#   - Global and path defaults configuration management
+#   - Dynamic path CRUD (add/delete/patch/replace) without restart
+#   - RTSP/RTSPS connection and session management with kick support
+#   - RTMP/RTMPS connection management with disconnect capability
+#   - SRT connection management
+#   - WebRTC session management
+#   - HLS muxer monitoring
+#   - Recording management and segment deletion
+#   - JWT JWKS credential refresh
+#   - Utility functions for connection counting and health checks
+#   - Generic API call wrapper with proper HTTP status handling
+#
 # v1.4.2 - Production reliability enhancements for 24/7 field deployment
 #   MONITORING ENHANCEMENTS:
 #   - Watchdog/heartbeat mechanism with optional hardware watchdog support
@@ -172,7 +188,7 @@ unset _LYREBIRD_COMMON _LYREBIRD_COMMON_EXPECTED_HASH
 unset -f _verify_common_library
 
 # Constants
-readonly VERSION="1.4.2"
+readonly VERSION="1.4.3"
 
 # Script identification
 SCRIPT_NAME="$(basename "${BASH_SOURCE[0]}")"
@@ -324,7 +340,7 @@ readonly USB_DISCONNECT_GRACE_PERIOD="${USB_DISCONNECT_GRACE_PERIOD:-10}" # Seco
 # Version compatibility
 readonly MIN_COMPATIBLE_COMMON_VERSION="1.0.0"
 # shellcheck disable=SC2034 # SCRIPT_COMPAT_VERSION exported for external version checking tools
-readonly SCRIPT_COMPAT_VERSION="1.4.2"
+readonly SCRIPT_COMPAT_VERSION="1.4.3"
 
 # Standard timing constants
 readonly QUICK_SLEEP=0.1
@@ -1544,6 +1560,525 @@ detect_mediamtx_api_version() {
     log WARN "Could not detect MediaMTX API version, defaulting to v3"
     echo "${base_url}/v3"
     return 0
+}
+
+# ============================================================================
+# MediaMTX API Integration Functions (v1.4.3)
+# Complete coverage of MediaMTX v1.15.5 REST API
+# ============================================================================
+
+# Make a generic API call to MediaMTX
+# Usage: mediamtx_api_call METHOD ENDPOINT [DATA]
+# Returns: JSON response on stdout, exit code 0 on success
+mediamtx_api_call() {
+    local method="${1:-GET}"
+    local endpoint="$2"
+    local data="${3:-}"
+
+    if ! command_exists curl; then
+        log DEBUG "curl not available for API call"
+        return 1
+    fi
+
+    local api_base
+    api_base=$(detect_mediamtx_api_version)
+    local url="${api_base}${endpoint}"
+
+    local curl_args=(-s --max-time 10)
+
+    case "$method" in
+        GET)
+            curl_args+=(-X GET)
+            ;;
+        POST)
+            curl_args+=(-X POST)
+            [[ -n "$data" ]] && curl_args+=(-H "Content-Type: application/json" -d "$data")
+            ;;
+        PATCH)
+            curl_args+=(-X PATCH -H "Content-Type: application/json" -d "$data")
+            ;;
+        DELETE)
+            curl_args+=(-X DELETE)
+            ;;
+        *)
+            log ERROR "Unknown HTTP method: $method"
+            return 1
+            ;;
+    esac
+
+    local response
+    local http_code
+
+    # Use -w to get HTTP status code
+    response=$(curl "${curl_args[@]}" -w "\n%{http_code}" "$url" 2>/dev/null)
+    http_code=$(echo "$response" | tail -1)
+    response=$(echo "$response" | sed '$d')
+
+    if [[ "$http_code" -ge 200 ]] && [[ "$http_code" -lt 300 ]]; then
+        echo "$response"
+        return 0
+    else
+        log DEBUG "API call failed: $method $url (HTTP $http_code)"
+        return 1
+    fi
+}
+
+# -----------------------------------------------------------------------------
+# Instance Information (/v3/info)
+# -----------------------------------------------------------------------------
+
+# Get MediaMTX instance information (version, uptime)
+# Returns: JSON with version and upTime fields
+mediamtx_get_info() {
+    mediamtx_api_call GET "/info"
+}
+
+# Get MediaMTX version string
+mediamtx_get_version() {
+    local info
+    info=$(mediamtx_get_info) || return 1
+    echo "$info" | grep -o '"version":"[^"]*"' | cut -d'"' -f4
+}
+
+# Get MediaMTX uptime in nanoseconds
+mediamtx_get_uptime() {
+    local info
+    info=$(mediamtx_get_info) || return 1
+    echo "$info" | grep -o '"upTime":[0-9]*' | cut -d':' -f2
+}
+
+# -----------------------------------------------------------------------------
+# Global Configuration (/v3/config/global)
+# -----------------------------------------------------------------------------
+
+# Get global MediaMTX configuration
+mediamtx_get_global_config() {
+    mediamtx_api_call GET "/config/global/get"
+}
+
+# Patch global MediaMTX configuration
+# Usage: mediamtx_patch_global_config '{"logLevel":"debug"}'
+mediamtx_patch_global_config() {
+    local config_json="$1"
+    mediamtx_api_call PATCH "/config/global/patch" "$config_json"
+}
+
+# -----------------------------------------------------------------------------
+# Path Defaults Configuration (/v3/config/pathdefaults)
+# -----------------------------------------------------------------------------
+
+# Get default path configuration
+mediamtx_get_path_defaults() {
+    mediamtx_api_call GET "/config/pathdefaults/get"
+}
+
+# Patch default path configuration
+mediamtx_patch_path_defaults() {
+    local config_json="$1"
+    mediamtx_api_call PATCH "/config/pathdefaults/patch" "$config_json"
+}
+
+# -----------------------------------------------------------------------------
+# Path Configuration CRUD (/v3/config/paths)
+# -----------------------------------------------------------------------------
+
+# List all path configurations (with pagination)
+# Usage: mediamtx_list_path_configs [itemsPerPage] [page]
+mediamtx_list_path_configs() {
+    local items_per_page="${1:-1000}"
+    local page="${2:-0}"
+    mediamtx_api_call GET "/config/paths/list?itemsPerPage=${items_per_page}&page=${page}"
+}
+
+# Get a specific path configuration
+mediamtx_get_path_config() {
+    local path_name="$1"
+    mediamtx_api_call GET "/config/paths/get/${path_name}"
+}
+
+# Add a new path configuration
+# Usage: mediamtx_add_path_config "stream_name" '{"source":"rtsp://..."}'
+mediamtx_add_path_config() {
+    local path_name="$1"
+    local config_json="${2:-{\}}"
+    mediamtx_api_call POST "/config/paths/add/${path_name}" "$config_json"
+}
+
+# Patch an existing path configuration
+mediamtx_patch_path_config() {
+    local path_name="$1"
+    local config_json="$2"
+    mediamtx_api_call PATCH "/config/paths/patch/${path_name}" "$config_json"
+}
+
+# Replace a path configuration entirely
+mediamtx_replace_path_config() {
+    local path_name="$1"
+    local config_json="$2"
+    mediamtx_api_call POST "/config/paths/replace/${path_name}" "$config_json"
+}
+
+# Delete a path configuration
+mediamtx_delete_path_config() {
+    local path_name="$1"
+    mediamtx_api_call DELETE "/config/paths/delete/${path_name}"
+}
+
+# -----------------------------------------------------------------------------
+# Runtime Paths (/v3/paths)
+# -----------------------------------------------------------------------------
+
+# List all active paths (runtime state)
+# Usage: mediamtx_list_paths [itemsPerPage] [page]
+mediamtx_list_paths() {
+    local items_per_page="${1:-1000}"
+    local page="${2:-0}"
+    mediamtx_api_call GET "/paths/list?itemsPerPage=${items_per_page}&page=${page}"
+}
+
+# Get a specific path's runtime state
+mediamtx_get_path() {
+    local path_name="$1"
+    mediamtx_api_call GET "/paths/get/${path_name}"
+}
+
+# Check if a path is ready (streaming)
+mediamtx_path_is_ready() {
+    local path_name="$1"
+    local path_info
+    path_info=$(mediamtx_get_path "$path_name") || return 1
+    echo "$path_info" | grep -q '"ready":true'
+}
+
+# -----------------------------------------------------------------------------
+# HLS Muxers (/v3/hlsmuxers)
+# -----------------------------------------------------------------------------
+
+# List all HLS muxers
+mediamtx_list_hls_muxers() {
+    local items_per_page="${1:-1000}"
+    local page="${2:-0}"
+    mediamtx_api_call GET "/hlsmuxers/list?itemsPerPage=${items_per_page}&page=${page}"
+}
+
+# Get a specific HLS muxer
+mediamtx_get_hls_muxer() {
+    local name="$1"
+    mediamtx_api_call GET "/hlsmuxers/get/${name}"
+}
+
+# -----------------------------------------------------------------------------
+# RTSP Connections (/v3/rtspconns)
+# -----------------------------------------------------------------------------
+
+# List all RTSP connections
+mediamtx_list_rtsp_conns() {
+    local items_per_page="${1:-1000}"
+    local page="${2:-0}"
+    mediamtx_api_call GET "/rtspconns/list?itemsPerPage=${items_per_page}&page=${page}"
+}
+
+# Get a specific RTSP connection
+mediamtx_get_rtsp_conn() {
+    local conn_id="$1"
+    mediamtx_api_call GET "/rtspconns/get/${conn_id}"
+}
+
+# -----------------------------------------------------------------------------
+# RTSP Sessions (/v3/rtspsessions)
+# -----------------------------------------------------------------------------
+
+# List all RTSP sessions
+mediamtx_list_rtsp_sessions() {
+    local items_per_page="${1:-1000}"
+    local page="${2:-0}"
+    mediamtx_api_call GET "/rtspsessions/list?itemsPerPage=${items_per_page}&page=${page}"
+}
+
+# Get a specific RTSP session
+mediamtx_get_rtsp_session() {
+    local session_id="$1"
+    mediamtx_api_call GET "/rtspsessions/get/${session_id}"
+}
+
+# Kick (disconnect) an RTSP session
+mediamtx_kick_rtsp_session() {
+    local session_id="$1"
+    mediamtx_api_call POST "/rtspsessions/kick/${session_id}"
+}
+
+# -----------------------------------------------------------------------------
+# RTSPS Connections (/v3/rtspsconns) - Secure RTSP
+# -----------------------------------------------------------------------------
+
+# List all RTSPS connections
+mediamtx_list_rtsps_conns() {
+    local items_per_page="${1:-1000}"
+    local page="${2:-0}"
+    mediamtx_api_call GET "/rtspsconns/list?itemsPerPage=${items_per_page}&page=${page}"
+}
+
+# Get a specific RTSPS connection
+mediamtx_get_rtsps_conn() {
+    local conn_id="$1"
+    mediamtx_api_call GET "/rtspsconns/get/${conn_id}"
+}
+
+# -----------------------------------------------------------------------------
+# RTSPS Sessions (/v3/rtspssessions) - Secure RTSP
+# -----------------------------------------------------------------------------
+
+# List all RTSPS sessions
+mediamtx_list_rtsps_sessions() {
+    local items_per_page="${1:-1000}"
+    local page="${2:-0}"
+    mediamtx_api_call GET "/rtspssessions/list?itemsPerPage=${items_per_page}&page=${page}"
+}
+
+# Get a specific RTSPS session
+mediamtx_get_rtsps_session() {
+    local session_id="$1"
+    mediamtx_api_call GET "/rtspssessions/get/${session_id}"
+}
+
+# Kick (disconnect) an RTSPS session
+mediamtx_kick_rtsps_session() {
+    local session_id="$1"
+    mediamtx_api_call POST "/rtspssessions/kick/${session_id}"
+}
+
+# -----------------------------------------------------------------------------
+# RTMP Connections (/v3/rtmpconns)
+# -----------------------------------------------------------------------------
+
+# List all RTMP connections
+mediamtx_list_rtmp_conns() {
+    local items_per_page="${1:-1000}"
+    local page="${2:-0}"
+    mediamtx_api_call GET "/rtmpconns/list?itemsPerPage=${items_per_page}&page=${page}"
+}
+
+# Get a specific RTMP connection
+mediamtx_get_rtmp_conn() {
+    local conn_id="$1"
+    mediamtx_api_call GET "/rtmpconns/get/${conn_id}"
+}
+
+# Kick (disconnect) an RTMP connection
+mediamtx_kick_rtmp_conn() {
+    local conn_id="$1"
+    mediamtx_api_call POST "/rtmpconns/kick/${conn_id}"
+}
+
+# -----------------------------------------------------------------------------
+# RTMPS Connections (/v3/rtmpsconns) - Secure RTMP
+# -----------------------------------------------------------------------------
+
+# List all RTMPS connections
+mediamtx_list_rtmps_conns() {
+    local items_per_page="${1:-1000}"
+    local page="${2:-0}"
+    mediamtx_api_call GET "/rtmpsconns/list?itemsPerPage=${items_per_page}&page=${page}"
+}
+
+# Get a specific RTMPS connection
+mediamtx_get_rtmps_conn() {
+    local conn_id="$1"
+    mediamtx_api_call GET "/rtmpsconns/get/${conn_id}"
+}
+
+# Kick (disconnect) an RTMPS connection
+mediamtx_kick_rtmps_conn() {
+    local conn_id="$1"
+    mediamtx_api_call POST "/rtmpsconns/kick/${conn_id}"
+}
+
+# -----------------------------------------------------------------------------
+# SRT Connections (/v3/srtconns)
+# -----------------------------------------------------------------------------
+
+# List all SRT connections
+mediamtx_list_srt_conns() {
+    local items_per_page="${1:-1000}"
+    local page="${2:-0}"
+    mediamtx_api_call GET "/srtconns/list?itemsPerPage=${items_per_page}&page=${page}"
+}
+
+# Get a specific SRT connection
+mediamtx_get_srt_conn() {
+    local conn_id="$1"
+    mediamtx_api_call GET "/srtconns/get/${conn_id}"
+}
+
+# Kick (disconnect) an SRT connection
+mediamtx_kick_srt_conn() {
+    local conn_id="$1"
+    mediamtx_api_call POST "/srtconns/kick/${conn_id}"
+}
+
+# -----------------------------------------------------------------------------
+# WebRTC Sessions (/v3/webrtcsessions)
+# -----------------------------------------------------------------------------
+
+# List all WebRTC sessions
+mediamtx_list_webrtc_sessions() {
+    local items_per_page="${1:-1000}"
+    local page="${2:-0}"
+    mediamtx_api_call GET "/webrtcsessions/list?itemsPerPage=${items_per_page}&page=${page}"
+}
+
+# Get a specific WebRTC session
+mediamtx_get_webrtc_session() {
+    local session_id="$1"
+    mediamtx_api_call GET "/webrtcsessions/get/${session_id}"
+}
+
+# Kick (disconnect) a WebRTC session
+mediamtx_kick_webrtc_session() {
+    local session_id="$1"
+    mediamtx_api_call POST "/webrtcsessions/kick/${session_id}"
+}
+
+# -----------------------------------------------------------------------------
+# Recordings (/v3/recordings)
+# -----------------------------------------------------------------------------
+
+# List all recordings
+mediamtx_list_recordings() {
+    local items_per_page="${1:-1000}"
+    local page="${2:-0}"
+    mediamtx_api_call GET "/recordings/list?itemsPerPage=${items_per_page}&page=${page}"
+}
+
+# Get recordings for a specific path
+mediamtx_get_recordings() {
+    local path_name="$1"
+    mediamtx_api_call GET "/recordings/get/${path_name}"
+}
+
+# Delete a recording segment
+# Usage: mediamtx_delete_recording_segment "path_name" "2024-01-15T10:30:00Z"
+mediamtx_delete_recording_segment() {
+    local path_name="$1"
+    local start_time="$2"
+    # URL encode the parameters
+    local encoded_path
+    encoded_path=$(printf '%s' "$path_name" | sed 's/ /%20/g')
+    local encoded_time
+    encoded_time=$(printf '%s' "$start_time" | sed 's/:/%3A/g')
+    mediamtx_api_call DELETE "/recordings/deletesegment?path=${encoded_path}&start=${encoded_time}"
+}
+
+# -----------------------------------------------------------------------------
+# Authentication (/v3/auth)
+# -----------------------------------------------------------------------------
+
+# Refresh JWT JWKS credentials
+mediamtx_refresh_jwks() {
+    mediamtx_api_call POST "/auth/jwks/refresh"
+}
+
+# -----------------------------------------------------------------------------
+# Utility Functions
+# -----------------------------------------------------------------------------
+
+# Get total count of active RTSP sessions (listeners)
+mediamtx_count_rtsp_sessions() {
+    local sessions
+    sessions=$(mediamtx_list_rtsp_sessions) || { echo "0"; return; }
+    local count
+    count=$(echo "$sessions" | grep -o '"id"' | wc -l)
+    echo "${count:-0}"
+}
+
+# Get total count of all connections across protocols
+mediamtx_count_all_connections() {
+    local total=0
+    local count
+
+    # RTSP sessions
+    count=$(mediamtx_count_rtsp_sessions 2>/dev/null)
+    total=$((total + count))
+
+    # RTSPS sessions
+    local rtsps
+    rtsps=$(mediamtx_list_rtsps_sessions 2>/dev/null) || rtsps=""
+    count=$(echo "$rtsps" | grep -o '"id"' | wc -l)
+    total=$((total + count))
+
+    # RTMP connections
+    local rtmp
+    rtmp=$(mediamtx_list_rtmp_conns 2>/dev/null) || rtmp=""
+    count=$(echo "$rtmp" | grep -o '"id"' | wc -l)
+    total=$((total + count))
+
+    # WebRTC sessions
+    local webrtc
+    webrtc=$(mediamtx_list_webrtc_sessions 2>/dev/null) || webrtc=""
+    count=$(echo "$webrtc" | grep -o '"id"' | wc -l)
+    total=$((total + count))
+
+    # SRT connections
+    local srt
+    srt=$(mediamtx_list_srt_conns 2>/dev/null) || srt=""
+    count=$(echo "$srt" | grep -o '"id"' | wc -l)
+    total=$((total + count))
+
+    echo "$total"
+}
+
+# Get count of ready paths
+mediamtx_count_ready_paths() {
+    local paths
+    paths=$(mediamtx_list_paths) || { echo "0"; return; }
+    local count
+    count=$(echo "$paths" | grep -o '"ready":true' | wc -l)
+    echo "${count:-0}"
+}
+
+# Check MediaMTX API health (enhanced version using /v3/info)
+# Returns: 0 if healthy, 1 if API unreachable, 2 if degraded
+mediamtx_check_health() {
+    local info
+    info=$(mediamtx_get_info) || return 1
+
+    # Verify we got valid response with version
+    if ! echo "$info" | grep -q '"version"'; then
+        return 2
+    fi
+
+    return 0
+}
+
+# Get summary of MediaMTX state for monitoring
+# Output: Human-readable status summary
+mediamtx_get_status_summary() {
+    local info
+    info=$(mediamtx_get_info 2>/dev/null) || {
+        echo "MediaMTX API: UNREACHABLE"
+        return 1
+    }
+
+    local version
+    version=$(echo "$info" | grep -o '"version":"[^"]*"' | cut -d'"' -f4)
+
+    local paths_json
+    paths_json=$(mediamtx_list_paths 2>/dev/null) || paths_json=""
+    local total_paths
+    total_paths=$(echo "$paths_json" | grep -o '"name"' | wc -l)
+    local ready_paths
+    ready_paths=$(echo "$paths_json" | grep -o '"ready":true' | wc -l)
+
+    local rtsp_sessions
+    rtsp_sessions=$(mediamtx_count_rtsp_sessions 2>/dev/null)
+
+    local total_conns
+    total_conns=$(mediamtx_count_all_connections 2>/dev/null)
+
+    echo "MediaMTX v${version:-unknown}"
+    echo "  Paths: ${ready_paths}/${total_paths} ready"
+    echo "  RTSP sessions: ${rtsp_sessions}"
+    echo "  Total connections: ${total_conns}"
 }
 
 # Check if ALSA device is available before attempting stream restart
