@@ -7,7 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### ⚠️ Breaking Changes
+- **Script Renamed**: `mediamtx-stream-manager.sh` → `lyrebird-stream-manager.sh`
+  - Log file path changed: `/var/log/mediamtx-stream-manager.log` → `/var/log/lyrebird-stream-manager.log`
+  - **Automatic migration**: Running `lyrebird-updater.sh` will automatically update:
+    - Systemd service files
+    - Cron jobs
+    - `/usr/local/bin` installations
+    - Log file symlinks for backward compatibility
+  - **Manual migration**: Run `sudo ./lyrebird-updater.sh --migrate`
+
 ### Added
+- Automatic migration system in `lyrebird-updater.sh` v1.6.0
+  - Post-update migrations for breaking changes
+  - Idempotent migration tracking in `/var/lib/lyrebird/migrations/`
+  - CLI flag `--migrate` for manual migration runs
+- Migration detection in `lyrebird-orchestrator.sh`
+  - Startup warning when old script names detected
+  - Clear remediation steps for users
 - Webhook alerting system (`lyrebird-alerts.sh`) for remote monitoring
   - Supports Discord, Slack, ntfy.sh, Pushover, and generic HTTP webhooks
   - Rate limiting and alert deduplication
@@ -18,6 +35,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 - Improved inline documentation in `usb-audio-mapper.sh`
 - Enhanced error messages with remediation steps
+- `lyrebird-stream-manager.sh` updated to v1.4.4
+  - Restructured API validation to preserve curl exit status for better error detection
+  - Replaced `curl|grep` pattern with explicit exit code checking
 
 ## [1.4.2] - 2025-12-19
 
@@ -33,7 +53,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `config/mediamtx.service`
   - `config/mediamtx-audio.service`
 - Log rotation configuration (`config/lyrebird-logrotate.conf`)
-- Security documentation (`docs/SECURITY.md`) with optional TLS/auth guides
+- Security documentation (`docs/SECURITY-GUIDE.md`) with optional TLS/auth guides
 - `.gitignore` file to prevent accidental sensitive data commits
 
 ### Changed
@@ -168,8 +188,8 @@ Each component maintains its own version:
 | Component | Current Version |
 |-----------|-----------------|
 | lyrebird-orchestrator.sh | 2.1.2 |
-| mediamtx-stream-manager.sh | 1.4.2 |
-| lyrebird-updater.sh | 1.5.1 |
+| lyrebird-stream-manager.sh | 1.4.4 |
+| lyrebird-updater.sh | 1.6.0 |
 | usb-audio-mapper.sh | 1.2.1 |
 | lyrebird-diagnostics.sh | 1.0.2 |
 | install_mediamtx.sh | 2.0.1 |

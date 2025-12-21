@@ -1,5 +1,5 @@
 #!/usr/bin/env bats
-# Unit tests for mediamtx-stream-manager.sh functions
+# Unit tests for lyrebird-stream-manager.sh functions
 # Run with: bats tests/test_stream_manager.bats
 # Note: These tests use function extraction, not the full script
 

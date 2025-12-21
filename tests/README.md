@@ -7,7 +7,7 @@ Unit tests for LyreBirdAudio using the [Bats](https://github.com/bats-core/bats-
 | Component | Test File | Tests | Est. Coverage |
 |-----------|-----------|-------|---------------|
 | lyrebird-common.sh | test_lyrebird_common.bats | 47 | 80% |
-| mediamtx-stream-manager.sh | test_stream_manager.bats | 32 | 50% |
+| lyrebird-stream-manager.sh | test_stream_manager.bats | 32 | 50% |
 | usb-audio-mapper.sh | test_usb_audio_mapper.bats | 33 | 65% |
 | lyrebird-diagnostics.sh | test_lyrebird_diagnostics.bats | 34 | 70% |
 | lyrebird-orchestrator.sh | test_lyrebird_orchestrator.bats | 44 | 70% |

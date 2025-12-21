@@ -32,7 +32,7 @@
 #   - Configuration generation with quality tiers (low/normal/high)
 #   - Configuration validation against hardware capabilities
 #   - Enhanced USB menu with comprehensive device configuration workflow
-#   - Support for mediamtx-stream-manager v1.4.1 friendly name feature
+#   - Support for lyrebird-stream-manager v1.4.1 friendly name feature
 #
 #   SECURITY & RELIABILITY ENHANCEMENTS:
 #   - TOCTOU race condition protection in log file handling
@@ -176,7 +176,7 @@ validate_log_path() {
 # External script paths
 declare -A EXTERNAL_SCRIPTS=(
     ["installer"]="install_mediamtx.sh"
-    ["stream_manager"]="mediamtx-stream-manager.sh"
+    ["stream_manager"]="lyrebird-stream-manager.sh"
     ["usb_mapper"]="usb-audio-mapper.sh"
     ["mic_check"]="lyrebird-mic-check.sh"
     ["updater"]="lyrebird-updater.sh"
@@ -375,6 +375,65 @@ check_dependencies() {
         info "Install with: sudo apt-get install ${missing[*]}"
         log "ERROR" "Missing dependencies: ${missing[*]}"
         exit ${E_DEPENDENCY}
+    fi
+}
+
+# Check for pending migrations and alert user if action needed
+# This detects breaking changes from updates that require migration
+check_pending_migrations() {
+    local migration_needed=false
+    local warnings=()
+
+    # Check for old stream manager script name in system locations
+    local old_script="/usr/local/bin/mediamtx-stream-manager.sh"
+    if [[ -f "$old_script" ]] && [[ ! -L "$old_script" ]]; then
+        migration_needed=true
+        warnings+=("Old script found: $old_script (should be lyrebird-stream-manager.sh)")
+    fi
+
+    # Check for old script name in systemd service
+    local service_file="/etc/systemd/system/mediamtx-audio.service"
+    if [[ -f "$service_file" ]]; then
+        if grep -q "mediamtx-stream-manager.sh" "$service_file" 2>/dev/null; then
+            migration_needed=true
+            warnings+=("Systemd service references old script name")
+        fi
+    fi
+
+    # Check for old log file without symlink
+    local old_log="/var/log/mediamtx-stream-manager.log"
+    if [[ -f "$old_log" ]] && [[ ! -L "$old_log" ]]; then
+        # This is just informational, not critical
+        log "INFO" "Old log file found: $old_log (will be migrated on next update)"
+    fi
+
+    # Check cron job
+    local cron_file="/etc/cron.d/mediamtx-monitor"
+    if [[ -f "$cron_file" ]]; then
+        if grep -q "mediamtx-stream-manager.sh" "$cron_file" 2>/dev/null; then
+            migration_needed=true
+            warnings+=("Cron job references old script name")
+        fi
+    fi
+
+    if [[ "$migration_needed" == "true" ]]; then
+        echo
+        warning "Migration needed: Script has been renamed to lyrebird-stream-manager.sh"
+        echo
+        for w in "${warnings[@]}"; do
+            echo "  - $w"
+        done
+        echo
+        info "To fix automatically, run one of:"
+        echo "  1. Quick Setup Wizard (Main Menu option 1)"
+        echo "  2. Reinstall Streaming Service (Stream Management -> Advanced)"
+        echo "  3. Update to latest version (Updates & Versions -> Check for Updates)"
+        echo
+        log "WARN" "Pending migrations detected: ${warnings[*]}"
+
+        # Give user time to read
+        read -r -t 10 -p "Press Enter to continue..." || true
+        echo
     fi
 }
 
@@ -1785,7 +1844,7 @@ menu_logs_status() {
                 echo
                 echo "Stream Manager Log (last 50 lines):"
                 echo "================================================================"
-                local stream_mgr_log="/var/log/mediamtx-stream-manager.log"
+                local stream_mgr_log="/var/log/lyrebird-stream-manager.log"
                 if [[ -f "$stream_mgr_log" ]]; then
                     tail -n 50 "$stream_mgr_log" 2>/dev/null || echo "Cannot read log file"
                 else
@@ -1974,6 +2033,9 @@ main() {
     if ! validate_script_versions; then
         log "WARN" "Version detection completed with warnings (non-blocking)"
     fi
+
+    # Check for pending migrations (alerts user if old script names detected)
+    check_pending_migrations
 
     # Initial system state detection
     refresh_system_state
