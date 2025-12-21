@@ -1462,7 +1462,7 @@ This modular design prevents duplicate business logic and ensures maintainabilit
 | `config/mediamtx.service` | systemd service for MediaMTX |
 | `config/mediamtx-audio.service` | systemd service for stream manager (with watchdog) |
 | `config/lyrebird-logrotate.conf` | Log rotation configuration |
-| `docs/SECURITY.md` | Security configuration guide (optional features) |
+| `docs/SECURITY-GUIDE.md` | Security configuration guide (optional features) |
 
 ### Orchestrator (lyrebird-orchestrator.sh)
 

@@ -50,7 +50,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `config/mediamtx.service`
   - `config/mediamtx-audio.service`
 - Log rotation configuration (`config/lyrebird-logrotate.conf`)
-- Security documentation (`docs/SECURITY.md`) with optional TLS/auth guides
+- Security documentation (`docs/SECURITY-GUIDE.md`) with optional TLS/auth guides
 - `.gitignore` file to prevent accidental sensitive data commits
 
 ### Changed
