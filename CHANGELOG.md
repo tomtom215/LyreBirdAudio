@@ -35,6 +35,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 - Improved inline documentation in `usb-audio-mapper.sh`
 - Enhanced error messages with remediation steps
+- `lyrebird-stream-manager.sh` updated to v1.4.4
+  - Restructured API validation to preserve curl exit status for better error detection
+  - Replaced `curl|grep` pattern with explicit exit code checking
 
 ## [1.4.2] - 2025-12-19
 
@@ -185,7 +188,7 @@ Each component maintains its own version:
 | Component | Current Version |
 |-----------|-----------------|
 | lyrebird-orchestrator.sh | 2.1.2 |
-| lyrebird-stream-manager.sh | 1.4.3 |
+| lyrebird-stream-manager.sh | 1.4.4 |
 | lyrebird-updater.sh | 1.6.0 |
 | usb-audio-mapper.sh | 1.2.1 |
 | lyrebird-diagnostics.sh | 1.0.2 |

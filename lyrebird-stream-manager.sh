@@ -10,10 +10,14 @@
 # This script automatically detects USB microphones and creates MediaMTX
 # configurations for continuous 24/7 RTSP audio streams.
 #
-# Version: 1.4.3 - Complete MediaMTX API integration
+# Version: 1.4.4 - Robustness improvements
 # Compatible with MediaMTX v1.15.0+
 #
 # Version History:
+# v1.4.4 - Robustness improvements
+#   - Restructured API validation to preserve curl exit status for better error detection
+#   - curl|grep pattern replaced with explicit exit code checking
+#
 # v1.4.3 - Complete MediaMTX v1.15.5 API integration
 #   API INTEGRATION:
 #   - Full REST API coverage for all MediaMTX v1.15.5 endpoints
@@ -2683,11 +2687,12 @@ validate_stream() {
 
         # Try API validation if curl available
         # v1.4.2: Use API version detection for compatibility
+        # v1.4.4: Restructured to preserve curl exit status for better error detection
         if command_exists curl; then
-            local api_base
+            local api_base api_response
             api_base=$(detect_mediamtx_api_version)
             local api_url="${api_base}/paths/get/${stream_path}"
-            if curl -s --max-time 2 "${api_url}" 2>/dev/null | grep -q '"ready":true'; then
+            if api_response=$(curl -s --max-time 2 "${api_url}" 2>/dev/null) && [[ "$api_response" == *'"ready":true'* ]]; then
                 log DEBUG "Stream $stream_path validated via API (attempt ${attempt})"
                 return 0
             fi
