@@ -7,7 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### ⚠️ Breaking Changes
+- **Script Renamed**: `mediamtx-stream-manager.sh` → `lyrebird-stream-manager.sh`
+  - Log file path changed: `/var/log/mediamtx-stream-manager.log` → `/var/log/lyrebird-stream-manager.log`
+  - **Automatic migration**: Running `lyrebird-updater.sh` will automatically update:
+    - Systemd service files
+    - Cron jobs
+    - `/usr/local/bin` installations
+    - Log file symlinks for backward compatibility
+  - **Manual migration**: Run `sudo ./lyrebird-updater.sh --migrate`
+
 ### Added
+- Automatic migration system in `lyrebird-updater.sh` v1.6.0
+  - Post-update migrations for breaking changes
+  - Idempotent migration tracking in `/var/lib/lyrebird/migrations/`
+  - CLI flag `--migrate` for manual migration runs
+- Migration detection in `lyrebird-orchestrator.sh`
+  - Startup warning when old script names detected
+  - Clear remediation steps for users
 - Webhook alerting system (`lyrebird-alerts.sh`) for remote monitoring
   - Supports Discord, Slack, ntfy.sh, Pushover, and generic HTTP webhooks
   - Rate limiting and alert deduplication

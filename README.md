@@ -1208,6 +1208,26 @@ LyreBirdAudio uses git-based version management via `lyrebird-updater.sh`:
 - Lock file prevents concurrent executions
 - Systemd service coordination (stops before update, reinstalls after)
 - Cron job update handling
+- **Automatic migrations** for breaking changes (script renames, path changes)
+
+### Migration Notes
+
+**Script Rename (v1.4.3+):** The stream manager was renamed for branding consistency:
+- `mediamtx-stream-manager.sh` → `lyrebird-stream-manager.sh`
+- Log file: `/var/log/mediamtx-stream-manager.log` → `/var/log/lyrebird-stream-manager.log`
+
+**Automatic Migration:** When you update using `lyrebird-updater.sh`, migrations run automatically:
+- Updates systemd service file references
+- Updates cron job references
+- Migrates `/usr/local/bin` installation
+- Creates backward-compatible log symlinks
+
+**Manual Migration:** If needed, you can run migrations manually:
+```bash
+sudo ./lyrebird-updater.sh --migrate
+```
+
+**Detection:** The orchestrator will warn you at startup if old script names are detected in your system.
 
 ### Version Requirements
 
