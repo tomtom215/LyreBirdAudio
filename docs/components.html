@@ -1,0 +1,582 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Component Reference - LyreBirdAudio Docs</title>
+  <meta name="description" content="Detailed reference for all LyreBirdAudio scripts and components.">
+  <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+
+<div id="sidebar-overlay" class="sidebar-overlay"></div>
+<aside id="sidebar" class="sidebar"></aside>
+
+<div class="content-wrapper">
+  <header id="topbar" class="topbar"></header>
+
+  <main class="content">
+    <div class="page-header">
+      <span class="page-label">Components</span>
+      <h1 class="page-title">Component Reference</h1>
+      <p class="page-subtitle">Detailed documentation for every script in the LyreBirdAudio suite.</p>
+    </div>
+
+    <div class="toc">
+      <div class="toc-title">Components</div>
+      <ul class="toc-list">
+        <li><a href="#overview">Quick Reference Table</a></li>
+        <li><a href="#orchestrator">Orchestrator</a></li>
+        <li><a href="#stream-manager">Stream Manager</a></li>
+        <li><a href="#usb-mapper">USB Audio Mapper</a></li>
+        <li><a href="#mic-check">Capability Checker</a></li>
+        <li><a href="#diagnostics">Diagnostics</a></li>
+        <li><a href="#installer">MediaMTX Installer</a></li>
+        <li><a href="#alerts">Webhook Alerts</a></li>
+        <li><a href="#metrics">Prometheus Metrics</a></li>
+        <li><a href="#storage">Storage Management</a></li>
+        <li><a href="#updater">Version Manager</a></li>
+        <li><a href="#common">Shared Library</a></li>
+      </ul>
+    </div>
+
+    <h2 id="overview">Quick Reference Table</h2>
+    <div class="table-wrapper">
+      <table>
+        <thead>
+          <tr><th>Script</th><th>Version</th><th>Purpose</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>lyrebird-orchestrator.sh</code></td><td><span class="version-badge">2.1.2</span></td><td>Unified management interface</td></tr>
+          <tr><td><code>lyrebird-stream-manager.sh</code></td><td><span class="version-badge">1.4.3</span></td><td>Stream lifecycle management</td></tr>
+          <tr><td><code>usb-audio-mapper.sh</code></td><td><span class="version-badge">1.2.1</span></td><td>USB device persistence via udev</td></tr>
+          <tr><td><code>lyrebird-mic-check.sh</code></td><td><span class="version-badge">1.0.0</span></td><td>Hardware capability detection</td></tr>
+          <tr><td><code>lyrebird-diagnostics.sh</code></td><td><span class="version-badge">1.0.2</span></td><td>System health diagnostics</td></tr>
+          <tr><td><code>install_mediamtx.sh</code></td><td><span class="version-badge">2.0.1</span></td><td>MediaMTX installation &amp; upgrade</td></tr>
+          <tr><td><code>lyrebird-alerts.sh</code></td><td><span class="version-badge">1.0.0</span></td><td>Webhook alerting system</td></tr>
+          <tr><td><code>lyrebird-metrics.sh</code></td><td><span class="version-badge">1.0.0</span></td><td>Prometheus metrics export</td></tr>
+          <tr><td><code>lyrebird-storage.sh</code></td><td><span class="version-badge">1.0.0</span></td><td>Storage management &amp; cleanup</td></tr>
+          <tr><td><code>lyrebird-updater.sh</code></td><td><span class="version-badge">1.5.1</span></td><td>Version management &amp; rollback</td></tr>
+          <tr><td><code>lyrebird-common.sh</code></td><td>—</td><td>Shared utility library</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <!-- ── ORCHESTRATOR ─────────────────────────────────────────── -->
+    <hr>
+    <h2 id="orchestrator">🎛️ Orchestrator</h2>
+    <p>
+      <strong><code>lyrebird-orchestrator.sh</code></strong> — Unified management interface that delegates
+      to all other scripts. This is the recommended entry point for all operations.
+    </p>
+
+    <h3>Usage</h3>
+    <pre><code>sudo ./lyrebird-orchestrator.sh</code></pre>
+
+    <h3>Features</h3>
+    <ul>
+      <li>Interactive TUI menu for all operations</li>
+      <li>Quick Setup Wizard for first-time configuration</li>
+      <li>Hardware capability inspection and display</li>
+      <li>SHA256 integrity verification for sourced scripts</li>
+      <li>Automatic detection of outdated script names</li>
+      <li>Comprehensive logging to <code>/var/log/lyrebird-orchestrator.log</code></li>
+    </ul>
+
+    <h3>Exit Codes</h3>
+    <div class="table-wrapper">
+      <table>
+        <thead><tr><th>Code</th><th>Meaning</th></tr></thead>
+        <tbody>
+          <tr><td>0</td><td>Success</td></tr>
+          <tr><td>1</td><td>General error</td></tr>
+          <tr><td>2</td><td>Permission denied</td></tr>
+          <tr><td>3</td><td>Missing dependencies</td></tr>
+          <tr><td>4</td><td>Script not found</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <!-- ── STREAM MANAGER ────────────────────────────────────────── -->
+    <hr>
+    <h2 id="stream-manager">📡 Stream Manager</h2>
+    <p>
+      <strong><code>lyrebird-stream-manager.sh</code></strong> — Core audio streaming script.
+      Detects USB microphones, manages FFmpeg processes, monitors stream health, and provides
+      automatic recovery with exponential backoff.
+    </p>
+
+    <h3>Usage</h3>
+    <pre><code># Individual streams (default)
+sudo ./lyrebird-stream-manager.sh start
+
+# Multiplex (mix all mics)
+sudo ./lyrebird-stream-manager.sh -m multiplex -f amix start
+
+# Multiplex (merge channels)
+sudo ./lyrebird-stream-manager.sh -m multiplex -f amerge start
+
+# Custom multiplex stream name
+sudo ./lyrebird-stream-manager.sh -m multiplex -n studio start</code></pre>
+
+    <h3>Commands</h3>
+    <div class="command-ref">
+      <div class="command-ref-header">Available Commands</div>
+      <div class="command-row"><span class="command-name">start</span><span class="command-desc">Start all configured streams</span></div>
+      <div class="command-row"><span class="command-name">stop</span><span class="command-desc">Gracefully stop all streams</span></div>
+      <div class="command-row"><span class="command-name">restart</span><span class="command-desc">Stop then start all streams</span></div>
+      <div class="command-row"><span class="command-name">status</span><span class="command-desc">Show stream status and process info</span></div>
+      <div class="command-row"><span class="command-name">monitor</span><span class="command-desc">Health check + restart failed streams (cron use)</span></div>
+      <div class="command-row"><span class="command-name">config</span><span class="command-desc">Display active stream configuration</span></div>
+      <div class="command-row"><span class="command-name">force-stop</span><span class="command-desc">Force kill all and clean stale files</span></div>
+      <div class="command-row"><span class="command-name">install</span><span class="command-desc">Install systemd service + cron monitoring</span></div>
+    </div>
+
+    <h3>Features</h3>
+    <ul>
+      <li>Wrapper-based FFmpeg supervision with exponential backoff (10s → 300s)</li>
+      <li>Health monitoring via MediaMTX REST API</li>
+      <li>Dual-lookup config (friendly name first, then full device ID, then defaults)</li>
+      <li>CPU, memory, and file descriptor monitoring</li>
+      <li>Lock file prevents concurrent executions</li>
+      <li>Graceful shutdown with process tree termination</li>
+      <li>Per-device FFmpeg log files with rotation</li>
+    </ul>
+
+    <h3>Exit Codes</h3>
+    <div class="table-wrapper">
+      <table>
+        <thead><tr><th>Code</th><th>Meaning</th></tr></thead>
+        <tbody>
+          <tr><td>0</td><td>Success</td></tr>
+          <tr><td>1</td><td>General error</td></tr>
+          <tr><td>2</td><td>Critical resource state (triggers restart)</td></tr>
+          <tr><td>3</td><td>Missing dependencies</td></tr>
+          <tr><td>4</td><td>Configuration error</td></tr>
+          <tr><td>5</td><td>Lock acquisition failed (another instance running)</td></tr>
+          <tr><td>6</td><td>No USB devices found</td></tr>
+          <tr><td>7</td><td>MediaMTX not running</td></tr>
+          <tr><td>10</td><td>Stream monitoring degraded</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <!-- ── USB MAPPER ────────────────────────────────────────────── -->
+    <hr>
+    <h2 id="usb-mapper">🔌 USB Audio Mapper</h2>
+    <p>
+      <strong><code>usb-audio-mapper.sh</code></strong> — Creates persistent udev rules that give
+      USB audio devices stable names across reboots, even when USB enumeration order changes.
+    </p>
+
+    <h3>Usage</h3>
+    <pre><code># Interactive mode (guided wizard)
+sudo ./usb-audio-mapper.sh
+
+# Non-interactive (for automation)
+sudo ./usb-audio-mapper.sh -n -d "Device" -v XXXX -p YYYY -f friendly-name
+
+# Test USB port detection
+sudo ./usb-audio-mapper.sh --test
+
+# Debug mode
+sudo ./usb-audio-mapper.sh --debug</code></pre>
+
+    <h3>Options</h3>
+    <div class="table-wrapper">
+      <table>
+        <thead><tr><th>Flag</th><th>Description</th></tr></thead>
+        <tbody>
+          <tr><td><code>-i, --interactive</code></td><td>Run in interactive mode (default)</td></tr>
+          <tr><td><code>-n, --non-interactive</code></td><td>Skip all prompts</td></tr>
+          <tr><td><code>-d, --device &lt;name&gt;</code></td><td>Device label for logging</td></tr>
+          <tr><td><code>-v, --vendor &lt;id&gt;</code></td><td>4-digit hex vendor ID</td></tr>
+          <tr><td><code>-p, --product &lt;id&gt;</code></td><td>4-digit hex product ID</td></tr>
+          <tr><td><code>-f, --friendly &lt;name&gt;</code></td><td>Friendly name for the stream</td></tr>
+          <tr><td><code>-t, --test</code></td><td>Test USB port detection without making changes</td></tr>
+          <tr><td><code>-D, --debug</code></td><td>Enable debug output</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h3>Output</h3>
+    <p>The script creates:</p>
+    <ul>
+      <li><code>/etc/udev/rules.d/99-usb-soundcards.rules</code> — udev rules file</li>
+      <li><code>/dev/snd/by-usb-port/Device_N</code> — Persistent symlinks (after reboot)</li>
+    </ul>
+
+    <div class="callout warning">
+      <span class="callout-icon">⚠️</span>
+      <div class="callout-body">
+        <strong>Reboot Required</strong>
+        <p>After mapping devices, a reboot is required for udev rules to take effect and persistent symlinks to be created. Do not skip this step.</p>
+      </div>
+    </div>
+
+    <!-- ── MIC CHECK ─────────────────────────────────────────────── -->
+    <hr>
+    <h2 id="mic-check">🎙️ Capability Checker</h2>
+    <p>
+      <strong><code>lyrebird-mic-check.sh</code></strong> — Non-invasively detects USB audio hardware
+      capabilities via the ALSA proc filesystem. Never opens devices (won't interrupt active streams).
+    </p>
+
+    <h3>Usage</h3>
+    <pre><code># List all detected devices
+./lyrebird-mic-check.sh
+
+# Show details for device index 0
+./lyrebird-mic-check.sh 0
+
+# Generate configuration file (recommended)
+sudo ./lyrebird-mic-check.sh -g --quality=normal
+
+# Validate existing configuration
+sudo ./lyrebird-mic-check.sh -V
+
+# JSON output for scripting
+./lyrebird-mic-check.sh --json
+
+# Restore configuration from backup
+sudo ./lyrebird-mic-check.sh --restore
+
+# Dry-run (preview without writing)
+./lyrebird-mic-check.sh -g --dry-run</code></pre>
+
+    <h3>What It Detects</h3>
+    <ul>
+      <li>Supported sample rates (16kHz, 44.1kHz, 48kHz, 96kHz, etc.)</li>
+      <li>Channel configurations (mono, stereo)</li>
+      <li>Supported audio formats and bit depths</li>
+      <li>Device busy state (non-destructively)</li>
+      <li>USB audio adapter chip type (with warnings for limited chips)</li>
+    </ul>
+
+    <div class="callout info">
+      <span class="callout-icon">ℹ️</span>
+      <div class="callout-body">
+        <strong>USB Audio Adapter Note</strong>
+        <p>For USB adapters with 3.5mm inputs, detected capabilities reflect the USB chip — not the microphone plugged into the analog jack. Always verify audio quality after configuration by checking actual recordings.</p>
+      </div>
+    </div>
+
+    <!-- ── DIAGNOSTICS ────────────────────────────────────────────── -->
+    <hr>
+    <h2 id="diagnostics">🩺 Diagnostics</h2>
+    <p>
+      <strong><code>lyrebird-diagnostics.sh</code></strong> — Comprehensive system health checker
+      with 20+ checks covering devices, services, connectivity, and resources.
+    </p>
+
+    <h3>Usage</h3>
+    <pre><code># Quick check (essential systems, fast)
+sudo ./lyrebird-diagnostics.sh quick
+
+# Full check (comprehensive analysis)
+sudo ./lyrebird-diagnostics.sh full
+
+# Debug check (maximum verbosity)
+sudo ./lyrebird-diagnostics.sh debug</code></pre>
+
+    <h3>Options</h3>
+    <div class="table-wrapper">
+      <table>
+        <thead><tr><th>Option</th><th>Description</th></tr></thead>
+        <tbody>
+          <tr><td><code>--config &lt;path&gt;</code></td><td>Specify alternate MediaMTX config file</td></tr>
+          <tr><td><code>--timeout &lt;seconds&gt;</code></td><td>Set command timeout (default: 30)</td></tr>
+          <tr><td><code>--debug</code></td><td>Enable verbose debug output</td></tr>
+          <tr><td><code>--quiet</code></td><td>Suppress non-error output</td></tr>
+          <tr><td><code>--no-color</code></td><td>Disable colored output</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h3>Exit Codes</h3>
+    <div class="table-wrapper">
+      <table>
+        <thead><tr><th>Code</th><th>Meaning</th></tr></thead>
+        <tbody>
+          <tr><td>0</td><td>All checks passed</td></tr>
+          <tr><td>1</td><td>Warnings detected (system functional but needs attention)</td></tr>
+          <tr><td>2</td><td>Failures detected (system degraded or non-functional)</td></tr>
+          <tr><td>127</td><td>Prerequisites missing (cannot complete diagnostics)</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <!-- ── INSTALLER ─────────────────────────────────────────────── -->
+    <hr>
+    <h2 id="installer">📦 MediaMTX Installer</h2>
+    <p>
+      <strong><code>install_mediamtx.sh</code></strong> — Downloads, verifies, and installs MediaMTX
+      with atomic updates and automatic rollback on failure.
+    </p>
+
+    <h3>Usage</h3>
+    <pre><code># Install latest version
+sudo ./install_mediamtx.sh install
+
+# Install specific version
+sudo ./install_mediamtx.sh -V v1.15.0 install
+
+# Update existing installation
+sudo ./install_mediamtx.sh update
+
+# Check current status
+./install_mediamtx.sh status
+
+# Verify installation integrity
+sudo ./install_mediamtx.sh verify
+
+# Uninstall MediaMTX
+sudo ./install_mediamtx.sh uninstall
+
+# Dry-run (show what would happen)
+sudo ./install_mediamtx.sh --dry-run install</code></pre>
+
+    <h3>Options</h3>
+    <div class="table-wrapper">
+      <table>
+        <thead><tr><th>Option</th><th>Description</th></tr></thead>
+        <tbody>
+          <tr><td><code>-V &lt;version&gt;</code></td><td>Install specific MediaMTX version (e.g., v1.15.0)</td></tr>
+          <tr><td><code>-p &lt;prefix&gt;</code></td><td>Custom installation prefix (default: /usr/local)</td></tr>
+          <tr><td><code>-f, --force</code></td><td>Force installation, skip verification</td></tr>
+          <tr><td><code>-n, --dry-run</code></td><td>Show actions without executing</td></tr>
+          <tr><td><code>-q, --quiet</code></td><td>Suppress non-error output</td></tr>
+          <tr><td><code>-v, --verbose</code></td><td>Enable debug output</td></tr>
+          <tr><td><code>--no-service</code></td><td>Skip systemd service creation</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h3>Features</h3>
+    <ul>
+      <li>Platform-aware: Linux (x86_64, ARM64, ARMv7, ARMv6), macOS, FreeBSD</li>
+      <li>SHA256 checksum verification of downloaded binaries</li>
+      <li>Atomic installation (writes to temp, then renames)</li>
+      <li>Automatic rollback if verification fails</li>
+      <li>Built-in upgrade support for MediaMTX 1.15.0+</li>
+      <li>Creates dedicated <code>mediamtx</code> service user</li>
+      <li>Generates default <code>mediamtx.yml</code> if not present</li>
+    </ul>
+
+    <!-- ── ALERTS ─────────────────────────────────────────────────── -->
+    <hr>
+    <h2 id="alerts">🔔 Webhook Alerts</h2>
+    <p>
+      <strong><code>lyrebird-alerts.sh</code></strong> — Pure-Bash webhook alerting with rate limiting
+      and deduplication. No new dependencies required.
+    </p>
+
+    <h3>Usage</h3>
+    <pre><code># Interactive setup wizard
+./lyrebird-alerts.sh setup
+
+# Send test alert
+./lyrebird-alerts.sh test
+
+# Send a custom alert
+./lyrebird-alerts.sh send --level warning --title "Alert" --message "Something happened"
+
+# Check configuration status
+./lyrebird-alerts.sh status
+
+# Show current config
+./lyrebird-alerts.sh config</code></pre>
+
+    <h3>Supported Webhook Types</h3>
+    <div class="table-wrapper">
+      <table>
+        <thead><tr><th>Type</th><th>Config Value</th><th>Notes</th></tr></thead>
+        <tbody>
+          <tr><td>Discord</td><td><code>discord</code></td><td>Rich embeds with color-coded severity</td></tr>
+          <tr><td>Slack</td><td><code>slack</code></td><td>Incoming webhook format</td></tr>
+          <tr><td>ntfy.sh</td><td><code>ntfy</code></td><td>Free, self-hostable push notifications</td></tr>
+          <tr><td>Pushover</td><td><code>pushover</code></td><td>Mobile push for iOS/Android</td></tr>
+          <tr><td>Generic HTTP</td><td><code>generic</code></td><td>Any HTTP POST endpoint</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h3>Configuration</h3>
+    <pre><code># /etc/lyrebird/alerts.conf
+LYREBIRD_ALERT_ENABLED=true
+LYREBIRD_WEBHOOK_URL="https://discord.com/api/webhooks/..."
+LYREBIRD_WEBHOOK_TYPE="discord"
+LYREBIRD_ALERT_RATE_LIMIT=300    # Seconds between duplicate alerts
+LYREBIRD_HOSTNAME="field-unit-1"
+LYREBIRD_LOCATION="North Forest"</code></pre>
+
+    <h3>Pre-Built Alert Functions</h3>
+    <pre><code># Source in your scripts
+source ./lyrebird-alerts.sh
+
+alert_stream_down "mic1" "FFmpeg process died"
+alert_stream_up "mic1"
+alert_device_disconnect "USB_Mic_2"
+alert_disk_warning "/" "82%"
+alert_mediamtx_down
+alert_network_down</code></pre>
+
+    <!-- ── METRICS ─────────────────────────────────────────────────── -->
+    <hr>
+    <h2 id="metrics">📊 Prometheus Metrics</h2>
+    <p>
+      <strong><code>lyrebird-metrics.sh</code></strong> — Exports operational metrics in
+      Prometheus/OpenMetrics text format for Grafana dashboards.
+    </p>
+
+    <h3>Usage</h3>
+    <pre><code># One-time metrics output (stdout)
+./lyrebird-metrics.sh
+
+# Start HTTP server (for Prometheus scraping)
+./lyrebird-metrics.sh serve --port 9100
+
+# Export only stream metrics
+./lyrebird-metrics.sh --streams-only
+
+# Export only system metrics
+./lyrebird-metrics.sh --system-only</code></pre>
+
+    <h3>Available Metrics</h3>
+    <pre><code># Service status
+lyrebird_mediamtx_up 1
+lyrebird_mediamtx_uptime_seconds 3600
+
+# Per-stream metrics
+lyrebird_stream_active{name="mic1"} 1
+lyrebird_stream_uptime_seconds{name="mic1"} 1800
+
+# USB device status
+lyrebird_usb_devices_total 3
+lyrebird_usb_device_connected{name="mic1"} 1
+
+# System resources
+lyrebird_cpu_usage_percent 15.5
+lyrebird_memory_usage_percent 45.2
+lyrebird_disk_usage_percent{mount="/"} 62
+lyrebird_load_average_1m 0.5</code></pre>
+
+    <h3>Prometheus Configuration</h3>
+    <pre><code># prometheus.yml
+scrape_configs:
+  - job_name: 'lyrebird'
+    static_configs:
+      - targets: ['field-unit-1:9100']
+    scrape_interval: 30s</code></pre>
+
+    <!-- ── STORAGE ─────────────────────────────────────────────────── -->
+    <hr>
+    <h2 id="storage">💾 Storage Management</h2>
+    <p>
+      <strong><code>lyrebird-storage.sh</code></strong> — Manages disk space with configurable
+      retention policies. Essential for long-running deployments.
+    </p>
+
+    <h3>Usage</h3>
+    <pre><code># Check storage status
+./lyrebird-storage.sh status
+
+# Run cleanup (respects retention policy)
+sudo ./lyrebird-storage.sh cleanup
+
+# Emergency cleanup (aggressive)
+sudo ./lyrebird-storage.sh emergency
+
+# Monitor mode (continuous)
+./lyrebird-storage.sh monitor --interval 300</code></pre>
+
+    <h3>Configuration</h3>
+    <pre><code># /etc/lyrebird/storage.conf
+RECORDING_RETENTION_DAYS=30   # Keep recordings for 30 days
+LOG_RETENTION_DAYS=7          # Keep logs for 7 days
+DISK_WARNING_PERCENT=80       # Warn at 80% disk usage
+DISK_CRITICAL_PERCENT=90      # Critical at 90% usage
+RECORDING_DIR="/var/recordings"
+LOG_DIR="/var/log/lyrebird"</code></pre>
+
+    <h3>Automated Cleanup</h3>
+    <pre><code># /etc/cron.d/lyrebird-storage
+0 3 * * * root /path/to/lyrebird-storage.sh cleanup --quiet
+*/15 * * * * root /path/to/lyrebird-storage.sh monitor --once</code></pre>
+
+    <!-- ── UPDATER ─────────────────────────────────────────────────── -->
+    <hr>
+    <h2 id="updater">🔄 Version Manager</h2>
+    <p>
+      <strong><code>lyrebird-updater.sh</code></strong> — Safe git-based version management with
+      transaction-based updates and automatic rollback.
+    </p>
+
+    <h3>Usage</h3>
+    <pre><code># Interactive menu
+./lyrebird-updater.sh
+
+# Check for updates
+./lyrebird-updater.sh --status
+
+# List available versions
+./lyrebird-updater.sh --list
+
+# Rollback to previous version
+./lyrebird-updater.sh --rollback
+
+# Run post-update migrations manually
+sudo ./lyrebird-updater.sh --migrate</code></pre>
+
+    <h3>Exit Codes</h3>
+    <div class="table-wrapper">
+      <table>
+        <thead><tr><th>Code</th><th>Meaning</th></tr></thead>
+        <tbody>
+          <tr><td>0</td><td>Success</td></tr>
+          <tr><td>2</td><td>Prerequisites not met</td></tr>
+          <tr><td>3</td><td>Not a git repository</td></tr>
+          <tr><td>5</td><td>Permission error</td></tr>
+          <tr><td>7</td><td>Locked (another instance running)</td></tr>
+          <tr><td>9</td><td>User aborted</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <!-- ── COMMON ─────────────────────────────────────────────────── -->
+    <hr>
+    <h2 id="common">📚 Shared Library</h2>
+    <p>
+      <strong><code>lyrebird-common.sh</code></strong> — Utility functions shared across all scripts
+      via sourcing. All scripts work with or without it (fallback definitions included).
+    </p>
+
+    <h3>Provided Functions</h3>
+    <div class="table-wrapper">
+      <table>
+        <thead><tr><th>Function</th><th>Purpose</th></tr></thead>
+        <tbody>
+          <tr><td><code>lyrebird_command_exists()</code></td><td>Check command availability (cached)</td></tr>
+          <tr><td><code>lyrebird_compute_hash()</code></td><td>Portable SHA256 hashing</td></tr>
+          <tr><td><code>log_debug() / log_info()</code></td><td>Logging with timestamps</td></tr>
+          <tr><td><code>log_warn() / log_error()</code></td><td>Warning and error logging</td></tr>
+          <tr><td><code>lyrebird_timestamp()</code></td><td>Formatted timestamp</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h3>Exit Code Constants</h3>
+    <pre><code>E_SUCCESS=0
+E_PERMISSION=2
+E_MISSING_DEPS=3
+E_CONFIG_ERROR=4
+E_LOCKED=5</code></pre>
+
+  </main>
+  <nav id="page-nav" class="page-nav"></nav>
+</div>
+
+<script src="js/nav.js"></script>
+<script src="js/search.js"></script>
+</body>
+</html>

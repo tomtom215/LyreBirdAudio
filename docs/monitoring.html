@@ -1,0 +1,346 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Monitoring & Diagnostics - LyreBirdAudio Docs</title>
+  <meta name="description" content="Health monitoring, diagnostics, performance optimization, and alerting for LyreBirdAudio.">
+  <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+
+<div id="sidebar-overlay" class="sidebar-overlay"></div>
+<aside id="sidebar" class="sidebar"></aside>
+
+<div class="content-wrapper">
+  <header id="topbar" class="topbar"></header>
+
+  <main class="content">
+    <div class="page-header">
+      <span class="page-label">Operations</span>
+      <h1 class="page-title">Monitoring &amp; Diagnostics</h1>
+      <p class="page-subtitle">Health checks, metrics, alerting, performance tuning, and long-term monitoring best practices.</p>
+    </div>
+
+    <div class="toc">
+      <div class="toc-title">On this page</div>
+      <ul class="toc-list">
+        <li><a href="#health-checking">Health Checking</a></li>
+        <li><a href="#check-categories">What Gets Checked</a></li>
+        <li><a href="#monitoring-best-practices">Monitoring Best Practices</a></li>
+        <li><a href="#prometheus">Prometheus Metrics</a></li>
+        <li><a href="#alerts">Webhook Alerting</a></li>
+        <li><a href="#performance">Performance &amp; Optimization</a></li>
+        <li><a href="#system-tuning">System Tuning</a></li>
+        <li><a href="#raspberry-pi">Raspberry Pi Optimization</a></li>
+      </ul>
+    </div>
+
+    <h2 id="health-checking">Health Checking</h2>
+    <p>
+      The <code>lyrebird-diagnostics.sh</code> script provides three diagnostic modes with increasing depth:
+    </p>
+
+    <div class="table-wrapper">
+      <table>
+        <thead>
+          <tr><th>Mode</th><th>Command</th><th>Use Case</th><th>Duration</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><strong>Quick</strong></td>
+            <td><code>sudo ./lyrebird-diagnostics.sh quick</code></td>
+            <td>Daily automated checks, pre-operation verification</td>
+            <td>~10 seconds</td>
+          </tr>
+          <tr>
+            <td><strong>Full</strong></td>
+            <td><code>sudo ./lyrebird-diagnostics.sh full</code></td>
+            <td>Weekly review, after configuration changes</td>
+            <td>~30 seconds</td>
+          </tr>
+          <tr>
+            <td><strong>Debug</strong></td>
+            <td><code>sudo ./lyrebird-diagnostics.sh debug</code></td>
+            <td>Troubleshooting failures, maximum verbosity</td>
+            <td>~60 seconds</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h3>Diagnostic Exit Codes</h3>
+    <div class="table-wrapper">
+      <table>
+        <thead><tr><th>Exit Code</th><th>Meaning</th><th>Action Required</th></tr></thead>
+        <tbody>
+          <tr><td>0</td><td>All checks passed</td><td>None</td></tr>
+          <tr><td>1</td><td>Warnings detected — system functional</td><td>Review warnings, plan maintenance</td></tr>
+          <tr><td>2</td><td>Failures detected — system degraded</td><td>Investigate and fix immediately</td></tr>
+          <tr><td>127</td><td>Prerequisites missing</td><td>Install missing dependencies</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h3>Orchestrator Integration</h3>
+    <p>Diagnostics are accessible from the Orchestrator menu without remembering commands:</p>
+    <ul>
+      <li><strong>Main Menu → 5 → 1</strong>: Quick health check</li>
+      <li><strong>Main Menu → 5 → 2</strong>: Full diagnostic</li>
+      <li><strong>Main Menu → 5 → 3</strong>: Debug diagnostic</li>
+    </ul>
+
+    <h2 id="check-categories">What Gets Checked</h2>
+
+    <div class="table-wrapper">
+      <table>
+        <thead><tr><th>Category</th><th>What's Verified</th></tr></thead>
+        <tbody>
+          <tr>
+            <td><strong>System</strong></td>
+            <td>OS type, kernel version, uptime, load average, memory &amp; CPU utilization</td>
+          </tr>
+          <tr>
+            <td><strong>Dependencies</strong></td>
+            <td>ffmpeg, arecord, jq, curl, lsusb, udevadm</td>
+          </tr>
+          <tr>
+            <td><strong>USB Audio Devices</strong></td>
+            <td>Detection, ALSA card availability, mapping status, port path validation, busy state</td>
+          </tr>
+          <tr>
+            <td><strong>MediaMTX Service</strong></td>
+            <td>Binary installation, config file validity, service status, API accessibility, port 8554 &amp; 9997</td>
+          </tr>
+          <tr>
+            <td><strong>Stream Status</strong></td>
+            <td>Active stream count, FFmpeg process validation, stream health &amp; uptime, per-stream resource usage</td>
+          </tr>
+          <tr>
+            <td><strong>RTSP Connectivity</strong></td>
+            <td>Port 8554 listening, protocol validation, test connection</td>
+          </tr>
+          <tr>
+            <td><strong>System Resources</strong></td>
+            <td>File descriptor usage, CPU per process, memory availability, disk space</td>
+          </tr>
+          <tr>
+            <td><strong>Log Analysis</strong></td>
+            <td>Error detection in recent logs, warnings, access patterns</td>
+          </tr>
+          <tr>
+            <td><strong>Time Sync</strong></td>
+            <td>NTP / Chrony service status, time drift detection</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h2 id="monitoring-best-practices">Monitoring Best Practices</h2>
+
+    <h3>Recommended Schedule</h3>
+    <pre><code># Add to /etc/cron.d/lyrebird-monitoring
+
+# Quick check every 5 minutes (via stream manager's install command)
+*/5 * * * * root /path/to/lyrebird-stream-manager.sh monitor
+
+# Full diagnostic daily at 6 AM
+0 6 * * * root /path/to/lyrebird-diagnostics.sh full >> /var/log/lyrebird-daily-check.log 2>&1
+
+# Storage cleanup daily at 3 AM
+0 3 * * * root /path/to/lyrebird-storage.sh cleanup --quiet</code></pre>
+
+    <div class="callout info">
+      <span class="callout-icon">ℹ️</span>
+      <div class="callout-body">
+        <strong>Auto-Installed Cron Job</strong>
+        <p>When you run <code>sudo ./lyrebird-stream-manager.sh install</code>, a cron job is automatically created at <code>/etc/cron.d/mediamtx-monitor</code> that runs health checks every 5 minutes. You don't need to set this up manually.</p>
+      </div>
+    </div>
+
+    <h3>Log Rotation</h3>
+    <p>Install the provided logrotate configuration to prevent log files from filling the disk:</p>
+    <pre><code># Install log rotation
+sudo cp config/lyrebird-logrotate.conf /etc/logrotate.d/lyrebird
+
+# Test configuration
+sudo logrotate -d /etc/logrotate.d/lyrebird
+
+# Force rotation (for testing)
+sudo logrotate -f /etc/logrotate.d/lyrebird</code></pre>
+
+    <h2 id="prometheus">Prometheus Metrics</h2>
+    <p>Export metrics for Grafana dashboards and alerting:</p>
+
+    <pre><code># Start HTTP metrics server
+./lyrebird-metrics.sh serve --port 9100
+
+# Or use as a textfile collector for node_exporter
+./lyrebird-metrics.sh > /var/lib/node_exporter/textfile_collector/lyrebird.prom</code></pre>
+
+    <h3>Grafana Dashboard Setup</h3>
+    <ol>
+      <li>Start the metrics server on port 9100</li>
+      <li>Add a Prometheus scrape job pointing to your server</li>
+      <li>Import a dashboard in Grafana using the <code>lyrebird_*</code> metrics</li>
+    </ol>
+
+    <p>Key metrics to dashboard:</p>
+    <ul>
+      <li><code>lyrebird_stream_active</code> — Alert when 0</li>
+      <li><code>lyrebird_mediamtx_up</code> — Alert when 0</li>
+      <li><code>lyrebird_disk_usage_percent</code> — Alert when &gt; 80%</li>
+      <li><code>lyrebird_cpu_usage_percent</code> — Alert when &gt; 80%</li>
+      <li><code>lyrebird_usb_device_connected</code> — Alert when 0</li>
+    </ul>
+
+    <h2 id="alerts">Webhook Alerting</h2>
+
+    <h3>Setup</h3>
+    <pre><code># Interactive webhook setup
+./lyrebird-alerts.sh setup
+
+# Test your webhook
+./lyrebird-alerts.sh test</code></pre>
+
+    <h3>What Events Trigger Alerts</h3>
+    <ul>
+      <li>Stream goes down or comes back up</li>
+      <li>USB device disconnects or reconnects</li>
+      <li>Disk usage exceeds warning/critical thresholds</li>
+      <li>MediaMTX service goes down or recovers</li>
+      <li>Network connectivity lost or restored</li>
+    </ul>
+
+    <h3>Rate Limiting</h3>
+    <p>
+      Alerts are rate-limited by default to prevent spam. Duplicate alerts within the configured window
+      (default: 300 seconds) are suppressed. Adjust in <code>/etc/lyrebird/alerts.conf</code>:
+    </p>
+    <pre><code>LYREBIRD_ALERT_RATE_LIMIT=300  # Seconds between duplicate alerts</code></pre>
+
+    <hr>
+    <h2 id="performance">Performance &amp; Optimization</h2>
+
+    <h3>Codec Selection</h3>
+    <div class="table-wrapper">
+      <table>
+        <thead><tr><th>Codec</th><th>Efficiency</th><th>Latency</th><th>Best For</th></tr></thead>
+        <tbody>
+          <tr><td>Opus</td><td>Best quality/bitrate ratio</td><td>Very low</td><td>All use cases (recommended)</td></tr>
+          <tr><td>AAC</td><td>Good</td><td>Moderate</td><td>Wide client compatibility</td></tr>
+          <tr><td>PCM</td><td>Lossless (highest bandwidth)</td><td>Lowest</td><td>Post-processing pipelines</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h3>Sample Rate Selection</h3>
+    <div class="table-wrapper">
+      <table>
+        <thead><tr><th>Sample Rate</th><th>CPU Impact</th><th>Bandwidth</th><th>Use Case</th></tr></thead>
+        <tbody>
+          <tr><td>16,000 Hz</td><td>Lowest</td><td>Lowest</td><td>Speech, monitoring</td></tr>
+          <tr><td>44,100 Hz</td><td>Low</td><td>Low</td><td>CD quality, general</td></tr>
+          <tr><td>48,000 Hz</td><td>Normal</td><td>Moderate</td><td>Professional standard (default)</td></tr>
+          <tr><td>96,000 Hz</td><td>High</td><td>High</td><td>High-res audio</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h3>Bitrate Tuning</h3>
+    <div class="table-wrapper">
+      <table>
+        <thead><tr><th>Bitrate</th><th>Bandwidth per Stream per Client</th><th>Quality</th></tr></thead>
+        <tbody>
+          <tr><td>64 kbps</td><td>~8 KB/s</td><td>Acceptable for speech</td></tr>
+          <tr><td>96 kbps</td><td>~12 KB/s</td><td>Good for speech</td></tr>
+          <tr><td>128 kbps</td><td>~16 KB/s</td><td>Good for speech &amp; music (default)</td></tr>
+          <tr><td>192 kbps</td><td>~24 KB/s</td><td>High quality</td></tr>
+          <tr><td>256 kbps</td><td>~32 KB/s</td><td>Very high quality</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h3>Resource Usage Estimates</h3>
+    <div class="table-wrapper">
+      <table>
+        <thead><tr><th>Component</th><th>Base RAM</th><th>Per Stream</th></tr></thead>
+        <tbody>
+          <tr><td>MediaMTX</td><td>~50–100 MB</td><td>~10 MB per active path</td></tr>
+          <tr><td>FFmpeg</td><td>—</td><td>~50–100 MB per stream</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h3>Thread Queue Tuning</h3>
+    <p>For high stream counts (4+), increase the thread queue size to reduce buffer underruns:</p>
+    <pre><code># In /etc/mediamtx/audio-devices.conf
+DEFAULT_THREAD_QUEUE=16384  # Default is 8192</code></pre>
+
+    <h2 id="system-tuning">System Tuning</h2>
+
+    <h3>File Descriptor Limits</h3>
+    <pre><code># Check current limits
+ulimit -n
+
+# Increase limits (add to /etc/security/limits.conf)
+echo "* soft nofile 8192" | sudo tee -a /etc/security/limits.conf
+echo "* hard nofile 16384" | sudo tee -a /etc/security/limits.conf
+echo "mediamtx soft nofile 4096" | sudo tee -a /etc/security/limits.conf
+echo "mediamtx hard nofile 8192" | sudo tee -a /etc/security/limits.conf
+
+# Apply (requires reboot)
+sudo reboot</code></pre>
+
+    <h3>Network Buffer Sizes</h3>
+    <pre><code># Increase UDP buffer sizes for streaming
+sudo sysctl -w net.core.rmem_max=26214400
+sudo sysctl -w net.core.wmem_max=26214400
+
+# Make permanent
+echo "net.core.rmem_max=26214400" | sudo tee -a /etc/sysctl.conf
+echo "net.core.wmem_max=26214400" | sudo tee -a /etc/sysctl.conf
+sudo sysctl -p</code></pre>
+
+    <h3>USB Power Management</h3>
+    <pre><code># Disable USB auto-suspend (prevents devices going to sleep)
+echo -1 | sudo tee /sys/bus/usb/devices/*/power/autosuspend
+
+# Make permanent via udev rule
+echo 'ACTION=="add", SUBSYSTEM=="usb", ATTR{idVendor}=="YOUR_VID", ATTR{power/autosuspend}="-1"' \
+  | sudo tee /etc/udev/rules.d/50-usb-power.rules</code></pre>
+
+    <h2 id="raspberry-pi">Raspberry Pi Optimization</h2>
+
+    <div class="callout warning">
+      <span class="callout-icon">⚠️</span>
+      <div class="callout-body">
+        <strong>USB Bandwidth Limitations</strong>
+        <p>Raspberry Pi shares USB bandwidth across all ports. This limits reliable operation to 1–2 USB microphones. For 4+ microphones, use an Intel N100 or similar mini PC ($100–150) with proper USB controller topology.</p>
+      </div>
+    </div>
+
+    <pre><code># Use low-quality settings for Raspberry Pi
+sudo ./lyrebird-mic-check.sh -g --quality=low
+
+# Consider mono recording to halve bandwidth
+DEFAULT_CHANNELS=1
+
+# Reduce stream count to 1-2 maximum</code></pre>
+
+    <h3>Raspberry Pi Recommended Settings</h3>
+    <pre><code># /etc/mediamtx/audio-devices.conf (Raspberry Pi)
+DEFAULT_SAMPLE_RATE=16000    # or 44100 at most
+DEFAULT_CHANNELS=1           # Mono to reduce CPU
+DEFAULT_BITRATE=64k          # Low bitrate
+DEFAULT_CODEC=opus
+DEFAULT_THREAD_QUEUE=4096    # Smaller queue to reduce memory</code></pre>
+
+  </main>
+  <nav id="page-nav" class="page-nav"></nav>
+</div>
+
+<script src="js/nav.js"></script>
+<script src="js/search.js"></script>
+</body>
+</html>

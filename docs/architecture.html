@@ -1,0 +1,323 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Architecture - LyreBirdAudio Docs</title>
+  <meta name="description" content="System architecture, component diagrams, and Architecture Decision Records for LyreBirdAudio.">
+  <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+
+<div id="sidebar-overlay" class="sidebar-overlay"></div>
+<aside id="sidebar" class="sidebar"></aside>
+
+<div class="content-wrapper">
+  <header id="topbar" class="topbar"></header>
+
+  <main class="content">
+    <div class="page-header">
+      <span class="page-label">Reference</span>
+      <h1 class="page-title">Architecture &amp; Design</h1>
+      <p class="page-subtitle">System design principles, component interactions, and the rationale behind key architectural decisions.</p>
+    </div>
+
+    <div class="toc">
+      <div class="toc-title">On this page</div>
+      <ul class="toc-list">
+        <li><a href="#philosophy">Design Philosophy</a></li>
+        <li><a href="#system-overview">System Architecture</a></li>
+        <li><a href="#management-arch">Management Architecture</a></li>
+        <li><a href="#data-flow">Data Flow</a></li>
+        <li><a href="#adrs">Architecture Decision Records</a></li>
+      </ul>
+    </div>
+
+    <h2 id="philosophy">Design Philosophy</h2>
+
+    <h3>Why Bash?</h3>
+    <p>
+      Bash is pre-installed on virtually every Linux system. Choosing Bash means: no pip/npm/gem
+      conflicts, no version mismatches, no build processes, no containers. Deployment is:
+      <em>git clone, chmod +x, run</em>.
+    </p>
+    <p>
+      This choice eliminates entire categories of deployment failures that are common with Python,
+      Node.js, or Ruby-based tools — especially on minimal embedded systems like Raspberry Pi.
+    </p>
+
+    <h3>Why Not Docker?</h3>
+    <p>
+      USB device management requires host-level udev rule creation and direct USB subsystem access.
+      Containers add complexity that conflicts with physical USB port mapping, which is a core feature.
+      LyreBirdAudio is designed for dedicated bare-metal hosts where systemd services provide
+      sufficient process isolation.
+    </p>
+
+    <h3>Single-Responsibility Principle</h3>
+    <p>Each script has exactly one domain:</p>
+    <ul>
+      <li><strong>Orchestrator</strong>: User interface and delegation only — no business logic</li>
+      <li><strong>Stream Manager</strong>: FFmpeg process management</li>
+      <li><strong>USB Mapper</strong>: Device persistence via udev</li>
+      <li><strong>Capability Checker</strong>: Hardware capability detection</li>
+      <li><strong>Updater</strong>: Version management</li>
+      <li><strong>Diagnostics</strong>: System health validation</li>
+      <li><strong>Installer</strong>: MediaMTX lifecycle</li>
+    </ul>
+    <p>This modularity prevents duplicate business logic, simplifies testing, and ensures maintainability.</p>
+
+    <h2 id="system-overview">System Architecture</h2>
+    <p>The full system stack from physical devices to client applications:</p>
+
+    <pre><code>+----------------------------------------------------------+
+|                     Client Applications                  |
+|            (VLC, FFplay, OBS, Custom RTSP Clients)       |
++--------------------+-------------------------------------+
+                     | RTSP://host:8554/DeviceName
+                     ▼
++----------------------------------------------------------+
+|                       MediaMTX                           |
+|                  (Real-time Media Server)                |
+|  ┌────────────────────────────────────────────────────┐  |
+|  │  RTSP Server (port 8554)                           │  |
+|  │  HTTP API (port 9997)                              │  |
+|  │  WebRTC (port 8889)                                │  |
+|  │  RTP/RTCP (ports 8000-8001)                        │  |
+|  └────────────────────────────────────────────────────┘  |
++--------------------+-------------------------------------+
+                     | Managed by
+                     ▼
++----------------------------------------------------------+
+|              Stream Manager + systemd                    |
+|  ┌────────────────────────────────────────────────────┐  |
+|  │  Process lifecycle management                      │  |
+|  │  Automatic stream recovery (exp. backoff)          │  |
+|  │  Health monitoring via MediaMTX API                │  |
+|  │  Resource monitoring (CPU, FD, memory)             │  |
+|  └────────────────────────────────────────────────────┘  |
++--------------------+-------------------------------------+
+                     | Captures from
+                     ▼
++----------------------------------------------------------+
+|                  FFmpeg Audio Pipeline                   |
+|  ┌────────────────────────────────────────────────────┐  |
+|  │  ALSA capture (hw:Device_N)                        │  |
+|  │  Audio encoding (Opus/AAC/PCM)                     │  |
+|  │  RTSP publishing to MediaMTX                       │  |
+|  │  Thread queue buffering                            │  |
+|  └────────────────────────────────────────────────────┘  |
++--------------------+-------------------------------------+
+                     | Reads from
+                     ▼
++----------------------------------------------------------+
+|              Persistent Device Layer (udev)              |
+|  ┌────────────────────────────────────────────────────┐  |
+|  │  /dev/snd/by-usb-port/Device_1 → /dev/snd/pcmC0D0c│  |
+|  │  /dev/snd/by-usb-port/Device_2 → /dev/snd/pcmC1D0c│  |
+|  │  Consistent naming across reboots                  │  |
+|  └────────────────────────────────────────────────────┘  |
++--------------------+-------------------------------------+
+                     | Physical layer
+                     ▼
++----------------------------------------------------------+
+|               Physical USB Audio Devices                 |
+|  ┌────────────────────────────────────────────────────┐  |
+|  │  USB Port 1-1.4: USB Microphone                    │  |
+|  │  USB Port 1-1.5: USB Audio Interface               │  |
+|  │  USB Port 2-1.2: USB Microphone                    │  |
+|  └────────────────────────────────────────────────────┘  |
++----------------------------------------------------------+</code></pre>
+
+    <h2 id="management-arch">Management Architecture</h2>
+    <p>The Orchestrator is the single management entry point, delegating to specialized scripts:</p>
+
+    <pre><code>lyrebird-orchestrator.sh (Unified Interface)
+│
+├── install_mediamtx.sh
+│     MediaMTX installation/upgrade lifecycle
+│     Atomic install with checksum verification &amp; rollback
+│
+├── lyrebird-stream-manager.sh
+│     FFmpeg process management
+│     Stream health + auto-recovery
+│     Individual + multiplex modes
+│
+├── usb-audio-mapper.sh
+│     USB device detection via lsusb
+│     udev rule generation
+│     Persistent naming across reboots
+│
+├── lyrebird-mic-check.sh
+│     Hardware capability detection (non-invasive)
+│     ALSA format enumeration via /proc/asound
+│     Configuration generation &amp; validation
+│
+├── lyrebird-updater.sh
+│     Git-based version management
+│     Transaction-based updates with rollback
+│     Post-update migration system
+│
+├── lyrebird-diagnostics.sh
+│     20+ system health checks
+│     USB, MediaMTX, streams, resources
+│     Quick / full / debug modes
+│
+├── lyrebird-alerts.sh
+│     Webhook notifications
+│     Discord, Slack, ntfy, Pushover
+│     Rate limiting &amp; deduplication
+│
+├── lyrebird-metrics.sh
+│     Prometheus metrics export
+│     HTTP server mode for scraping
+│
+└── lyrebird-storage.sh
+      Disk space management
+      Retention policy enforcement</code></pre>
+
+    <h2 id="data-flow">Data Flow</h2>
+
+    <h3>Stream Startup Sequence</h3>
+    <ol>
+      <li>Stream manager reads <code>/etc/mediamtx/audio-devices.conf</code></li>
+      <li>Scans <code>/dev/snd/by-usb-port/</code> for available devices</li>
+      <li>For each device, looks up config (friendly name → full ID → defaults)</li>
+      <li>Starts MediaMTX if not running</li>
+      <li>Launches FFmpeg wrapper for each device</li>
+      <li>Wrapper supervises FFmpeg with exponential backoff restart logic</li>
+      <li>MediaMTX API confirms stream is active</li>
+      <li>Cron job monitors health every 5 minutes via <code>monitor</code> command</li>
+    </ol>
+
+    <h3>Exponential Backoff Recovery</h3>
+    <pre><code>Attempt 1: Wait 10s before restart
+Attempt 2: Wait 20s
+Attempt 3: Wait 40s
+...
+Max delay: 300s (5 minutes)
+
+After 300s of stable operation: reset backoff counter
+After MAX_CONSECUTIVE_FAILURES: alert and stop retrying</code></pre>
+
+    <h3>USB Device Persistence Flow</h3>
+    <ol>
+      <li>USB device connected to physical port</li>
+      <li>Kernel assigns <code>/dev/snd/pcmC0D0c</code> (order may vary)</li>
+      <li>udev rule matches: <code>SUBSYSTEM=="sound", ATTRS{idVendor}=="XXXX", ENV{ID_PATH}=="..."</code></li>
+      <li>udev creates symlink: <code>/dev/snd/by-usb-port/Device_1 → ../pcmC0D0c</code></li>
+      <li>FFmpeg uses symlink path — always <code>/dev/snd/by-usb-port/Device_1</code></li>
+      <li>On next boot: symlink is recreated in same location regardless of enumeration order</li>
+    </ol>
+
+    <h2 id="adrs">Architecture Decision Records</h2>
+    <p>Key technical decisions and their rationale:</p>
+
+    <h3>ADR-001: Bash as Primary Language</h3>
+    <dl>
+      <dt>Decision</dt>
+      <dd>Bash 4.0+ for all scripts</dd>
+      <dt>Rationale</dt>
+      <dd>Universal availability on Linux, zero runtime dependencies, native system integration, easy to audit, familiar to sysadmins</dd>
+      <dt>Trade-offs</dt>
+      <dd>Limited to Linux/Unix; more verbose than Python for complex logic; requires careful quoting discipline</dd>
+    </dl>
+
+    <h3>ADR-002: MediaMTX as RTSP Server</h3>
+    <dl>
+      <dt>Decision</dt>
+      <dd>MediaMTX (formerly rtsp-simple-server) as the RTSP server</dd>
+      <dt>Rationale</dt>
+      <dd>Single binary deployment, low resource usage (suitable for Pi), REST API for programmatic control, supports RTSP/WebRTC/HLS, active development</dd>
+      <dt>Trade-offs</dt>
+      <dd>External dependency; must handle API version changes</dd>
+    </dl>
+
+    <h3>ADR-003: FFmpeg for Audio Transcoding</h3>
+    <dl>
+      <dt>Decision</dt>
+      <dd>FFmpeg as the audio capture and encoding pipeline</dd>
+      <dt>Rationale</dt>
+      <dd>Native ALSA support, codec flexibility, battle-tested stability, configurable for quality/performance trade-offs</dd>
+      <dt>Trade-offs</dt>
+      <dd>Must be installed; process lifecycle management complexity</dd>
+    </dl>
+
+    <h3>ADR-004: Shared Library Pattern</h3>
+    <dl>
+      <dt>Decision</dt>
+      <dd><code>lyrebird-common.sh</code> sourced by all scripts</dd>
+      <dt>Rationale</dt>
+      <dd>DRY principle, consistent logging format, backward compatibility via override pattern</dd>
+      <dt>Trade-offs</dt>
+      <dd>Must maintain backward compatibility; source order matters</dd>
+    </dl>
+
+    <h3>ADR-005: Atomic File Operations</h3>
+    <dl>
+      <dt>Decision</dt>
+      <dd>Write to <code>.tmp</code> file, then <code>mv</code> to final location</dd>
+      <dt>Rationale</dt>
+      <dd>Prevents partial reads by concurrent processes; POSIX guarantees <code>mv</code> on same filesystem is atomic; crash-safe</dd>
+      <dt>Trade-offs</dt>
+      <dd>Slightly more complex code; stale <code>.tmp</code> cleanup needed</dd>
+    </dl>
+
+    <h3>ADR-006: udev for Device Persistence</h3>
+    <dl>
+      <dt>Decision</dt>
+      <dd>udev rules create persistent symlinks by USB port topology</dd>
+      <dt>Rationale</dt>
+      <dd>Kernel-integrated, no daemon required, survives reboots and reconnections</dd>
+      <dt>Trade-offs</dt>
+      <dd>Root required to install rules; USB hub changes require remapping; reboot needed</dd>
+    </dl>
+
+    <h3>ADR-007: Webhook-Based Alerting</h3>
+    <dl>
+      <dt>Decision</dt>
+      <dd>Pure-Bash webhook support for Discord, Slack, ntfy, Pushover</dd>
+      <dt>Rationale</dt>
+      <dd>Users choose their own notification platform; no email/SMS infrastructure required; easy to extend</dd>
+      <dt>Trade-offs</dt>
+      <dd>Requires network connectivity; rate limiting needed to prevent spam</dd>
+    </dl>
+
+    <h3>ADR-008: Prometheus Metrics Format</h3>
+    <dl>
+      <dt>Decision</dt>
+      <dd>Export metrics in Prometheus/OpenMetrics text format</dd>
+      <dt>Rationale</dt>
+      <dd>Industry standard, plain text (easy to debug), wide ecosystem (Grafana, AlertManager)</dd>
+      <dt>Trade-offs</dt>
+      <dd>Must maintain metric naming conventions; metric cardinality control required</dd>
+    </dl>
+
+    <h3>ADR-009: Lockfile Concurrency Control</h3>
+    <dl>
+      <dt>Decision</dt>
+      <dd>Lockfiles prevent concurrent script execution</dd>
+      <dt>Rationale</dt>
+      <dd>Simple, debuggable, atomic acquisition via <code>mkdir</code> or <code>flock</code></dd>
+      <dt>Trade-offs</dt>
+      <dd>Stale locks possible after crash; cleanup logic required</dd>
+    </dl>
+
+    <h3>ADR-010: Signal Handler Pattern</h3>
+    <dl>
+      <dt>Decision</dt>
+      <dd><code>trap cleanup EXIT INT TERM HUP QUIT</code> in all long-running scripts</dd>
+      <dt>Rationale</dt>
+      <dd>Ensures cleanup (remove locks, kill child processes) on all exit paths</dd>
+      <dt>Trade-offs</dt>
+      <dd>More complex code; cleanup must be idempotent</dd>
+    </dl>
+
+  </main>
+  <nav id="page-nav" class="page-nav"></nav>
+</div>
+
+<script src="js/nav.js"></script>
+<script src="js/search.js"></script>
+</body>
+</html>

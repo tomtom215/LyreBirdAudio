@@ -1,0 +1,213 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Changelog - LyreBirdAudio Docs</title>
+  <meta name="description" content="Version history and release notes for LyreBirdAudio.">
+  <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+
+<div id="sidebar-overlay" class="sidebar-overlay"></div>
+<aside id="sidebar" class="sidebar"></aside>
+
+<div class="content-wrapper">
+  <header id="topbar" class="topbar"></header>
+
+  <main class="content">
+    <div class="page-header">
+      <span class="page-label">Reference</span>
+      <h1 class="page-title">Changelog</h1>
+      <p class="page-subtitle">All notable changes, releases, and breaking changes. Follows <a href="https://keepachangelog.com/en/1.0.0/" target="_blank" rel="noopener">Keep a Changelog</a> and <a href="https://semver.org/" target="_blank" rel="noopener">Semantic Versioning</a>.</p>
+    </div>
+
+    <!-- Unreleased -->
+    <h2 id="unreleased">Unreleased</h2>
+
+    <div class="callout warning">
+      <span class="callout-icon">⚠️</span>
+      <div class="callout-body">
+        <strong>Breaking Change: Script Renamed</strong>
+        <p><code>mediamtx-stream-manager.sh</code> has been renamed to <code>lyrebird-stream-manager.sh</code>. Log file path changed from <code>/var/log/mediamtx-stream-manager.log</code> to <code>/var/log/lyrebird-stream-manager.log</code>.</p>
+        <p><strong>Automatic migration:</strong> Run <code>./lyrebird-updater.sh</code> — migrations update systemd service files, cron jobs, <code>/usr/local/bin</code> installations, and create backward-compatible log symlinks.</p>
+        <p><strong>Manual migration:</strong> <code>sudo ./lyrebird-updater.sh --migrate</code></p>
+      </div>
+    </div>
+
+    <h3>Added</h3>
+    <ul>
+      <li>Automatic migration system in <code>lyrebird-updater.sh</code> v1.6.0
+        <ul>
+          <li>Post-update migrations for breaking changes</li>
+          <li>Idempotent migration tracking in <code>/var/lib/lyrebird/migrations/</code></li>
+          <li>CLI flag <code>--migrate</code> for manual migration runs</li>
+        </ul>
+      </li>
+      <li>Migration detection in <code>lyrebird-orchestrator.sh</code>
+        <ul>
+          <li>Startup warning when old script names detected</li>
+          <li>Clear remediation steps</li>
+        </ul>
+      </li>
+      <li>Webhook alerting system (<code>lyrebird-alerts.sh</code>) for remote monitoring
+        <ul>
+          <li>Supports Discord, Slack, ntfy.sh, Pushover, and generic HTTP webhooks</li>
+          <li>Rate limiting and alert deduplication</li>
+          <li>Pure bash implementation with no new dependencies</li>
+        </ul>
+      </li>
+      <li><code>CHANGELOG.md</code> to track version history</li>
+      <li><code>CONTRIBUTING.md</code> with contribution guidelines</li>
+    </ul>
+
+    <h3>Changed</h3>
+    <ul>
+      <li>Improved inline documentation in <code>usb-audio-mapper.sh</code></li>
+      <li>Enhanced error messages with remediation steps</li>
+      <li><code>lyrebird-stream-manager.sh</code> v1.4.4 — Restructured API validation to preserve curl exit status; replaced <code>curl|grep</code> pattern with explicit exit code checking</li>
+    </ul>
+
+    <hr>
+
+    <!-- v1.4.2 -->
+    <h2 id="v142"><span class="version-badge">v1.4.2</span> — 2025-12-19</h2>
+
+    <h3>Added</h3>
+    <ul>
+      <li>Prometheus metrics export (<code>lyrebird-metrics.sh</code>)</li>
+      <li>Storage management with configurable retention (<code>lyrebird-storage.sh</code>)</li>
+      <li>Comprehensive test suite (~90 tests, ~50% coverage)
+        <ul>
+          <li><code>test_usb_audio_mapper.bats</code> — 15 tests</li>
+          <li><code>test_lyrebird_diagnostics.bats</code> — 16 tests</li>
+          <li><code>test_lyrebird_orchestrator.bats</code> — 14 tests</li>
+          <li><code>test_stream_manager.bats</code> — 32 tests</li>
+        </ul>
+      </li>
+      <li>systemd service files with watchdog support
+        <ul>
+          <li><code>config/mediamtx.service</code></li>
+          <li><code>config/mediamtx-audio.service</code></li>
+        </ul>
+      </li>
+      <li>Log rotation configuration (<code>config/lyrebird-logrotate.conf</code>)</li>
+      <li>Security documentation (<code>docs/SECURITY-GUIDE.md</code>) with optional TLS/auth guides</li>
+      <li><code>.gitignore</code> file to prevent accidental sensitive data commits</li>
+    </ul>
+
+    <h3>Changed</h3>
+    <ul>
+      <li>Updated stream manager to v1.4.2</li>
+      <li>README updated with new scripts and configuration files</li>
+    </ul>
+
+    <hr>
+
+    <!-- v1.4.1 -->
+    <h2 id="v141"><span class="version-badge">v1.4.1</span> — 2025-12</h2>
+
+    <h3>Added</h3>
+    <ul>
+      <li>Friendly name support for device configuration in stream manager</li>
+      <li>Dual-lookup config system (friendly names and full device IDs)</li>
+    </ul>
+
+    <h3>Fixed</h3>
+    <ul>
+      <li>Device configuration lookup now tries friendly name first, then full ID</li>
+    </ul>
+
+    <hr>
+
+    <!-- v1.4.0 -->
+    <h2 id="v140"><span class="version-badge">v1.4.0</span> — 2025-12</h2>
+
+    <h3>Added</h3>
+    <ul>
+      <li>Production stability and monitoring enhancements</li>
+      <li>Heartbeat/watchdog integration with systemd</li>
+      <li>Network connectivity monitoring</li>
+      <li>Resource threshold monitoring (CPU, memory, file descriptors)</li>
+    </ul>
+
+    <h3>Changed</h3>
+    <ul>
+      <li>Improved stream recovery with exponential backoff</li>
+      <li>Better cron-based health monitoring</li>
+    </ul>
+
+    <hr>
+
+    <!-- Orchestrator versions -->
+    <h2 id="orchestrator-versions">Orchestrator History</h2>
+
+    <h3><span class="version-badge">v2.1.2</span></h3>
+    <ul>
+      <li>Fixed broken integrations found in verification testing</li>
+      <li>Improved menu navigation and user feedback</li>
+    </ul>
+
+    <h3><span class="version-badge">v2.1.0</span></h3>
+    <ul>
+      <li>Added microphone capability detection integration</li>
+      <li>Security hardening for external script calls</li>
+      <li>SHA256 integrity checking for sourced scripts</li>
+      <li>Improved hardware capability display</li>
+    </ul>
+
+    <hr>
+
+    <!-- USB Mapper -->
+    <h2 id="usb-mapper-versions">USB Audio Mapper History</h2>
+
+    <h3><span class="version-badge">v1.2.1</span></h3>
+    <ul>
+      <li><strong>Fixed:</strong> USB port detection bug causing incorrect device-to-port mapping</li>
+      <li><strong>Fixed:</strong> Improved physical port path resolution</li>
+    </ul>
+
+    <hr>
+
+    <!-- Updater -->
+    <h2 id="updater-versions">Version Manager History</h2>
+
+    <h3><span class="version-badge">v1.5.1</span></h3>
+    <ul>
+      <li>Pre-execution syntax validation for self-updates</li>
+      <li>Self-update safety checks</li>
+      <li><strong>Fixed:</strong> Improved rollback reliability</li>
+    </ul>
+
+    <h3><span class="version-badge">v1.5.0</span></h3>
+    <ul>
+      <li>Automatic systemd service lifecycle management</li>
+      <li>Stop services before update, reinstall after</li>
+      <li>Cron job update handling</li>
+    </ul>
+
+    <hr>
+
+    <!-- Installer -->
+    <h2 id="installer-versions">MediaMTX Installer History</h2>
+
+    <h3><span class="version-badge">v2.0.1</span></h3>
+    <ul>
+      <li>Cross-platform support improvements</li>
+      <li>Security fixes for input handling</li>
+    </ul>
+
+    <hr>
+    <p>
+      For the complete changelog with all detailed entries, see
+      <a href="https://github.com/tomtom215/LyreBirdAudio/blob/main/CHANGELOG.md" target="_blank" rel="noopener">CHANGELOG.md on GitHub</a>.
+    </p>
+
+  </main>
+  <nav id="page-nav" class="page-nav"></nav>
+</div>
+
+<script src="js/nav.js"></script>
+<script src="js/search.js"></script>
+</body>
+</html>

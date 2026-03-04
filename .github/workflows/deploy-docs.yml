@@ -1,0 +1,62 @@
+# LyreBirdAudio - GitHub Pages Documentation Deployment
+#
+# Deploys the static documentation site in docs/ to GitHub Pages
+# whenever changes are pushed to the main branch.
+#
+# Setup (one-time, in repo Settings):
+#   Settings → Pages → Source: GitHub Actions
+#
+# Author: Tom F (https://github.com/tomtom215)
+# License: Apache 2.0
+
+name: Deploy Docs to GitHub Pages
+
+on:
+  push:
+    branches:
+      - main
+      - master
+    paths:
+      - 'docs/**'
+      - '.github/workflows/deploy-docs.yml'
+
+  # Allow manual trigger from the Actions tab
+  workflow_dispatch:
+
+# Only one deployment runs at a time; cancel any in-progress run
+# for the same branch so the latest push always wins.
+concurrency:
+  group: pages-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+jobs:
+  deploy:
+    name: Deploy to GitHub Pages
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure GitHub Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload docs/ as Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: docs/
+
+      - name: Deploy to GitHub Pages
+        id: deploy
+        uses: actions/deploy-pages@v4
+
+      - name: Print deployment URL
+        run: echo "Docs deployed to ${{ steps.deploy.outputs.page_url }}"

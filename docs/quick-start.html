@@ -1,0 +1,261 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Quick Start - LyreBirdAudio Docs</title>
+  <meta name="description" content="Get LyreBirdAudio set up and streaming in 5 minutes.">
+  <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+
+<div id="sidebar-overlay" class="sidebar-overlay"></div>
+<aside id="sidebar" class="sidebar"></aside>
+
+<div class="content-wrapper">
+  <header id="topbar" class="topbar"></header>
+
+  <main class="content">
+    <div class="page-header">
+      <span class="page-label">Getting Started</span>
+      <h1 class="page-title">Quick Start</h1>
+      <p class="page-subtitle">Get LyreBirdAudio installed and streaming in 5 minutes using the guided setup wizard.</p>
+    </div>
+
+    <div class="toc">
+      <div class="toc-title">On this page</div>
+      <ul class="toc-list">
+        <li><a href="#requirements">System Requirements</a></li>
+        <li><a href="#clone">Clone the Repository</a></li>
+        <li><a href="#wizard">Run the Setup Wizard</a></li>
+        <li><a href="#access">Access Your Streams</a></li>
+        <li><a href="#installation">Manual Installation</a></li>
+        <li><a href="#verification">Verification</a></li>
+        <li><a href="#next-steps">Next Steps</a></li>
+      </ul>
+    </div>
+
+    <h2 id="requirements">System Requirements</h2>
+
+    <h3>Operating System</h3>
+    <div class="table-wrapper">
+      <table>
+        <thead><tr><th>OS</th><th>Minimum Version</th><th>Status</th></tr></thead>
+        <tbody>
+          <tr><td>Ubuntu</td><td>20.04 LTS</td><td><span class="badge badge-green">Supported</span></td></tr>
+          <tr><td>Debian</td><td>11 (Bullseye)</td><td><span class="badge badge-green">Supported</span></td></tr>
+          <tr><td>Raspberry Pi OS</td><td>Bullseye</td><td><span class="badge badge-blue">Supported</span></td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h3>Hardware</h3>
+    <div class="table-wrapper">
+      <table>
+        <thead><tr><th>Component</th><th>Minimum</th><th>Recommended</th></tr></thead>
+        <tbody>
+          <tr><td>CPU</td><td>1 core</td><td>2+ cores (for multiple streams)</td></tr>
+          <tr><td>RAM</td><td>512 MB</td><td>1 GB+ (for 4+ streams)</td></tr>
+          <tr><td>Storage</td><td>100 MB</td><td>1 GB+ (for recordings)</td></tr>
+          <tr><td>Architecture</td><td colspan="2">x86_64, ARM64, ARMv7, ARMv6</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="callout warning">
+      <span class="callout-icon">⚠️</span>
+      <div class="callout-body">
+        <strong>Raspberry Pi Limitations</strong>
+        <p>Raspberry Pi (especially Pi Zero and 3B+) supports a maximum of 1–2 USB microphones due to shared USB bandwidth. For 4+ simultaneous microphones, an Intel N100 mini PC ($100–150) is strongly recommended.</p>
+      </div>
+    </div>
+
+    <h3>Software Dependencies</h3>
+    <p>Verify these are installed before proceeding:</p>
+    <pre><code># Check required tools
+bash --version           # Must be 4.0+
+ffmpeg -version          # Required for audio capture
+git --version            # Required for installation
+lsusb                    # From usbutils package
+arecord --version        # From alsa-utils package
+
+# Install missing dependencies (Ubuntu/Debian)
+sudo apt update
+sudo apt install -y ffmpeg git usbutils alsa-utils curl</code></pre>
+
+    <p><strong>Optional but recommended:</strong></p>
+    <pre><code>sudo apt install -y jq          # Better MediaMTX API parsing
+sudo apt install -y shellcheck  # For script validation (developers)</code></pre>
+
+    <h2 id="clone">Clone the Repository</h2>
+
+    <h3>Option A: Latest Stable Release (Recommended for Production)</h3>
+    <pre><code>git clone https://github.com/tomtom215/LyreBirdAudio.git
+cd LyreBirdAudio
+
+# Checkout the latest tagged release
+git checkout $(git describe --tags --abbrev=0)
+
+chmod +x *.sh</code></pre>
+
+    <h3>Option B: Latest Main Branch</h3>
+    <pre><code>git clone https://github.com/tomtom215/LyreBirdAudio.git
+cd LyreBirdAudio
+chmod +x *.sh</code></pre>
+
+    <div class="callout tip">
+      <span class="callout-icon">💡</span>
+      <div class="callout-body">
+        <strong>Production Tip</strong>
+        <p>For 24/7 deployments, always use tagged releases. The main branch may contain work-in-progress features. Tagged releases are tested for at least 72 hours on real hardware before publishing.</p>
+      </div>
+    </div>
+
+    <h2 id="wizard">Run the Setup Wizard</h2>
+    <p>The Orchestrator provides a guided wizard that handles everything in one flow:</p>
+    <pre><code>sudo ./lyrebird-orchestrator.sh</code></pre>
+
+    <p>When the menu appears, select <strong>"Quick Setup Wizard"</strong>. The wizard will:</p>
+    <ol class="steps">
+      <li>
+        <div>
+          <strong>Install MediaMTX</strong>
+          <p>Downloads the latest MediaMTX binary with SHA256 checksum verification and sets up a systemd service.</p>
+        </div>
+      </li>
+      <li>
+        <div>
+          <strong>Map USB Audio Devices</strong>
+          <p>Scans connected USB microphones and creates persistent udev rules so device names never change across reboots.</p>
+        </div>
+      </li>
+      <li>
+        <div>
+          <strong>Detect Hardware Capabilities</strong>
+          <p>Non-invasively analyzes each microphone's supported sample rates, channels, and formats to generate an optimal configuration.</p>
+        </div>
+      </li>
+      <li>
+        <div>
+          <strong>Generate Configuration</strong>
+          <p>Creates <code>/etc/mediamtx/audio-devices.conf</code> with device-specific settings for the best audio quality.</p>
+        </div>
+      </li>
+      <li>
+        <div>
+          <strong>Start Streams</strong>
+          <p>Launches FFmpeg for each device and publishes streams to MediaMTX with automatic recovery on failure.</p>
+        </div>
+      </li>
+      <li>
+        <div>
+          <strong>Run Diagnostics</strong>
+          <p>Verifies all components are healthy and streams are accessible.</p>
+        </div>
+      </li>
+    </ol>
+
+    <div class="callout info">
+      <span class="callout-icon">ℹ️</span>
+      <div class="callout-body">
+        <strong>Reboot Recommended After Device Mapping</strong>
+        <p>After USB devices are mapped, a reboot ensures udev rules take full effect and device symlinks are created. The wizard will prompt you. After rebooting, run <code>sudo ./lyrebird-orchestrator.sh</code> again to start streams.</p>
+      </div>
+    </div>
+
+    <h2 id="access">Access Your Streams</h2>
+    <p>Streams are available at:</p>
+    <pre><code>rtsp://your-server-ip:8554/Device_1
+rtsp://your-server-ip:8554/Device_2
+# etc.</code></pre>
+
+    <p>Test with common players:</p>
+    <pre><code># Test with ffplay (from ffmpeg)
+ffplay rtsp://localhost:8554/Device_1
+
+# Test with VLC
+vlc rtsp://localhost:8554/Device_1
+
+# Record a stream
+ffmpeg -i rtsp://your-ip:8554/Device_1 -c copy recording.mkv</code></pre>
+
+    <h2 id="installation">Manual Installation</h2>
+    <p>If you prefer step-by-step control or are automating the setup:</p>
+
+    <pre><code># Step 1: Install MediaMTX
+sudo ./install_mediamtx.sh install
+
+# Step 2: Map USB devices (interactive)
+sudo ./usb-audio-mapper.sh
+
+# Step 3: Reboot for udev rules to take effect
+sudo reboot
+
+# Step 4: Generate optimal configuration
+sudo ./lyrebird-mic-check.sh -g
+
+# Step 5: Start streams
+sudo ./lyrebird-stream-manager.sh start
+
+# Step 6 (Recommended): Install as systemd service for 24/7 operation
+sudo ./lyrebird-stream-manager.sh install
+sudo systemctl enable mediamtx-audio
+sudo systemctl start mediamtx-audio</code></pre>
+
+    <div class="callout warning">
+      <span class="callout-icon">⚠️</span>
+      <div class="callout-body">
+        <strong>Install as a Systemd Service for Production</strong>
+        <p>Running the stream manager directly (without systemd) means streams stop when your SSH session ends or the system reboots. For 24/7 bird monitoring or continuous recording, the systemd service is essential — it automatically starts streams on boot and restarts them if they fail.</p>
+      </div>
+    </div>
+
+    <h2 id="verification">Verification</h2>
+    <p>Run the built-in health check to confirm everything is working:</p>
+    <pre><code># Quick health check
+sudo ./lyrebird-diagnostics.sh quick
+
+# Check stream status
+./lyrebird-stream-manager.sh status</code></pre>
+
+    <p>The quick check verifies:</p>
+    <ul>
+      <li>MediaMTX is installed and running</li>
+      <li>USB audio devices are detected</li>
+      <li>FFmpeg streams are active</li>
+      <li>RTSP port 8554 is listening</li>
+      <li>System resources are healthy</li>
+    </ul>
+
+    <h2 id="next-steps">Next Steps</h2>
+    <div class="card-grid">
+      <a href="usage.html" class="card">
+        <div class="card-icon">📖</div>
+        <div class="card-title">Basic Usage</div>
+        <div class="card-desc">Learn how to start, stop, and manage your streams.</div>
+      </a>
+      <a href="configuration.html" class="card">
+        <div class="card-icon">⚙️</div>
+        <div class="card-title">Configuration</div>
+        <div class="card-desc">Customize audio quality, codecs, and stream settings.</div>
+      </a>
+      <a href="components.html" class="card">
+        <div class="card-icon">🧩</div>
+        <div class="card-title">Components</div>
+        <div class="card-desc">Explore the full set of management scripts.</div>
+      </a>
+      <a href="troubleshooting.html" class="card">
+        <div class="card-icon">🔧</div>
+        <div class="card-title">Troubleshooting</div>
+        <div class="card-desc">Diagnose and fix common problems.</div>
+      </a>
+    </div>
+
+  </main>
+  <nav id="page-nav" class="page-nav"></nav>
+</div>
+
+<script src="js/nav.js"></script>
+<script src="js/search.js"></script>
+</body>
+</html>

@@ -1,0 +1,323 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Contributing - LyreBirdAudio Docs</title>
+  <meta name="description" content="How to contribute to LyreBirdAudio: code standards, testing, and the PR workflow.">
+  <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+
+<div id="sidebar-overlay" class="sidebar-overlay"></div>
+<aside id="sidebar" class="sidebar"></aside>
+
+<div class="content-wrapper">
+  <header id="topbar" class="topbar"></header>
+
+  <main class="content">
+    <div class="page-header">
+      <span class="page-label">Reference</span>
+      <h1 class="page-title">Contributing</h1>
+      <p class="page-subtitle">Guidelines for contributing code, documentation, and bug reports to LyreBirdAudio.</p>
+    </div>
+
+    <div class="toc">
+      <div class="toc-title">On this page</div>
+      <ul class="toc-list">
+        <li><a href="#getting-started">Getting Started</a></li>
+        <li><a href="#code-standards">Code Standards</a></li>
+        <li><a href="#style">Style Guidelines</a></li>
+        <li><a href="#testing">Testing</a></li>
+        <li><a href="#workflow">Contribution Workflow</a></li>
+        <li><a href="#issues">Reporting Issues</a></li>
+        <li><a href="#conduct">Code of Conduct</a></li>
+      </ul>
+    </div>
+
+    <h2 id="getting-started">Getting Started</h2>
+
+    <h3>Prerequisites</h3>
+    <pre><code># Install development dependencies (Ubuntu/Debian)
+sudo apt install -y shellcheck bats
+
+# macOS
+brew install shellcheck bats-core</code></pre>
+
+    <h3>Fork and Clone</h3>
+    <pre><code># 1. Fork on GitHub, then clone your fork
+git clone https://github.com/YOUR_USERNAME/LyreBirdAudio.git
+cd LyreBirdAudio
+
+# 2. Add upstream remote
+git remote add upstream https://github.com/tomtom215/LyreBirdAudio.git
+
+# 3. Make scripts executable
+chmod +x *.sh</code></pre>
+
+    <h3>Verify Development Setup</h3>
+    <pre><code># Syntax check all scripts
+for script in *.sh; do
+    bash -n "$script" && echo "✓ $script"
+done
+
+# ShellCheck all scripts
+shellcheck *.sh
+
+# Run test suite (requires BATS)
+cd tests && bats *.bats</code></pre>
+
+    <hr>
+    <h2 id="code-standards">Code Standards</h2>
+
+    <h3>Required Header Format</h3>
+    <p>Every script must begin with a standard header:</p>
+    <pre><code>#!/bin/bash
+# script-name.sh - Brief Description
+# Part of LyreBirdAudio - RTSP Audio Streaming Suite
+# https://github.com/tomtom215/LyreBirdAudio
+#
+# Author: Your Name (https://github.com/yourusername)
+# Copyright: Tom F and LyreBirdAudio contributors
+# License: Apache 2.0
+#
+# Version: X.Y.Z
+#
+# DESCRIPTION:
+#   Detailed description of what the script does.
+#   Include any important behavioral notes.
+#
+# USAGE:
+#   ./script-name.sh [options] command
+#
+# DEPENDENCIES:
+#   - bash 4.0+
+#   - ffmpeg, curl, etc.
+
+set -euo pipefail</code></pre>
+
+    <h3>Safety Requirements</h3>
+    <ul>
+      <li><strong>Always use</strong> <code>set -euo pipefail</code> at the top of every script</li>
+      <li><strong>Always quote</strong> variables: <code>"${variable}"</code> not <code>$variable</code></li>
+      <li><strong>Use <code>local</code></strong> for all function-scoped variables</li>
+      <li><strong>Use <code>readonly</code></strong> for constants</li>
+      <li><strong>Validate all inputs</strong> at system boundaries (user input, external APIs)</li>
+      <li><strong>Use <code>mktemp</code></strong> for all temporary files</li>
+      <li><strong>Implement signal handlers</strong> in long-running scripts: <code>trap cleanup EXIT INT TERM</code></li>
+    </ul>
+
+    <hr>
+    <h2 id="style">Style Guidelines</h2>
+
+    <h3>Naming Conventions</h3>
+    <div class="table-wrapper">
+      <table>
+        <thead><tr><th>Type</th><th>Convention</th><th>Example</th></tr></thead>
+        <tbody>
+          <tr><td>Constants</td><td>UPPERCASE_WITH_UNDERSCORES</td><td><code>MAX_RESTART_DELAY=300</code></td></tr>
+          <tr><td>Local variables</td><td>lowercase_with_underscores</td><td><code>local stream_count=0</code></td></tr>
+          <tr><td>Functions</td><td>lowercase_with_underscores</td><td><code>check_stream_health()</code></td></tr>
+          <tr><td>LyreBird config vars</td><td>LYREBIRD_ prefix</td><td><code>LYREBIRD_ALERT_ENABLED</code></td></tr>
+          <tr><td>MediaMTX config vars</td><td>MEDIAMTX_ prefix</td><td><code>MEDIAMTX_API_PORT</code></td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h3>Formatting Rules</h3>
+    <ul>
+      <li>4 spaces for indentation — no tabs</li>
+      <li>Maximum line length: 100 characters</li>
+      <li>Use <code>[[ ]]</code> instead of <code>[ ]</code> for conditionals</li>
+      <li>Use <code>(( ))</code> for arithmetic</li>
+      <li>Add comments for non-obvious logic</li>
+    </ul>
+
+    <h3>Function Documentation</h3>
+    <pre><code># Checks if a stream is healthy via the MediaMTX API
+# Arguments:
+#   $1 - Stream/path name to check
+# Returns:
+#   0 if stream is active, 1 if not found or unhealthy
+# Outputs:
+#   Nothing to stdout; logs to LOGFILE
+check_stream_health() {
+    local stream_name="${1:?stream name required}"
+    # Implementation here
+}</code></pre>
+
+    <h3>Logging Pattern</h3>
+    <pre><code># Use the shared logging functions (from lyrebird-common.sh)
+log_debug "Processing device: ${device_name}"
+log_info "Stream started: ${stream_url}"
+log_warn "Device busy, retrying in ${delay}s"
+log_error "Failed to start MediaMTX: ${error_msg}"</code></pre>
+
+    <h3>Atomic File Operations</h3>
+    <pre><code># Always write to temp first, then move atomically
+local tmp_file
+tmp_file=$(mktemp "${config_file}.tmp.XXXXXX")
+trap 'rm -f "${tmp_file}"' EXIT
+
+cat > "${tmp_file}" << EOF
+# Configuration generated by lyrebird-mic-check.sh
+${config_content}
+EOF
+
+mv "${tmp_file}" "${config_file}"</code></pre>
+
+    <hr>
+    <h2 id="testing">Testing</h2>
+
+    <h3>Running Tests</h3>
+    <pre><code># Run all tests
+bats tests/
+
+# Run a specific test file
+bats tests/test_lyrebird_common.bats
+
+# Run tests matching a pattern
+bats --filter "validation" tests/
+
+# Verbose output
+bats --verbose-run tests/
+
+# TAP format (for CI)
+bats --tap tests/</code></pre>
+
+    <h3>Test Suite Overview</h3>
+    <div class="table-wrapper">
+      <table>
+        <thead><tr><th>Test File</th><th>Tests</th><th>What's Covered</th></tr></thead>
+        <tbody>
+          <tr><td><code>test_lyrebird_common.bats</code></td><td>47</td><td>Shared library functions</td></tr>
+          <tr><td><code>test_lyrebird_updater.bats</code></td><td>55</td><td>Version management, git operations</td></tr>
+          <tr><td><code>test_install_mediamtx.bats</code></td><td>55</td><td>MediaMTX installation flow</td></tr>
+          <tr><td><code>test_lyrebird_orchestrator.bats</code></td><td>44</td><td>Menu system, integration</td></tr>
+          <tr><td><code>test_lyrebird_alerts.bats</code></td><td>45</td><td>Webhook formatting, rate limiting</td></tr>
+          <tr><td><code>test_lyrebird_mic_check.bats</code></td><td>45</td><td>Hardware detection, config gen</td></tr>
+          <tr><td><code>test_lyrebird_storage.bats</code></td><td>42</td><td>Disk management, retention</td></tr>
+          <tr><td><code>test_lyrebird_diagnostics.bats</code></td><td>34</td><td>Health checks</td></tr>
+          <tr><td><code>test_usb_audio_mapper.bats</code></td><td>33</td><td>udev rule generation</td></tr>
+          <tr><td><code>test_stream_manager.bats</code></td><td>32</td><td>Stream lifecycle, recovery</td></tr>
+          <tr><td><code>test_lyrebird_metrics.bats</code></td><td>32</td><td>Prometheus metrics format</td></tr>
+          <tr><td><code>test_integration.bats</code></td><td>—</td><td>End-to-end integration</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h3>Writing Tests</h3>
+    <pre><code>#!/usr/bin/env bats
+
+# Source the script being tested
+setup() {
+    # Load the script or helper
+    source "${BATS_TEST_DIRNAME}/../lyrebird-common.sh" 2>/dev/null || true
+}
+
+@test "lyrebird_command_exists returns 0 for bash" {
+    run lyrebird_command_exists bash
+    [ "$status" -eq 0 ]
+}
+
+@test "log_info outputs formatted message" {
+    run log_info "Test message"
+    [ "$status" -eq 0 ]
+    [[ "$output" =~ "Test message" ]]
+}</code></pre>
+
+    <h3>Testing Requirements Before PR</h3>
+    <ul>
+      <li>☐ All existing tests pass: <code>bats tests/</code></li>
+      <li>☐ New tests added for new functionality</li>
+      <li>☐ <code>bash -n script.sh</code> passes (syntax check)</li>
+      <li>☐ <code>shellcheck script.sh</code> passes with no errors</li>
+      <li>☐ Manual testing on Ubuntu 20.04+ or equivalent</li>
+      <li>☐ Tested with at least one real USB audio device (if applicable)</li>
+    </ul>
+
+    <hr>
+    <h2 id="workflow">Contribution Workflow</h2>
+    <ol class="steps">
+      <li>
+        <div>
+          <strong>Create a feature branch</strong>
+          <pre><code>git checkout -b feature/your-improvement
+# or
+git checkout -b fix/issue-description</code></pre>
+        </div>
+      </li>
+      <li>
+        <div>
+          <strong>Make your changes</strong>
+          <p>Follow the code standards and style guidelines above.</p>
+        </div>
+      </li>
+      <li>
+        <div>
+          <strong>Validate your changes</strong>
+          <pre><code>bash -n your-script.sh
+shellcheck your-script.sh
+bats tests/</code></pre>
+        </div>
+      </li>
+      <li>
+        <div>
+          <strong>Test on target platforms</strong>
+          <p>Ubuntu 20.04+, Debian 11+, and Raspberry Pi OS if applicable. Test with actual USB devices.</p>
+        </div>
+      </li>
+      <li>
+        <div>
+          <strong>Submit a pull request</strong>
+          <ul>
+            <li>Clear description of changes and motivation</li>
+            <li>Reference any related issues (<code>Closes #123</code>)</li>
+            <li>Include test results</li>
+            <li>Update documentation if needed</li>
+          </ul>
+        </div>
+      </li>
+    </ol>
+
+    <hr>
+    <h2 id="issues">Reporting Issues</h2>
+    <p>
+      Found a bug? Please
+      <a href="https://github.com/tomtom215/LyreBirdAudio/issues" target="_blank" rel="noopener">open an issue on GitHub</a>.
+    </p>
+
+    <h3>Include in Your Report</h3>
+    <ol>
+      <li><strong>System info</strong>: <code>cat /etc/os-release && uname -a</code></li>
+      <li><strong>Script versions</strong>: From the Orchestrator menu or <code>head -5 *.sh | grep Version</code></li>
+      <li><strong>Diagnostics</strong>: <code>sudo ./lyrebird-diagnostics.sh full > diagnostics.txt 2>&amp;1</code></li>
+      <li><strong>Relevant logs</strong>: Last 50 lines showing the error from <code>/var/log/lyrebird-stream-manager.log</code></li>
+      <li><strong>Hardware info</strong>: <code>lsusb && ./lyrebird-mic-check.sh</code></li>
+    </ol>
+
+    <h3>Feature Requests</h3>
+    <p>
+      Feature requests are welcome! Open a
+      <a href="https://github.com/tomtom215/LyreBirdAudio/discussions" target="_blank" rel="noopener">GitHub Discussion</a>
+      to discuss before opening a pull request for major features.
+    </p>
+
+    <hr>
+    <h2 id="conduct">Code of Conduct</h2>
+    <ul>
+      <li>Be respectful and inclusive to all contributors</li>
+      <li>Focus on constructive, actionable feedback</li>
+      <li>Help others learn and grow</li>
+      <li>Keep discussions on-topic and technical</li>
+      <li>Assume good faith from other contributors</li>
+    </ul>
+
+  </main>
+  <nav id="page-nav" class="page-nav"></nav>
+</div>
+
+<script src="js/nav.js"></script>
+<script src="js/search.js"></script>
+</body>
+</html>
