@@ -1,0 +1,276 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Security - LyreBirdAudio Docs</title>
+  <meta name="description" content="Optional security features for LyreBirdAudio: RTSP auth, TLS, network hardening, and field deployments.">
+  <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+
+<div id="sidebar-overlay" class="sidebar-overlay"></div>
+<aside id="sidebar" class="sidebar"></aside>
+
+<div class="content-wrapper">
+  <header id="topbar" class="topbar"></header>
+
+  <main class="content">
+    <div class="page-header">
+      <span class="page-label">Operations</span>
+      <h1 class="page-title">Security</h1>
+      <p class="page-subtitle">Optional security features for sensitive or remote deployments. Home users on trusted networks typically need none of this.</p>
+    </div>
+
+    <div class="callout tip">
+      <span class="callout-icon">💡</span>
+      <div class="callout-body">
+        <strong>Default Security is Fine for Home Use</strong>
+        <p>For home users on a trusted local network, the default configuration is appropriate and secure. The features on this page are <strong>optional enhancements</strong> for remote deployments, multi-user environments, or sensitive monitoring locations.</p>
+      </div>
+    </div>
+
+    <div class="toc">
+      <div class="toc-title">On this page</div>
+      <ul class="toc-list">
+        <li><a href="#model">Security Model Overview</a></li>
+        <li><a href="#default-posture">Default Security Posture</a></li>
+        <li><a href="#checklist">Security Checklist</a></li>
+        <li><a href="#rtsp-auth">RTSP Authentication</a></li>
+        <li><a href="#network">Network Security</a></li>
+        <li><a href="#api-security">API Security</a></li>
+        <li><a href="#file-security">File System Security</a></li>
+        <li><a href="#integrity">Library Integrity Verification</a></li>
+        <li><a href="#field">Field Deployment Recommendations</a></li>
+      </ul>
+    </div>
+
+    <h2 id="model">Security Model Overview</h2>
+    <p>LyreBirdAudio has three main network interfaces:</p>
+    <div class="table-wrapper">
+      <table>
+        <thead><tr><th>Interface</th><th>Default Port</th><th>Purpose</th><th>Default Security</th></tr></thead>
+        <tbody>
+          <tr>
+            <td>RTSP</td>
+            <td>8554</td>
+            <td>Audio stream consumption</td>
+            <td>Open (no auth)</td>
+          </tr>
+          <tr>
+            <td>MediaMTX API</td>
+            <td>9997</td>
+            <td>Stream management REST API</td>
+            <td>Localhost only</td>
+          </tr>
+          <tr>
+            <td>WebRTC</td>
+            <td>8889</td>
+            <td>Browser-based streaming</td>
+            <td>Open (no auth)</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h2 id="default-posture">Default Security Posture</h2>
+    <p>Out of the box, LyreBirdAudio implements:</p>
+    <ul>
+      <li><strong>No hardcoded credentials</strong> — all authentication delegated to MediaMTX</li>
+      <li><strong>Restrictive permissions</strong> — config files mode 640, state directories 750</li>
+      <li><strong>Service user isolation</strong> — MediaMTX runs as dedicated <code>mediamtx</code> user</li>
+      <li><strong>systemd hardening</strong> — <code>NoNewPrivileges</code>, <code>PrivateTmp</code>, <code>ProtectSystem</code></li>
+      <li><strong>Input validation</strong> — all user inputs sanitized against injection</li>
+      <li><strong>Safe temp files</strong> — <code>mktemp</code> used for all temporary files</li>
+      <li><strong>Download verification</strong> — SHA256 checksums verify MediaMTX binaries</li>
+      <li><strong>API localhost-only</strong> — MediaMTX REST API bound to 127.0.0.1 by default</li>
+    </ul>
+
+    <h2 id="checklist">Security Checklist</h2>
+
+    <h3>Minimal Security (Home Use)</h3>
+    <ul>
+      <li>☐ Keep system updated: <code>sudo apt update &amp;&amp; sudo apt upgrade</code></li>
+      <li>☐ Use firewall to block external access if streams are local-only</li>
+      <li>☐ Don't expose ports to the internet unnecessarily</li>
+    </ul>
+
+    <h3>Standard Security (Remote Access)</h3>
+    <ul>
+      <li>☐ All minimal items above</li>
+      <li>☐ Enable RTSP authentication</li>
+      <li>☐ Restrict API to localhost or specific IPs</li>
+      <li>☐ Configure firewall rules to limit access</li>
+      <li>☐ Enable log rotation</li>
+    </ul>
+
+    <h3>Enhanced Security (Field Deployment)</h3>
+    <ul>
+      <li>☐ All standard items above</li>
+      <li>☐ Enable TLS encryption (RTSPS)</li>
+      <li>☐ Use VPN for remote access instead of direct exposure</li>
+      <li>☐ Enable audit logging</li>
+      <li>☐ Implement physical security measures</li>
+      <li>☐ Schedule regular security update runs</li>
+    </ul>
+
+    <h2 id="rtsp-auth">RTSP Authentication</h2>
+
+    <h3>Internal Authentication (Recommended)</h3>
+    <pre><code># Edit /etc/mediamtx/mediamtx.yml
+
+authMethod: internal
+
+authInternalUsers:
+  # Admin user - can publish and read all streams
+  - user: admin
+    pass: your_secure_password_here
+    permissions:
+      - action: publish
+      - action: read
+      - action: playback
+      - action: api
+
+  # Read-only viewer
+  - user: viewer
+    pass: viewer_password_here
+    permissions:
+      - action: read</code></pre>
+
+    <h3>JWT Authentication</h3>
+    <pre><code># Edit /etc/mediamtx/mediamtx.yml
+
+authMethod: jwt
+authJWTJWKS: https://your-auth-server/.well-known/jwks.json</code></pre>
+
+    <h3>Client Usage with Authentication</h3>
+    <pre><code># VLC / FFplay with credentials
+ffplay rtsp://username:password@your-server:8554/Device_1
+vlc rtsp://username:password@your-server:8554/Device_1
+
+# FFmpeg recording with auth
+ffmpeg -i rtsp://viewer:pass@server:8554/Device_1 -c copy out.mkv</code></pre>
+
+    <h2 id="network">Network Security</h2>
+
+    <h3>UFW Firewall Rules</h3>
+    <pre><code># Allow RTSP only from your local network
+sudo ufw allow from 192.168.1.0/24 to any port 8554 proto tcp
+
+# Block external RTSP access entirely
+sudo ufw deny 8554
+
+# Keep API localhost-only (deny external)
+sudo ufw deny 9997
+
+# Enable UFW
+sudo ufw enable
+sudo ufw status</code></pre>
+
+    <h3>Bind MediaMTX to Specific Interface</h3>
+    <pre><code># /etc/mediamtx/mediamtx.yml
+
+# Only listen on specific interface (not all)
+rtspAddress: 192.168.1.100:8554
+
+# Keep API on localhost only (already default)
+apiAddress: 127.0.0.1:9997</code></pre>
+
+    <h3>VPN Access (Recommended for Remote Monitoring)</h3>
+    <p>
+      Instead of exposing RTSP publicly, connect remote viewers through a VPN.
+      This is more secure and avoids the complexity of TLS certificate management.
+    </p>
+    <pre><code># Install WireGuard (recommended VPN)
+sudo apt install wireguard
+
+# All streams accessible within VPN network
+# rtsp://10.0.0.1:8554/Device_1  (VPN IP)
+# No need to expose ports to public internet</code></pre>
+
+    <h2 id="api-security">API Security</h2>
+    <p>The MediaMTX REST API should remain localhost-only unless you have specific integration needs:</p>
+    <pre><code># /etc/mediamtx/mediamtx.yml
+
+# Localhost only (default, recommended)
+apiAddress: 127.0.0.1:9997
+
+# If you need LAN access, restrict to specific IP:
+# apiAddress: 192.168.1.100:9997</code></pre>
+
+    <h2 id="file-security">File System Security</h2>
+    <pre><code># Verify configuration file permissions
+stat /etc/mediamtx/audio-devices.conf
+# Should be: -rw-r----- (640) owned by root:mediamtx
+
+# Fix permissions if needed
+sudo chmod 640 /etc/mediamtx/audio-devices.conf
+sudo chown root:mediamtx /etc/mediamtx/audio-devices.conf
+
+# Secure the config directory
+sudo chmod 750 /etc/mediamtx
+sudo chown root:mediamtx /etc/mediamtx</code></pre>
+
+    <h2 id="integrity">Library Integrity Verification</h2>
+    <p>For high-security deployments, verify the shared library before execution:</p>
+    <pre><code># Generate hash of lyrebird-common.sh
+HASH=$(sha256sum lyrebird-common.sh | cut -d' ' -f1)
+echo "Expected hash: $HASH"
+
+# Set in environment or systemd service override
+export LYREBIRD_COMMON_EXPECTED_HASH="$HASH"
+
+# Scripts will verify the library before sourcing it
+sudo ./lyrebird-stream-manager.sh start</code></pre>
+
+    <h2 id="field">Field Deployment Recommendations</h2>
+
+    <div class="callout info">
+      <span class="callout-icon">ℹ️</span>
+      <div class="callout-body">
+        <strong>Wildlife Monitoring Context</strong>
+        <p>These recommendations are particularly relevant for unattended field deployments — remote wildlife monitoring stations, environmental sensors, or any system with limited physical access and potential exposure to untrusted networks.</p>
+      </div>
+    </div>
+
+    <ol>
+      <li>
+        <strong>Use VPN</strong> — Connect remote units via WireGuard or OpenVPN rather than exposing RTSP directly to the internet.
+      </li>
+      <li>
+        <strong>Enable authentication</strong> — Add internal users with strong passwords to MediaMTX if VPN isn't available.
+      </li>
+      <li>
+        <strong>Regular updates</strong> — Schedule monthly: <code>./lyrebird-updater.sh</code> and <code>sudo apt upgrade</code>.
+      </li>
+      <li>
+        <strong>Review logs</strong> — Check <code>/var/log/lyrebird/</code> monthly for anomalies.
+      </li>
+      <li>
+        <strong>Physical security</strong> — Secure the device against physical access. USB port tamper detection is not built-in.
+      </li>
+      <li>
+        <strong>Emergency wipe plan</strong> — For sensitive deployments, keep a plan for remote wiping if a unit is compromised.
+      </li>
+      <li>
+        <strong>Disable unused ports</strong> — Block WebRTC (8889) if not needed: <code>sudo ufw deny 8889</code>.
+      </li>
+      <li>
+        <strong>Log rotation</strong> — Ensure logrotate is configured to prevent disk exhaustion: <code>sudo cp config/lyrebird-logrotate.conf /etc/logrotate.d/lyrebird</code>.
+      </li>
+    </ol>
+
+    <p>
+      For comprehensive security guidance, see the full
+      <a href="https://github.com/tomtom215/LyreBirdAudio/blob/main/docs/SECURITY-GUIDE.md" target="_blank" rel="noopener">SECURITY-GUIDE.md</a>
+      in the repository.
+    </p>
+
+  </main>
+  <nav id="page-nav" class="page-nav"></nav>
+</div>
+
+<script src="js/nav.js"></script>
+<script src="js/search.js"></script>
+</body>
+</html>

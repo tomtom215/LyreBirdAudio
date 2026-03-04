@@ -1,0 +1,248 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>LyreBirdAudio Documentation</title>
+  <meta name="description" content="Production-hardened RTSP audio streaming suite for USB microphones with 24/7 reliability.">
+  <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+
+<div id="sidebar-overlay" class="sidebar-overlay"></div>
+<aside id="sidebar" class="sidebar"></aside>
+
+<div class="content-wrapper">
+  <header id="topbar" class="topbar"></header>
+
+  <main class="content">
+
+    <div class="hero">
+      <div class="hero-label">🐦 Open Source · Apache 2.0</div>
+      <h1>LyreBirdAudio</h1>
+      <p>Production-hardened RTSP audio streaming for USB microphones. 24/7 reliability with automatic recovery, persistent device naming, and comprehensive diagnostics — built entirely in Bash.</p>
+      <div class="hero-badges">
+        <span class="hero-badge">🐧 Linux / Raspberry Pi</span>
+        <span class="hero-badge">🎙️ USB Microphones</span>
+        <span class="hero-badge">📡 RTSP Streaming</span>
+        <span class="hero-badge">🔄 Auto-Recovery</span>
+        <span class="hero-badge">📊 Prometheus Metrics</span>
+      </div>
+      <div class="hero-actions">
+        <a href="quick-start.html" class="btn btn-primary">🚀 Quick Start</a>
+        <a href="https://github.com/tomtom215/LyreBirdAudio" class="btn btn-secondary" target="_blank" rel="noopener">⬡ View on GitHub</a>
+      </div>
+    </div>
+
+    <h2 id="what-is-lyrebirdaudio">What is LyreBirdAudio?</h2>
+    <p>
+      LyreBirdAudio turns USB microphones into reliable, always-on RTSP audio streams. Built on top of
+      <a href="https://github.com/bluenviron/mediamtx" target="_blank" rel="noopener">MediaMTX</a> and FFmpeg,
+      it handles every aspect of long-term unattended operation: device persistence across reboots,
+      automatic stream recovery, health monitoring, alerting, and metrics export — all without requiring
+      Docker, Python runtimes, or complex dependencies.
+    </p>
+    <p>
+      Originally created to monitor bird activity using USB microphones on spare mini PCs, it has grown into
+      a complete, production-hardened streaming suite suitable for wildlife monitoring, environmental sensing,
+      security audio, and any scenario requiring continuous, reliable audio capture.
+    </p>
+
+    <h2 id="key-features">Key Features</h2>
+    <ul class="feature-list">
+      <li>Persistent USB device naming via udev</li>
+      <li>Automatic stream recovery &amp; restart</li>
+      <li>Hardware capability auto-detection</li>
+      <li>Interactive setup wizard (Orchestrator)</li>
+      <li>Systemd service with watchdog</li>
+      <li>Cron-based health monitoring</li>
+      <li>Multiplex streaming (amix / amerge)</li>
+      <li>Opus, AAC, PCM codec support</li>
+      <li>Prometheus metrics export</li>
+      <li>Webhook alerts (Discord, Slack, ntfy…)</li>
+      <li>Storage management &amp; retention</li>
+      <li>Git-based version management</li>
+      <li>Atomic config file operations</li>
+      <li>Comprehensive diagnostic suite</li>
+      <li>Optional RTSP authentication &amp; TLS</li>
+      <li>No Docker, no Python, pure Bash</li>
+    </ul>
+
+    <h2 id="architecture-overview">Architecture Overview</h2>
+    <p>
+      At its core, LyreBirdAudio uses <strong>FFmpeg</strong> to capture audio from ALSA devices and push
+      RTSP streams to <strong>MediaMTX</strong>, which serves them to any RTSP-compatible client.
+      USB devices are given permanent names through <strong>udev rules</strong>, so streams keep their names
+      across reboots even when USB enumeration order changes.
+    </p>
+    <div class="table-wrapper">
+      <table>
+        <thead>
+          <tr>
+            <th>Layer</th>
+            <th>Technology</th>
+            <th>Role</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Clients</td>
+            <td>VLC, FFplay, OBS, custom</td>
+            <td>Consume RTSP streams</td>
+          </tr>
+          <tr>
+            <td>Media Server</td>
+            <td>MediaMTX</td>
+            <td>RTSP / WebRTC / HLS serving</td>
+          </tr>
+          <tr>
+            <td>Capture</td>
+            <td>FFmpeg + ALSA</td>
+            <td>Audio encoding &amp; publishing</td>
+          </tr>
+          <tr>
+            <td>Device Layer</td>
+            <td>udev rules</td>
+            <td>Persistent USB device names</td>
+          </tr>
+          <tr>
+            <td>Management</td>
+            <td>Bash scripts + systemd</td>
+            <td>Lifecycle, recovery, monitoring</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h2 id="components">Components at a Glance</h2>
+    <div class="card-grid">
+      <a href="components.html#orchestrator" class="card">
+        <div class="card-icon">🎛️</div>
+        <div class="card-title">Orchestrator</div>
+        <div class="card-desc">Interactive menu-driven management interface for all operations.</div>
+      </a>
+      <a href="components.html#stream-manager" class="card">
+        <div class="card-icon">📡</div>
+        <div class="card-title">Stream Manager</div>
+        <div class="card-desc">Manages FFmpeg processes, health monitoring, and automatic recovery.</div>
+      </a>
+      <a href="components.html#usb-mapper" class="card">
+        <div class="card-icon">🔌</div>
+        <div class="card-title">USB Audio Mapper</div>
+        <div class="card-desc">Creates persistent udev rules for stable device naming across reboots.</div>
+      </a>
+      <a href="components.html#mic-check" class="card">
+        <div class="card-icon">🎙️</div>
+        <div class="card-title">Capability Checker</div>
+        <div class="card-desc">Non-invasively detects hardware capabilities and generates optimal configs.</div>
+      </a>
+      <a href="components.html#diagnostics" class="card">
+        <div class="card-icon">🩺</div>
+        <div class="card-title">Diagnostics</div>
+        <div class="card-desc">20+ health checks covering devices, services, connectivity, and resources.</div>
+      </a>
+      <a href="components.html#alerts" class="card">
+        <div class="card-icon">🔔</div>
+        <div class="card-title">Webhook Alerts</div>
+        <div class="card-desc">Discord, Slack, ntfy.sh, Pushover notifications with rate limiting.</div>
+      </a>
+      <a href="components.html#metrics" class="card">
+        <div class="card-icon">📊</div>
+        <div class="card-title">Prometheus Metrics</div>
+        <div class="card-desc">Export stream and system metrics for Grafana dashboards.</div>
+      </a>
+      <a href="components.html#storage" class="card">
+        <div class="card-icon">💾</div>
+        <div class="card-title">Storage Management</div>
+        <div class="card-desc">Automated disk cleanup with configurable retention policies.</div>
+      </a>
+    </div>
+
+    <h2 id="quick-start-summary">Get Streaming in 5 Minutes</h2>
+    <ol class="steps">
+      <li>
+        <div>
+          <strong>Clone the repository</strong>
+          <pre><code>git clone https://github.com/tomtom215/LyreBirdAudio.git
+cd LyreBirdAudio
+chmod +x *.sh</code></pre>
+        </div>
+      </li>
+      <li>
+        <div>
+          <strong>Launch the setup wizard</strong>
+          <pre><code>sudo ./lyrebird-orchestrator.sh
+# Select: Quick Setup Wizard</code></pre>
+        </div>
+      </li>
+      <li>
+        <div>
+          <strong>Access your streams</strong>
+          <pre><code>rtsp://your-server-ip:8554/device-name</code></pre>
+        </div>
+      </li>
+    </ol>
+    <p>
+      The wizard installs MediaMTX, maps USB devices, generates an optimal configuration, starts streams,
+      and runs initial diagnostics — all in one guided flow. See the <a href="quick-start.html">Quick Start guide</a>
+      for more detail.
+    </p>
+
+    <h2 id="platform-support">Platform Support</h2>
+    <div class="table-wrapper">
+      <table>
+        <thead>
+          <tr><th>Platform</th><th>Support</th><th>Notes</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Ubuntu 20.04+</td>
+            <td><span class="badge badge-green">✓ Recommended</span></td>
+            <td>Primary development platform</td>
+          </tr>
+          <tr>
+            <td>Debian 11+</td>
+            <td><span class="badge badge-green">✓ Supported</span></td>
+            <td>Fully tested</td>
+          </tr>
+          <tr>
+            <td>Raspberry Pi OS</td>
+            <td><span class="badge badge-blue">✓ Supported</span></td>
+            <td>Max 2 USB mics recommended</td>
+          </tr>
+          <tr>
+            <td>Intel N100 Mini PC</td>
+            <td><span class="badge badge-green">✓ Recommended</span></td>
+            <td>4+ mics, best stability</td>
+          </tr>
+          <tr>
+            <td>macOS / Windows</td>
+            <td><span class="badge badge-gray">✗ Not supported</span></td>
+            <td>Linux-specific udev required</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h2 id="project-info">Project Info</h2>
+    <div class="table-wrapper">
+      <table>
+        <tbody>
+          <tr><td><strong>License</strong></td><td>Apache 2.0</td></tr>
+          <tr><td><strong>Language</strong></td><td>Bash 4.0+</td></tr>
+          <tr><td><strong>Author</strong></td><td><a href="https://github.com/tomtom215" target="_blank" rel="noopener">Tom F (tomtom215)</a></td></tr>
+          <tr><td><strong>GitHub</strong></td><td><a href="https://github.com/tomtom215/LyreBirdAudio" target="_blank" rel="noopener">tomtom215/LyreBirdAudio</a></td></tr>
+          <tr><td><strong>Issues</strong></td><td><a href="https://github.com/tomtom215/LyreBirdAudio/issues" target="_blank" rel="noopener">GitHub Issues</a></td></tr>
+          <tr><td><strong>Discussions</strong></td><td><a href="https://github.com/tomtom215/LyreBirdAudio/discussions" target="_blank" rel="noopener">GitHub Discussions</a></td></tr>
+        </tbody>
+      </table>
+    </div>
+
+  </main>
+  <nav id="page-nav" class="page-nav"></nav>
+</div>
+
+<script src="js/nav.js"></script>
+<script src="js/search.js"></script>
+</body>
+</html>

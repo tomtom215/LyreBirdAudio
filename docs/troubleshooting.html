@@ -1,0 +1,332 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Troubleshooting - LyreBirdAudio Docs</title>
+  <meta name="description" content="Diagnose and fix common LyreBirdAudio issues.">
+  <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+
+<div id="sidebar-overlay" class="sidebar-overlay"></div>
+<aside id="sidebar" class="sidebar"></aside>
+
+<div class="content-wrapper">
+  <header id="topbar" class="topbar"></header>
+
+  <main class="content">
+    <div class="page-header">
+      <span class="page-label">Operations</span>
+      <h1 class="page-title">Troubleshooting</h1>
+      <p class="page-subtitle">Diagnose and fix the most common issues with LyreBirdAudio.</p>
+    </div>
+
+    <div class="toc">
+      <div class="toc-title">On this page</div>
+      <ul class="toc-list">
+        <li><a href="#quick-check">Start Here: Quick Check</a></li>
+        <li><a href="#no-devices">No USB Devices Found</a></li>
+        <li><a href="#stream-issues">Streams Won't Start</a></li>
+        <li><a href="#device-names">Device Names Change After Reboot</a></li>
+        <li><a href="#permissions">Permission Errors</a></li>
+        <li><a href="#mediamtx-crash">MediaMTX Crashes</a></li>
+        <li><a href="#cpu-usage">High CPU Usage</a></li>
+        <li><a href="#update-fail">Update Failed</a></li>
+        <li><a href="#debug">Debug Procedures</a></li>
+        <li><a href="#log-locations">Log Locations</a></li>
+        <li><a href="#collecting-info">Collecting Debug Information</a></li>
+      </ul>
+    </div>
+
+    <h2 id="quick-check">Start Here: Quick Check</h2>
+    <p>Always run the built-in diagnostics first — they check all common failure points automatically:</p>
+    <pre><code># Run quick health check
+sudo ./lyrebird-diagnostics.sh quick
+
+# Check stream status
+./lyrebird-stream-manager.sh status</code></pre>
+    <p>The exit code tells you the severity:</p>
+    <div class="table-wrapper">
+      <table>
+        <thead><tr><th>Exit Code</th><th>Meaning</th></tr></thead>
+        <tbody>
+          <tr><td>0</td><td>All checks passed</td></tr>
+          <tr><td>1</td><td>Warnings — system functional but needs attention</td></tr>
+          <tr><td>2</td><td>Failures — system degraded or non-functional</td></tr>
+          <tr><td>127</td><td>Prerequisites missing — cannot complete diagnostics</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <hr>
+    <h2 id="no-devices">No USB Devices Found</h2>
+    <p><strong>Symptom:</strong> Stream manager reports no USB audio devices, or device list is empty.</p>
+
+    <pre><code># Step 1: Check what Linux sees
+lsusb | grep -i audio
+arecord -l
+
+# Step 2: Check ALSA device enumeration
+cat /proc/asound/cards
+
+# Step 3: Verify udev rules exist
+sudo cat /etc/udev/rules.d/99-usb-soundcards.rules
+
+# Step 4: Reload udev and check symlinks
+sudo udevadm control --reload-rules
+sudo udevadm trigger
+ls -la /dev/snd/by-usb-port/
+
+# Step 5: Re-run device mapping
+sudo ./usb-audio-mapper.sh
+
+# Step 6: Reboot (required for udev rules)
+sudo reboot</code></pre>
+
+    <div class="callout tip">
+      <span class="callout-icon">💡</span>
+      <div class="callout-body">
+        <strong>Check Physical Connections</strong>
+        <p>Unplug and re-plug the USB microphone, then check <code>dmesg | tail -20</code> to see if Linux recognizes the device. Look for "USB Audio" or "snd_usb_audio" in the output.</p>
+      </div>
+    </div>
+
+    <hr>
+    <h2 id="stream-issues">Streams Won't Start</h2>
+    <p><strong>Symptom:</strong> Start command completes but no streams are active, or streams immediately die.</p>
+
+    <pre><code># Check stream manager logs
+sudo tail -50 /var/log/lyrebird-stream-manager.log
+
+# Check per-device FFmpeg logs
+sudo tail -50 /var/log/lyrebird/*.log
+
+# Validate device configuration
+sudo ./lyrebird-mic-check.sh -V
+
+# Check if MediaMTX is running
+./install_mediamtx.sh status
+curl -s http://localhost:9997/v3/paths/list | head -20
+
+# Try a force-restart
+sudo ./lyrebird-stream-manager.sh force-stop
+sudo ./lyrebird-stream-manager.sh start</code></pre>
+
+    <p><strong>Common causes:</strong></p>
+    <ul>
+      <li>MediaMTX is not running — start it first</li>
+      <li>Configuration has an unsupported sample rate for the device</li>
+      <li>Device is busy (another process has it open)</li>
+      <li>Lock file is stale from a crashed previous run</li>
+    </ul>
+
+    <pre><code># Check if device is busy
+sudo lsof /dev/snd/*
+
+# Remove stale lock file
+sudo rm -f /run/mediamtx-audio.lock /run/mediamtx-audio.pid</code></pre>
+
+    <hr>
+    <h2 id="device-names">Device Names Change After Reboot</h2>
+    <p><strong>Symptom:</strong> <code>Device_1</code> becomes <code>Device_2</code> after reboot, or devices swap names.</p>
+
+    <pre><code># Verify udev rules are in place
+cat /etc/udev/rules.d/99-usb-soundcards.rules
+
+# Check if symlinks exist
+ls -la /dev/snd/by-usb-port/
+
+# Reload udev
+sudo udevadm control --reload-rules
+sudo udevadm trigger
+
+# Re-run mapper if rules are missing/incorrect
+sudo ./usb-audio-mapper.sh
+
+# Reboot to apply
+sudo reboot</code></pre>
+
+    <div class="callout info">
+      <span class="callout-icon">ℹ️</span>
+      <div class="callout-body">
+        <strong>USB Port Changes</strong>
+        <p>If you physically moved a microphone to a different USB port, you must re-run <code>sudo ./usb-audio-mapper.sh</code> and reboot. udev rules are tied to the physical USB port path, not the device itself.</p>
+      </div>
+    </div>
+
+    <hr>
+    <h2 id="permissions">Permission Errors</h2>
+    <p><strong>Symptom:</strong> "Permission denied" errors when accessing audio devices or log directories.</p>
+
+    <pre><code># Add your user to the audio group
+sudo usermod -a -G audio $USER
+
+# Fix log directory permissions
+sudo mkdir -p /var/log/lyrebird
+sudo chmod 755 /var/log/lyrebird
+
+# Fix state directory permissions
+sudo mkdir -p /var/lib/mediamtx-ffmpeg
+sudo chmod 755 /var/lib/mediamtx-ffmpeg
+
+# Apply group changes (requires reboot or re-login)
+sudo reboot</code></pre>
+
+    <div class="callout warning">
+      <span class="callout-icon">⚠️</span>
+      <div class="callout-body">
+        <strong>Run as Root or via Sudo</strong>
+        <p>The stream manager requires root to access USB audio devices and write to system directories. Always use <code>sudo ./lyrebird-stream-manager.sh start</code>. The diagnostics script can be run as a regular user for read-only checks.</p>
+      </div>
+    </div>
+
+    <hr>
+    <h2 id="mediamtx-crash">MediaMTX Crashes</h2>
+    <p><strong>Symptom:</strong> MediaMTX process dies unexpectedly, streams go offline.</p>
+
+    <pre><code># Check system resources
+free -h
+df -h
+ulimit -n
+
+# View crash logs
+sudo journalctl -u mediamtx -n 100
+
+# Increase file descriptor limits
+sudo bash -c 'echo "* soft nofile 4096" >> /etc/security/limits.conf'
+sudo bash -c 'echo "* hard nofile 8192" >> /etc/security/limits.conf'
+sudo bash -c 'echo "mediamtx soft nofile 4096" >> /etc/security/limits.conf'
+sudo bash -c 'echo "mediamtx hard nofile 8192" >> /etc/security/limits.conf'
+
+# Restart the service
+sudo systemctl restart mediamtx</code></pre>
+
+    <hr>
+    <h2 id="cpu-usage">High CPU Usage</h2>
+    <p><strong>Symptom:</strong> System becomes unresponsive, CPU at 100%.</p>
+
+    <pre><code># Identify which processes are hot
+sudo ./lyrebird-stream-manager.sh monitor
+top -p $(pgrep -f ffmpeg | tr '\n' ',')</code></pre>
+
+    <p><strong>Solutions:</strong></p>
+    <ul>
+      <li>Reduce sample rate: change <code>SAMPLE_RATE=48000</code> to <code>16000</code></li>
+      <li>Use a lower bitrate: <code>BITRATE=64k</code> instead of <code>192k</code></li>
+      <li>Reduce number of simultaneous streams</li>
+      <li>Check for FFmpeg zombie process accumulation (<code>ps aux | grep ffmpeg</code>)</li>
+    </ul>
+
+    <pre><code># Clean up zombie FFmpeg processes
+sudo pkill -f ffmpeg
+sudo ./lyrebird-stream-manager.sh start</code></pre>
+
+    <hr>
+    <h2 id="update-fail">Update Failed</h2>
+    <p><strong>Symptom:</strong> <code>lyrebird-updater.sh</code> reports errors, git conflicts, or update won't complete.</p>
+
+    <pre><code># Check repository state
+git status
+git stash list
+
+# Check update status
+./lyrebird-updater.sh --status
+
+# Stash local changes and retry
+git stash
+./lyrebird-updater.sh
+
+# Reset to known-good state
+git reset --hard origin/main
+git checkout $(git describe --tags --abbrev=0)
+chmod +x *.sh</code></pre>
+
+    <hr>
+    <h2 id="debug">Debug Procedures</h2>
+
+    <h3>Enable Debug Mode</h3>
+    <pre><code>export DEBUG=1
+sudo ./lyrebird-stream-manager.sh start</code></pre>
+
+    <h3>Test FFmpeg Directly</h3>
+    <pre><code># Test ALSA capture for a specific device
+arecord -D hw:0,0 -f cd -t wav -d 5 test.wav
+
+# Test FFmpeg capture and publish
+ffmpeg -f alsa -i hw:0,0 \
+  -acodec libopus \
+  -b:a 128k \
+  -ar 48000 \
+  -ac 2 \
+  -f rtsp \
+  rtsp://localhost:8554/test</code></pre>
+
+    <h3>Test RTSP Connectivity</h3>
+    <pre><code># Check if port 8554 is listening
+ss -tlnp | grep 8554
+
+# Test RTSP connection
+ffplay -i rtsp://localhost:8554/Device_1 -loglevel debug 2>&1 | head -50
+
+# Check MediaMTX API
+curl -s http://localhost:9997/v3/paths/list | python3 -m json.tool</code></pre>
+
+    <hr>
+    <h2 id="log-locations">Log Locations</h2>
+    <div class="table-wrapper">
+      <table>
+        <thead><tr><th>Log</th><th>Path</th></tr></thead>
+        <tbody>
+          <tr><td>MediaMTX output</td><td><code>/var/log/mediamtx.out</code></td></tr>
+          <tr><td>Stream Manager</td><td><code>/var/log/lyrebird-stream-manager.log</code></td></tr>
+          <tr><td>Orchestrator</td><td><code>/var/log/lyrebird-orchestrator.log</code></td></tr>
+          <tr><td>Diagnostics</td><td><code>/var/log/lyrebird-diagnostics.log</code></td></tr>
+          <tr><td>Per-device FFmpeg</td><td><code>/var/log/lyrebird/&lt;device&gt;.log</code></td></tr>
+          <tr><td>systemd (MediaMTX)</td><td><code>journalctl -u mediamtx</code></td></tr>
+          <tr><td>systemd (Streams)</td><td><code>journalctl -u mediamtx-audio</code></td></tr>
+          <tr><td>USB events</td><td><code>dmesg | grep -i usb</code></td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <pre><code># Follow all lyrebird logs in real time
+sudo tail -f /var/log/lyrebird-stream-manager.log /var/log/lyrebird/*.log
+
+# Follow systemd service logs
+sudo journalctl -u mediamtx-audio -f</code></pre>
+
+    <hr>
+    <h2 id="collecting-info">Collecting Debug Information for Bug Reports</h2>
+    <p>When filing a GitHub issue, please include the following:</p>
+
+    <pre><code># 1. Run full diagnostics (safe to share)
+sudo ./lyrebird-diagnostics.sh full > /tmp/diagnostics.txt 2>&1
+
+# 2. Collect logs (review before sharing — may contain paths)
+tar -czf /tmp/lyrebird-logs-$(date +%Y%m%d).tar.gz \
+  /var/log/mediamtx.out \
+  /var/log/lyrebird-stream-manager.log \
+  /var/log/lyrebird/*.log \
+  /etc/mediamtx/audio-devices.conf \
+  /etc/udev/rules.d/99-usb-soundcards.rules 2>/dev/null
+
+# 3. System info
+cat /etc/os-release > /tmp/system-info.txt
+uname -a >> /tmp/system-info.txt
+lsusb >> /tmp/system-info.txt
+bash --version >> /tmp/system-info.txt</code></pre>
+
+    <p>
+      Include <code>/tmp/diagnostics.txt</code>, the logs tarball, and <code>/tmp/system-info.txt</code> in your
+      <a href="https://github.com/tomtom215/LyreBirdAudio/issues" target="_blank" rel="noopener">GitHub issue</a>.
+    </p>
+
+  </main>
+  <nav id="page-nav" class="page-nav"></nav>
+</div>
+
+<script src="js/nav.js"></script>
+<script src="js/search.js"></script>
+</body>
+</html>

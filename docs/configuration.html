@@ -1,0 +1,367 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Configuration - LyreBirdAudio Docs</title>
+  <meta name="description" content="Configure audio devices, codecs, sample rates, and MediaMTX integration.">
+  <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+
+<div id="sidebar-overlay" class="sidebar-overlay"></div>
+<aside id="sidebar" class="sidebar"></aside>
+
+<div class="content-wrapper">
+  <header id="topbar" class="topbar"></header>
+
+  <main class="content">
+    <div class="page-header">
+      <span class="page-label">User Guide</span>
+      <h1 class="page-title">Configuration</h1>
+      <p class="page-subtitle">Customize audio quality, device settings, environment variables, and MediaMTX integration.</p>
+    </div>
+
+    <div class="toc">
+      <div class="toc-title">On this page</div>
+      <ul class="toc-list">
+        <li><a href="#audio-config">Audio Device Configuration</a></li>
+        <li><a href="#config-files">Configuration Files</a></li>
+        <li><a href="#env-vars">Environment Variables</a></li>
+        <li><a href="#mediamtx">MediaMTX Integration</a></li>
+        <li><a href="#quality-tiers">Quality Tiers</a></li>
+      </ul>
+    </div>
+
+    <h2 id="audio-config">Audio Device Configuration</h2>
+    <p>
+      Device-specific audio settings live in <code>/etc/mediamtx/audio-devices.conf</code>.
+      This file uses a simple <code>KEY=VALUE</code> format (bash environment variables) that
+      the stream manager reads at startup.
+    </p>
+
+    <h3>Auto-Generate Configuration (Recommended)</h3>
+    <p>The <code>lyrebird-mic-check.sh</code> script detects your hardware capabilities and writes an optimal configuration:</p>
+    <pre><code># Generate with normal quality (recommended default)
+sudo ./lyrebird-mic-check.sh -g
+
+# Generate with high quality (more bandwidth)
+sudo ./lyrebird-mic-check.sh -g --quality=high
+
+# Generate with low quality (speech / bandwidth-constrained)
+sudo ./lyrebird-mic-check.sh -g --quality=low
+
+# Preview what would be generated without writing (dry-run)
+./lyrebird-mic-check.sh -g --dry-run</code></pre>
+
+    <h3>Manual Configuration Format</h3>
+    <p>Settings use a <code>DEVICE_&lt;NAME&gt;_&lt;PARAMETER&gt;=value</code> pattern. Device names are sanitized
+    (special characters → underscores, uppercased).</p>
+    <pre><code># /etc/mediamtx/audio-devices.conf
+
+# ── Device-specific settings (by friendly name) ──────────────────
+DEVICE_USB_MICROPHONE_SAMPLE_RATE=48000
+DEVICE_USB_MICROPHONE_CHANNELS=2
+DEVICE_USB_MICROPHONE_BITRATE=192k
+DEVICE_USB_MICROPHONE_CODEC=opus
+
+# ── Device-specific settings (by full device ID, guaranteed unique) ──
+DEVICE_USB_MANUFACTURER_MODEL_SERIAL_00000000_SAMPLE_RATE=48000
+DEVICE_USB_MANUFACTURER_MODEL_SERIAL_00000000_CHANNELS=2
+DEVICE_USB_MANUFACTURER_MODEL_SERIAL_00000000_BITRATE=128k
+
+# ── Fallback defaults ─────────────────────────────────────────────
+DEFAULT_SAMPLE_RATE=48000
+DEFAULT_CHANNELS=2
+DEFAULT_BITRATE=128k
+DEFAULT_CODEC=opus
+DEFAULT_THREAD_QUEUE=8192</code></pre>
+
+    <div class="callout info">
+      <span class="callout-icon">ℹ️</span>
+      <div class="callout-body">
+        <strong>Lookup Priority</strong>
+        <p>The stream manager tries settings in this order: (1) friendly name config, (2) full device ID config, (3) defaults. This lets you set one value for a device regardless of which USB port it's plugged into.</p>
+      </div>
+    </div>
+
+    <h3>Available Parameters</h3>
+    <div class="table-wrapper">
+      <table>
+        <thead><tr><th>Parameter</th><th>Values</th><th>Default</th><th>Description</th></tr></thead>
+        <tbody>
+          <tr><td><code>SAMPLE_RATE</code></td><td>16000, 44100, 48000, 96000</td><td>48000</td><td>Audio sample rate in Hz</td></tr>
+          <tr><td><code>CHANNELS</code></td><td>1 (mono), 2 (stereo)</td><td>2</td><td>Number of audio channels</td></tr>
+          <tr><td><code>BITRATE</code></td><td>64k, 96k, 128k, 192k, 256k</td><td>128k</td><td>Encoder bitrate</td></tr>
+          <tr><td><code>CODEC</code></td><td>opus, aac, mp3, pcm</td><td>opus</td><td>Audio codec</td></tr>
+          <tr><td><code>THREAD_QUEUE</code></td><td>Integer (power of 2)</td><td>8192</td><td>FFmpeg thread queue size (buffer)</td></tr>
+          <tr><td><code>ANALYZEDURATION</code></td><td>Integer (microseconds)</td><td>5000000</td><td>FFmpeg input analysis duration</td></tr>
+          <tr><td><code>PROBESIZE</code></td><td>Integer (bytes)</td><td>5000000</td><td>FFmpeg input probe size</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h3>Validate Configuration</h3>
+    <pre><code># Check configuration against detected hardware capabilities
+sudo ./lyrebird-mic-check.sh -V
+
+# Also validates MediaMTX config
+/usr/local/bin/mediamtx --check /etc/mediamtx/mediamtx.yml</code></pre>
+
+    <h2 id="config-files">Configuration Files</h2>
+    <div class="table-wrapper">
+      <table>
+        <thead><tr><th>File</th><th>Format</th><th>Purpose</th></tr></thead>
+        <tbody>
+          <tr>
+            <td><code>/etc/mediamtx/mediamtx.yml</code></td>
+            <td>YAML</td>
+            <td>MediaMTX main configuration (ports, protocols, auth)</td>
+          </tr>
+          <tr>
+            <td><code>/etc/mediamtx/audio-devices.conf</code></td>
+            <td>Bash env vars</td>
+            <td>Per-device audio codec and quality settings</td>
+          </tr>
+          <tr>
+            <td><code>/etc/udev/rules.d/99-usb-soundcards.rules</code></td>
+            <td>udev</td>
+            <td>USB device persistence rules (persistent symlinks)</td>
+          </tr>
+          <tr>
+            <td><code>/etc/systemd/system/mediamtx.service</code></td>
+            <td>systemd unit</td>
+            <td>MediaMTX server service definition</td>
+          </tr>
+          <tr>
+            <td><code>/etc/systemd/system/mediamtx-audio.service</code></td>
+            <td>systemd unit</td>
+            <td>Stream manager service with watchdog support</td>
+          </tr>
+          <tr>
+            <td><code>/etc/lyrebird/alerts.conf</code></td>
+            <td>Bash env vars</td>
+            <td>Webhook alert configuration</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h3>Runtime State Files</h3>
+    <div class="table-wrapper">
+      <table>
+        <thead><tr><th>Path</th><th>Purpose</th></tr></thead>
+        <tbody>
+          <tr><td><code>/run/mediamtx-audio.pid</code></td><td>Stream manager PID</td></tr>
+          <tr><td><code>/run/mediamtx-audio.lock</code></td><td>Concurrency lock file</td></tr>
+          <tr><td><code>/var/lib/mediamtx-ffmpeg/</code></td><td>Per-device FFmpeg PID files and wrapper scripts</td></tr>
+          <tr><td><code>/var/log/mediamtx.out</code></td><td>MediaMTX output log</td></tr>
+          <tr><td><code>/var/log/lyrebird-stream-manager.log</code></td><td>Stream manager log</td></tr>
+          <tr><td><code>/var/log/lyrebird/</code></td><td>Per-device FFmpeg logs</td></tr>
+          <tr><td><code>/var/log/lyrebird-orchestrator.log</code></td><td>Orchestrator log</td></tr>
+          <tr><td><code>/var/log/lyrebird-diagnostics.log</code></td><td>Diagnostics output</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h2 id="env-vars">Environment Variables</h2>
+    <p>
+      All configuration can be overridden via environment variables. This is useful for custom
+      deployments, Docker-adjacent setups, or testing alternative values.
+    </p>
+
+    <h3>Stream Manager</h3>
+    <pre><code># MediaMTX paths
+MEDIAMTX_BINARY="/usr/local/bin/mediamtx"
+MEDIAMTX_CONFIG_DIR="/etc/mediamtx"
+MEDIAMTX_CONFIG_FILE="/etc/mediamtx/mediamtx.yml"
+MEDIAMTX_DEVICE_CONFIG="/etc/mediamtx/audio-devices.conf"
+MEDIAMTX_LOG_FILE="/var/log/mediamtx.out"
+MEDIAMTX_HOST="localhost"
+MEDIAMTX_API_PORT="9997"
+
+# Process management
+MEDIAMTX_PID_FILE="/run/mediamtx-audio.pid"
+MEDIAMTX_LOCK_FILE="/run/mediamtx-audio.lock"
+MEDIAMTX_FFMPEG_DIR="/var/lib/mediamtx-ffmpeg"
+
+# Timing
+STREAM_STARTUP_DELAY=10         # Seconds before starting streams
+USB_STABILIZATION_DELAY=5       # Seconds to wait after USB events
+RESTART_STABILIZATION_DELAY=15  # Seconds between restart attempts
+
+# Recovery
+MAX_WRAPPER_RESTARTS=50         # Max auto-restarts before giving up
+WRAPPER_SUCCESS_DURATION=300    # Seconds to count as "successful run"
+MAX_CONSECUTIVE_FAILURES=5      # Max failures before escalation
+INITIAL_RESTART_DELAY=10        # Starting exponential backoff (seconds)
+MAX_RESTART_DELAY=300           # Maximum backoff delay (5 minutes)
+
+# Resource thresholds
+MAX_FD_WARNING=500              # File descriptor warning level
+MAX_FD_CRITICAL=1000            # File descriptor critical level
+MAX_CPU_WARNING=20              # CPU % warning per stream
+MAX_CPU_CRITICAL=40             # CPU % critical per stream
+
+# Audio defaults (when not in config file)
+DEFAULT_SAMPLE_RATE=48000
+DEFAULT_CHANNELS=2
+DEFAULT_CODEC=opus
+DEFAULT_BITRATE=128k
+DEFAULT_THREAD_QUEUE=8192
+
+# Debugging
+DEBUG=1                         # Enable verbose output</code></pre>
+
+    <h3>Usage Examples</h3>
+    <pre><code># Use custom log location
+FFMPEG_LOG_DIR=/mnt/storage/logs sudo ./lyrebird-stream-manager.sh start
+
+# Increase startup delay for slow USB hubs
+STREAM_STARTUP_DELAY=20 sudo ./lyrebird-stream-manager.sh start
+
+# Enable debug output
+export DEBUG=1
+sudo ./lyrebird-stream-manager.sh start
+
+# Install MediaMTX to a custom prefix
+MEDIAMTX_PREFIX=/opt/mediamtx sudo ./install_mediamtx.sh install</code></pre>
+
+    <h2 id="mediamtx">MediaMTX Integration</h2>
+    <p>
+      MediaMTX serves RTSP, WebRTC, HLS, and RTMP. LyreBirdAudio configures and manages the MediaMTX
+      process. The main configuration is at <code>/etc/mediamtx/mediamtx.yml</code>.
+    </p>
+
+    <h3>Default Port Assignments</h3>
+    <div class="table-wrapper">
+      <table>
+        <thead><tr><th>Protocol</th><th>Default Port</th><th>Purpose</th></tr></thead>
+        <tbody>
+          <tr><td>RTSP</td><td>8554</td><td>Stream consumption (VLC, FFplay, etc.)</td></tr>
+          <tr><td>HTTP API</td><td>9997</td><td>REST API for stream management</td></tr>
+          <tr><td>WebRTC</td><td>8889</td><td>Browser-based streaming</td></tr>
+          <tr><td>RTP / RTCP</td><td>8000–8001</td><td>Media transport</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h3>Management Modes</h3>
+    <div class="table-wrapper">
+      <table>
+        <thead><tr><th>Mode</th><th>Best For</th><th>How to Use</th></tr></thead>
+        <tbody>
+          <tr>
+            <td><strong>Stream Manager</strong> (default)</td>
+            <td>Audio streaming with automatic recovery</td>
+            <td><code>./lyrebird-stream-manager.sh start</code></td>
+          </tr>
+          <tr>
+            <td><strong>Systemd Direct</strong></td>
+            <td>General MediaMTX usage without audio scripts</td>
+            <td><code>systemctl start mediamtx</code></td>
+          </tr>
+          <tr>
+            <td><strong>Manual</strong></td>
+            <td>Development / debugging</td>
+            <td><code>/usr/local/bin/mediamtx /etc/mediamtx/mediamtx.yml</code></td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h3>MediaMTX API</h3>
+    <p>The REST API (port 9997) is available for programmatic stream management:</p>
+    <pre><code># List all active paths/streams
+curl http://localhost:9997/v3/paths/list
+
+# Get info for a specific stream
+curl http://localhost:9997/v3/paths/get/Device_1
+
+# Check MediaMTX health
+curl http://localhost:9997/v3/config/global/get</code></pre>
+
+    <h2 id="quality-tiers">Quality Tiers</h2>
+    <p>The capability checker provides three quality presets. Choose based on your use case:</p>
+
+    <div class="table-wrapper">
+      <table>
+        <thead><tr><th>Tier</th><th>Sample Rate</th><th>Bitrate</th><th>Best For</th></tr></thead>
+        <tbody>
+          <tr>
+            <td><span class="badge badge-blue">low</span></td>
+            <td>16,000 Hz</td>
+            <td>64 kbps</td>
+            <td>Speech, monitoring, bandwidth-constrained</td>
+          </tr>
+          <tr>
+            <td><span class="badge badge-green">normal</span></td>
+            <td>48,000 Hz</td>
+            <td>128 kbps</td>
+            <td>General purpose, balanced (default)</td>
+          </tr>
+          <tr>
+            <td><span class="badge badge-orange">high</span></td>
+            <td>48,000 Hz+</td>
+            <td>256 kbps+</td>
+            <td>Music, high-quality recording</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h3>Codec Comparison</h3>
+    <div class="table-wrapper">
+      <table>
+        <thead><tr><th>Codec</th><th>Quality/Bitrate</th><th>Compatibility</th><th>Latency</th></tr></thead>
+        <tbody>
+          <tr>
+            <td><strong>Opus</strong></td>
+            <td>Best (recommended)</td>
+            <td>Modern clients, VLC, FFplay</td>
+            <td>Very low</td>
+          </tr>
+          <tr>
+            <td><strong>AAC</strong></td>
+            <td>Good</td>
+            <td>Widest (iOS, browsers)</td>
+            <td>Moderate</td>
+          </tr>
+          <tr>
+            <td><strong>PCM</strong></td>
+            <td>Lossless</td>
+            <td>All FFmpeg-capable clients</td>
+            <td>Lowest</td>
+          </tr>
+          <tr>
+            <td><strong>MP3</strong></td>
+            <td>Good</td>
+            <td>Universal</td>
+            <td>Moderate</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h3>High-Quality Example</h3>
+    <pre><code># High quality music streaming
+DEVICE_STUDIO_MIC_SAMPLE_RATE=96000
+DEVICE_STUDIO_MIC_CHANNELS=2
+DEVICE_STUDIO_MIC_BITRATE=256k
+DEVICE_STUDIO_MIC_CODEC=opus</code></pre>
+
+    <h3>Low-Bandwidth Speech Example</h3>
+    <pre><code># Speech/monitoring (bandwidth-constrained)
+DEVICE_FIELD_MIC_SAMPLE_RATE=16000
+DEVICE_FIELD_MIC_CHANNELS=1
+DEVICE_FIELD_MIC_BITRATE=64k
+DEVICE_FIELD_MIC_CODEC=opus</code></pre>
+
+  </main>
+  <nav id="page-nav" class="page-nav"></nav>
+</div>
+
+<script src="js/nav.js"></script>
+<script src="js/search.js"></script>
+</body>
+</html>
