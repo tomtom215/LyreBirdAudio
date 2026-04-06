@@ -223,7 +223,7 @@ mask_url() {
 load_config() {
     if [[ -f "$ALERT_CONFIG_FILE" ]]; then
         log_debug "Loading configuration from $ALERT_CONFIG_FILE"
-        local line key value
+        local key value
         while IFS='=' read -r key value; do
             # Skip comments and empty lines
             [[ -z "$key" || "$key" =~ ^[[:space:]]*# ]] && continue
