@@ -1617,9 +1617,10 @@ mediamtx_api_call() {
     # Use -w to get HTTP status code
     response=$(curl "${curl_args[@]}" -w "\n%{http_code}" "$url" 2>/dev/null)
     http_code=$(echo "$response" | tail -1)
+    http_code="${http_code:-0}"
     response=$(echo "$response" | sed '$d')
 
-    if [[ "$http_code" -ge 200 ]] && [[ "$http_code" -lt 300 ]]; then
+    if [[ "$http_code" =~ ^[0-9]+$ ]] && [[ "$http_code" -ge 200 ]] && [[ "$http_code" -lt 300 ]]; then
         echo "$response"
         return 0
     else
@@ -4537,7 +4538,7 @@ force_stop_mediamtx() {
     # Kill MediaMTX
     if [[ -f "${PID_FILE}" ]]; then
         local pid
-        pid="$(cat "${PID_FILE}" 2>/dev/null || true)"
+        pid="$(read_pid_safe "${PID_FILE}")"
         if [[ -n "$pid" ]]; then
             kill -KILL "$pid" 2>/dev/null || true
         fi
