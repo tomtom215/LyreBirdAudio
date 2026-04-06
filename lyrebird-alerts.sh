@@ -486,7 +486,7 @@ send_webhook() {
     local attempt=0
 
     while ((attempt < retries)); do
-        ((attempt++))
+        ((attempt++)) || true
         log_debug "Sending webhook (attempt ${attempt}/${retries}): $(mask_url "$webhook_url")"
 
         local http_code

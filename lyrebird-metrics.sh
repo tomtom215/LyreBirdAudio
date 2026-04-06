@@ -277,7 +277,7 @@ api_call_with_retry() {
     local result=""
 
     while ((attempt < retries)); do
-        ((attempt++))
+        ((attempt++)) || true
         result=$(curl -s --connect-timeout "$timeout" "$url" 2>/dev/null) && break
         # Brief pause before retry
         ((attempt < retries)) && sleep 1

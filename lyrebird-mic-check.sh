@@ -1445,7 +1445,7 @@ restore_config_backup() {
             mod_time=$(stat -c '%y' "$backup_file" 2>/dev/null | cut -d'.' -f1)
 
             printf '  %d) %s - %s (%s)\n' "$i" "$timestamp" "$mod_time" "$size"
-            ((i++))
+            ((i++)) || true
         done
 
         echo ""
@@ -1711,7 +1711,7 @@ EOF
         # Skip non-USB devices
         [[ -f "$card_dir/usbid" ]] || continue
 
-        ((devices_found++))
+        ((devices_found++)) || true
 
         log_info "Processing card $card_num..."
 
@@ -1719,7 +1719,7 @@ EOF
         local device_info
         if ! device_info=$(get_device_info "$card_num" 2>/dev/null); then
             log_warn "Could not get info for card $card_num - skipping"
-            ((devices_skipped++))
+            ((devices_skipped++)) || true
             continue
         fi
 
@@ -1737,7 +1737,7 @@ EOF
         local caps
         if ! caps=$(detect_device_capabilities "$card_num" 2>/dev/null); then
             log_warn "Could not detect capabilities for card $card_num - skipping"
-            ((devices_skipped++))
+            ((devices_skipped++)) || true
             continue
         fi
 
@@ -1747,7 +1747,7 @@ EOF
         # Check if device supports capture
         if [[ "${PARSED_CAPS[capture_capable]:-false}" != "true" ]]; then
             log_warn "Card $card_num does not support audio capture - skipping"
-            ((devices_skipped++))
+            ((devices_skipped++)) || true
             continue
         fi
 
@@ -1755,7 +1755,7 @@ EOF
         local optimal_settings
         if ! optimal_settings=$(determine_optimal_settings "$QUALITY_TIER"); then
             log_warn "Could not determine optimal settings for card $card_num - skipping"
-            ((devices_skipped++))
+            ((devices_skipped++)) || true
             continue
         fi
 
@@ -1780,7 +1780,7 @@ DEVICE_${safe_name}_BITRATE=${enc_bitrate}k
 
 EOF
 
-        ((devices_configured++))
+        ((devices_configured++)) || true
         log_info "  Configured: $device_name"
         log_info "    Sample rate: $optimal_rate Hz"
         log_info "    Channels: $optimal_channels"
@@ -1945,7 +1945,7 @@ validate_config() {
         # Skip non-USB devices
         [[ -f "$card_dir/usbid" ]] || continue
 
-        ((devices_checked++))
+        ((devices_checked++)) || true
 
         # Get device info
         local device_info
@@ -2176,10 +2176,10 @@ parse_arguments() {
 
     # Count mutually exclusive primary modes
     local mode_count=0
-    [[ "$MODE_GENERATE" = true ]] && ((mode_count++))
-    [[ "$MODE_VALIDATE" = true ]] && ((mode_count++))
-    [[ "$MODE_LIST_BACKUPS" = true ]] && ((mode_count++))
-    [[ "$MODE_RESTORE" = true ]] && ((mode_count++))
+    [[ "$MODE_GENERATE" = true ]] && ((mode_count++)) || true
+    [[ "$MODE_VALIDATE" = true ]] && ((mode_count++)) || true
+    [[ "$MODE_LIST_BACKUPS" = true ]] && ((mode_count++)) || true
+    [[ "$MODE_RESTORE" = true ]] && ((mode_count++)) || true
 
     if [[ $mode_count -gt 1 ]]; then
         log_error "Only one of --generate-config, --validate, --list-backups, or --restore can be used at a time"

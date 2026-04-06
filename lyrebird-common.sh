@@ -52,13 +52,13 @@
 # Guard Against Multiple Inclusion
 #=============================================================================
 
-# Version of the common library
-readonly LYREBIRD_COMMON_VERSION="1.0.0"
-
 # Prevent multiple sourcing (idempotent)
 if [[ -n "${_LYREBIRD_COMMON_LOADED:-}" ]]; then
     return 0 2>/dev/null || exit 0
 fi
+
+# Version of the common library (declared after guard to avoid readonly error on re-source)
+readonly LYREBIRD_COMMON_VERSION="1.0.0"
 readonly _LYREBIRD_COMMON_LOADED=true
 
 #=============================================================================
@@ -80,7 +80,7 @@ fi
 
 _lyrebird_init_colors() {
     # Check if colors already defined
-    if declare -p RED &>/dev/null 2>&1; then
+    if declare -p RED &>/dev/null; then
         return 0
     fi
 
@@ -595,7 +595,6 @@ if ! declare -f lyrebird_spinner_start &>/dev/null; then
             done
         ) &
         _LYREBIRD_SPINNER_PID=$!
-        disown "$_LYREBIRD_SPINNER_PID" 2>/dev/null || true
     }
 fi
 
@@ -639,12 +638,17 @@ if ! declare -f lyrebird_progress_bar &>/dev/null; then
             return 0
         fi
 
-        # Calculate percentage and filled width
-        local percent=0
-        if ((total > 0)); then
-            percent=$((current * 100 / total))
+        # Guard against division by zero
+        if ((total <= 0)); then
+            printf '\r%s [%*s] %3d%% ' "${message}" "${width}" "" 0
+            return 0
         fi
+
+        # Calculate percentage and filled width
+        local percent=$((current * 100 / total))
         local filled=$((width * current / total))
+        # Clamp filled to width to prevent overflow when current > total
+        ((filled > width)) && filled=$width
         local empty=$((width - filled))
 
         # Build the bar
@@ -701,7 +705,7 @@ if ! declare -f lyrebird_countdown &>/dev/null; then
                 printf '\r%s... %d ' "${message}" "${seconds}"
             fi
             sleep 1
-            ((seconds--))
+            seconds=$((seconds - 1))
         done
 
         if [[ -t 1 ]] && [[ -z "${NO_COLOR:-}" ]]; then

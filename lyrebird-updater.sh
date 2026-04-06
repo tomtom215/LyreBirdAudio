@@ -301,7 +301,7 @@ acquire_lock() {
 
         [[ $waited -eq 0 ]] && log_info "Waiting for other instance to finish..."
         sleep 1
-        ((waited++))
+        ((waited++)) || true
     done
 }
 
@@ -481,7 +481,7 @@ stop_service_safe() {
         local elapsed=0
         while systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null && [[ $elapsed -lt $SERVICE_STOP_TIMEOUT ]]; do
             sleep 1
-            ((elapsed++))
+            ((elapsed++)) || true
         done
 
         if systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null; then
@@ -626,7 +626,7 @@ start_service_safe() {
     local elapsed=0
     while ! systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null && [[ $elapsed -lt $SERVICE_START_TIMEOUT ]]; do
         sleep 1
-        ((elapsed++))
+        ((elapsed++)) || true
     done
 
     # Verify service is running
@@ -729,7 +729,7 @@ EOF
             # Escape quotes for safe storage
             local escaped_line="${env_line//\"/\\\"}"
             echo "CUSTOM_ENV_${i}=\"${escaped_line}\"" >>"$temp_marker"
-            ((i++))
+            ((i++)) || true
         done
     else
         echo "CUSTOM_ENV_COUNT=0" >>"$temp_marker"
@@ -762,29 +762,43 @@ load_service_state_from_marker() {
     SERVICE_STATE=()
     SERVICE_CUSTOM_ENV=()
 
-    # Source the marker file to load variables
-    # shellcheck source=/dev/null
-    source "$marker" 2>/dev/null || {
-        log_error "Failed to load service state marker"
+    # Parse marker file safely without source (prevents code injection)
+    local line key value
+    local -A marker_vars=()
+    while IFS='=' read -r key value; do
+        # Skip comments and empty lines
+        [[ -z "$key" || "$key" =~ ^[[:space:]]*# ]] && continue
+        # Strip leading/trailing whitespace from key
+        key="${key#"${key%%[![:space:]]*}"}"
+        key="${key%"${key##*[![:space:]]}"}"
+        # Only accept known safe key patterns
+        if [[ "$key" =~ ^[A-Z_][A-Z_0-9]*$ ]]; then
+            # Strip surrounding quotes from value
+            value="${value#\"}"
+            value="${value%\"}"
+            marker_vars["$key"]="$value"
+        fi
+    done <"$marker" || {
+        log_error "Failed to read service state marker"
         return 1
     }
 
     # Reconstruct SERVICE_STATE associative array
-    SERVICE_STATE[installed]="${INSTALLED:-false}"
-    SERVICE_STATE[was_running]="${WAS_RUNNING:-false}"
-    SERVICE_STATE[was_enabled]="${WAS_ENABLED:-false}"
-    SERVICE_STATE[has_customizations]="${HAS_CUSTOMIZATIONS:-false}"
-    SERVICE_STATE[service_file]="${SERVICE_FILE:-}"
-    SERVICE_STATE[cron_file]="${CRON_FILE:-}"
-    SERVICE_STATE[backup_service_file]="${BACKUP_SERVICE_FILE:-}"
-    SERVICE_STATE[backup_cron_file]="${BACKUP_CRON_FILE:-}"
+    SERVICE_STATE[installed]="${marker_vars[INSTALLED]:-false}"
+    SERVICE_STATE[was_running]="${marker_vars[WAS_RUNNING]:-false}"
+    SERVICE_STATE[was_enabled]="${marker_vars[WAS_ENABLED]:-false}"
+    SERVICE_STATE[has_customizations]="${marker_vars[HAS_CUSTOMIZATIONS]:-false}"
+    SERVICE_STATE[service_file]="${marker_vars[SERVICE_FILE]:-}"
+    SERVICE_STATE[cron_file]="${marker_vars[CRON_FILE]:-}"
+    SERVICE_STATE[backup_service_file]="${marker_vars[BACKUP_SERVICE_FILE]:-}"
+    SERVICE_STATE[backup_cron_file]="${marker_vars[BACKUP_CRON_FILE]:-}"
 
     # Reconstruct SERVICE_CUSTOM_ENV array
-    local custom_env_count="${CUSTOM_ENV_COUNT:-0}"
+    local custom_env_count="${marker_vars[CUSTOM_ENV_COUNT]:-0}"
+    local i
     for ((i = 0; i < custom_env_count; i++)); do
-        local var_name="CUSTOM_ENV_${i}"
+        local env_value="${marker_vars[CUSTOM_ENV_${i}]:-}"
         # Unescape quotes
-        local env_value="${!var_name}"
         env_value="${env_value//\\\"/\"}"
         SERVICE_CUSTOM_ENV+=("$env_value")
     done
@@ -1034,10 +1048,10 @@ migration_stream_manager_rename() {
             log_info "  Updating systemd service file..."
             if sed -i "s|${OLD_STREAM_MANAGER}|${SERVICE_SCRIPT}|g" "$SERVICE_FILE" 2>/dev/null; then
                 log_success "  Updated service file references"
-                ((changes_made++))
+                ((changes_made++)) || true
             else
                 log_warn "  Could not update service file (permission denied?)"
-                ((errors++))
+                ((errors++)) || true
             fi
         fi
     fi
@@ -1050,10 +1064,10 @@ migration_stream_manager_rename() {
         log_info "  Removing old script from /usr/local/bin..."
         if rm -f "$old_bin" 2>/dev/null; then
             log_success "  Removed $old_bin"
-            ((changes_made++))
+            ((changes_made++)) || true
         else
             log_warn "  Could not remove $old_bin (permission denied?)"
-            ((errors++))
+            ((errors++)) || true
         fi
     fi
 
@@ -1062,10 +1076,10 @@ migration_stream_manager_rename() {
         log_info "  Installing new script to /usr/local/bin..."
         if cp "./${SERVICE_SCRIPT}" "$new_bin" && chmod +x "$new_bin" 2>/dev/null; then
             log_success "  Installed $new_bin"
-            ((changes_made++))
+            ((changes_made++)) || true
         else
             log_warn "  Could not install to /usr/local/bin (permission denied?)"
-            ((errors++))
+            ((errors++)) || true
         fi
     fi
 
@@ -1076,13 +1090,13 @@ migration_stream_manager_rename() {
         if mv "$OLD_STREAM_MANAGER_LOG" "$NEW_STREAM_MANAGER_LOG" 2>/dev/null; then
             if ln -sf "$NEW_STREAM_MANAGER_LOG" "$OLD_STREAM_MANAGER_LOG" 2>/dev/null; then
                 log_success "  Log file migrated with backward-compatible symlink"
-                ((changes_made++))
+                ((changes_made++)) || true
             else
                 log_warn "  Could not create backward-compatible symlink"
             fi
         else
             log_warn "  Could not migrate log file (permission denied?)"
-            ((errors++))
+            ((errors++)) || true
         fi
     fi
 
@@ -1092,10 +1106,10 @@ migration_stream_manager_rename() {
             log_info "  Updating cron job..."
             if sed -i "s|${OLD_STREAM_MANAGER}|${SERVICE_SCRIPT}|g" "$SERVICE_CRON_FILE" 2>/dev/null; then
                 log_success "  Updated cron job references"
-                ((changes_made++))
+                ((changes_made++)) || true
             else
                 log_warn "  Could not update cron job (permission denied?)"
-                ((errors++))
+                ((errors++)) || true
             fi
         fi
     fi
@@ -1950,10 +1964,10 @@ switch_version_safe() {
 
     # Handle systemd service update (pre-checkout)
     local service_update_result=0
-    if handle_systemd_service_update "$target_version"; then
+    handle_systemd_service_update "$target_version" || service_update_result=$?
+    if [[ $service_update_result -eq 0 ]]; then
         log_debug "Service update preparation successful"
     else
-        service_update_result=$?
         if [[ $service_update_result -eq $E_USER_ABORT ]]; then
             log_info "Operation cancelled by user during service update"
             transaction_rollback
@@ -2248,7 +2262,7 @@ list_available_releases() {
             printf "  %2d) %-15s (created: %s)\n" "$counter" "$tag" "$tag_date"
 
             AVAILABLE_VERSIONS+=("$tag")
-            ((counter++))
+            ((counter++)) || true
         done < <(git tag -l 'v*' --sort=-creatordate | head -n "$TAG_LIST_LIMIT")
 
         local tag_count
@@ -2277,7 +2291,7 @@ list_available_releases() {
                 printf "  %2d) %s\n" "$branch_counter" "$branch"
             fi
             AVAILABLE_VERSIONS+=("$branch")
-            ((branch_counter++))
+            ((branch_counter++)) || true
         done <<<"$git_branches"
     else
         echo "  (no development branches found)"

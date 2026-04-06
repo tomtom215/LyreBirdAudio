@@ -49,13 +49,19 @@ LimitNOFILE=65535
 # Increase core dump size for debugging (0 to disable)
 LimitCORE=0
 
-# Security hardening (optional, uncomment as needed)
-# NoNewPrivileges=yes
-# ProtectSystem=strict
-# ProtectHome=yes
-# PrivateTmp=yes
-# ReadWritePaths=/var/log /var/lib/mediamtx /etc/mediamtx
-# CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+# Security hardening
+NoNewPrivileges=yes
+ProtectHome=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ReadWritePaths=/var/log /var/lib/mediamtx /etc/mediamtx
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+
+# Resource limits for production stability
+MemoryMax=512M
+MemoryHigh=400M
 
 # Logging
 StandardOutput=append:/var/log/mediamtx.out

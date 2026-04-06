@@ -56,16 +56,23 @@ Environment=LYREBIRD_WATCHDOG_INTERVAL=30
 # Optional: increase file descriptor limit for many streams
 LimitNOFILE=65535
 
-# Security hardening (optional, uncomment as needed)
-# NoNewPrivileges=yes
-# ProtectSystem=strict
-# ProtectHome=yes
-# PrivateTmp=yes
-# ReadWritePaths=/var/log/lyrebird /var/lib/lyrebird /etc/mediamtx
+# Security hardening
+NoNewPrivileges=yes
+ProtectHome=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ReadWritePaths=/var/log /var/lib/lyrebird /etc/mediamtx /run
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+
+# Resource limits for production stability
+MemoryMax=1G
+MemoryHigh=800M
 
 # Logging
-StandardOutput=append:/var/log/lyrebird/stream-manager.log
-StandardError=append:/var/log/lyrebird/stream-manager.log
+StandardOutput=append:/var/log/lyrebird-stream-manager.log
+StandardError=append:/var/log/lyrebird-stream-manager.log
 SyslogIdentifier=lyrebird-audio
 
 [Install]

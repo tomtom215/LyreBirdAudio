@@ -360,8 +360,9 @@ declare -gi CONFIG_LOCK_FD=-1
 # Skip cleanup flag
 declare -g SKIP_CLEANUP=false
 
-# Command being executed
+# Command being executed (COMMAND used by cleanup trap, must be initialized early)
 declare -g CURRENT_COMMAND="${1:-}"
+declare -g COMMAND=""
 
 # Flag to indicate if we're in a stop/force-stop operation
 declare -g STOPPING_SERVICE=false
@@ -524,7 +525,7 @@ verify_cleanup_complete() {
     wrapper_count=$(pgrep -f "${FFMPEG_PID_DIR}/.*\.sh" 2>/dev/null | wc -l || echo 0)
     if [[ $wrapper_count -gt 0 ]]; then
         log WARN "Found $wrapper_count orphaned wrapper processes"
-        ((issues_found++))
+        ((issues_found++)) || true
     fi
 
     # Check for orphaned FFmpeg processes
@@ -532,7 +533,7 @@ verify_cleanup_complete() {
     ffmpeg_count=$(pgrep -f "^ffmpeg.*rtsp://${MEDIAMTX_HOST}:8554" 2>/dev/null | wc -l || echo 0)
     if [[ $ffmpeg_count -gt 0 ]]; then
         log WARN "Found $ffmpeg_count orphaned FFmpeg processes"
-        ((issues_found++))
+        ((issues_found++)) || true
     fi
 
     # Check for stale PID files
@@ -545,7 +546,7 @@ verify_cleanup_complete() {
             local pid
             pid="$(cat "$pid_file" 2>/dev/null || true)"
             if [[ -n "$pid" ]] && ! kill -0 "$pid" 2>/dev/null; then
-                ((stale_pids++))
+                ((stale_pids++)) || true
                 rm -f "$pid_file"
             fi
         fi
@@ -555,7 +556,7 @@ verify_cleanup_complete() {
 
     if [[ $stale_pids -gt 0 ]]; then
         log WARN "Cleaned $stale_pids stale PID files"
-        ((issues_found++))
+        ((issues_found++)) || true
     fi
 
     if [[ $issues_found -eq 0 ]]; then
@@ -864,7 +865,7 @@ wait_for_pid_termination() {
     local elapsed=0
     while kill -0 "$pid" 2>/dev/null && [[ $elapsed -lt $timeout ]]; do
         sleep "$SHORT_SLEEP"
-        ((elapsed++))
+        ((elapsed++)) || true
     done
 
     if kill -0 "$pid" 2>/dev/null; then
@@ -2218,7 +2219,7 @@ check_all_audio_levels() {
         stream_path="$(generate_stream_path "$device_name" "$card_num" 2>/dev/null)" || continue
 
         if ! check_audio_level "$card_num" "$stream_path"; then
-            ((silent_count++))
+            ((silent_count++)) || true
         fi
     done
 
@@ -2379,7 +2380,7 @@ check_all_resources() {
     if [[ $disk_result -eq 2 ]]; then
         critical=true
     fi
-    [[ $disk_result -ne 0 ]] && ((issues++))
+    [[ $disk_result -ne 0 ]] && ((issues++)) || true
 
     # Memory check
     local mem_result
@@ -2388,11 +2389,11 @@ check_all_resources() {
     if [[ $mem_result -eq 2 ]]; then
         critical=true
     fi
-    [[ $mem_result -ne 0 ]] && ((issues++))
+    [[ $mem_result -ne 0 ]] && ((issues++)) || true
 
     # Network check
     if ! check_network_connectivity; then
-        ((issues++))
+        ((issues++)) || true
     fi
 
     # Update heartbeat to show we're alive
@@ -2918,7 +2919,7 @@ wait_for_mediamtx_ready() {
         fi
 
         sleep 1
-        ((elapsed++))
+        ((elapsed++)) || true
 
         if [[ $((elapsed % 5)) -eq 0 ]]; then
             log DEBUG "Still waiting for MediaMTX API... (${elapsed}s/${max_wait}s)"
@@ -3118,7 +3119,7 @@ detect_audio_devices() {
 
         # Wait a bit before retry
         sleep 0.5
-        ((retry_count++))
+        ((retry_count++)) || true
     done
 
     # Fallback to /proc/asound/cards if no devices found
@@ -3384,7 +3385,7 @@ cleanup_wrapper() {
             local term_wait=0
             while kill -0 "$ffmpeg_pid" 2>/dev/null && [[ $term_wait -lt 5 ]]; do
                 sleep 0.2
-                ((term_wait++))
+                ((term_wait++)) || true
             done
             
             # Force kill if still running
@@ -3581,7 +3582,7 @@ while true; do
     
     if ! run_ffmpeg; then
         log_message "Failed to start FFmpeg"
-        ((CONSECUTIVE_FAILURES++))
+        ((CONSECUTIVE_FAILURES++)) || true
         # Protect against integer overflow in restart delay
         if (( RESTART_DELAY <= 0 )) || (( RESTART_DELAY > MAX_RESTART_DELAY )); then
             RESTART_DELAY=$INITIAL_RESTART_DELAY
@@ -3606,7 +3607,7 @@ while true; do
     
     log_message "FFmpeg exited with code ${exit_code} after ${RUN_TIME} seconds"
     
-    ((RESTART_COUNT++))
+    ((RESTART_COUNT++)) || true
     
     # Reset failures and delay if ran successfully
     if [[ ${RUN_TIME} -gt ${WRAPPER_SUCCESS_DURATION} ]]; then
@@ -3614,7 +3615,7 @@ while true; do
         RESTART_DELAY=$INITIAL_RESTART_DELAY
         log_message "Successful run, reset delay to ${RESTART_DELAY}s"
     else
-        ((CONSECUTIVE_FAILURES++))
+        ((CONSECUTIVE_FAILURES++)) || true
         # Protect against integer overflow in restart delay
         if (( RESTART_DELAY <= 0 )) || (( RESTART_DELAY > MAX_RESTART_DELAY )); then
             RESTART_DELAY=$INITIAL_RESTART_DELAY
@@ -3808,7 +3809,7 @@ cleanup_wrapper() {
             local term_wait=0
             while kill -0 "$ffmpeg_pid" 2>/dev/null && [[ $term_wait -lt 5 ]]; do
                 sleep 0.2
-                ((term_wait++))
+                ((term_wait++)) || true
             done
             
             # Force kill if still running
@@ -3983,7 +3984,7 @@ while true; do
     
     if ! run_ffmpeg; then
         log_message "Failed to start FFmpeg"
-        ((CONSECUTIVE_FAILURES++))
+        ((CONSECUTIVE_FAILURES++)) || true
         # Protect against integer overflow in restart delay
         if (( RESTART_DELAY <= 0 )) || (( RESTART_DELAY > MAX_RESTART_DELAY )); then
             RESTART_DELAY=$INITIAL_RESTART_DELAY
@@ -4008,7 +4009,7 @@ while true; do
     
     log_message "FFmpeg exited with code ${exit_code} after ${RUN_TIME} seconds"
     
-    ((RESTART_COUNT++))
+    ((RESTART_COUNT++)) || true
     
     # Reset failures and delay if ran successfully
     if [[ ${RUN_TIME} -gt ${WRAPPER_SUCCESS_DURATION} ]]; then
@@ -4016,7 +4017,7 @@ while true; do
         RESTART_DELAY=$INITIAL_RESTART_DELAY
         log_message "Successful run, reset delay to ${RESTART_DELAY}s"
     else
-        ((CONSECUTIVE_FAILURES++))
+        ((CONSECUTIVE_FAILURES++)) || true
         # Protect against integer overflow in restart delay
         if (( RESTART_DELAY <= 0 )) || (( RESTART_DELAY > MAX_RESTART_DELAY )); then
             RESTART_DELAY=$INITIAL_RESTART_DELAY
@@ -4251,6 +4252,10 @@ generate_mediamtx_config() {
     local tmp_config
     tmp_config="$(mktemp -p "$(dirname "${CONFIG_FILE}")" "$(basename "${CONFIG_FILE}").XXXXXX")"
 
+    # Ensure temp file and lock are cleaned up on any failure
+    local _config_cleanup_needed=true
+    trap 'if [[ "${_config_cleanup_needed:-}" == "true" ]]; then rm -f "$tmp_config" 2>/dev/null; exec {CONFIG_LOCK_FD}>&- 2>/dev/null; CONFIG_LOCK_FD=-1; fi' RETURN
+
     cat >"$tmp_config" <<'EOF'
 # MediaMTX Configuration - Audio Streams
 logLevel: info
@@ -4315,6 +4320,7 @@ EOF
     exec {CONFIG_LOCK_FD}>&- 2>/dev/null || true
     CONFIG_LOCK_FD=-1
 
+    _config_cleanup_needed=false
     log INFO "Configuration generated successfully"
     return 0
 }
@@ -5070,13 +5076,12 @@ main() {
             setup_directories
             # v1.4.2: Use enhanced resource monitoring with disk, memory, and network checks
             # First check all resources (returns E_CRITICAL_RESOURCE if critical issues)
-            if ! check_all_resources; then
-                local resource_code=$?
-                if [[ $resource_code -eq ${E_CRITICAL_RESOURCE} ]]; then
-                    exit ${E_CRITICAL_RESOURCE}
-                fi
-                # Non-critical issues are logged but we continue
+            local resource_code=0
+            check_all_resources || resource_code=$?
+            if [[ $resource_code -eq ${E_CRITICAL_RESOURCE} ]]; then
+                exit ${E_CRITICAL_RESOURCE}
             fi
+            # Non-critical resource issues are logged but we continue
             # Then check and restart streams (returns error codes for failures)
             monitor_streams
             exit_code=$?

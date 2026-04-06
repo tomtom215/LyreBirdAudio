@@ -115,7 +115,7 @@ get_script_dir() {
             source="$next_source"
         fi
 
-        ((depth++))
+        ((depth++)) || true
     done
 
     # Final safety validation
@@ -692,13 +692,13 @@ execute_script() {
 
         CHILD_PID=$!
 
-        if wait $CHILD_PID; then
-            CHILD_PID=""
+        local exit_code=0
+        wait $CHILD_PID || exit_code=$?
+        CHILD_PID=""
+        if [[ $exit_code -eq 0 ]]; then
             log "INFO" "${script_name} completed successfully (privilege-dropped)"
             return 0
         else
-            local exit_code=$?
-            CHILD_PID=""
             error "${script_name} failed (exit code: ${exit_code})"
             LAST_ERROR="${script_name} failed (exit code: ${exit_code})"
             log "ERROR" "${script_name} failed with exit code ${exit_code} (privilege-dropped)"
@@ -713,8 +713,8 @@ execute_script() {
         "${script_path}" "${args[@]}" &
         CHILD_PID=$!
 
-        wait $CHILD_PID
-        local exit_code=$?
+        local exit_code=0
+        wait $CHILD_PID || exit_code=$?
         CHILD_PID=""
 
         case ${exit_code} in
@@ -743,13 +743,13 @@ execute_script() {
     "${script_path}" "${args[@]}" &
     CHILD_PID=$!
 
-    if wait $CHILD_PID; then
-        CHILD_PID=""
+    local exit_code=0
+    wait $CHILD_PID || exit_code=$?
+    CHILD_PID=""
+    if [[ $exit_code -eq 0 ]]; then
         log "INFO" "${script_name} completed successfully"
         return 0
     else
-        local exit_code=$?
-        CHILD_PID=""
         error "${script_name} failed (exit code: ${exit_code})"
         LAST_ERROR="${script_name} failed (exit code: ${exit_code})"
         log "ERROR" "${script_name} failed with exit code ${exit_code}"

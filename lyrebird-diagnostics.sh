@@ -970,7 +970,7 @@ validate_yaml_syntax() {
 
     # Try Python YAML parser (most common)
     if command -v python3 >/dev/null 2>&1; then
-        if python3 -c "import yaml; yaml.safe_load(open('${yaml_file}'))" 2>/dev/null; then
+        if python3 -c "import yaml, sys; yaml.safe_load(open(sys.argv[1]))" "${yaml_file}" 2>/dev/null; then
             return 0
         else
             return 2
@@ -988,7 +988,7 @@ validate_yaml_syntax() {
 
     # Try Perl YAML parser (fallback)
     if command -v perl >/dev/null 2>&1; then
-        if perl -MYAML -e "YAML::LoadFile('${yaml_file}')" 2>/dev/null; then
+        if perl -MYAML -e 'YAML::LoadFile($ARGV[0])' "${yaml_file}" 2>/dev/null; then
             return 0
         else
             return 2
@@ -3137,7 +3137,7 @@ main() {
 
     # Cache MediaMTX PID once at startup
     if command -v pgrep >/dev/null 2>&1; then
-        MEDIAMTX_PID="$(pgrep -f "${MEDIAMTX_BINARY}" | head -1 || echo "")"
+        MEDIAMTX_PID="$(pgrep -f "${MEDIAMTX_BINARY}" | grep -v "^$$\$" | head -1 || echo "")"
     fi
     log DEBUG "Cached MediaMTX PID: ${MEDIAMTX_PID}"
 
