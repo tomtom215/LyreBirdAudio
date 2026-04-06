@@ -186,6 +186,8 @@ collect_stream_manager_metrics() {
     if [[ -f "$HEARTBEAT_FILE" ]]; then
         local heartbeat_time
         heartbeat_time=$(cat "$HEARTBEAT_FILE" 2>/dev/null || echo 0)
+        # Validate numeric to prevent arithmetic crash on corrupted file
+        [[ "$heartbeat_time" =~ ^[0-9]+$ ]] || heartbeat_time=0
         local now
         now=$(date +%s)
         local heartbeat_age=$((now - heartbeat_time))
