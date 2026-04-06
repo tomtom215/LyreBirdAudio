@@ -832,7 +832,7 @@ parse_github_release() {
     # Try python3
     if command -v python3 &>/dev/null; then
         local result
-        result=$(python3 -c "import sys, json; data=json.load(open('${json_file}')); print(data.get('${field}', ''))" 2>/dev/null)
+        result=$(python3 -c 'import sys, json; data=json.load(open(sys.argv[1])); print(data.get(sys.argv[2], ""))' "${json_file}" "${field}" 2>/dev/null)
         if [[ -n "${result}" ]]; then
             echo "${result}"
             return 0
