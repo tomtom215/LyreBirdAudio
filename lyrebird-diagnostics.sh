@@ -2253,9 +2253,8 @@ check_configuration_validity() {
 
     print_status "MediaMTX Config" "PASS" "Config file accessible"
 
-    local validation_result
-    validate_mediamtx_config "${config_file}"
-    validation_result=$?
+    local validation_result=0
+    validate_mediamtx_config "${config_file}" || validation_result=$?
 
     case "${validation_result}" in
         0)
