@@ -958,7 +958,7 @@ post_checkout_service_update() {
 
         # Reload systemd daemon to pick up new service definition
         log_step "Reloading systemd daemon..."
-        if ! systemctl daemon-reload 2>&1 | grep -v "^$" | head -5; then
+        if ! systemctl daemon-reload 2>/dev/null; then
             log_error "Failed to reload systemd daemon"
             return 1
         fi
@@ -1743,10 +1743,6 @@ transaction_rollback() {
     log_warn "Rolling back: ${TRANSACTION_STATE[operation]}"
 
     # Disable traps during rollback to prevent recursion
-    local original_exit_trap original_int_trap original_term_trap
-    original_exit_trap="$(trap -p EXIT)"
-    original_int_trap="$(trap -p INT)"
-    original_term_trap="$(trap -p TERM)"
     trap - EXIT INT TERM
 
     # Attempt to return to original ref
@@ -1810,10 +1806,9 @@ transaction_rollback() {
     TRANSACTION_STATE[original_head]=""
     TRANSACTION_STATE[operation]=""
 
-    # Restore traps
-    eval "$original_exit_trap"
-    eval "$original_int_trap"
-    eval "$original_term_trap"
+    # Restore traps (direct re-installation avoids eval of arbitrary strings)
+    trap cleanup EXIT
+    trap 'log_error "Script interrupted by user"; exit $E_USER_ABORT' INT TERM
 
     log_warn "Rollback complete"
 
