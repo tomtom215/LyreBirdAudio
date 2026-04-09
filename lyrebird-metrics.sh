@@ -20,11 +20,15 @@
 # Integration with node_exporter:
 #   ./lyrebird-metrics.sh --file /var/lib/node_exporter/textfile_collector/lyrebird.prom
 #
+# Version: 1.1.1 - MediaMTX v1.17.1 compatibility
+#   - Path "ready" count now prefers the new "available" field (v1.16+),
+#     falling back to the deprecated "ready" field for v1.15.x compatibility.
+#
 # Version: 1.1.0 - Enhanced MediaMTX API metrics coverage
 
 set -euo pipefail
 
-readonly VERSION="1.1.0"
+readonly VERSION="1.1.1"
 SCRIPT_NAME="$(basename "${BASH_SOURCE[0]}")"
 readonly SCRIPT_NAME
 
@@ -331,10 +335,19 @@ collect_api_metrics() {
             path_count=$(echo "$paths_json" | grep -o '"name"' | wc -l)
             emit_metric "api_paths_total" "$path_count" "Total paths registered in MediaMTX"
 
-            # Count ready paths
+            # Count ready paths.
+            # MediaMTX v1.16.0 deprecated the "ready" field in favor of
+            # "available" (and added a new "online" field). Both fields are
+            # emitted in v1.16.x/v1.17.x, but "ready" may be removed in a
+            # future release. Prefer "available" when present and fall back
+            # to "ready" for backward compatibility with MediaMTX v1.15.x.
             local ready_count
-            ready_count=$(echo "$paths_json" | grep -o '"ready":true' | wc -l)
-            emit_metric "api_paths_ready" "$ready_count" "Paths with ready status"
+            if echo "$paths_json" | grep -q '"available":'; then
+                ready_count=$(echo "$paths_json" | grep -o '"available":true' | wc -l)
+            else
+                ready_count=$(echo "$paths_json" | grep -o '"ready":true' | wc -l)
+            fi
+            emit_metric "api_paths_ready" "$ready_count" "Paths with ready/available status"
         fi
 
         # Collect RTSP session metrics

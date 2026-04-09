@@ -10,10 +10,18 @@
 # This script automatically detects USB microphones and creates MediaMTX
 # configurations for continuous 24/7 RTSP audio streams.
 #
-# Version: 1.4.4 - Robustness improvements
-# Compatible with MediaMTX v1.15.0+
+# Version: 1.4.5 - MediaMTX v1.17.1 compatibility
+# Compatible with MediaMTX v1.15.0 through v1.17.1 (latest tested)
 #
 # Version History:
+# v1.4.5 - MediaMTX v1.17.1 compatibility
+#   - Path readiness checks now prefer the "available" field introduced in
+#     MediaMTX v1.16.0 and fall back to the legacy "ready" field (deprecated
+#     in v1.16.0 but still emitted through v1.17.x) for backward compatibility
+#     with MediaMTX v1.15.x deployments. Introduces _mediamtx_json_path_is_ready
+#     and _mediamtx_json_count_ready_paths helpers. No behavior change on
+#     v1.15.x; forward-compatible with future releases that may remove "ready".
+#
 # v1.4.4 - Robustness improvements
 #   - Restructured API validation to preserve curl exit status for better error detection
 #   - curl|grep pattern replaced with explicit exit code checking
@@ -1749,12 +1757,50 @@ mediamtx_get_path() {
     mediamtx_api_call GET "/paths/get/${path_name}"
 }
 
+# Check whether a Path JSON blob reports ready/available status.
+# MediaMTX v1.16.0 split the legacy "ready" field into "available" and "online"
+# and marked "ready" as deprecated (still emitted in v1.17.x for back-compat).
+# To stay compatible with MediaMTX v1.15.x through future releases that may
+# remove "ready" entirely, prefer the new "available" field and fall back to
+# "ready" only when "available" is absent from the response.
+# Usage: _mediamtx_json_path_is_ready <json>
+# Returns: 0 if the path is ready/available, non-zero otherwise
+_mediamtx_json_path_is_ready() {
+    local json="$1"
+    if [[ "$json" == *'"available":'* ]]; then
+        [[ "$json" == *'"available":true'* ]]
+    else
+        [[ "$json" == *'"ready":true'* ]]
+    fi
+}
+
+# Count ready/available paths in a /v3/paths/list response.
+# Same compatibility rationale as _mediamtx_json_path_is_ready above.
+# Usage: _mediamtx_json_count_ready_paths <paths_list_json>
+# Returns: count on stdout (0 if none or on parse failure)
+_mediamtx_json_count_ready_paths() {
+    local paths_json="$1"
+    local count
+    if [[ -z "$paths_json" ]]; then
+        echo "0"
+        return 0
+    fi
+    # Prefer new field when present (v1.16+); fall back to legacy "ready" (v1.15.x).
+    # In v1.16+ both fields are emitted, so counting only one avoids double counting.
+    if echo "$paths_json" | grep -q '"available":'; then
+        count=$(echo "$paths_json" | grep -o '"available":true' | wc -l)
+    else
+        count=$(echo "$paths_json" | grep -o '"ready":true' | wc -l)
+    fi
+    echo "${count:-0}"
+}
+
 # Check if a path is ready (streaming)
 mediamtx_path_is_ready() {
     local path_name="$1"
     local path_info
     path_info=$(mediamtx_get_path "$path_name") || return 1
-    echo "$path_info" | grep -q '"ready":true'
+    _mediamtx_json_path_is_ready "$path_info"
 }
 
 # -----------------------------------------------------------------------------
@@ -2043,9 +2089,7 @@ mediamtx_count_all_connections() {
 mediamtx_count_ready_paths() {
     local paths
     paths=$(mediamtx_list_paths) || { echo "0"; return; }
-    local count
-    count=$(echo "$paths" | grep -o '"ready":true' | wc -l)
-    echo "${count:-0}"
+    _mediamtx_json_count_ready_paths "$paths"
 }
 
 # Check MediaMTX API health (enhanced version using /v3/info)
@@ -2079,7 +2123,7 @@ mediamtx_get_status_summary() {
     local total_paths
     total_paths=$(echo "$paths_json" | grep -o '"name"' | wc -l)
     local ready_paths
-    ready_paths=$(echo "$paths_json" | grep -o '"ready":true' | wc -l)
+    ready_paths=$(_mediamtx_json_count_ready_paths "$paths_json")
 
     local rtsp_sessions
     rtsp_sessions=$(mediamtx_count_rtsp_sessions 2>/dev/null)
@@ -2690,11 +2734,14 @@ validate_stream() {
         # Try API validation if curl available
         # v1.4.2: Use API version detection for compatibility
         # v1.4.4: Restructured to preserve curl exit status for better error detection
+        # v1.4.5: Use _mediamtx_json_path_is_ready for MediaMTX v1.16+ compatibility
+        #         (the "ready" field was deprecated in favor of "available"/"online")
         if command_exists curl; then
             local api_base api_response
             api_base=$(detect_mediamtx_api_version)
             local api_url="${api_base}/paths/get/${stream_path}"
-            if api_response=$(curl -s --max-time 2 "${api_url}" 2>/dev/null) && [[ "$api_response" == *'"ready":true'* ]]; then
+            if api_response=$(curl -s --max-time 2 "${api_url}" 2>/dev/null) && \
+               _mediamtx_json_path_is_ready "$api_response"; then
                 log DEBUG "Stream $stream_path validated via API (attempt ${attempt})"
                 return 0
             fi
@@ -4281,12 +4328,19 @@ srt: no
 paths:
 EOF
 
-    # Add paths based on stream mode
+    # Add paths based on stream mode.
+    #
+    # Note: MediaMTX v1.16.0 deprecated the path-level `sourceProtocol` key
+    # in favour of `rtspTransport`. Both keys only affect paths whose source
+    # is an RTSP/RTSPS URL; they are no-ops for `source: publisher`, which is
+    # what LyreBirdAudio always uses (FFmpeg publishes to MediaMTX). The key
+    # has therefore been removed rather than renamed, which also silences the
+    # "parameter 'sourceProtocol' is deprecated" warning emitted by MediaMTX
+    # v1.16.0+ on every config load without changing any runtime behaviour.
     if [[ "${STREAM_MODE}" == "multiplex" ]]; then
         cat >>"$tmp_config" <<EOF
   ${MULTIPLEX_STREAM_NAME}:
     source: publisher
-    sourceProtocol: automatic
     sourceOnDemand: no
 EOF
     else
@@ -4294,7 +4348,6 @@ EOF
         cat >>"$tmp_config" <<EOF
   '~^[a-zA-Z0-9_-]+$':
     source: publisher
-    sourceProtocol: automatic
     sourceOnDemand: no
 EOF
     fi

@@ -35,9 +35,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 - Improved inline documentation in `usb-audio-mapper.sh`
 - Enhanced error messages with remediation steps
+- `lyrebird-stream-manager.sh` updated to v1.4.5
+  - MediaMTX v1.17.1 compatibility: path readiness checks now prefer the new
+    `available` field introduced in MediaMTX v1.16.0, falling back to the
+    deprecated `ready` field for backward compatibility with MediaMTX v1.15.x
+    deployments. Forward-compatible with future MediaMTX releases that may
+    remove the `ready` field entirely.
+  - New internal helpers `_mediamtx_json_path_is_ready` and
+    `_mediamtx_json_count_ready_paths` centralise the compatibility logic.
 - `lyrebird-stream-manager.sh` updated to v1.4.4
   - Restructured API validation to preserve curl exit status for better error detection
   - Replaced `curl|grep` pattern with explicit exit code checking
+- `lyrebird-metrics.sh` updated to v1.1.1
+  - MediaMTX v1.17.1 compatibility: `api_paths_ready` metric now prefers the
+    new `available` field (v1.16+), falling back to the deprecated `ready`
+    field for v1.15.x compatibility.
 
 ## [1.4.2] - 2025-12-19
 
