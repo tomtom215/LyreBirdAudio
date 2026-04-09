@@ -219,11 +219,28 @@ mask_url() {
 }
 
 # Load configuration file if it exists
+# Uses safe key=value parsing instead of source to prevent code injection
 load_config() {
     if [[ -f "$ALERT_CONFIG_FILE" ]]; then
         log_debug "Loading configuration from $ALERT_CONFIG_FILE"
-        # shellcheck source=/dev/null
-        source "$ALERT_CONFIG_FILE"
+        local key value
+        while IFS='=' read -r key value; do
+            # Skip comments and empty lines
+            [[ -z "$key" || "$key" =~ ^[[:space:]]*# ]] && continue
+            # Strip whitespace from key
+            key="${key#"${key%%[![:space:]]*}"}"
+            key="${key%"${key##*[![:space:]]}"}"
+            # Only accept known LYREBIRD_ variable names
+            if [[ "$key" =~ ^LYREBIRD_[A-Z_]+$ ]]; then
+                # Strip surrounding quotes from value
+                value="${value#\"}"
+                value="${value%\"}"
+                value="${value#\'}"
+                value="${value%\'}"
+                # Export the variable
+                declare -g "$key=$value"
+            fi
+        done < "$ALERT_CONFIG_FILE"
     fi
 }
 
@@ -321,6 +338,17 @@ cleanup_state() {
 # Webhook Formatters
 #=============================================================================
 
+# Escape a string for safe JSON embedding
+json_escape() {
+    local s="$1"
+    s="${s//\\/\\\\}"
+    s="${s//\"/\\\"}"
+    s="${s//$'\n'/\\n}"
+    s="${s//$'\r'/\\r}"
+    s="${s//$'\t'/\\t}"
+    printf '%s' "$s"
+}
+
 # Format message for generic webhook (simple JSON)
 format_generic() {
     local level="$1"
@@ -330,14 +358,23 @@ format_generic() {
     local timestamp
     timestamp="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
 
+    # Escape all values for safe JSON
+    level="$(json_escape "$level")"
+    title="$(json_escape "$title")"
+    message="$(json_escape "$message")"
+    alert_type="$(json_escape "$alert_type")"
+    local hostname location
+    hostname="$(json_escape "${LYREBIRD_HOSTNAME}")"
+    location="$(json_escape "${LYREBIRD_LOCATION}")"
+
     cat <<EOF
 {
   "level": "${level}",
   "title": "${title}",
   "message": "${message}",
   "type": "${alert_type}",
-  "hostname": "${LYREBIRD_HOSTNAME}",
-  "location": "${LYREBIRD_LOCATION}",
+  "hostname": "${hostname}",
+  "location": "${location}",
   "timestamp": "${timestamp}",
   "source": "lyrebird-alerts"
 }
@@ -356,12 +393,13 @@ format_discord() {
     local timestamp
     timestamp="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
 
-    # Escape special characters for JSON
-    message="${message//\\/\\\\}"
-    message="${message//\"/\\\"}"
-    message="${message//$'\n'/\\n}"
-    title="${title//\\/\\\\}"
-    title="${title//\"/\\\"}"
+    # Escape all values for safe JSON
+    message="$(json_escape "$message")"
+    title="$(json_escape "$title")"
+    level="$(json_escape "$level")"
+    alert_type="$(json_escape "$alert_type")"
+    local hostname
+    hostname="$(json_escape "${LYREBIRD_HOSTNAME}")"
 
     cat <<EOF
 {
@@ -370,7 +408,7 @@ format_discord() {
     "description": "${message}",
     "color": ${color},
     "fields": [
-      {"name": "Host", "value": "${LYREBIRD_HOSTNAME}", "inline": true},
+      {"name": "Host", "value": "${hostname}", "inline": true},
       {"name": "Level", "value": "${level}", "inline": true},
       {"name": "Type", "value": "${alert_type}", "inline": true}
     ],
@@ -390,12 +428,12 @@ format_slack() {
     local emoji
     emoji=$(get_alert_prefix "$level")
 
-    # Escape special characters for JSON
-    message="${message//\\/\\\\}"
-    message="${message//\"/\\\"}"
-    message="${message//$'\n'/\\n}"
-    title="${title//\\/\\\\}"
-    title="${title//\"/\\\"}"
+    # Escape all values for safe JSON
+    message="$(json_escape "$message")"
+    title="$(json_escape "$title")"
+    alert_type="$(json_escape "$alert_type")"
+    local hostname
+    hostname="$(json_escape "${LYREBIRD_HOSTNAME}")"
 
     # Slack colors
     local color
@@ -414,7 +452,7 @@ format_slack() {
     "title": "${emoji} ${title}",
     "text": "${message}",
     "fields": [
-      {"title": "Host", "value": "${LYREBIRD_HOSTNAME}", "short": true},
+      {"title": "Host", "value": "${hostname}", "short": true},
       {"title": "Level", "value": "${level}", "short": true}
     ],
     "footer": "LyreBirdAudio Alerts",
@@ -486,7 +524,7 @@ send_webhook() {
     local attempt=0
 
     while ((attempt < retries)); do
-        ((attempt++))
+        ((attempt++)) || true
         log_debug "Sending webhook (attempt ${attempt}/${retries}): $(mask_url "$webhook_url")"
 
         local http_code
@@ -948,8 +986,14 @@ interactive_setup() {
     echo ""
     echo "Creating configuration..."
 
-    # Write config file
-    cat > /tmp/lyrebird-alerts.conf <<EOF
+    # Write config file to secure temp location
+    local tmpconf
+    tmpconf="$(mktemp /tmp/lyrebird-alerts.XXXXXXXXXX.conf)" || {
+        echo "ERROR: Failed to create temp file"
+        return 1
+    }
+    chmod 600 "$tmpconf"
+    cat > "$tmpconf" <<EOF
 # LyreBird Alerts Configuration
 # Generated by setup wizard
 
@@ -965,7 +1009,7 @@ LYREBIRD_PUSHOVER_TOKEN="${pushover_token}"
 LYREBIRD_PUSHOVER_USER="${pushover_user}"
 EOF
 
-    if sudo mv /tmp/lyrebird-alerts.conf "$ALERT_CONFIG_FILE" 2>/dev/null; then
+    if sudo mv "$tmpconf" "$ALERT_CONFIG_FILE" 2>/dev/null; then
         sudo chmod 600 "$ALERT_CONFIG_FILE"
         echo "Configuration saved to: $ALERT_CONFIG_FILE"
         echo ""

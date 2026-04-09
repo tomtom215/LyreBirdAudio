@@ -186,6 +186,8 @@ collect_stream_manager_metrics() {
     if [[ -f "$HEARTBEAT_FILE" ]]; then
         local heartbeat_time
         heartbeat_time=$(cat "$HEARTBEAT_FILE" 2>/dev/null || echo 0)
+        # Validate numeric to prevent arithmetic crash on corrupted file
+        [[ "$heartbeat_time" =~ ^[0-9]+$ ]] || heartbeat_time=0
         local now
         now=$(date +%s)
         local heartbeat_age=$((now - heartbeat_time))
@@ -277,7 +279,7 @@ api_call_with_retry() {
     local result=""
 
     while ((attempt < retries)); do
-        ((attempt++))
+        ((attempt++)) || true
         result=$(curl -s --connect-timeout "$timeout" "$url" 2>/dev/null) && break
         # Brief pause before retry
         ((attempt < retries)) && sleep 1

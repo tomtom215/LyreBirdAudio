@@ -102,7 +102,8 @@ validate_safe_path() {
     resolved_path=$(realpath -m "$path" 2>/dev/null) || resolved_path="$path"
 
     for parent in "${allowed_parents[@]}"; do
-        if [[ "$resolved_path" == "$parent"* ]]; then
+        # Require trailing slash match to prevent /tmp-evil matching /tmp
+        if [[ "$resolved_path" == "$parent/"* ]] || [[ "$resolved_path" == "$parent" ]]; then
             return 0
         fi
     done
