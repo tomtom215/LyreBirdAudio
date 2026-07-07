@@ -23,6 +23,12 @@ setup() {
 
     # Source the storage script
     source "$PROJECT_ROOT/lyrebird-storage.sh"
+
+    # The script enables `set -euo pipefail`, which leaks into the bats test
+    # shell and turns failing assertions / unset-var reads into silent aborts
+    # (bats loses control of errexit and stops emitting results). Restore bats'
+    # own error handling so failures report as "not ok" instead of vanishing.
+    set +euo pipefail
 }
 
 # Teardown - clean up temp directories
