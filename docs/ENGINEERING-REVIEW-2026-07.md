@@ -46,6 +46,29 @@ this produces **silent mid-run aborts** — found independently in four files:
 
 This class is the highest-leverage thing to fix and to guard with tests.
 
+### Remediation status (updated as fixes land)
+
+| Item | Status |
+|------|--------|
+| Test harness (159 hidden tests, `set -e` leak) + CI wiring | ✅ fixed |
+| C1 udev rules commented out + H7 sanitizer injection | ✅ fixed |
+| C2/C3 FFmpeg wrapper auto-restart (`wait`, parent-PID) | ✅ fixed (+ E2E) |
+| C4 mic-check ↔ stream-manager device-config case | ✅ fixed |
+| C5 ntfy/Pushover alerts dropped | ✅ fixed |
+| C6 metrics duplicate HELP/TYPE (+ M2 empty value, df) | ✅ fixed |
+| C7 updater self-update lock deadlock | ✅ fixed |
+| C8 orchestrator interactive-delegation stdin | ✅ fixed |
+| H1/H2/H3 storage cleanup abort / over-delete / dry-run | ✅ fixed |
+| H4 diagnostics `grep -c` arithmetic abort | ✅ fixed |
+| H10 alerts/mic-check JSON escaping | ✅ fixed |
+| MediaMTX v1.19.x support + deprecated-field note | ✅ documented |
+| H5/H6/H8/H9, and MEDIUM/LOW items | ⬜ pending (see below) |
+
+Every ✅ item ships with a regression test; the suite (473 tests) is green and
+now a required CI gate. Remaining items are lower-severity or need real-hardware
+/ live-MediaMTX validation before changing (e.g. the stream-manager supervision
+architecture and the deprecated-JSON-field migration).
+
 ---
 
 ## 2. Test-suite state (before this review)

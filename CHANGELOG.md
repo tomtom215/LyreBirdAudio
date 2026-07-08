@@ -38,6 +38,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `lyrebird-stream-manager.sh` updated to v1.4.4
   - Restructured API validation to preserve curl exit status for better error detection
   - Replaced `curl|grep` pattern with explicit exit code checking
+- CI now runs the `bats` test suite as a required check (previously never run)
+- Documented MediaMTX support through v1.19.x (endpoints/assets unchanged from v1.15.x)
+
+### Fixed (Engineering Excellence Review, 2026-07)
+Full line-by-line audit; see `docs/ENGINEERING-REVIEW-2026-07.md`. Each fix ships
+with a regression test. Highlights (all verified against the code):
+- **USB persistent naming never worked** — `usb-audio-mapper.sh` emitted every
+  udev rule as a comment (a literal `\n` collapsed the comment and rule onto one
+  `#`-prefixed line). Also fixed an injection-prone card-name sanitizer.
+- **FFmpeg streams did not auto-restart** — the supervisor wrapper died on the
+  first FFmpeg failure (bare `wait` under `set -euo pipefail`) and again when the
+  transient launcher PID exited. Restored the wrapper's backoff-restart loop.
+- **Per-device audio config was ignored** — `lyrebird-mic-check.sh` wrote
+  `DEVICE_<name>_*` keys in the wrong case for the stream manager's uppercase
+  lookup; a "high quality" mic silently ran at defaults (and `--validate` passed).
+- **ntfy/Pushover alerts were silently dropped** and falsely reported as sent.
+- **Prometheus scrape was rejected** — duplicate `# HELP`/`# TYPE` lines.
+- **Self-update always failed** — the updater deadlocked on its own lock after
+  `exec`.
+- **Orchestrator interactive delegations couldn't read input** (backgrounded
+  child stdin was `/dev/null`) — the Quick Setup Wizard could not map devices.
+- **Storage cleanup halted on a 0-byte file** (disk fill risk); emergency cleanup
+  no longer deletes unrelated `/var/log/*.gz` or ignores `--dry-run`.
+- **Diagnostics aborted on a healthy host** — `grep -c … || echo 0` produced a
+  `0\n0` arithmetic error under `set -e`.
+- **Webhook/JSON output is now valid** for control characters and backslashes.
+- **Test suite repaired** — 159 tests silently never ran; source guards + `set -e`
+  handling restored so all tests execute (and CI enforces them).
 
 ## [1.4.2] - 2025-12-19
 
