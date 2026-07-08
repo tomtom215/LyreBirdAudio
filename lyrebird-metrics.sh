@@ -309,7 +309,7 @@ api_call_with_retry() {
 }
 
 # Collect MediaMTX API metrics (if available)
-# Enhanced in v1.1.0 with full MediaMTX v1.15.5 API coverage
+# Enhanced in v1.1.0 with MediaMTX /v3 API coverage (validated v1.15.5 - v1.19.x)
 collect_api_metrics() {
     if ! has_command curl; then
         return

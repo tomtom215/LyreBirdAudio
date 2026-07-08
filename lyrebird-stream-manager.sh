@@ -11,7 +11,12 @@
 # configurations for continuous 24/7 RTSP audio streams.
 #
 # Version: 1.4.4 - Robustness improvements
-# Compatible with MediaMTX v1.15.0+
+# Compatible with MediaMTX v1.15.0 through at least v1.19.x. The /v3 REST API
+# endpoints used here are unchanged across that range. NOTE: the path status
+# fields parsed below ("ready", "bytesReceived", "tracks") are DEPRECATED as of
+# v1.16/v1.17 in favour of "available"/"online"/"inboundBytes"/"tracks2" -- they
+# are still returned today, but a JSON-field migration (with real-hardware
+# validation) is advisable before a future MediaMTX major release removes them.
 #
 # Version History:
 # v1.4.4 - Robustness improvements
@@ -1569,7 +1574,7 @@ detect_mediamtx_api_version() {
 
 # ============================================================================
 # MediaMTX API Integration Functions (v1.4.3)
-# Complete coverage of MediaMTX v1.15.5 REST API
+# Covers the MediaMTX /v3 REST API (validated against v1.15.5 - v1.19.x)
 # ============================================================================
 
 # Make a generic API call to MediaMTX
