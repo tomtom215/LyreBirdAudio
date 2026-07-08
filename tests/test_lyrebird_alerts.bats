@@ -371,3 +371,25 @@ teardown() {
     [ "$status" -eq 0 ]
     grep -q 'ntfy.example/t' "$calllog"
 }
+
+# ============================================================================
+# Regression tests for JSON escaping validity (H10)
+# ============================================================================
+
+@test "json_escape yields a valid JSON string for control chars/backslash [H10 regression]" {
+    # backslash, quote, newline, tab, ESC (0x1b), backspace (0x08), formfeed (0x0c)
+    local msg; msg=$(printf 'a\\b"c\nd\te\033f\010g\014h')
+    local esc; esc=$(json_escape "$msg")
+    # Wrapping the escaped output in quotes must parse as a JSON string.
+    run python3 -c 'import json,sys; json.loads("\""+sys.argv[1]+"\""); print("OK")' "$esc"
+    [ "$status" -eq 0 ]
+    [ "$output" = "OK" ]
+}
+
+@test "format_discord payload is valid JSON with a hostile message [H10 regression]" {
+    # ANSI colour codes (ESC), newline, tab, quotes, backslash, and a colon title.
+    local msg; msg=$(printf 'ffmpeg \033[31merror\033[0m\nline2\ttab "q" \\ back')
+    run format_discord "critical" "Stream Down: mic1" "$msg" "stream_down"
+    [ "$status" -eq 0 ]
+    printf '%s' "$output" | python3 -c 'import json,sys; json.load(sys.stdin); print("valid")'
+}

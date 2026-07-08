@@ -341,11 +341,30 @@ cleanup_state() {
 # Escape a string for safe JSON embedding
 json_escape() {
     local s="$1"
-    s="${s//\\/\\\\}"
+    s="${s//\\/\\\\}"       # backslash first, or later escapes double-escape
     s="${s//\"/\\\"}"
     s="${s//$'\n'/\\n}"
     s="${s//$'\r'/\\r}"
     s="${s//$'\t'/\\t}"
+    s="${s//$'\b'/\\b}"
+    s="${s//$'\f'/\\f}"
+    # Escape any remaining control characters (U+0001..U+001F -- e.g. ESC 0x1B
+    # from ANSI/ffmpeg output pasted into a reason) as \u00XX per RFC 8259.
+    # Without this, a control byte yields invalid JSON and the webhook (Discord/
+    # Slack) rejects it with HTTP 400, silently dropping the alert.
+    if [[ "$s" == *[$'\x01'-$'\x1f']* ]]; then
+        local i c cc out=""
+        for ((i = 0; i < ${#s}; i++)); do
+            c="${s:i:1}"
+            if [[ "$c" == [$'\x01'-$'\x1f'] ]]; then
+                printf -v cc '\\u%04x' "'$c"
+                out+="$cc"
+            else
+                out+="$c"
+            fi
+        done
+        s="$out"
+    fi
     printf '%s' "$s"
 }
 

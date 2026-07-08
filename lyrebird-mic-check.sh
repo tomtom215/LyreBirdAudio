@@ -2262,8 +2262,14 @@ output_json() {
         fi
 
         if [[ "$in_device" = true ]]; then
-            # Escape quotes in value
+            # Escape for JSON: backslash FIRST (else a trailing '\' escapes the
+            # closing quote and produces invalid JSON), then quotes and the
+            # common control characters.
+            value="${value//\\/\\\\}"
             value="${value//\"/\\\"}"
+            value="${value//$'\n'/\\n}"
+            value="${value//$'\r'/\\r}"
+            value="${value//$'\t'/\\t}"
 
             # Determine if value is numeric, boolean, or string
             if [[ "$value" =~ ^[0-9]+$ ]]; then
