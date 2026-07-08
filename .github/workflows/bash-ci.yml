@@ -484,12 +484,44 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
   # ===========================================================================
-  # Job 7: Final Summary
+  # Job 7: Bats Test Suite (Required)
+  # ===========================================================================
+  bats-tests:
+    name: Bats Tests
+    runs-on: ubuntu-latest
+    needs: discover-scripts
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install bats
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq bats
+
+      - name: Run bats test suite
+        run: |
+          echo "============================================"
+          echo "Bats Test Suite: $(bats --version)"
+          echo "============================================"
+          # Keep bats' working files off any shared /tmp cleanup path
+          export TMPDIR="${RUNNER_TEMP:-/tmp}"
+          export BATS_TMPDIR="${RUNNER_TEMP:-/tmp}"
+
+          if bats --print-output-on-failure --timing tests/; then
+            echo "All bats tests passed"
+          else
+            echo "::error::Bats tests failed"
+            exit 1
+          fi
+
+  # ===========================================================================
+  # Job 8: Final Summary
   # ===========================================================================
   summary:
     name: CI Summary
     runs-on: ubuntu-latest
-    needs: [discover-scripts, bash-syntax, shellcheck, shfmt, bashate, security-scan]
+    needs: [discover-scripts, bash-syntax, shellcheck, shfmt, bashate, security-scan, bats-tests]
     if: always()
     steps:
       - name: Generate Comprehensive Summary
@@ -506,7 +538,7 @@ jobs:
             echo ""
 
             # Determine overall result
-            if [[ "${{ needs.bash-syntax.result }}" == "success" && "${{ needs.shellcheck.result }}" == "success" ]]; then
+            if [[ "${{ needs.bash-syntax.result }}" == "success" && "${{ needs.shellcheck.result }}" == "success" && "${{ needs.bats-tests.result }}" == "success" ]]; then
               echo "### All Required Checks Passed"
             else
               echo "### Required Checks Failed"
@@ -520,6 +552,7 @@ jobs:
             echo "|-------|------|--------|-------------|"
             echo "| **Bash Syntax** | Required | ${{ needs.bash-syntax.result == 'success' && 'Passed' || 'Failed' }} | Validates script syntax with \`bash -n\` |"
             echo "| **ShellCheck** | Required | ${{ needs.shellcheck.result == 'success' && 'Passed' || 'Failed' }} | Static analysis for bugs and issues |"
+            echo "| **Bats Tests** | Required | ${{ needs.bats-tests.result == 'success' && 'Passed' || 'Failed' }} | Unit and regression test suite |"
             echo "| **shfmt** | Advisory | ${{ needs.shfmt.result == 'success' && 'Passed' || 'Warnings' }} | Code formatting consistency |"
             echo "| **bashate** | Advisory | ${{ needs.bashate.result == 'success' && 'Passed' || 'Warnings' }} | OpenStack style guidelines |"
             echo "| **Security** | Advisory | ${{ needs.security-scan.result == 'success' && 'Passed' || 'Warnings' }} | Security anti-pattern detection |"
@@ -646,6 +679,13 @@ jobs:
             failed=1
           else
             echo "ShellCheck: passed"
+          fi
+
+          if [[ "${{ needs.bats-tests.result }}" != "success" ]]; then
+            echo "::error::Bats test suite failed"
+            failed=1
+          else
+            echo "Bats tests: passed"
           fi
 
           echo ""
