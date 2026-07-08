@@ -617,12 +617,16 @@ generate_udev_rules() {
         error_exit "Missing required parameters for rule generation"
     fi
 
-    # Sanitize card name
+    # Sanitize card name (used only in the human-readable comment).
+    # NOTE: the hyphen must be LAST in the tr set so it is a literal, not a
+    # range. The previous set '[:alnum:] \t-_.' was read as the range 0x09-0x5F,
+    # which let quotes, '$', ';', '=', and (crucially) newlines through — a udev
+    # rule-injection vector. This set keeps only alnum, space, '.', '_', '-'.
     local safe_card_name
-    safe_card_name=$(printf '%s' "$card_name" | tr -cd '[:alnum:] \t-_.' | tr -s ' ')
+    safe_card_name=$(printf '%s' "$card_name" | tr -cd '[:alnum:] ._-' | tr -s ' ')
 
-    # Build rule comment
-    local rules="# USB Sound Card: ${safe_card_name:-$friendly_name}\n"
+    # Build rule comment (emitted on its own physical line — see printf below)
+    local rule_comment="# USB Sound Card: ${safe_card_name:-$friendly_name}"
 
     # Build rule content
     local rules_content="SUBSYSTEM==\"sound\", ATTRS{idVendor}==\"$vendor_id\", ATTRS{idProduct}==\"$product_id\""
@@ -641,8 +645,13 @@ generate_udev_rules() {
     # Complete the rule
     rules_content+=", ATTR{id}=\"$friendly_name\", SYMLINK+=\"sound/by-id/$friendly_name\""
 
-    rules+="$rules_content"
-    printf '%s' "$rules"
+    # Emit the comment and the rule on SEPARATE physical lines.
+    # A previous version stored a literal "\n" inside a double-quoted string
+    # (bash does not expand "\n" in double quotes) and printed it with
+    # printf '%s', collapsing the comment and the rule onto a single
+    # '#'-prefixed line. udev then treated the ENTIRE rule as a comment, so
+    # ATTR{id} was never applied and devices were never persistently renamed.
+    printf '%s\n%s\n' "$rule_comment" "$rules_content"
 }
 
 # Function to write rules atomically with deduplication

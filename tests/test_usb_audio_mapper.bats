@@ -185,20 +185,40 @@ teardown() {
 # udev Rule Generation Tests
 # ============================================================================
 
-@test "generate_udev_rule creates valid symlink" {
-    generate_udev_rule() {
-        local vid="$1"
-        local pid="$2"
-        local name="$3"
-        echo "ACTION==\"add\", SUBSYSTEM==\"sound\", ATTRS{idVendor}==\"$vid\", ATTRS{idProduct}==\"$pid\", ATTR{id}=\"$name\""
-    }
-
-    run generate_udev_rule "1234" "5678" "test_mic"
+@test "generate_udev_rules emits an active (non-comment) udev rule [C1 regression]" {
+    # Exercises the REAL function, not a local mock. The historical bug stored a
+    # literal "\n" in a double-quoted string and printed it with printf '%s', so
+    # the comment and the rule collapsed onto one '#'-prefixed line and udev
+    # ignored the entire rule -- USB persistent naming silently never worked.
+    run env PROJECT_ROOT="$PROJECT_ROOT" bash -c '
+        set +euo pipefail
+        source "$PROJECT_ROOT/usb-audio-mapper.sh" >/dev/null 2>&1
+        generate_udev_rules "0d8c" "0014" "test-mic" "Blue Yeti" "1-1.4" ""
+    '
     [ "$status" -eq 0 ]
-    [[ "$output" =~ ACTION==\"add\" ]]
-    [[ "$output" =~ idVendor==\"1234\" ]]
-    [[ "$output" =~ idProduct==\"5678\" ]]
-    [[ "$output" =~ id=\"test_mic\" ]]
+    # At least one ACTIVE (non-#) line must exist; the bug produced zero.
+    [ "$(printf '%s\n' "$output" | grep -vc '^[[:space:]]*#')" -ge 1 ]
+    # It is a real udev rule that applies the persistent id.
+    printf '%s\n' "$output" | grep -qE '^SUBSYSTEM=="sound".*ATTR\{id\}="test-mic"'
+    # No stray literal backslash-n survived into the output.
+    [[ "$output" != *'\n'* ]]
+}
+
+@test "generate_udev_rules strips injection from the card name [H7 regression]" {
+    # A card name carrying a newline + RUN+= must not yield an active udev
+    # directive other than the intended SUBSYSTEM rule. The old tr set
+    # '[:alnum:] \t-_.' was read as the range 0x09-0x5F and let newlines through.
+    run env PROJECT_ROOT="$PROJECT_ROOT" bash -c '
+        set +euo pipefail
+        source "$PROJECT_ROOT/usb-audio-mapper.sh" >/dev/null 2>&1
+        evil=$(printf "pwned\nRUN+=\"/bin/sh -c evilcmd\"")
+        generate_udev_rules "0d8c" "0014" "good-mic" "$evil" "1-1.4" ""
+    '
+    [ "$status" -eq 0 ]
+    # No RUN/PROGRAM/IMPORT directive anywhere in the output.
+    ! printf '%s\n' "$output" | grep -qE "RUN[+]=|PROGRAM==|IMPORT[{]"
+    # Exactly one active (non-comment) line: the intended rule.
+    [ "$(printf '%s\n' "$output" | grep -vc '^[[:space:]]*#')" -eq 1 ]
 }
 
 # ============================================================================
