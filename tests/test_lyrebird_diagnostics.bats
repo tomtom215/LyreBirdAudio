@@ -380,7 +380,12 @@ EOF
 
 @test "get_primary_interface returns interface name" {
     get_primary_interface() {
-        ip route 2>/dev/null | awk '/default/{print $5; exit}' || echo "unknown"
+        # NOTE: `awk` succeeds (exit 0) even with no match, so `|| echo` never
+        # fires; default with parameter expansion instead. A host with no
+        # default route (e.g. a CI container) legitimately has no primary iface.
+        local iface
+        iface=$(ip route 2>/dev/null | awk '/default/{print $5; exit}')
+        echo "${iface:-unknown}"
     }
 
     run get_primary_interface
@@ -532,4 +537,28 @@ EOF
     run count_alsa_cards
     [ "$status" -eq 0 ]
     [[ "$output" =~ ^[0-9]+$ ]]
+}
+
+# ============================================================================
+# Regression tests for the grep -c "double-zero" arithmetic abort (H4)
+# ============================================================================
+
+@test "log-count arithmetic does not abort a healthy diagnostic under set -e [H4 regression]" {
+    local qlog="${BATS_TEST_TMPDIR:-/tmp}/quiet.$$.log"
+    printf 'all fine\nnothing to see here\n' > "$qlog"
+    # OLD buggy form: grep -ic prints "0" AND '|| echo 0' prints another -> "0\n0"
+    # -> $(( "0\n0" )) is an arithmetic syntax error -> set -e aborts the run.
+    run env Q="$qlog" bash -c 'set -euo pipefail; n=$(($(grep -ic "error" "$Q" || echo 0))); echo "n=$n"'
+    [ "$status" -ne 0 ]
+    # NEW form used by the code: '|| true' keeps grep's own single "0" and stops
+    # the non-zero exit from aborting the (set -e) assignment.
+    run env Q="$qlog" bash -c 'set -euo pipefail; n=$(($(grep -ic "error" "$Q" || true) + 0)); echo "n=$n"'
+    [ "$status" -eq 0 ]
+    [ "$output" = "n=0" ]
+    rm -f "$qlog"
+}
+
+@test "diagnostics no longer uses grep -c ... || echo 0 [H4 regression]" {
+    run grep -nE 'grep -[a-z]*c[a-z]* [^|]*\|\| echo 0' "$PROJECT_ROOT/lyrebird-diagnostics.sh"
+    [ "$status" -ne 0 ]
 }

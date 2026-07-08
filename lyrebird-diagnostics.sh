@@ -867,9 +867,9 @@ get_recent_log_warnings() {
     since_time=$(get_relative_date "-24H" 2>/dev/null || echo "")
 
     if [[ -z "${since_time}" ]]; then
-        warning_count=$(tail -n 2000 "${MEDIAMTX_LOG_FILE}" 2>/dev/null | grep -ic "warn\|error" || echo 0)
+        warning_count=$(tail -n 2000 "${MEDIAMTX_LOG_FILE}" 2>/dev/null | grep -ic "warn\|error" || true)
     else
-        warning_count=$(grep "${since_time%% *}" "${MEDIAMTX_LOG_FILE}" 2>/dev/null | grep -ic "warn\|error" || echo 0)
+        warning_count=$(grep "${since_time%% *}" "${MEDIAMTX_LOG_FILE}" 2>/dev/null | grep -ic "warn\|error" || true)
     fi
 
     echo "${warning_count}"
@@ -1452,7 +1452,7 @@ validate_device_config_consistency() {
     local referenced_devices=0
 
     if is_readable "${config_file}"; then
-        referenced_devices=$(grep -c "source:\|input:" "${config_file}" 2>/dev/null || echo 0)
+        referenced_devices=$(grep -c "source:\|input:" "${config_file}" 2>/dev/null || true)
 
         if [[ ! -f "${MEDIAMTX_DEVICE_CONFIG}" ]] || ! is_readable "${MEDIAMTX_DEVICE_CONFIG}"; then
             echo "config_unreadable"
@@ -1460,7 +1460,7 @@ validate_device_config_consistency() {
         fi
 
         local available_devices
-        available_devices=$(grep -c "^[^ ].*:" "${MEDIAMTX_DEVICE_CONFIG}" 2>/dev/null || echo 0)
+        available_devices=$(grep -c "^[^ ].*:" "${MEDIAMTX_DEVICE_CONFIG}" 2>/dev/null || true)
 
         if ((referenced_devices > available_devices)); then
             echo "mismatch"
@@ -2034,7 +2034,7 @@ check_stream_health() {
 
     if [[ -f "${MEDIAMTX_LOG_FILE}" ]] && is_readable "${MEDIAMTX_LOG_FILE}"; then
         local error_count
-        error_count=$(($(tail -n "${DIAGNOSTIC_LOG_TAIL_LINES}" "${MEDIAMTX_LOG_FILE}" 2>/dev/null | grep -ic "error\|fail") + 0))
+        error_count=$(($(tail -n "${DIAGNOSTIC_LOG_TAIL_LINES}" "${MEDIAMTX_LOG_FILE}" 2>/dev/null | grep -ic "error\|fail" || true) + 0))
 
         if [[ "${error_count}" -gt 10 ]]; then
             print_status "Recent Errors" "WARN" "Found ${error_count} errors in recent logs"
@@ -2156,9 +2156,13 @@ check_log_analysis() {
     print_status "Log Size" "INFO" "Total lines: ${total_lines}"
 
     local error_lines
-    error_lines=$(($(tail -n "${DIAGNOSTIC_LOG_TAIL_LINES}" "${MEDIAMTX_LOG_FILE}" 2>/dev/null | grep -ic "error" || echo 0)))
+    # NOTE: `grep -ic` already prints "0" on no match (and exits 1). The old
+    # `|| echo 0` appended a SECOND "0", so $(( "0\n0" )) was an arithmetic syntax
+    # error that, under set -euo pipefail, aborted the whole diagnostic on a quiet
+    # (healthy) system. Match the safe `+ 0` form used elsewhere in this file.
+    error_lines=$(($(tail -n "${DIAGNOSTIC_LOG_TAIL_LINES}" "${MEDIAMTX_LOG_FILE}" 2>/dev/null | grep -ic "error" || true) + 0))
     local warn_lines
-    warn_lines=$(($(tail -n "${DIAGNOSTIC_LOG_TAIL_LINES}" "${MEDIAMTX_LOG_FILE}" 2>/dev/null | grep -ic "warn" || echo 0)))
+    warn_lines=$(($(tail -n "${DIAGNOSTIC_LOG_TAIL_LINES}" "${MEDIAMTX_LOG_FILE}" 2>/dev/null | grep -ic "warn" || true) + 0))
 
     if [[ "${error_lines}" -gt 0 ]]; then
         print_status "Error Patterns" "WARN" "Found ${error_lines} error line(s)"
@@ -3239,4 +3243,7 @@ main() {
     return "${EXIT_CODE}"
 }
 
-main "$@"
+# Only execute when run directly, not when sourced (e.g. by the test suite)
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    main "$@"
+fi

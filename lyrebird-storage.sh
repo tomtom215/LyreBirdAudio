@@ -227,7 +227,7 @@ cleanup_recordings() {
         size=$(stat -c%s "$file" 2>/dev/null || echo 0)
         safe_delete "$file" "recording"
         ((++count))
-        ((freed_bytes += size))
+        freed_bytes=$((freed_bytes + size))
     done < <(find "$RECORDING_DIR" -type f \( -name "*.wav" -o -name "*.mp3" -o -name "*.flac" -o -name "*.opus" -o -name "*.ogg" \) -mtime "+${RECORDING_RETENTION_DAYS}" -print0 2>/dev/null)
 
     # Remove empty directories
@@ -250,7 +250,7 @@ cleanup_logs() {
             size=$(stat -c%s "$file" 2>/dev/null || echo 0)
             safe_delete "$file" "log"
             ((++count))
-            ((freed_bytes += size))
+            freed_bytes=$((freed_bytes + size))
         done < <(find "$LOG_DIR" -type f -name "*.log*" -mtime "+${LOG_RETENTION_DAYS}" -print0 2>/dev/null)
     fi
 
@@ -261,7 +261,7 @@ cleanup_logs() {
             size=$(stat -c%s "$file" 2>/dev/null || echo 0)
             safe_delete "$file" "mediamtx log"
             ((++count))
-            ((freed_bytes += size))
+            freed_bytes=$((freed_bytes + size))
         done < <(find "$MEDIAMTX_LOG_DIR" -type f -name "mediamtx*.out.*" -mtime "+${LOG_RETENTION_DAYS}" -print0 2>/dev/null)
     fi
 
@@ -281,7 +281,7 @@ cleanup_temp() {
         size=$(stat -c%s "$file" 2>/dev/null || echo 0)
         safe_delete "$file" "temp"
         ((++count))
-        ((freed_bytes += size))
+        freed_bytes=$((freed_bytes + size))
     done < <(find "$TEMP_DIR" -maxdepth 1 -type f -name "lyrebird-*" -mmin "+$((TEMP_RETENTION_HOURS * 60))" -print0 2>/dev/null)
 
     # Clean memory buffer directory if present
@@ -291,7 +291,7 @@ cleanup_temp() {
             size=$(stat -c%s "$file" 2>/dev/null || echo 0)
             safe_delete "$file" "buffer"
             ((++count))
-            ((freed_bytes += size))
+            freed_bytes=$((freed_bytes + size))
         done < <(find "$BUFFER_DIR" -type f -mmin "+$((TEMP_RETENTION_HOURS * 60))" -print0 2>/dev/null)
     fi
 
@@ -302,9 +302,11 @@ cleanup_temp() {
 truncate_large_logs() {
     log_info "Checking for oversized log files"
 
-    # Clean up any stale .tmp files from interrupted previous runs
-    find "$MEDIAMTX_LOG_DIR" -name "*.tmp" -mmin +5 -delete 2>/dev/null || true
-    [[ -d "$LOG_DIR" ]] && find "$LOG_DIR" -name "*.tmp" -mmin +5 -delete 2>/dev/null || true
+    # Clean up any stale .tmp files from interrupted previous runs.
+    # MEDIAMTX_LOG_DIR is typically /var/log, so scope tightly to our own files
+    # (maxdepth 1 + mediamtx-prefixed) rather than every *.tmp on the system.
+    find "$MEDIAMTX_LOG_DIR" -maxdepth 1 -name "mediamtx*.tmp" -mmin +5 -delete 2>/dev/null || true
+    [[ -d "$LOG_DIR" ]] && find "$LOG_DIR" -maxdepth 1 -name "*.tmp" -mmin +5 -delete 2>/dev/null || true
 
     # Check MediaMTX log
     if [[ -f "$MEDIAMTX_LOG" ]]; then
@@ -358,16 +360,24 @@ emergency_cleanup() {
         log_info "Emergency: Deleted $deleted oldest recording(s)"
     fi
 
-    # Delete all rotated logs
-    find "$LOG_DIR" -name "*.gz" -delete 2>/dev/null || true
-    find "$MEDIAMTX_LOG_DIR" -name "*.gz" -delete 2>/dev/null || true
+    # Delete rotated logs, temp files, and buffer contents.
+    # These must honour DRY_RUN (a "preview" must not delete anything), and the
+    # *.gz sweep must be tightly scoped: MEDIAMTX_LOG_DIR is typically /var/log,
+    # so a bare `find "$MEDIAMTX_LOG_DIR" -name '*.gz' -delete` would wipe every
+    # rotated SYSTEM log (syslog, auth.log, journal exports) during an incident.
+    if [[ "$DRY_RUN" == "true" ]]; then
+        log_info "[DRY RUN] Would delete rotated LyreBird/MediaMTX logs, LyreBird temp files, and buffer contents"
+    else
+        [[ -d "$LOG_DIR" ]] && find "$LOG_DIR" -maxdepth 1 -name "*.gz" -delete 2>/dev/null || true
+        find "$MEDIAMTX_LOG_DIR" -maxdepth 1 -name "mediamtx*.out*.gz" -delete 2>/dev/null || true
 
-    # Clear temp directory
-    find "$TEMP_DIR" -maxdepth 1 -name "lyrebird-*" -type f -delete 2>/dev/null || true
+        # Clear LyreBird temp files
+        find "$TEMP_DIR" -maxdepth 1 -name "lyrebird-*" -type f -delete 2>/dev/null || true
 
-    # Clear buffer directory (with safety validation)
-    if [[ -d "$BUFFER_DIR" ]] && validate_safe_path "$BUFFER_DIR"; then
-        rm -rf "${BUFFER_DIR:?}"/* 2>/dev/null || true
+        # Clear buffer directory (with safety validation)
+        if [[ -d "$BUFFER_DIR" ]] && validate_safe_path "$BUFFER_DIR"; then
+            rm -rf "${BUFFER_DIR:?}"/* 2>/dev/null || true
+        fi
     fi
 }
 
@@ -581,4 +591,7 @@ main() {
     esac
 }
 
-main "$@"
+# Only execute when run directly, not when sourced (e.g. by the test suite)
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    main "$@"
+fi

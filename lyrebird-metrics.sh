@@ -88,6 +88,18 @@ emit_metric() {
     fi
 }
 
+# Emit ONLY the HELP/TYPE header lines for a metric family. Prometheus requires
+# exactly one HELP and one TYPE per family; for metrics produced in a loop (one
+# sample per disk/stream) the header must be printed once, before the samples,
+# with each per-sample emit_metric call passing an empty help argument.
+emit_help_type() {
+    local name="$1"
+    local help="$2"
+    local type="${3:-gauge}"
+    echo "# HELP ${METRIC_PREFIX}_${name} ${help}"
+    echo "# TYPE ${METRIC_PREFIX}_${name} ${type}"
+}
+
 # Collect MediaMTX service metrics
 collect_mediamtx_metrics() {
     local mediamtx_running=0
@@ -227,14 +239,22 @@ collect_usb_audio_metrics() {
 
 # Collect system resource metrics
 collect_system_metrics() {
-    # Disk usage for relevant paths
+    # Disk usage for relevant paths. HELP/TYPE for the disk_usage_percent family
+    # must appear exactly once (not once per path) or Prometheus rejects the whole
+    # scrape. df -P forces single-line POSIX output; a wrapped long device name
+    # (LVM/dm/ZFS) would otherwise shift columns and yield a non-numeric percent.
+    local _disk_hdr=0
     for path in "/" "/var" "/tmp"; do
         if [[ -d "$path" ]] && has_command df; then
             local usage
-            usage=$(df "$path" 2>/dev/null | tail -1 | awk '{print $5}' | sed 's/%//')
+            usage=$(df -P "$path" 2>/dev/null | awk 'NR==2 {gsub(/%/,"",$5); print $5}')
             if [[ "$usage" =~ ^[0-9]+$ ]]; then
+                if [[ $_disk_hdr -eq 0 ]]; then
+                    emit_help_type "disk_usage_percent" "Disk usage percentage" "gauge"
+                    _disk_hdr=1
+                fi
                 local label="mount=\"${path}\""
-                emit_metric "disk_usage_percent" "$usage" "Disk usage percentage" "gauge" "$label"
+                emit_metric "disk_usage_percent" "$usage" "" "gauge" "$label"
             fi
         fi
     done
@@ -289,7 +309,7 @@ api_call_with_retry() {
 }
 
 # Collect MediaMTX API metrics (if available)
-# Enhanced in v1.1.0 with full MediaMTX v1.15.5 API coverage
+# Enhanced in v1.1.0 with MediaMTX /v3 API coverage (validated v1.15.5 - v1.19.x)
 collect_api_metrics() {
     if ! has_command curl; then
         return
@@ -436,6 +456,7 @@ collect_stream_metrics() {
         return
     fi
 
+    local _stream_hdr=0
     for pid_file in "${FFMPEG_PID_DIR}"/*.pid; do
         [[ -f "$pid_file" ]] || continue
 
@@ -444,6 +465,14 @@ collect_stream_metrics() {
         local pid
         pid=$(cat "$pid_file" 2>/dev/null)
 
+        # Emit HELP/TYPE for the per-stream families exactly once, before samples.
+        if [[ $_stream_hdr -eq 0 ]]; then
+            emit_help_type "stream_up" "Stream running status" "gauge"
+            emit_help_type "stream_memory_bytes" "Stream memory usage in bytes" "gauge"
+            emit_help_type "stream_cpu_percent" "Stream CPU usage percentage" "gauge"
+            _stream_hdr=1
+        fi
+
         # Stream status
         local status=0
         if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
@@ -451,7 +480,7 @@ collect_stream_metrics() {
         fi
 
         local labels="stream=\"${stream_name}\""
-        emit_metric "stream_up" "$status" "Stream running status" "gauge" "$labels"
+        emit_metric "stream_up" "$status" "" "gauge" "$labels"
 
         if [[ $status -eq 1 ]] && [[ -d "/proc/${pid}" ]]; then
             # Stream memory usage
@@ -459,15 +488,17 @@ collect_stream_metrics() {
                 local vm_rss
                 vm_rss=$(grep "^VmRSS:" "/proc/${pid}/status" 2>/dev/null | awk '{print $2}' || echo 0)
                 if [[ "$vm_rss" =~ ^[0-9]+$ ]]; then
-                    emit_metric "stream_memory_bytes" "$((vm_rss * 1024))" "Stream memory usage" "gauge" "$labels"
+                    emit_metric "stream_memory_bytes" "$((vm_rss * 1024))" "" "gauge" "$labels"
                 fi
             fi
 
-            # Stream CPU usage
+            # Stream CPU usage. ps may print nothing if the process just exited;
+            # default to 0 so we never emit a metric line with an empty value.
             if has_command ps; then
                 local cpu
-                cpu=$(ps -p "$pid" -o %cpu= 2>/dev/null | tr -d ' ' || echo 0)
-                emit_metric "stream_cpu_percent" "${cpu%.*}" "Stream CPU usage" "gauge" "$labels"
+                cpu=$(ps -p "$pid" -o %cpu= 2>/dev/null | tr -d ' ')
+                cpu="${cpu:-0}"
+                emit_metric "stream_cpu_percent" "${cpu%.*}" "" "gauge" "$labels"
             fi
         fi
     done
@@ -647,4 +678,7 @@ main() {
     esac
 }
 
-main "$@"
+# Only execute when run directly, not when sourced (e.g. by the test suite)
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    main "$@"
+fi

@@ -2083,6 +2083,14 @@ switch_version_safe() {
         # Service update marker remains for post-exec completion
         # No need to cleanup - new script will handle it
 
+        # Release our lock BEFORE exec. exec replaces the process (same PID) and
+        # does NOT fire the EXIT trap, so the lock dir would survive. The re-exec'd
+        # process would then find a lock held by its own live PID -- the staleness
+        # check cannot fire (the PID is alive and is us) -- wait LOCK_MAX_WAIT, and
+        # abort with E_LOCKED. That made every self-update fail (and orphaned the
+        # stash and the service-update marker).
+        release_lock
+
         # Replace this process with the new script
         # shellcheck disable=SC2093  # exec is intentional here for self-update
         exec "$script_path" "${restart_args[@]}"
@@ -3055,4 +3063,7 @@ main() {
 }
 
 # Run main function
-main "$@"
+# Only execute when run directly, not when sourced (e.g. by the test suite)
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    main "$@"
+fi

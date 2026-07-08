@@ -16,6 +16,11 @@ setup() {
 
     # Source the mic check script
     source "$PROJECT_ROOT/lyrebird-mic-check.sh"
+
+    # The script enables `set -euo pipefail`, which leaks into the bats shell and
+    # turns failing assertions / unset-var reads into silent aborts. Restore
+    # bats' own error handling so failures report as "not ok".
+    set +euo pipefail
 }
 
 # Teardown - clean up temp files
@@ -294,4 +299,31 @@ teardown() {
 
 @test "PROC_ASOUND_CARDS path is defined" {
     [ -n "$PROC_ASOUND_CARDS" ]
+}
+
+# ============================================================================
+# Regression tests for the device-config key contract (C4)
+# ============================================================================
+
+@test "generate_config emits UPPERCASE device keys [C4 regression]" {
+    # The stream manager reads DEVICE_${name^^}_${param^^}; the generator must
+    # emit the same uppercase names or every per-device setting is ignored.
+    grep -qE 'DEVICE_\$\{safe_name\^\^\}_SAMPLE_RATE=' "$PROJECT_ROOT/lyrebird-mic-check.sh"
+    run grep -cE 'DEVICE_\$\{safe_name\}_(SAMPLE_RATE|CHANNELS|BITRATE)=' "$PROJECT_ROOT/lyrebird-mic-check.sh"
+    [ "$output" -eq 0 ]
+}
+
+@test "device key for a normal device matches stream-manager's lookup [C4 contract]" {
+    # sanitize_device_name is sourced from mic-check in setup(). The uppercased
+    # key must equal what stream-manager's get_device_config looks up.
+    local name; name="$(sanitize_device_name "Blue Yeti")"
+    [ "DEVICE_${name^^}_SAMPLE_RATE" = "DEVICE_BLUE_YETI_SAMPLE_RATE" ]
+}
+
+@test "get_config_value reads UPPERCASE keys so --validate stays consistent [C4 regression]" {
+    # A config written by generate_config must be readable by mic-check itself.
+    DEVICE_BLUE_YETI_SAMPLE_RATE=96000
+    run get_config_value "Blue_Yeti" "" "SAMPLE_RATE"
+    [ "$status" -eq 0 ]
+    [ "$output" = "96000" ]
 }

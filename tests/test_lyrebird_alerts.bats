@@ -20,6 +20,11 @@ setup() {
 
     # Source the alerts script (functions only, don't run main)
     source "$PROJECT_ROOT/lyrebird-alerts.sh"
+
+    # The script enables `set -euo pipefail`, which leaks into the bats shell and
+    # turns failing assertions / unset-var reads into silent aborts. Restore
+    # bats' own error handling so failures report as "not ok".
+    set +euo pipefail
 }
 
 # Teardown - clean up temp files
@@ -330,4 +335,61 @@ teardown() {
     run show_config
     [ "$status" -eq 0 ]
     [[ "$output" =~ "LYREBIRD_ALERT_ENABLED" ]]
+}
+
+# ============================================================================
+# Regression tests for destination detection / dispatch (C5)
+# ============================================================================
+
+@test "ntfy destination is recognized without a webhook URL [C5 regression]" {
+    LYREBIRD_WEBHOOK_URL="" LYREBIRD_WEBHOOK_URLS="" \
+    LYREBIRD_WEBHOOK_TYPE="ntfy" LYREBIRD_NTFY_TOPIC="mytopic" \
+        alert_destination_configured
+}
+
+@test "pushover destination requires both token and user [C5 regression]" {
+    LYREBIRD_WEBHOOK_URL="" LYREBIRD_WEBHOOK_URLS="" LYREBIRD_WEBHOOK_TYPE="pushover"
+    run env LYREBIRD_WEBHOOK_URL="" LYREBIRD_WEBHOOK_URLS="" LYREBIRD_WEBHOOK_TYPE="pushover" \
+        LYREBIRD_PUSHOVER_TOKEN="" LYREBIRD_PUSHOVER_USER="" bash -c \
+        "source '$PROJECT_ROOT/lyrebird-alerts.sh' >/dev/null 2>&1; set +euo pipefail; alert_destination_configured"
+    [ "$status" -ne 0 ]
+    LYREBIRD_PUSHOVER_TOKEN="tok" LYREBIRD_PUSHOVER_USER="usr" \
+    LYREBIRD_WEBHOOK_URL="" LYREBIRD_WEBHOOK_URLS="" LYREBIRD_WEBHOOK_TYPE="pushover" \
+        alert_destination_configured
+}
+
+@test "send_alert actually dispatches an ntfy alert via curl [C5 regression]" {
+    # Previously send_alert returned 0 from the guard WITHOUT sending. Shim curl
+    # to record the endpoint it is called with and prove dispatch happens.
+    local calllog="${BATS_TEST_TMPDIR:-$LYREBIRD_ALERT_STATE_DIR}/curl.log"
+    : > "$calllog"
+    curl() { printf '%s\n' "$*" >> "$calllog"; printf '200'; }
+    LYREBIRD_ALERT_ENABLED="true"
+    LYREBIRD_WEBHOOK_URL="" LYREBIRD_WEBHOOK_URLS=""
+    LYREBIRD_WEBHOOK_TYPE="ntfy" LYREBIRD_NTFY_TOPIC="t" LYREBIRD_NTFY_SERVER="https://ntfy.example"
+    run send_alert "info" "Stream Down: mic1" "Body text" "test"
+    [ "$status" -eq 0 ]
+    grep -q 'ntfy.example/t' "$calllog"
+}
+
+# ============================================================================
+# Regression tests for JSON escaping validity (H10)
+# ============================================================================
+
+@test "json_escape yields a valid JSON string for control chars/backslash [H10 regression]" {
+    # backslash, quote, newline, tab, ESC (0x1b), backspace (0x08), formfeed (0x0c)
+    local msg; msg=$(printf 'a\\b"c\nd\te\033f\010g\014h')
+    local esc; esc=$(json_escape "$msg")
+    # Wrapping the escaped output in quotes must parse as a JSON string.
+    run python3 -c 'import json,sys; json.loads("\""+sys.argv[1]+"\""); print("OK")' "$esc"
+    [ "$status" -eq 0 ]
+    [ "$output" = "OK" ]
+}
+
+@test "format_discord payload is valid JSON with a hostile message [H10 regression]" {
+    # ANSI colour codes (ESC), newline, tab, quotes, backslash, and a colon title.
+    local msg; msg=$(printf 'ffmpeg \033[31merror\033[0m\nline2\ttab "q" \\ back')
+    run format_discord "critical" "Stream Down: mic1" "$msg" "stream_down"
+    [ "$status" -eq 0 ]
+    printf '%s' "$output" | python3 -c 'import json,sys; json.load(sys.stdin); print("valid")'
 }

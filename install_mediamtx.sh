@@ -1937,4 +1937,7 @@ main() {
     log_debug "Operation completed successfully"
 }
 
-main "$@"
+# Only execute when run directly, not when sourced (e.g. by the test suite)
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    main "$@"
+fi
