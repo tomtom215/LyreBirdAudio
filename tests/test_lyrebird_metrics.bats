@@ -235,3 +235,31 @@ teardown() {
     run bash -c "source $PROJECT_ROOT/lyrebird-metrics.sh && collect_mediamtx_metrics && collect_system_metrics"
     [ "$status" -eq 0 ]
 }
+
+# ============================================================================
+# Regression tests for Prometheus exposition-format validity (C6, M2)
+# ============================================================================
+
+@test "no metric family emits duplicate HELP/TYPE with multiple streams [C6 regression]" {
+    # >=2 streams and 3 disk mounts previously produced repeated HELP/TYPE lines,
+    # which makes the Prometheus text parser reject the ENTIRE scrape.
+    # FFMPEG_PID_DIR is created (and made readonly) by setup(); populate it.
+    echo $$ > "$FFMPEG_PID_DIR/mic1.pid"
+    echo $$ > "$FFMPEG_PID_DIR/mic2.pid"
+    output="$( { collect_system_metrics; collect_stream_metrics; } 2>/dev/null )"
+
+    # Each metric name may appear in at most one '# HELP' and one '# TYPE' line.
+    dup_help="$(printf '%s\n' "$output" | awk '/^# HELP /{c[$3]++} END{for(n in c) if(c[n]>1) print n}')"
+    [ -z "$dup_help" ]
+    dup_type="$(printf '%s\n' "$output" | awk '/^# TYPE /{c[$3]++} END{for(n in c) if(c[n]>1) print n}')"
+    [ -z "$dup_type" ]
+}
+
+@test "no sample line is emitted with an empty value [C6/M2 regression]" {
+    echo $$ > "$FFMPEG_PID_DIR/mic1.pid"
+    output="$( { collect_system_metrics; collect_stream_metrics; } 2>/dev/null )"
+    # A metric/sample line must end with a value; reject a name (optionally with
+    # labels) followed by only whitespace/EOL.
+    run bash -c 'printf "%s\n" "$1" | grep -nE "^[a-zA-Z_][a-zA-Z0-9_:]*(\{[^}]*\})?[[:space:]]*$"' _ "$output"
+    [ "$status" -ne 0 ]
+}
