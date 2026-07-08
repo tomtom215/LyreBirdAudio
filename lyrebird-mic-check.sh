@@ -1678,13 +1678,16 @@ generate_config() {
 #   DEVICE_<sanitized_name>_<PARAMETER>=value
 #
 # Where:
-#   - <sanitized_name> is the device name with special chars replaced by underscore
+#   - <sanitized_name> is the device name with special chars replaced by
+#     underscore and then UPPERCASED, so the key matches the exact lookup the
+#     stream manager performs (DEVICE_${name^^}_${param^^}). A case mismatch
+#     here silently drops every per-device setting.
 #   - <PARAMETER> is one of: SAMPLE_RATE, CHANNELS, BITRATE
 #
-# Example:
-#   DEVICE_Blue_Yeti_SAMPLE_RATE=48000
-#   DEVICE_Blue_Yeti_CHANNELS=2
-#   DEVICE_Blue_Yeti_BITRATE=192k
+# Example (device "Blue Yeti"):
+#   DEVICE_BLUE_YETI_SAMPLE_RATE=48000
+#   DEVICE_BLUE_YETI_CHANNELS=2
+#   DEVICE_BLUE_YETI_BITRATE=192k
 #
 # Fallback Defaults (used when device-specific config not found):
 
@@ -1774,9 +1777,9 @@ EOF
 #   Channels: ${PARSED_CAPS[channels]:-unknown}
 #   Formats: ${PARSED_CAPS[formats]:-unknown}
 # Selected settings (quality tier: $QUALITY_TIER):
-DEVICE_${safe_name}_SAMPLE_RATE=$optimal_rate
-DEVICE_${safe_name}_CHANNELS=$optimal_channels
-DEVICE_${safe_name}_BITRATE=${enc_bitrate}k
+DEVICE_${safe_name^^}_SAMPLE_RATE=$optimal_rate
+DEVICE_${safe_name^^}_CHANNELS=$optimal_channels
+DEVICE_${safe_name^^}_BITRATE=${enc_bitrate}k
 
 EOF
 
@@ -1860,8 +1863,10 @@ get_config_value() {
     local device_id_safe="$2"
     local param="$3"
 
-    # Try friendly name first
-    local var_name="DEVICE_${safe_name}_${param}"
+    # Try friendly name first. Keys are UPPERCASED to match the exact lookup the
+    # stream manager performs (DEVICE_${name^^}_${param^^}); a case mismatch here
+    # silently drops every generated per-device setting.
+    local var_name="DEVICE_${safe_name^^}_${param^^}"
     if [[ -n "${!var_name:-}" ]]; then
         echo "${!var_name}"
         return 0
@@ -1869,7 +1874,7 @@ get_config_value() {
 
     # Try full device ID if provided
     if [[ -n "$device_id_safe" ]]; then
-        var_name="DEVICE_${device_id_safe}_${param}"
+        var_name="DEVICE_${device_id_safe^^}_${param^^}"
         if [[ -n "${!var_name:-}" ]]; then
             echo "${!var_name}"
             return 0
