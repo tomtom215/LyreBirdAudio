@@ -668,3 +668,17 @@ teardown() {
     run validate_pid "abc"
     [ "$status" -eq 1 ]
 }
+
+# ============================================================================
+# Regression test for interactive-delegation stdin (C8)
+# ============================================================================
+
+@test "delegations receive the controlling terminal, not /dev/null [C8 regression]" {
+    # A backgrounded command's stdin defaults to /dev/null, so interactive
+    # delegations (USB mapper, updater menu, uninstall confirm) read EOF and
+    # abort. Every exec site must give the child </dev/tty.
+    run grep -c -F '"${args[@]}" &' "$PROJECT_ROOT/lyrebird-orchestrator.sh"
+    [ "$output" -eq 0 ]
+    run grep -c -F '"${args[@]}" </dev/tty &' "$PROJECT_ROOT/lyrebird-orchestrator.sh"
+    [ "$output" -eq 3 ]
+}

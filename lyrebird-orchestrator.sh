@@ -688,7 +688,7 @@ execute_script() {
             PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
             LOGNAME="$SUDO_USER" \
             USER="$SUDO_USER" \
-            "${script_path}" "${args[@]}" &
+            "${script_path}" "${args[@]}" </dev/tty &
 
         CHILD_PID=$!
 
@@ -710,7 +710,7 @@ execute_script() {
     # Diagnostics uses exit codes: 0=success, 1=warnings, 2=failures
     # We should NOT show error messages for warnings (exit code 1)
     if [[ "$script_key" == "diagnostics" ]]; then
-        "${script_path}" "${args[@]}" &
+        "${script_path}" "${args[@]}" </dev/tty &
         CHILD_PID=$!
 
         local exit_code=0
@@ -739,8 +739,12 @@ execute_script() {
         esac
     fi
 
-    # All other scripts execute as root with child process tracking
-    "${script_path}" "${args[@]}" &
+    # All other scripts execute as root with child process tracking.
+    # `</dev/tty` gives the child the controlling terminal: a backgrounded
+    # command (needed here for CHILD_PID signal tracking) otherwise has its stdin
+    # redirected from /dev/null, so interactive delegations (USB mapper, updater
+    # menu, uninstall confirmation) read EOF and abort instead of prompting.
+    "${script_path}" "${args[@]}" </dev/tty &
     CHILD_PID=$!
 
     local exit_code=0
