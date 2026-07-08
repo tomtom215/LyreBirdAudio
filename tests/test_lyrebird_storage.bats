@@ -375,3 +375,50 @@ teardown() {
     run type main
     [ "$status" -eq 0 ]
 }
+
+# ============================================================================
+# Regression tests (exercise the REAL functions with proper path overrides)
+# ============================================================================
+
+@test "cleanup_recordings survives a 0-byte recording under set -e [H1 regression]" {
+    local rec; rec="$(mktemp -d)"
+    : > "$rec/old.wav"                                   # 0-byte recording
+    touch -d "400 days ago" "$rec/old.wav" 2>/dev/null || touch "$rec/old.wav"
+    # ((freed_bytes += size)) returned exit 1 when the running total was still 0
+    # and the file was 0 bytes; under set -e that aborted cleanup mid-run, so the
+    # disk kept filling. Must now complete cleanly.
+    run env PROJECT_ROOT="$PROJECT_ROOT" LYREBIRD_RECORDING_DIR="$rec" DRY_RUN=false \
+        bash -c 'set -euo pipefail; source "$PROJECT_ROOT/lyrebird-storage.sh"; cleanup_recordings'
+    rm -rf "$rec"
+    [ "$status" -eq 0 ]
+}
+
+@test "emergency_cleanup does not delete unrelated system logs [H2 regression]" {
+    local logdir; logdir="$(mktemp -d)"
+    : > "$logdir/syslog.1.gz"           # unrelated system log
+    : > "$logdir/mediamtx.out.1.gz"     # our own rotated log
+    run env PROJECT_ROOT="$PROJECT_ROOT" MEDIAMTX_LOG="$logdir/mediamtx.out" \
+        LYREBIRD_RECORDING_DIR="$(mktemp -d)" LYREBIRD_LOG_DIR="$(mktemp -d)" \
+        LYREBIRD_BUFFER_DIR="$(mktemp -d)" DRY_RUN=false \
+        bash -c 'source "$PROJECT_ROOT/lyrebird-storage.sh"; emergency_cleanup'
+    local survived=0
+    [ -f "$logdir/syslog.1.gz" ] && survived=1
+    rm -rf "$logdir"
+    [ "$survived" -eq 1 ]              # MEDIAMTX_LOG_DIR is /var/log in production
+}
+
+@test "emergency_cleanup with DRY_RUN deletes nothing [H3 regression]" {
+    local logdir; logdir="$(mktemp -d)"; local buf; buf="$(mktemp -d)"
+    : > "$logdir/mediamtx.out.1.gz"
+    : > "$buf/chunk.raw"
+    run env PROJECT_ROOT="$PROJECT_ROOT" MEDIAMTX_LOG="$logdir/mediamtx.out" \
+        LYREBIRD_RECORDING_DIR="$(mktemp -d)" LYREBIRD_LOG_DIR="$(mktemp -d)" \
+        LYREBIRD_BUFFER_DIR="$buf" DRY_RUN=true \
+        bash -c 'source "$PROJECT_ROOT/lyrebird-storage.sh"; emergency_cleanup'
+    local gz=0 raw=0
+    [ -f "$logdir/mediamtx.out.1.gz" ] && gz=1
+    [ -f "$buf/chunk.raw" ] && raw=1
+    rm -rf "$logdir" "$buf"
+    [ "$gz" -eq 1 ]
+    [ "$raw" -eq 1 ]
+}
