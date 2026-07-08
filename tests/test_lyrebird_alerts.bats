@@ -336,3 +336,38 @@ teardown() {
     [ "$status" -eq 0 ]
     [[ "$output" =~ "LYREBIRD_ALERT_ENABLED" ]]
 }
+
+# ============================================================================
+# Regression tests for destination detection / dispatch (C5)
+# ============================================================================
+
+@test "ntfy destination is recognized without a webhook URL [C5 regression]" {
+    LYREBIRD_WEBHOOK_URL="" LYREBIRD_WEBHOOK_URLS="" \
+    LYREBIRD_WEBHOOK_TYPE="ntfy" LYREBIRD_NTFY_TOPIC="mytopic" \
+        alert_destination_configured
+}
+
+@test "pushover destination requires both token and user [C5 regression]" {
+    LYREBIRD_WEBHOOK_URL="" LYREBIRD_WEBHOOK_URLS="" LYREBIRD_WEBHOOK_TYPE="pushover"
+    run env LYREBIRD_WEBHOOK_URL="" LYREBIRD_WEBHOOK_URLS="" LYREBIRD_WEBHOOK_TYPE="pushover" \
+        LYREBIRD_PUSHOVER_TOKEN="" LYREBIRD_PUSHOVER_USER="" bash -c \
+        "source '$PROJECT_ROOT/lyrebird-alerts.sh' >/dev/null 2>&1; set +euo pipefail; alert_destination_configured"
+    [ "$status" -ne 0 ]
+    LYREBIRD_PUSHOVER_TOKEN="tok" LYREBIRD_PUSHOVER_USER="usr" \
+    LYREBIRD_WEBHOOK_URL="" LYREBIRD_WEBHOOK_URLS="" LYREBIRD_WEBHOOK_TYPE="pushover" \
+        alert_destination_configured
+}
+
+@test "send_alert actually dispatches an ntfy alert via curl [C5 regression]" {
+    # Previously send_alert returned 0 from the guard WITHOUT sending. Shim curl
+    # to record the endpoint it is called with and prove dispatch happens.
+    local calllog="${BATS_TEST_TMPDIR:-$LYREBIRD_ALERT_STATE_DIR}/curl.log"
+    : > "$calllog"
+    curl() { printf '%s\n' "$*" >> "$calllog"; printf '200'; }
+    LYREBIRD_ALERT_ENABLED="true"
+    LYREBIRD_WEBHOOK_URL="" LYREBIRD_WEBHOOK_URLS=""
+    LYREBIRD_WEBHOOK_TYPE="ntfy" LYREBIRD_NTFY_TOPIC="t" LYREBIRD_NTFY_SERVER="https://ntfy.example"
+    run send_alert "info" "Stream Down: mic1" "Body text" "test"
+    [ "$status" -eq 0 ]
+    grep -q 'ntfy.example/t' "$calllog"
+}
