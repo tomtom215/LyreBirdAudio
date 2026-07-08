@@ -356,3 +356,25 @@ teardown() {
     run type cleanup
     [ "$status" -eq 0 ]
 }
+
+# ============================================================================
+# Regression tests for self-update lock handling (C7)
+# ============================================================================
+
+@test "self-update releases the lock immediately before exec [C7 regression]" {
+    # exec keeps the same PID and does NOT fire the EXIT trap, so the lock must be
+    # released explicitly before exec or the re-exec'd process deadlocks on its
+    # own live-PID lock and every self-update fails with E_LOCKED.
+    run grep -B6 -F 'exec "$script_path" "${restart_args[@]}"' "$PROJECT_ROOT/lyrebird-updater.sh"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"release_lock"* ]]
+}
+
+@test "release_lock removes a lock owned by the current PID [C7 regression]" {
+    mkdir -p "$LOCKFILE"
+    echo "$$" > "$LOCKFILE/pid"
+    [ -d "$LOCKFILE" ]
+    release_lock
+    [ ! -d "$LOCKFILE" ]
+    rm -rf "$LOCKFILE" 2>/dev/null || true
+}
