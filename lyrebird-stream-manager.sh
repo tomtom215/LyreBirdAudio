@@ -3536,12 +3536,15 @@ check_devices_exist() {
 
 # Check if parent is still alive
 check_parent_alive() {
-    if [[ -n "${MAIN_SCRIPT_PID}" ]] && [[ "${MAIN_SCRIPT_PID}" -gt 1 ]]; then
-        if ! kill -0 "${MAIN_SCRIPT_PID}" 2>/dev/null; then
-            log_message "Main script (PID ${MAIN_SCRIPT_PID}) has terminated, exiting"
-            return 1
-        fi
-    fi
+    # Intentionally a no-op. MAIN_SCRIPT_PID is the transient launcher process,
+    # which exits BY DESIGN after starting the wrappers (start_mediamtx returns
+    # and the systemd unit is Type=forking). Tying wrapper lifetime to it made
+    # every wrapper exit shortly after boot, defeating auto-restart entirely.
+    # Graceful shutdown is handled by the CLEANUP_MARKER check in the loop and by
+    # `stop` terminating the wrapper process groups directly; an abnormal launcher
+    # exit creates CLEANUP_MARKER, which also stops the wrappers. Kept as a
+    # function (rather than deleting call sites) to minimise churn in the
+    # generated wrapper.
     return 0
 }
 
@@ -3597,9 +3600,13 @@ while true; do
         continue
     fi
     
-    # Wait for FFmpeg to exit
-    wait "${FFMPEG_PID}" 2>/dev/null
-    exit_code=$?
+    # Wait for FFmpeg to exit.
+    # NOTE: capture the status with `|| exit_code=$?`. A bare `wait` returns
+    # FFmpeg's (usually non-zero) exit status and, under `set -euo pipefail`,
+    # errexit would kill the wrapper HERE -- before the restart/backoff logic
+    # below -- so streams never auto-restarted after a failure.
+    exit_code=0
+    wait "${FFMPEG_PID}" 2>/dev/null || exit_code=$?
     
     FFMPEG_PID=""
     
@@ -3939,12 +3946,15 @@ check_device_exists() {
 
 # Check if parent is still alive
 check_parent_alive() {
-    if [[ -n "${MAIN_SCRIPT_PID}" ]] && [[ "${MAIN_SCRIPT_PID}" -gt 1 ]]; then
-        if ! kill -0 "${MAIN_SCRIPT_PID}" 2>/dev/null; then
-            log_message "Main script (PID ${MAIN_SCRIPT_PID}) has terminated, exiting"
-            return 1
-        fi
-    fi
+    # Intentionally a no-op. MAIN_SCRIPT_PID is the transient launcher process,
+    # which exits BY DESIGN after starting the wrappers (start_mediamtx returns
+    # and the systemd unit is Type=forking). Tying wrapper lifetime to it made
+    # every wrapper exit shortly after boot, defeating auto-restart entirely.
+    # Graceful shutdown is handled by the CLEANUP_MARKER check in the loop and by
+    # `stop` terminating the wrapper process groups directly; an abnormal launcher
+    # exit creates CLEANUP_MARKER, which also stops the wrappers. Kept as a
+    # function (rather than deleting call sites) to minimise churn in the
+    # generated wrapper.
     return 0
 }
 
@@ -3999,9 +4009,13 @@ while true; do
         continue
     fi
     
-    # Wait for FFmpeg to exit
-    wait "${FFMPEG_PID}" 2>/dev/null
-    exit_code=$?
+    # Wait for FFmpeg to exit.
+    # NOTE: capture the status with `|| exit_code=$?`. A bare `wait` returns
+    # FFmpeg's (usually non-zero) exit status and, under `set -euo pipefail`,
+    # errexit would kill the wrapper HERE -- before the restart/backoff logic
+    # below -- so streams never auto-restarted after a failure.
+    exit_code=0
+    wait "${FFMPEG_PID}" 2>/dev/null || exit_code=$?
     
     FFMPEG_PID=""
     

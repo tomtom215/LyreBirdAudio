@@ -523,3 +523,53 @@ setup() {
     run process_exists 999999999
     [ "$status" -eq 1 ]
 }
+
+# ============================================================================
+# Regression tests for the FFmpeg wrapper self-healing loop (C2/C3)
+# The wrapper is generated text run under `set -euo pipefail`, so these guard
+# the generated source AND prove the underlying bash mechanism.
+# ============================================================================
+
+@test "wrapper wait preserves exit code without tripping errexit [C2 regression]" {
+    # Both wrappers (individual + multiplex) must use the safe idiom.
+    run grep -c 'wait "${FFMPEG_PID}" 2>/dev/null || exit_code=$?' \
+        "$PROJECT_ROOT/lyrebird-stream-manager.sh"
+    [ "$status" -eq 0 ]
+    [ "$output" -eq 2 ]
+    # The old bare-wait-then-$? pattern must be gone (would let errexit kill the
+    # wrapper on FFmpeg's first non-zero exit, before restart/backoff ran).
+    run grep -nE '^[[:space:]]*wait "\$\{FFMPEG_PID\}" 2>/dev/null[[:space:]]*$' \
+        "$PROJECT_ROOT/lyrebird-stream-manager.sh"
+    [ "$status" -ne 0 ]
+}
+
+@test "safe wait idiom survives a non-zero child under set -e [C2 mechanism]" {
+    run bash -c '
+        set -euo pipefail
+        ( exit 3 ) & p=$!          # stand-in for FFmpeg dying non-zero
+        exit_code=0
+        wait "$p" 2>/dev/null || exit_code=$?
+        echo "reached restart logic ec=$exit_code"
+    '
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"reached restart logic ec=3"* ]]
+}
+
+@test "old bare-wait idiom aborts under set -e [C2 characterization]" {
+    # Documents the bug this fixes: control never reaches the restart logic.
+    run bash -c '
+        set -euo pipefail
+        ( exit 3 ) & p=$!
+        wait "$p" 2>/dev/null
+        echo "reached restart logic"
+    '
+    [ "$status" -ne 0 ]
+    [[ "$output" != *"reached restart logic"* ]]
+}
+
+@test "wrapper does not tie its lifetime to the transient launcher PID [C3 regression]" {
+    # check_parent_alive must be neutralised: MAIN_SCRIPT_PID is the launcher,
+    # which exits by design, so killing the wrapper on its death defeats restart.
+    run grep -c 'kill -0 "${MAIN_SCRIPT_PID}"' "$PROJECT_ROOT/lyrebird-stream-manager.sh"
+    [ "$output" -eq 0 ]
+}
