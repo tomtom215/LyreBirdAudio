@@ -16,6 +16,11 @@ setup() {
 
     # Source the metrics script
     source "$PROJECT_ROOT/lyrebird-metrics.sh"
+
+    # The script enables `set -euo pipefail`, which leaks into the bats shell and
+    # turns failing assertions / unset-var reads into silent aborts. Restore
+    # bats' own error handling so failures report as "not ok".
+    set +euo pipefail
 }
 
 # Teardown - clean up temp files

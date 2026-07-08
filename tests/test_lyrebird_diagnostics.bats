@@ -380,7 +380,12 @@ EOF
 
 @test "get_primary_interface returns interface name" {
     get_primary_interface() {
-        ip route 2>/dev/null | awk '/default/{print $5; exit}' || echo "unknown"
+        # NOTE: `awk` succeeds (exit 0) even with no match, so `|| echo` never
+        # fires; default with parameter expansion instead. A host with no
+        # default route (e.g. a CI container) legitimately has no primary iface.
+        local iface
+        iface=$(ip route 2>/dev/null | awk '/default/{print $5; exit}')
+        echo "${iface:-unknown}"
     }
 
     run get_primary_interface

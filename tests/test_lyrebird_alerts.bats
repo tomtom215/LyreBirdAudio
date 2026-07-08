@@ -20,6 +20,11 @@ setup() {
 
     # Source the alerts script (functions only, don't run main)
     source "$PROJECT_ROOT/lyrebird-alerts.sh"
+
+    # The script enables `set -euo pipefail`, which leaks into the bats shell and
+    # turns failing assertions / unset-var reads into silent aborts. Restore
+    # bats' own error handling so failures report as "not ok".
+    set +euo pipefail
 }
 
 # Teardown - clean up temp files

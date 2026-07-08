@@ -20,6 +20,10 @@ setup() {
 
     # Source the updater script
     source "$PROJECT_ROOT/lyrebird-updater.sh"
+
+    # The script enables errexit, which leaks into the bats shell and turns
+    # failing assertions into silent aborts. Restore bats' own error handling.
+    set +euo pipefail
 }
 
 # Teardown - clean up temp files
