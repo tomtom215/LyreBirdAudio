@@ -573,3 +573,73 @@ setup() {
     run grep -c 'kill -0 "${MAIN_SCRIPT_PID}"' "$PROJECT_ROOT/lyrebird-stream-manager.sh"
     [ "$output" -eq 0 ]
 }
+
+# ============================================================================
+# Regression tests for supervision reliability (SM-2 H8, SM-4)
+# ============================================================================
+
+@test "cron resurrection is bounded per stream per hour [SM-2/H8 regression]" {
+    run env PROJECT_ROOT="$PROJECT_ROOT" CRON=1 \
+        CRON_RESTART_STATE_DIR="$(mktemp -d)" CRON_RESTART_MAX_PER_HOUR=2 bash -c '
+        source "$PROJECT_ROOT/lyrebird-stream-manager.sh" >/dev/null 2>&1 || true
+        set +euo pipefail
+        r=""
+        for i in 1 2 3 4; do should_restart_stream s >/dev/null 2>&1 && r+=A || r+=D; done
+        printf "%s" "$r"
+    '
+    [ "$status" -eq 0 ]
+    # First two restarts allowed, the rest rate-limited (was: never restart at all).
+    [ "$output" = "AADD" ]
+}
+
+@test "non-cron (service/interactive) restart is always permitted [SM-2 regression]" {
+    run env PROJECT_ROOT="$PROJECT_ROOT" bash -c '
+        unset CRON
+        source "$PROJECT_ROOT/lyrebird-stream-manager.sh" >/dev/null 2>&1 || true
+        set +euo pipefail
+        r=""
+        for i in 1 2 3 4 5; do should_restart_stream s >/dev/null 2>&1 && r+=A || r+=D; done
+        printf "%s" "$r"
+    '
+    [ "$status" -eq 0 ]
+    [ "$output" = "AAAAA" ]
+}
+
+@test "disk-full alone is degraded, NOT a service-restart trigger [SM-4 regression]" {
+    run env PROJECT_ROOT="$PROJECT_ROOT" bash -c '
+        source "$PROJECT_ROOT/lyrebird-stream-manager.sh" >/dev/null 2>&1 || true
+        set +euo pipefail
+        check_resource_usage() { return 0; }       # our own process fine
+        check_disk_space() { return 2; }           # disk critical
+        check_memory_usage() { return 0; }
+        check_network_connectivity() { return 0; }
+        update_heartbeat() { :; }
+        check_all_resources; rc=$?
+        printf "rc=%s ecrit=%s\n" "$rc" "$E_CRITICAL_RESOURCE"
+    '
+    [ "$status" -eq 0 ]
+    local rc ecrit
+    rc=$(printf '%s\n' "$output" | sed -n 's/.*rc=\([0-9]*\).*/\1/p')
+    ecrit=$(printf '%s\n' "$output" | sed -n 's/.*ecrit=\([0-9]*\).*/\1/p')
+    # A restart can't free disk; must NOT return the restart-triggering code.
+    [ "$rc" != "$ecrit" ]
+}
+
+@test "our-process resource exhaustion IS a restart trigger [SM-4 regression]" {
+    run env PROJECT_ROOT="$PROJECT_ROOT" bash -c '
+        source "$PROJECT_ROOT/lyrebird-stream-manager.sh" >/dev/null 2>&1 || true
+        set +euo pipefail
+        check_resource_usage() { return 1; }       # OUR process critical (fixable by restart)
+        check_disk_space() { return 0; }
+        check_memory_usage() { return 0; }
+        check_network_connectivity() { return 0; }
+        update_heartbeat() { :; }
+        check_all_resources; rc=$?
+        printf "rc=%s ecrit=%s\n" "$rc" "$E_CRITICAL_RESOURCE"
+    '
+    [ "$status" -eq 0 ]
+    local rc ecrit
+    rc=$(printf '%s\n' "$output" | sed -n 's/.*rc=\([0-9]*\).*/\1/p')
+    ecrit=$(printf '%s\n' "$output" | sed -n 's/.*ecrit=\([0-9]*\).*/\1/p')
+    [ "$rc" = "$ecrit" ]     # restart trigger preserved for genuinely fixable conditions
+}

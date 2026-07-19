@@ -294,6 +294,14 @@ readonly MEDIAMTX_LOG_MAX_SIZE="${MEDIAMTX_LOG_MAX_SIZE:-52428800}" # 50MB
 # Production Reliability Settings (v1.4.2 additions)
 # ============================================================================
 
+# Bounded cron resurrection: how many times per rolling hour the cron monitor
+# may restart a single dead stream. A stream whose wrapper has given up (after
+# repeated failures) MUST be brought back under cron, or it stays down forever on
+# an unattended box (H8). The cap prevents a persistently-failing stream from
+# being restarted every 5 minutes indefinitely (a restart storm).
+readonly CRON_RESTART_MAX_PER_HOUR="${CRON_RESTART_MAX_PER_HOUR:-6}"
+readonly CRON_RESTART_STATE_DIR="${CRON_RESTART_STATE_DIR:-/run/lyrebird/cron-restarts}"
+
 # Watchdog/Heartbeat settings
 # Heartbeat runs more frequently than cron for faster failure detection
 readonly HEARTBEAT_INTERVAL="${HEARTBEAT_INTERVAL:-30}"             # Seconds between heartbeats
@@ -1239,14 +1247,14 @@ ${MEDIAMTX_LOG_FILE} {
     delaycompress
     missingok
     notifempty
-    create 640 root adm
+    # copytruncate: MediaMTX's stdout here is an inherited shell redirect (>>),
+    # so it cannot be told to reopen the file. Copy-then-truncate-in-place keeps
+    # the same inode/fd, so MediaMTX keeps writing to the rotated file instead of
+    # an unlinked one that grows invisibly until the disk fills. (The old
+    # create + kill -USR1 could not work: the fd is owned by the shell redirect,
+    # not by a MediaMTX-managed log file.)
+    copytruncate
     size ${MEDIAMTX_LOG_MAX_SIZE}
-    postrotate
-        # Send USR1 signal to MediaMTX if running
-        if [ -f "${PID_FILE}" ]; then
-            kill -USR1 \$(cat ${PID_FILE}) 2>/dev/null || true
-        fi
-    endscript
 }
 
 ${LOG_FILE} {
@@ -1256,7 +1264,10 @@ ${LOG_FILE} {
     delaycompress
     missingok
     notifempty
-    create 644 root root
+    # copytruncate: the manager's log is held open (systemd append: / the
+    # running process), so a plain create would leave it writing to the rotated
+    # inode.
+    copytruncate
     size ${MAIN_LOG_MAX_SIZE}
 }
 
@@ -1267,6 +1278,8 @@ ${FFMPEG_PID_DIR}/*.log {
     delaycompress
     missingok
     notifempty
+    # copytruncate: each FFmpeg holds its log open and does not reopen on rotate.
+    copytruncate
     size ${FFMPEG_LOG_MAX_SIZE}
 }
 EOF
@@ -2379,22 +2392,24 @@ check_all_resources() {
         critical=true
     fi
 
-    # Disk space check
+    # Disk space check. IMPORTANT: disk-full is NOT restart-fixable — restarting
+    # the service frees no disk and would just tear down every stream every 5
+    # minutes for the whole duration of the condition (a data-loss-maximizing
+    # restart storm). Treat it as DEGRADED (logged/alerted, exit 1) so the
+    # operator is notified and the storage-cleanup cron can act, while the
+    # service keeps running and capturing. A leak in OUR OWN processes is caught
+    # by check_resource_usage above, which DOES remain a restart trigger.
     local disk_result
     check_disk_space
     disk_result=$?
-    if [[ $disk_result -eq 2 ]]; then
-        critical=true
-    fi
     [[ $disk_result -ne 0 ]] && ((issues++)) || true
 
-    # Memory check
+    # System-wide memory pressure is likewise environmental (it may be caused by
+    # other processes) and a restart of our streams cannot remediate it. Degraded,
+    # not critical — same restart-storm reasoning as disk.
     local mem_result
     check_memory_usage
     mem_result=$?
-    if [[ $mem_result -eq 2 ]]; then
-        critical=true
-    fi
     [[ $mem_result -ne 0 ]] && ((issues++)) || true
 
     # Network check
@@ -2455,6 +2470,57 @@ is_cron_context() {
     return 1
 }
 
+# --- Bounded cron resurrection (H8) -----------------------------------------
+# Count this stream's cron restarts within the last hour (read-only).
+_cron_restart_count() {
+    local stream_path="$1"
+    local state_file="${CRON_RESTART_STATE_DIR}/${stream_path}.restarts"
+    [[ -f "$state_file" ]] || { printf '0'; return 0; }
+    local now cutoff count=0 ts
+    now="$(date +%s)"
+    cutoff=$((now - 3600))
+    while read -r ts; do
+        [[ "$ts" =~ ^[0-9]+$ ]] || continue
+        ((ts >= cutoff)) && ((count++)) || true
+    done <"$state_file"
+    printf '%s' "$count"
+}
+
+# Record a cron restart attempt for this stream (prunes entries older than 1h).
+_record_cron_restart() {
+    local stream_path="$1"
+    local state_file="${CRON_RESTART_STATE_DIR}/${stream_path}.restarts"
+    mkdir -p "${CRON_RESTART_STATE_DIR}" 2>/dev/null || true
+    local now cutoff kept="" ts
+    now="$(date +%s)"
+    cutoff=$((now - 3600))
+    if [[ -f "$state_file" ]]; then
+        while read -r ts; do
+            [[ "$ts" =~ ^[0-9]+$ ]] || continue
+            ((ts >= cutoff)) && kept+="${ts}"$'\n'
+        done <"$state_file"
+    fi
+    printf '%s%s\n' "$kept" "$now" >"$state_file" 2>/dev/null || true
+}
+
+# Decide whether monitor_streams may (re)start this stream now. Interactive and
+# service invocations always may. Under cron, a dead stream is resurrected but
+# no more than CRON_RESTART_MAX_PER_HOUR times per hour; the attempt is recorded
+# here so the cap also bounds attempts that fail to come up.
+should_restart_stream() {
+    local stream_path="$1"
+    is_cron_context || return 0
+    local count
+    count="$(_cron_restart_count "$stream_path")"
+    if ((count < CRON_RESTART_MAX_PER_HOUR)); then
+        _record_cron_restart "$stream_path"
+        log INFO "cron: resurrecting dead stream $stream_path (restart ${count}/${CRON_RESTART_MAX_PER_HOUR} this hour)"
+        return 0
+    fi
+    log WARN "cron: $stream_path is down but its restart budget (${CRON_RESTART_MAX_PER_HOUR}/hour) is exhausted; not restarting"
+    return 1
+}
+
 # Stream health monitoring with automatic restart
 monitor_streams() {
     log INFO "Checking stream health..."
@@ -2469,11 +2535,13 @@ monitor_streams() {
         return "${E_MEDIAMTX_DOWN}"
     fi
 
-    # Detect if running from cron - if so, report only, don't restart
-    local allow_restart=true
+    # Restart decisions are made per-stream by should_restart_stream: interactive
+    # and service runs restart a dead stream immediately; cron performs BOUNDED
+    # resurrection (up to CRON_RESTART_MAX_PER_HOUR per stream per hour) so a dead
+    # stream is brought back instead of staying down forever (H8), without a
+    # restart storm.
     if is_cron_context; then
-        allow_restart=false
-        log DEBUG "Running from cron - report-only mode (no stream restarts)"
+        log DEBUG "Running from cron - bounded resurrection mode"
     fi
 
     # Get current devices
@@ -2505,7 +2573,7 @@ monitor_streams() {
 
         # Check if PID file exists
         if [[ ! -f "$pid_file" ]]; then
-            if [[ "$allow_restart" == "true" ]]; then
+            if should_restart_stream "$stream_path"; then
                 log WARN "Multiplex stream $stream_path has no PID file - restarting"
                 if start_ffmpeg_multiplex_stream "${devices[@]}"; then
                     ((streams_restarted++)) || true
@@ -2524,7 +2592,7 @@ monitor_streams() {
             pid="$(read_pid_safe "$pid_file")"
 
             if [[ -z "$pid" ]]; then
-                if [[ "$allow_restart" == "true" ]]; then
+                if should_restart_stream "$stream_path"; then
                     log WARN "Multiplex stream $stream_path PID is invalid - restarting"
                     if start_ffmpeg_multiplex_stream "${devices[@]}"; then
                         ((streams_restarted++)) || true
@@ -2538,7 +2606,7 @@ monitor_streams() {
                     log WARN "Multiplex stream $stream_path PID is invalid (cron mode: not restarting)"
                 fi
             elif ! pgrep -f "${FFMPEG_PID_DIR}/${stream_path}.sh" | grep -q "^${pid}$" 2>/dev/null; then
-                if [[ "$allow_restart" == "true" ]]; then
+                if should_restart_stream "$stream_path"; then
                     log WARN "Multiplex stream $stream_path PID $pid is stale - restarting"
                     rm -f "$pid_file"
                     if start_ffmpeg_multiplex_stream "${devices[@]}"; then
@@ -2574,7 +2642,7 @@ monitor_streams() {
 
             # Check if PID file exists
             if [[ ! -f "$pid_file" ]]; then
-                if [[ "$allow_restart" == "true" ]]; then
+                if should_restart_stream "$stream_path"; then
                     # v1.4.2: Check ALSA device availability before restart
                     if ! check_alsa_device_available "$card_num"; then
                         log WARN "Stream $stream_path: ALSA device not available (card $card_num), skipping restart"
@@ -2601,7 +2669,7 @@ monitor_streams() {
             pid="$(read_pid_safe "$pid_file")"
 
             if [[ -z "$pid" ]]; then
-                if [[ "$allow_restart" == "true" ]]; then
+                if should_restart_stream "$stream_path"; then
                     # v1.4.2: Check ALSA device availability before restart
                     if ! check_alsa_device_available "$card_num"; then
                         log WARN "Stream $stream_path: ALSA device not available (card $card_num), skipping restart"
@@ -2625,7 +2693,7 @@ monitor_streams() {
 
             # Verify the PID actually belongs to our wrapper
             if ! pgrep -f "${FFMPEG_PID_DIR}/${stream_path}.sh" | grep -q "^${pid}$" 2>/dev/null; then
-                if [[ "$allow_restart" == "true" ]]; then
+                if should_restart_stream "$stream_path"; then
                     # v1.4.2: Check ALSA device availability before restart
                     if ! check_alsa_device_available "$card_num"; then
                         log WARN "Stream $stream_path: ALSA device not available (card $card_num), skipping restart"
@@ -3624,7 +3692,14 @@ while true; do
     
     # Reset failures and delay if ran successfully
     if [[ ${RUN_TIME} -gt ${WRAPPER_SUCCESS_DURATION} ]]; then
+        # A run longer than WRAPPER_SUCCESS_DURATION is "healthy": reset BOTH the
+        # consecutive-failure counter AND the restart odometer. RESTART_COUNT was
+        # previously never reset, making MAX_WRAPPER_RESTARTS a LIFETIME cap
+        # rather than a rate -- so benign restarts (USB re-enumeration, MediaMTX
+        # blips) accumulated over weeks until the wrapper gave up for good and the
+        # stream died silently on an unattended box.
         CONSECUTIVE_FAILURES=0
+        RESTART_COUNT=0
         RESTART_DELAY=$INITIAL_RESTART_DELAY
         log_message "Successful run, reset delay to ${RESTART_DELAY}s"
     else
@@ -4033,7 +4108,14 @@ while true; do
     
     # Reset failures and delay if ran successfully
     if [[ ${RUN_TIME} -gt ${WRAPPER_SUCCESS_DURATION} ]]; then
+        # A run longer than WRAPPER_SUCCESS_DURATION is "healthy": reset BOTH the
+        # consecutive-failure counter AND the restart odometer. RESTART_COUNT was
+        # previously never reset, making MAX_WRAPPER_RESTARTS a LIFETIME cap
+        # rather than a rate -- so benign restarts (USB re-enumeration, MediaMTX
+        # blips) accumulated over weeks until the wrapper gave up for good and the
+        # stream died silently on an unattended box.
         CONSECUTIVE_FAILURES=0
+        RESTART_COUNT=0
         RESTART_DELAY=$INITIAL_RESTART_DELAY
         log_message "Successful run, reset delay to ${RESTART_DELAY}s"
     else
@@ -4768,14 +4850,14 @@ ${MEDIAMTX_LOG_FILE} {
     delaycompress
     missingok
     notifempty
-    create 640 root adm
+    # copytruncate: MediaMTX's stdout here is an inherited shell redirect (>>),
+    # so it cannot be told to reopen the file. Copy-then-truncate-in-place keeps
+    # the same inode/fd, so MediaMTX keeps writing to the rotated file instead of
+    # an unlinked one that grows invisibly until the disk fills. (The old
+    # create + kill -USR1 could not work: the fd is owned by the shell redirect,
+    # not by a MediaMTX-managed log file.)
+    copytruncate
     size ${MEDIAMTX_LOG_MAX_SIZE}
-    postrotate
-        # Send USR1 signal to MediaMTX if running
-        if [ -f "${PID_FILE}" ]; then
-            kill -USR1 \$(cat ${PID_FILE}) 2>/dev/null || true
-        fi
-    endscript
 }
 
 ${LOG_FILE} {
@@ -4785,7 +4867,10 @@ ${LOG_FILE} {
     delaycompress
     missingok
     notifempty
-    create 644 root root
+    # copytruncate: the manager's log is held open (systemd append: / the
+    # running process), so a plain create would leave it writing to the rotated
+    # inode.
+    copytruncate
     size ${MAIN_LOG_MAX_SIZE}
 }
 
@@ -4796,6 +4881,8 @@ ${FFMPEG_PID_DIR}/*.log {
     delaycompress
     missingok
     notifempty
+    # copytruncate: each FFmpeg holds its log open and does not reopen on rotate.
+    copytruncate
     size ${FFMPEG_LOG_MAX_SIZE}
 }
 EOF
@@ -5130,5 +5217,8 @@ main() {
     exit ${exit_code}
 }
 
-# Run main
-main "$@"
+# Run main only when executed directly, not when sourced (e.g. by the test
+# suite). Matches the source guard used by every other script in the suite.
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    main "$@"
+fi

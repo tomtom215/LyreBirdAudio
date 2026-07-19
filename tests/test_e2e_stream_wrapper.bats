@@ -111,3 +111,49 @@ CFG
     # timeout returns 124 only if the wrapper was still running at the deadline.
     [ "$status" -ne 124 ]
 }
+
+@test "wrapper does NOT give up at MAX_WRAPPER_RESTARTS when runs succeed [SM-1 E2E regression]" {
+    # RESTART_COUNT was a lifetime odometer that was never reset, so after
+    # MAX_WRAPPER_RESTARTS benign restarts the wrapper quit for good. It must now
+    # reset on each healthy (>WRAPPER_SUCCESS_DURATION) run and keep supervising.
+    mkdir -p "$E2E_TMP/bin"
+    cat > "$E2E_TMP/bin/ffmpeg" <<EOF
+#!/bin/bash
+echo "call" >> "$E2E_TMP/calls.log"
+sleep 2       # longer than WRAPPER_SUCCESS_DURATION -> counts as a successful run
+exit 0
+EOF
+    chmod +x "$E2E_TMP/bin/ffmpeg"
+    : > "$E2E_TMP/calls.log"
+
+    local wrapper="$E2E_TMP/wrapper.sh"
+    {
+        echo '#!/bin/bash'
+        echo 'set -euo pipefail'
+        echo "export PATH=\"$E2E_TMP/bin:\$PATH\""
+        cat <<'CFG'
+STREAM_PATH="testmic"; CARD_NUM=0; FFMPEG_PID=""
+CLEANUP_MARKER="/nonexistent/cleanup.marker"
+RESTART_COUNT=0; CONSECUTIVE_FAILURES=0
+MAX_CONSECUTIVE_FAILURES=100; MAX_WRAPPER_RESTARTS=2
+WRAPPER_SUCCESS_DURATION=1
+INITIAL_RESTART_DELAY=1; MAX_RESTART_DELAY=1; RESTART_DELAY=1
+log_message() { :; }
+log_critical() { :; }
+check_parent_alive() { return 0; }
+check_device_exists() { return 0; }
+check_devices_exist() { return 0; }
+run_ffmpeg() { ffmpeg >/dev/null 2>&1 & FFMPEG_PID=$!; return 0; }
+CFG
+        _extract_restart_loop
+    } > "$wrapper"
+    bash -n "$wrapper"
+
+    # With MAX_WRAPPER_RESTARTS=2 and the pre-fix lifetime counter, ffmpeg would
+    # be launched exactly 2 times and the wrapper would exit. With the reset it
+    # keeps going, so >2 calls in the window.
+    timeout 12s bash "$wrapper" || true
+    local calls
+    calls=$(grep -c 'call' "$E2E_TMP/calls.log" 2>/dev/null || echo 0)
+    [ "$calls" -gt 2 ]
+}
