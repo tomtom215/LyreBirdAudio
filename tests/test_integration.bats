@@ -108,30 +108,26 @@ EOF
 # API Interaction Tests
 # ============================================================================
 
-@test "INTEGRATION: metrics collector connects to MediaMTX API" {
-    skip "Integration test - requires running MediaMTX instance"
-
-    # Would need to:
-    # 1. Start a mock MediaMTX API server
-    # 2. Run metrics collection
-    # 3. Verify metrics were collected
-
-    run "$PROJECT_ROOT/lyrebird-metrics.sh" --once
-
-    # Should produce some output even if MediaMTX is not running
+@test "INTEGRATION: metrics collector runs end-to-end and emits Prometheus metrics" {
+    # Real end-to-end run of the actual exporter. With no MediaMTX present the
+    # API is simply reported down (api_up 0); the scrape must still complete and
+    # be well-formed (this exercises the MET-1 abort-safety fix). A stub-MediaMTX
+    # scrape with api_up 1 is covered in tests/test_e2e_integration.bats.
+    run env FFMPEG_PID_DIR="$(mktemp -d)" PID_FILE="$(mktemp)" HEARTBEAT_FILE="$(mktemp)" \
+        "$PROJECT_ROOT/lyrebird-metrics.sh" --once
+    [ "$status" -eq 0 ]
     [[ -n "$output" ]]
+    printf '%s\n' "$output" | grep -q '^lyrebird_'
+    printf '%s\n' "$output" | grep -qxE 'lyrebird_api_up [01]'
+    # No bare value-only line (the scrape-breaking "0\n0" class).
+    run grep -nxE '[[:space:]]*[-0-9.]+' <(printf '%s\n' "$output")
+    [ "$status" -ne 0 ]
 }
 
-@test "INTEGRATION: alerts send to mock webhook endpoint" {
-    skip "Integration test - requires mock webhook server"
-
-    # Would need to:
-    # 1. Start a mock HTTP server
-    # 2. Configure alerts to point to it
-    # 3. Trigger an alert
-    # 4. Verify the mock received the request
-
-    [[ true ]]
+@test "INTEGRATION: alerts send to a mock webhook endpoint" {
+    # Real coverage (mock webhook via a fake curl, JSON body validated) lives in
+    # tests/test_e2e_integration.bats. Kept here as an index of the scenario.
+    skip "Covered by tests/test_e2e_integration.bats (mock webhook delivery)"
 }
 
 # ============================================================================
@@ -150,14 +146,9 @@ EOF
 }
 
 @test "INTEGRATION: storage manager handles disk full condition" {
-    skip "Integration test - requires disk simulation"
-
-    # Would need to:
-    # 1. Create a small test filesystem
-    # 2. Fill it up
-    # 3. Verify cleanup runs correctly
-
-    [[ true ]]
+    # Real coverage (fake df at 99%, monitor -> emergency cleanup, dry-run so no
+    # deletion) lives in tests/test_e2e_integration.bats. Kept here as an index.
+    skip "Covered by tests/test_e2e_integration.bats (disk-full monitor flow)"
 }
 
 # ============================================================================
