@@ -20,8 +20,18 @@ PartOf=mediamtx.service
 After=alsa-restore.service
 Wants=alsa-restore.service
 
+# Limit restart frequency (max 5 restarts in 300 seconds). These belong in
+# [Unit]; systemd IGNORES StartLimitIntervalSec in [Service], so the rate limit
+# there would silently not apply.
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
 [Service]
-Type=simple
+# Type=forking (NOT simple): `start` daemonizes the FFmpeg wrappers and returns,
+# writing the PID file below. With Type=simple systemd would treat that return as
+# the service exiting and, with Restart=always, restart it in a loop.
+Type=forking
+PIDFile=/run/mediamtx-audio.pid
 ExecStart=/usr/local/bin/lyrebird-stream-manager.sh start
 ExecStop=/usr/local/bin/lyrebird-stream-manager.sh stop
 ExecReload=/usr/local/bin/lyrebird-stream-manager.sh reload
@@ -38,18 +48,20 @@ Restart=always
 RestartSec=10
 RestartPreventExitStatus=SIGTERM SIGINT
 
-# Watchdog support for automatic recovery
-# Service must notify systemd within this interval or will be restarted
-WatchdogSec=120
+# NOTE: no WatchdogSec. The stream manager can feed systemd's watchdog only via
+# the `systemd-notify` HELPER (a child process), which systemd rejects under the
+# default NotifyAccess=main -- so a WatchdogSec would receive no keep-alive and
+# kill the service every interval. LyreBird's own heartbeat, the optional
+# hardware watchdog, and the cron health monitor provide recovery instead. To use
+# the systemd watchdog anyway, add `NotifyAccess=all`, set WatchdogSec well above
+# LYREBIRD_WATCHDOG_INTERVAL, and validate on your hardware first.
 
 # Give time for graceful shutdown
 TimeoutStopSec=30
 
-# Limit restart frequency (max 5 restarts in 300 seconds)
-StartLimitIntervalSec=300
-StartLimitBurst=5
-
-# Environment
+# Environment. LYREBIRD_WATCHDOG_* drives LyreBird's OWN heartbeat / hardware
+# watchdog (independent of systemd's WatchdogSec, which is intentionally unset
+# above).
 Environment=LYREBIRD_WATCHDOG_ENABLED=true
 Environment=LYREBIRD_WATCHDOG_INTERVAL=30
 
