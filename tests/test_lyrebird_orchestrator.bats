@@ -679,6 +679,37 @@ teardown() {
     # abort. Every exec site must give the child </dev/tty.
     run grep -c -F '"${args[@]}" &' "$PROJECT_ROOT/lyrebird-orchestrator.sh"
     [ "$output" -eq 0 ]
+    # 4 exec sites: privilege-dropped updater, diagnostics, installer, general.
     run grep -c -F '"${args[@]}" </dev/tty &' "$PROJECT_ROOT/lyrebird-orchestrator.sh"
-    [ "$output" -eq 3 ]
+    [ "$output" -eq 4 ]
+}
+
+# ============================================================================
+# Regression tests for integrity refresh / paths (ORCH-5 / ORCH-7 / ORCH-8)
+# ============================================================================
+
+@test "verify_script_integrity detects modification and recompute refreshes it [ORCH-5/ORCH-8 regression]" {
+    local f; f="$(mktemp)"; echo "orig" > "$f"
+    run env PROJECT_ROOT="$PROJECT_ROOT" F="$f" LOG_FILE=/dev/null bash -c '
+        set +euo pipefail
+        source "$PROJECT_ROOT/lyrebird-orchestrator.sh" >/dev/null 2>&1
+        SCRIPT_PATHS[x]="$F"
+        SCRIPT_CHECKSUMS[x]="$(sha256sum "$F" | awk "{print \$1}")"
+        verify_script_integrity x || { echo FAIL-baseline; exit 1; }
+        echo "modified-by-update" > "$F"
+        if verify_script_integrity x; then echo FAIL-nodetect; exit 1; fi
+        recompute_script_checksums
+        verify_script_integrity x || { echo FAIL-refresh; exit 1; }
+        echo ALLOK
+    '
+    rm -f "$f"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *ALLOK* ]]
+}
+
+@test "orchestrator references /dev/snd/by-id (what the mapper creates), not by-usb-port [ORCH-7 regression]" {
+    run grep -c "by-usb-port" "$PROJECT_ROOT/lyrebird-orchestrator.sh"
+    [ "$output" -eq 0 ]
+    run grep -c "/dev/snd/by-id/" "$PROJECT_ROOT/lyrebird-orchestrator.sh"
+    [ "$output" -ge 2 ]
 }
