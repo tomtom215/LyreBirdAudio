@@ -62,12 +62,38 @@ This class is the highest-leverage thing to fix and to guard with tests.
 | H4 diagnostics `grep -c` arithmetic abort | ✅ fixed |
 | H10 alerts/mic-check JSON escaping | ✅ fixed |
 | MediaMTX v1.19.x support + deprecated-field note | ✅ documented |
-| H5/H6/H8/H9, and MEDIUM/LOW items | ⬜ pending (see below) |
+| H5 updater branch switch no fast-forward | ✅ fixed |
+| H6 updater `update -V` overridden to latest | ✅ fixed |
+| H8 stream-manager dead-stream cron resurrection | ✅ fixed (bounded) |
+| H9 stream-manager health check only checks bash PID | ⬜ deferred (needs hardware) |
+| MEDIUM/LOW register (§5) | ✅ largely cleared (see below) |
 
-Every ✅ item ships with a regression test; the suite (473 tests) is green and
-now a required CI gate. Remaining items are lower-severity or need real-hardware
-/ live-MediaMTX validation before changing (e.g. the stream-manager supervision
-architecture and the deprecated-JSON-field migration).
+Every ✅ item ships with a regression test; the suite (**528 tests**) is green
+and a required CI gate.
+
+### Reliability Hardening pass (2026-07 follow-up)
+
+A second, deeper audit (6 parallel reviewers, every finding reproduced) closed
+the pending HIGH items and most of the MEDIUM/LOW register, plus **new** findings
+of the same classes:
+
+- **New CRITICAL:** installer `update` left MediaMTX stopped indefinitely on any
+  failure (rollback never restarted it); metrics scrape silently aborted in the
+  normal state → stale `.prom`, a dead recorder looks alive; storage `df`
+  misparse → a full disk read as "OK" (no cleanup).
+- **New HIGH:** wrapper `RESTART_COUNT` was a lifetime odometer (streams die off
+  over weeks); disk-full → 5-minute service-restart storm; udev-rule injection
+  via `-u`; diagnostics run aborts on a non-root/`EACCES` `/proc/<pid>/fd`.
+- **H5/H6/H8** fixed; **H1-class** silent-abort idiom swept across metrics,
+  diagnostics, orchestrator; systemd sample units de-trapped (watchdog restart
+  loops, `Type`, `StartLimit`); logrotate `copytruncate`; a hardware-free E2E
+  integration suite added.
+
+**Deferred (documented, need real-hardware / live-MediaMTX validation):** H9 (add
+MediaMTX-API readiness/silence to the health check), the deprecated-JSON-field
+migration, and monotonic-clock backoff timing. Changing these blind risks
+restart-churn on live systems, so they are left with the safer partial
+mitigations already in place (RESTART_COUNT reset, bounded cron resurrection).
 
 ---
 
