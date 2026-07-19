@@ -496,24 +496,25 @@ check_rtsp_reachable() {
         return 2
     fi
 
-    # Try nc first (most reliable)
+    # Try nc first. Use -w (connect timeout) + </dev/null, NOT -z: BusyBox nc
+    # has no -z, so `nc -zv` errored and reported a LISTENING server as
+    # unreachable (a false alarm) on Alpine/BusyBox/minimal images.
     if command -v nc >/dev/null 2>&1; then
-        if timeout "${timeout_sec}" nc -zv "${host}" "${port}" >/dev/null 2>&1; then
+        if timeout "${timeout_sec}" nc -w "${timeout_sec}" "${host}" "${port}" </dev/null >/dev/null 2>&1; then
             return 0
         fi
         return 1
     fi
 
-    # Check if /dev/tcp is available before using it
-    if command -v timeout >/dev/null 2>&1 && [[ -n "${BASH_VERSION}" ]]; then
-        # Test /dev/tcp availability
-        if (exec 3<>/dev/tcp/127.0.0.1/1) 2>/dev/null; then
-            exec 3>&-
-            if timeout "${timeout_sec}" bash -c "exec 3<>/dev/tcp/${host}/${port}" 2>/dev/null; then
-                return 0
-            fi
-            return 1
+    # Fall back to bash's /dev/tcp. Gate on the bash version rather than probing
+    # a CLOSED port: the old `(exec 3<>/dev/tcp/127.0.0.1/1)` availability test
+    # failed even on a fully-capable bash (port 1 refuses), so the real
+    # connection test below was dead code and every host WARNed "unreachable".
+    if [[ -n "${BASH_VERSINFO:-}" ]] && command -v timeout >/dev/null 2>&1; then
+        if timeout "${timeout_sec}" bash -c "exec 3<>/dev/tcp/${host}/${port}" 2>/dev/null; then
+            return 0
         fi
+        return 1
     fi
 
     return 3
@@ -755,7 +756,7 @@ get_configured_devices() {
         return
     fi
 
-    stream_count=$(timeout "${TIMEOUT_SECONDS}" "${stream_manager_path}" status 2>/dev/null | grep -c "Stream: rtsp://" || echo "0")
+    stream_count=$(timeout "${TIMEOUT_SECONDS}" "${stream_manager_path}" status 2>/dev/null | grep -c "Stream: rtsp://" || true)
     echo "${stream_count}"
 }
 
@@ -1017,7 +1018,11 @@ get_disk_usage_percent() {
         return
     fi
 
-    usage=$(df "${path}" 2>/dev/null | tail -1 | awk '{if (NF >= 5) print $5; else print ""}' | sed 's/%//')
+    # POSIX `df -P` guarantees single-line output: a plain `df` wraps a long
+    # device name (LVM/`/dev/mapper/...`) onto its own line, so `tail -1 | awk`
+    # reads the mount point instead of Use% and the disk-full check is silently
+    # skipped on exactly the hosts most likely to fill up.
+    usage=$(df -P "${path}" 2>/dev/null | awk 'NR==2 {if (NF >= 5) print $5; else print ""}' | sed 's/%//')
 
     if [[ -z "${usage}" ]]; then
         echo "unknown"
@@ -1274,10 +1279,10 @@ check_alsa_locks() {
     fi
 
     local lock_count
-    lock_count=$(find /var/run -name 'asound.*' -type f 2>/dev/null | wc -l)
+    lock_count=$(find /var/run -name 'asound.*' -type f 2>/dev/null | wc -l || true)
 
     if [[ "${lock_count}" -gt 0 ]]; then
-        stale_locks=$(find /var/run -name 'asound.*' -type f -mmin +60 2>/dev/null | wc -l)
+        stale_locks=$(find /var/run -name 'asound.*' -type f -mmin +60 2>/dev/null | wc -l || true)
     fi
 
     echo "${stale_locks}"
@@ -1293,7 +1298,7 @@ get_fd_usage_percent() {
     fi
 
     local current_fds
-    current_fds=$(find "/proc/${pid}/fd" -maxdepth 1 -type l 2>/dev/null | wc -l)
+    current_fds=$(find "/proc/${pid}/fd" -maxdepth 1 -type l 2>/dev/null | wc -l || true)
 
     if [[ -z "${current_fds}" ]] || [[ ! "${current_fds}" =~ ^[0-9]+$ ]]; then
         echo "unknown"
@@ -1317,29 +1322,32 @@ get_fd_usage_percent() {
 
 # FIXED: Consolidated validation with explicit zero-check
 get_inotify_usage() {
-    local proc_inotify="/proc/sys/fs/inotify/max_user_watches"
+    # This counts inotify INSTANCES (one per inotify fd), so the correct ceiling
+    # is max_user_instances, NOT max_user_watches. Dividing the instance count
+    # by max_user_watches (~128k) always rounded to ~0%, so genuine instance
+    # exhaustion was never detected.
+    local proc_inotify="/proc/sys/fs/inotify/max_user_instances"
 
     if [[ ! -f "${proc_inotify}" ]]; then
         echo "0 0"
         return
     fi
 
-    local max_watches
-    max_watches=$(cat "${proc_inotify}" 2>/dev/null)
+    local max_instances
+    max_instances=$(cat "${proc_inotify}" 2>/dev/null)
 
-    # FIXED: Single comprehensive validation including zero-check
-    if [[ -z "${max_watches}" ]] || [[ ! "${max_watches}" =~ ^[0-9]+$ ]] || ((max_watches == 0)); then
+    if [[ -z "${max_instances}" ]] || [[ ! "${max_instances}" =~ ^[0-9]+$ ]] || ((max_instances == 0)); then
         echo "unknown unknown"
         return
     fi
 
-    local current_watches=0
+    local current_instances=0
     if [[ -d "/proc" ]]; then
-        current_watches=$(find /proc/*/fd -lname 'anon_inode:inotify' 2>/dev/null | wc -l)
+        current_instances=$(find /proc/*/fd -lname 'anon_inode:inotify' 2>/dev/null | wc -l || true)
     fi
 
-    local percent=$((current_watches * 100 / max_watches))
-    echo "${current_watches} ${percent}"
+    local percent=$((current_instances * 100 / max_instances))
+    echo "${current_instances} ${percent}"
 }
 
 # Get entropy pool availability
@@ -1358,12 +1366,12 @@ get_entropy_available() {
 get_tcp_timewait_connections() {
     if ! command -v ss >/dev/null 2>&1; then
         if command -v netstat >/dev/null 2>&1; then
-            netstat -tan 2>/dev/null | grep -c "TIME_WAIT" || echo "0"
+            netstat -tan 2>/dev/null | grep -c "TIME_WAIT" || true
         else
             echo "unknown"
         fi
     else
-        ss -tan 2>/dev/null | grep -c "TIME-WAIT" || echo "0"
+        ss -tan 2>/dev/null | grep -c "TIME-WAIT" || true
     fi
 }
 
@@ -1421,10 +1429,10 @@ check_alsa_devices() {
     fi
 
     local cards_count
-    cards_count=$(find /proc/asound -maxdepth 1 -name 'card*' -type d 2>/dev/null | wc -l)
+    cards_count=$(find /proc/asound -maxdepth 1 -name 'card*' -type d 2>/dev/null | wc -l || true)
 
     local devices_count
-    devices_count=$(find /dev/snd -maxdepth 1 -name 'pcm*' -type c 2>/dev/null | wc -l)
+    devices_count=$(find /dev/snd -maxdepth 1 -name 'pcm*' -type c 2>/dev/null | wc -l || true)
 
     if ((cards_count > 0 && devices_count > 0)); then
         echo "compatible"
@@ -1748,7 +1756,7 @@ check_system_info() {
 
     if [[ -f "/etc/os-release" ]]; then
         local os_name
-        os_name="$(grep '^PRETTY_NAME=' /etc/os-release 2>/dev/null | cut -d'=' -f2 | tr -d '"')"
+        os_name="$(grep '^PRETTY_NAME=' /etc/os-release 2>/dev/null | cut -d'=' -f2 | tr -d '"' || true)"
         if [[ -n "${os_name}" ]]; then
             print_status "Operating System" "INFO" "${os_name}"
         fi
@@ -2126,7 +2134,7 @@ check_resource_usage() {
 
     if [[ -d "/proc/${MEDIAMTX_PID}/fd" ]]; then
         local fd_count
-        fd_count="$(find "/proc/${MEDIAMTX_PID}/fd" -maxdepth 1 -type l 2>/dev/null | wc -l)"
+        fd_count="$(find "/proc/${MEDIAMTX_PID}/fd" -maxdepth 1 -type l 2>/dev/null | wc -l || true)"
 
         if [[ "${fd_count}" -lt "${WARN_FD_COUNT}" ]]; then
             print_status "File Descriptors" "PASS" "Using ${fd_count} FDs"
@@ -2208,7 +2216,7 @@ check_system_limits() {
     if [[ -n "${MEDIAMTX_PID}" ]]; then
         if [[ -f "/proc/${MEDIAMTX_PID}/limits" ]]; then
             local max_fds
-            max_fds=$(grep "Max open files" "/proc/${MEDIAMTX_PID}/limits" 2>/dev/null | awk '{print $4}' | head -1)
+            max_fds=$(grep "Max open files" "/proc/${MEDIAMTX_PID}/limits" 2>/dev/null | awk '{print $4}' | head -1 || true)
             if [[ -n "${max_fds}" ]] && [[ "${max_fds}" =~ ^[0-9]+$ ]]; then
                 print_status "MediaMTX FD Soft Limit" "INFO" "${max_fds} FDs"
             fi
@@ -2444,7 +2452,11 @@ check_file_permissions_validity() {
         local config_perms
         config_perms=$(get_file_permissions "${config_file}")
         if [[ "${config_perms}" != "unknown" ]] && [[ "${config_perms}" =~ ^[0-7]{3}$ ]]; then
-            if [[ "${config_perms}" =~ ^64 ]]; then
+            # PASS only for owner rw, group r/none, and NOT world-writable.
+            # The old `^64` anchor accepted 646/647 (rw-r--rw-/rwx), reporting a
+            # WORLD-WRITABLE config as secure; check the other-write bit
+            # explicitly (8# forces octal parsing).
+            if [[ "${config_perms}" =~ ^6[04][0-7]$ ]] && (( (8#${config_perms} & 2) == 0 )); then
                 print_status "Config Permissions" "PASS" "Mode: ${config_perms}"
             else
                 print_status "Config Permissions" "WARN" "Permissive: ${config_perms} (expected: ${MEDIAMTX_CONFIG_MODE}+)"
@@ -2559,8 +2571,13 @@ check_process_stability() {
                 sys_uptime_sec=$(awk '{print int($1)}' "/proc/uptime" 2>/dev/null)
 
                 if [[ -n "${sys_uptime_sec}" ]] && [[ "${sys_uptime_sec}" =~ ^[0-9]+$ ]]; then
-                    if ((process_uptime_sec < sys_uptime_sec / 2)); then
-                        print_status "Recent Crash Detection" "WARN" "Process uptime (${uptime_str}) << system uptime - recent restart detected"
+                    # WARN only for a genuinely recent restart: the process is
+                    # young in ABSOLUTE terms (<15 min) AND the system has been up
+                    # much longer (>30 min). The old `< sys_uptime/2` ratio
+                    # false-flagged any unit installed after provisioning (e.g. a
+                    # 100-day process on a 300-day host) as a "recent crash".
+                    if ((process_uptime_sec < 900 && sys_uptime_sec > 1800)); then
+                        print_status "Recent Crash Detection" "WARN" "Process uptime (${uptime_str}) is very recent - possible restart"
                         print_status "Analysis" "INFO" "Process may have crashed/restarted. Check: sudo journalctl -u mediamtx --since '15 min ago'"
                     else
                         print_status "Process Uptime" "PASS" "Stable uptime: ${uptime_str}"
@@ -2661,7 +2678,7 @@ check_fd_leak_detection() {
 
         local proc_fds
         if [[ -d "/proc/${MEDIAMTX_PID}/fd" ]]; then
-            proc_fds=$(find "/proc/${MEDIAMTX_PID}/fd" -maxdepth 1 -type l 2>/dev/null | wc -l)
+            proc_fds=$(find "/proc/${MEDIAMTX_PID}/fd" -maxdepth 1 -type l 2>/dev/null | wc -l || true)
             if [[ -n "${proc_fds}" ]]; then
                 print_status "MediaMTX Open FDs" "INFO" "Currently: ${proc_fds} FDs"
             fi
@@ -2765,12 +2782,12 @@ check_inotify_and_entropy() {
             print_status "inotify Current Usage" "WARN" "Invalid percent value: ${inotify_percent}"
         else
             if ((inotify_percent < WARN_INOTIFY_PERCENT)); then
-                print_status "inotify Current Usage" "PASS" "${inotify_current} watches (${inotify_percent}%)"
+                print_status "inotify Current Usage" "PASS" "${inotify_current} instances (${inotify_percent}%)"
             elif ((inotify_percent < CRIT_INOTIFY_PERCENT)); then
-                print_status "inotify Current Usage" "WARN" "${inotify_current} watches (${inotify_percent}%) - approaching limit"
+                print_status "inotify Current Usage" "WARN" "${inotify_current} instances (${inotify_percent}%) - approaching limit"
                 print_status "Analysis" "INFO" "Stream setup may experience delays if limit reached"
             else
-                print_status "inotify Current Usage" "FAIL" "${inotify_current} watches (${inotify_percent}%) - critical"
+                print_status "inotify Current Usage" "FAIL" "${inotify_current} instances (${inotify_percent}%) - critical"
                 print_status "Remediation" "INFO" "Investigate heavy watchers: find /proc/*/fd -lname 'anon_inode:inotify' 2>/dev/null | head -5"
             fi
         fi
@@ -2819,7 +2836,7 @@ check_network_resources() {
 
         if command -v ss >/dev/null 2>&1; then
             local total_connections
-            total_connections=$(ss -tan 2>/dev/null | tail -n +2 | wc -l)
+            total_connections=$(ss -tan 2>/dev/null | tail -n +2 | wc -l || true)
             if [[ -n "${total_connections}" ]] && [[ "${total_connections}" =~ ^[0-9]+$ ]] && ((total_connections > 0)); then
                 local tw_percent=$((timewait_connections * 100 / total_connections))
                 if ((tw_percent > CRIT_TCP_TIMEWAIT_PERCENT)); then
