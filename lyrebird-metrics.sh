@@ -68,6 +68,19 @@ get_timestamp_ms() {
 # Metric Collection Functions
 # ============================================================================
 
+# Escape a Prometheus label VALUE per the text exposition format: backslash and
+# double-quote are backslash-escaped and newlines become "\n". An unescaped `"`,
+# `\`, or newline in a value (a device name, or the version string from the
+# MediaMTX API) produces a malformed line and Prometheus rejects the ENTIRE
+# scrape — so every dynamic label value must pass through here.
+prom_escape_label() {
+    local v="$1"
+    v="${v//\\/\\\\}"      # backslash first
+    v="${v//\"/\\\"}"      # then double-quote
+    v="${v//$'\n'/\\n}"    # then newline
+    printf '%s' "$v"
+}
+
 # Output a metric in Prometheus format
 emit_metric() {
     local name="$1"
@@ -134,7 +147,7 @@ collect_mediamtx_metrics() {
         # File descriptors
         if [[ -d "/proc/${mediamtx_pid}/fd" ]]; then
             local fd_count
-            fd_count=$(find "/proc/${mediamtx_pid}/fd" -maxdepth 1 -type l 2>/dev/null | wc -l)
+            fd_count=$(find "/proc/${mediamtx_pid}/fd" -maxdepth 1 -type l 2>/dev/null | wc -l || true)
             emit_metric "mediamtx_open_fds" "$fd_count" "MediaMTX open file descriptors"
         fi
 
@@ -189,7 +202,7 @@ collect_stream_manager_metrics() {
 
     # Count configured devices
     if [[ -f "$DEVICE_CONFIG" ]]; then
-        configured_devices=$(grep -c "^DEVICE_" "$DEVICE_CONFIG" 2>/dev/null || echo 0)
+        configured_devices=$(grep -c "^DEVICE_" "$DEVICE_CONFIG" 2>/dev/null || true)
     fi
 
     emit_metric "configured_devices" "$configured_devices" "Number of configured audio devices"
@@ -253,7 +266,8 @@ collect_system_metrics() {
                     emit_help_type "disk_usage_percent" "Disk usage percentage" "gauge"
                     _disk_hdr=1
                 fi
-                local label="mount=\"${path}\""
+                local label
+                label="mount=\"$(prom_escape_label "${path}")\""
                 emit_metric "disk_usage_percent" "$usage" "" "gauge" "$label"
             fi
         fi
@@ -263,8 +277,8 @@ collect_system_metrics() {
     if [[ -f "/proc/meminfo" ]]; then
         local mem_total
         local mem_available
-        mem_total=$(grep "^MemTotal:" /proc/meminfo | awk '{print $2}')
-        mem_available=$(grep "^MemAvailable:" /proc/meminfo | awk '{print $2}')
+        mem_total=$(grep "^MemTotal:" /proc/meminfo | awk '{print $2}' || true)
+        mem_available=$(grep "^MemAvailable:" /proc/meminfo | awk '{print $2}' || true)
 
         if [[ -n "$mem_total" ]] && [[ "$mem_total" =~ ^[0-9]+$ ]]; then
             emit_metric "system_memory_total_bytes" "$((mem_total * 1024))" "Total system memory in bytes"
@@ -331,7 +345,7 @@ collect_api_metrics() {
         # Extract version for info metric
         local version
         version=$(echo "$info_json" | grep -o '"version":"[^"]*"' | cut -d'"' -f4 || echo "unknown")
-        emit_metric "api_info" "1" "MediaMTX instance info" "gauge" "version=\"${version}\""
+        emit_metric "api_info" "1" "MediaMTX instance info" "gauge" "version=\"$(prom_escape_label "${version}")\""
 
         # Extract uptime (in nanoseconds, convert to seconds)
         local uptime_ns
@@ -343,98 +357,98 @@ collect_api_metrics() {
 
         # Get path count from API
         local paths_json
-        paths_json=$(curl -s --connect-timeout 5 "${api_url}/v3/paths/list" 2>/dev/null)
+        paths_json=$(curl -s --connect-timeout 5 "${api_url}/v3/paths/list" 2>/dev/null || true)
 
         if [[ -n "$paths_json" ]]; then
             # Count paths (simple grep approach for portability)
             local path_count
-            path_count=$(echo "$paths_json" | grep -o '"name"' | wc -l)
+            path_count=$(echo "$paths_json" | grep -o '"name"' | wc -l || true)
             emit_metric "api_paths_total" "$path_count" "Total paths registered in MediaMTX"
 
             # Count ready paths
             local ready_count
-            ready_count=$(echo "$paths_json" | grep -o '"ready":true' | wc -l)
+            ready_count=$(echo "$paths_json" | grep -o '"ready":true' | wc -l || true)
             emit_metric "api_paths_ready" "$ready_count" "Paths with ready status"
         fi
 
         # Collect RTSP session metrics
         local rtsp_sessions_json
-        rtsp_sessions_json=$(curl -s --connect-timeout 5 "${api_url}/v3/rtspsessions/list" 2>/dev/null)
+        rtsp_sessions_json=$(curl -s --connect-timeout 5 "${api_url}/v3/rtspsessions/list" 2>/dev/null || true)
         if [[ -n "$rtsp_sessions_json" ]]; then
             local rtsp_session_count
-            rtsp_session_count=$(echo "$rtsp_sessions_json" | grep -o '"id"' | wc -l)
+            rtsp_session_count=$(echo "$rtsp_sessions_json" | grep -o '"id"' | wc -l || true)
             emit_metric "api_rtsp_sessions" "$rtsp_session_count" "Active RTSP sessions (listeners)"
         fi
 
         # Collect RTSP connection metrics
         local rtsp_conns_json
-        rtsp_conns_json=$(curl -s --connect-timeout 5 "${api_url}/v3/rtspconns/list" 2>/dev/null)
+        rtsp_conns_json=$(curl -s --connect-timeout 5 "${api_url}/v3/rtspconns/list" 2>/dev/null || true)
         if [[ -n "$rtsp_conns_json" ]]; then
             local rtsp_conn_count
-            rtsp_conn_count=$(echo "$rtsp_conns_json" | grep -o '"id"' | wc -l)
+            rtsp_conn_count=$(echo "$rtsp_conns_json" | grep -o '"id"' | wc -l || true)
             emit_metric "api_rtsp_connections" "$rtsp_conn_count" "Active RTSP connections"
         fi
 
         # Collect RTSPS (secure) session metrics
         local rtsps_sessions_json
-        rtsps_sessions_json=$(curl -s --connect-timeout 5 "${api_url}/v3/rtspssessions/list" 2>/dev/null)
+        rtsps_sessions_json=$(curl -s --connect-timeout 5 "${api_url}/v3/rtspssessions/list" 2>/dev/null || true)
         if [[ -n "$rtsps_sessions_json" ]]; then
             local rtsps_session_count
-            rtsps_session_count=$(echo "$rtsps_sessions_json" | grep -o '"id"' | wc -l)
+            rtsps_session_count=$(echo "$rtsps_sessions_json" | grep -o '"id"' | wc -l || true)
             emit_metric "api_rtsps_sessions" "$rtsps_session_count" "Active RTSPS sessions (secure)"
         fi
 
         # Collect RTMP connection metrics
         local rtmp_conns_json
-        rtmp_conns_json=$(curl -s --connect-timeout 5 "${api_url}/v3/rtmpconns/list" 2>/dev/null)
+        rtmp_conns_json=$(curl -s --connect-timeout 5 "${api_url}/v3/rtmpconns/list" 2>/dev/null || true)
         if [[ -n "$rtmp_conns_json" ]]; then
             local rtmp_conn_count
-            rtmp_conn_count=$(echo "$rtmp_conns_json" | grep -o '"id"' | wc -l)
+            rtmp_conn_count=$(echo "$rtmp_conns_json" | grep -o '"id"' | wc -l || true)
             emit_metric "api_rtmp_connections" "$rtmp_conn_count" "Active RTMP connections"
         fi
 
         # Collect RTMPS (secure) connection metrics
         local rtmps_conns_json
-        rtmps_conns_json=$(curl -s --connect-timeout 5 "${api_url}/v3/rtmpsconns/list" 2>/dev/null)
+        rtmps_conns_json=$(curl -s --connect-timeout 5 "${api_url}/v3/rtmpsconns/list" 2>/dev/null || true)
         if [[ -n "$rtmps_conns_json" ]]; then
             local rtmps_conn_count
-            rtmps_conn_count=$(echo "$rtmps_conns_json" | grep -o '"id"' | wc -l)
+            rtmps_conn_count=$(echo "$rtmps_conns_json" | grep -o '"id"' | wc -l || true)
             emit_metric "api_rtmps_connections" "$rtmps_conn_count" "Active RTMPS connections (secure)"
         fi
 
         # Collect WebRTC session metrics
         local webrtc_sessions_json
-        webrtc_sessions_json=$(curl -s --connect-timeout 5 "${api_url}/v3/webrtcsessions/list" 2>/dev/null)
+        webrtc_sessions_json=$(curl -s --connect-timeout 5 "${api_url}/v3/webrtcsessions/list" 2>/dev/null || true)
         if [[ -n "$webrtc_sessions_json" ]]; then
             local webrtc_session_count
-            webrtc_session_count=$(echo "$webrtc_sessions_json" | grep -o '"id"' | wc -l)
+            webrtc_session_count=$(echo "$webrtc_sessions_json" | grep -o '"id"' | wc -l || true)
             emit_metric "api_webrtc_sessions" "$webrtc_session_count" "Active WebRTC sessions"
         fi
 
         # Collect SRT connection metrics
         local srt_conns_json
-        srt_conns_json=$(curl -s --connect-timeout 5 "${api_url}/v3/srtconns/list" 2>/dev/null)
+        srt_conns_json=$(curl -s --connect-timeout 5 "${api_url}/v3/srtconns/list" 2>/dev/null || true)
         if [[ -n "$srt_conns_json" ]]; then
             local srt_conn_count
-            srt_conn_count=$(echo "$srt_conns_json" | grep -o '"id"' | wc -l)
+            srt_conn_count=$(echo "$srt_conns_json" | grep -o '"id"' | wc -l || true)
             emit_metric "api_srt_connections" "$srt_conn_count" "Active SRT connections"
         fi
 
         # Collect HLS muxer metrics
         local hls_muxers_json
-        hls_muxers_json=$(curl -s --connect-timeout 5 "${api_url}/v3/hlsmuxers/list" 2>/dev/null)
+        hls_muxers_json=$(curl -s --connect-timeout 5 "${api_url}/v3/hlsmuxers/list" 2>/dev/null || true)
         if [[ -n "$hls_muxers_json" ]]; then
             local hls_muxer_count
-            hls_muxer_count=$(echo "$hls_muxers_json" | grep -o '"path"' | wc -l)
+            hls_muxer_count=$(echo "$hls_muxers_json" | grep -o '"path"' | wc -l || true)
             emit_metric "api_hls_muxers" "$hls_muxer_count" "Active HLS muxers"
         fi
 
         # Collect recording metrics
         local recordings_json
-        recordings_json=$(curl -s --connect-timeout 5 "${api_url}/v3/recordings/list" 2>/dev/null)
+        recordings_json=$(curl -s --connect-timeout 5 "${api_url}/v3/recordings/list" 2>/dev/null || true)
         if [[ -n "$recordings_json" ]]; then
             local recording_count
-            recording_count=$(echo "$recordings_json" | grep -o '"name"' | wc -l)
+            recording_count=$(echo "$recordings_json" | grep -o '"name"' | wc -l || true)
             emit_metric "api_recordings_total" "$recording_count" "Total recording paths"
         fi
 
@@ -479,7 +493,8 @@ collect_stream_metrics() {
             status=1
         fi
 
-        local labels="stream=\"${stream_name}\""
+        local labels
+        labels="stream=\"$(prom_escape_label "${stream_name}")\""
         emit_metric "stream_up" "$status" "" "gauge" "$labels"
 
         if [[ $status -eq 1 ]] && [[ -d "/proc/${pid}" ]]; then
@@ -496,7 +511,7 @@ collect_stream_metrics() {
             # default to 0 so we never emit a metric line with an empty value.
             if has_command ps; then
                 local cpu
-                cpu=$(ps -p "$pid" -o %cpu= 2>/dev/null | tr -d ' ')
+                cpu=$(ps -p "$pid" -o %cpu= 2>/dev/null | tr -d ' ' || true)
                 cpu="${cpu:-0}"
                 emit_metric "stream_cpu_percent" "${cpu%.*}" "" "gauge" "$labels"
             fi
@@ -517,22 +532,26 @@ generate_all_metrics() {
     emit_metric "build_info" "1" "LyreBirdAudio metrics exporter version" "gauge" "version=\"${VERSION}\""
     echo ""
 
-    collect_mediamtx_metrics
+    # Each collector is best-effort: a `|| true` ensures one collector failing
+    # (a probe error, an API blip) can never abort generate_all_metrics and
+    # leave a stale/empty scrape that hides a dead recorder. The per-line guards
+    # inside the collectors already prevent this; these are defense in depth.
+    collect_mediamtx_metrics || true
     echo ""
 
-    collect_stream_manager_metrics
+    collect_stream_manager_metrics || true
     echo ""
 
-    collect_usb_audio_metrics
+    collect_usb_audio_metrics || true
     echo ""
 
-    collect_system_metrics
+    collect_system_metrics || true
     echo ""
 
-    collect_api_metrics
+    collect_api_metrics || true
     echo ""
 
-    collect_stream_metrics
+    collect_stream_metrics || true
 }
 
 # Simple HTTP server using netcat (for basic metrics serving)
@@ -669,8 +688,15 @@ main() {
                 log "ERROR: Output file path required"
                 exit 1
             fi
-            generate_all_metrics > "${output_file}.tmp"
-            mv "${output_file}.tmp" "$output_file"
+            # Only replace the published file on a successful, complete
+            # generation; on failure keep the previous file and drop the partial
+            # temp rather than orphaning a `.tmp` (and never crash the cron).
+            if generate_all_metrics > "${output_file}.tmp"; then
+                mv "${output_file}.tmp" "$output_file"
+            else
+                log "ERROR: metric generation failed; leaving previous ${output_file} in place"
+                rm -f "${output_file}.tmp" 2>/dev/null || true
+            fi
             ;;
         once|*)
             generate_all_metrics

@@ -263,3 +263,62 @@ teardown() {
     run bash -c 'printf "%s\n" "$1" | grep -nE "^[a-zA-Z_][a-zA-Z0-9_:]*(\{[^}]*\})?[[:space:]]*$"' _ "$output"
     [ "$status" -ne 0 ]
 }
+
+# --- MET-1: collectors must not abort the whole scrape (the normal state) -----
+
+@test "collect_api_metrics completes with empty API lists (no publishers/listeners) [MET-1 regression]" {
+    local bin; bin="$(mktemp -d)"
+    cat > "$bin/curl" <<'CURLEOF'
+#!/bin/bash
+# Valid /v3/info so api_up=1; empty item lists for every other endpoint.
+for a in "$@"; do
+    case "$a" in *"/v3/info") echo '{"version":"1.19.2","upTime":100}'; exit 0;; esac
+done
+echo '{"itemCount":0,"items":[]}'
+exit 0
+CURLEOF
+    chmod +x "$bin/curl"
+    run env PROJECT_ROOT="$PROJECT_ROOT" PATH="$bin:$PATH" \
+        bash -c 'set -euo pipefail; source "$PROJECT_ROOT/lyrebird-metrics.sh"; collect_api_metrics'
+    rm -rf "$bin"
+    [ "$status" -eq 0 ]
+    # Reaching the LAST metric proves it did not abort on an empty grep|wc-l pipe
+    # partway through (the pre-fix code stopped at the first empty list).
+    [[ "$output" =~ lyrebird_api_total_connections ]]
+    [[ "$output" =~ lyrebird_api_up[[:space:]]+1 ]]
+}
+
+# --- MET-2: grep -c must not emit "0\n0" and break the scrape ------------------
+
+@test "configured_devices emits a single valid 0, never '0\\n0' [MET-2 regression]" {
+    local cfgdir; cfgdir="$(mktemp -d)"
+    printf '# a config with no DEVICE_ lines\n# just comments\n' > "$cfgdir/audio-devices.conf"
+    # NOTE: the device-config path derives from MEDIAMTX_CONFIG_DIR; a file that
+    # EXISTS but has zero DEVICE_ lines is what triggers `grep -c` to print 0 and
+    # exit 1 (the "0\n0" bug). A missing file takes a different branch.
+    run env PROJECT_ROOT="$PROJECT_ROOT" MEDIAMTX_CONFIG_DIR="$cfgdir" \
+        PID_FILE="$(mktemp)" FFMPEG_PID_DIR="$(mktemp -d)" HEARTBEAT_FILE="$(mktemp)" \
+        bash -c 'set -euo pipefail; source "$PROJECT_ROOT/lyrebird-metrics.sh"; collect_stream_manager_metrics'
+    rm -rf "$cfgdir"
+    [ "$status" -eq 0 ]
+    [ "$(printf '%s\n' "$output" | grep -c '^lyrebird_configured_devices ')" -eq 1 ]
+    printf '%s\n' "$output" | grep -qx 'lyrebird_configured_devices 0'
+    # No stray bare "0" line (the "0\n0" bug) anywhere in the output
+    run bash -c 'printf "%s\n" "$1" | grep -qx 0' _ "$output"
+    [ "$status" -ne 0 ]
+}
+
+# --- MET-6: label values must be escaped so one bad name can't reject a scrape -
+
+@test "prom_escape_label escapes backslash, then quote, then newline [MET-6 regression]" {
+    run prom_escape_label 'a"b\c'
+    [ "$status" -eq 0 ]
+    [ "$output" = 'a\"b\\c' ]
+}
+
+@test "emit_metric keeps a quoted device name on one valid line [MET-6 regression]" {
+    run emit_metric "stream_up" "1" "" "gauge" "stream=\"$(prom_escape_label 'AKG "C414"')\""
+    [ "$status" -eq 0 ]
+    [ "$(printf '%s\n' "$output" | grep -c .)" -eq 1 ]     # exactly one line
+    [[ "$output" == *'stream="AKG \"C414\""'* ]]
+}
