@@ -1,0 +1,130 @@
+# LyreBirdAudio - Release
+#
+# Fires when a version tag (vX.Y.Z) is pushed. It first re-runs the required
+# quality gates against the EXACT tagged commit, then publishes a GitHub Release
+# whose notes are the matching section of CHANGELOG.md. This keeps release
+# creation a deliberate, tested step (push the tag after your soak test) while
+# guaranteeing a broken commit can never become a release.
+#
+# Usage after merging to main:
+#   git checkout main && git pull
+#   git tag -a v1.3.0 -m "v1.3.0"
+#   git push origin v1.3.0
+#
+# Author: Tom F (https://github.com/tomtom215)
+# License: Apache 2.0
+
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+      - 'v[0-9]+.[0-9]+.[0-9]+-*'   # pre-releases (e.g. v1.3.0-rc1)
+
+# Least privilege: only the release job needs write access to create the release.
+permissions:
+  contents: read
+
+env:
+  SHELLCHECK_VERSION: 'v0.11.0'
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Re-validate the tagged commit (syntax + ShellCheck + the full bats suite)
+  # ---------------------------------------------------------------------------
+  validate:
+    name: Validate tagged commit
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Bash syntax (bash -n)
+        run: |
+          errors=0
+          while IFS= read -r script; do
+            bash -n "$script" || { echo "::error::syntax: $script"; errors=$((errors + 1)); }
+          done < <(find . -name '*.sh' -type f | sort)
+          [ "$errors" -eq 0 ]
+
+      - name: Install ShellCheck ${{ env.SHELLCHECK_VERSION }}
+        run: |
+          wget -qO- "https://github.com/koalaman/shellcheck/releases/download/${SHELLCHECK_VERSION}/shellcheck-${SHELLCHECK_VERSION}.linux.x86_64.tar.xz" | tar -xJf -
+          sudo mv "shellcheck-${SHELLCHECK_VERSION}/shellcheck" /usr/local/bin/
+          shellcheck --version | grep version:
+
+      - name: ShellCheck (--severity=warning, required gate)
+        run: |
+          rc=0
+          while IFS= read -r script; do
+            shellcheck --format=gcc --severity=warning --external-sources --shell=bash "$script" || rc=1
+          done < <(find . -name '*.sh' -type f | sort)
+          [ "$rc" -eq 0 ]
+
+      - name: Install bats
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq bats
+
+      - name: Bats test suite
+        run: |
+          export TMPDIR="${RUNNER_TEMP:-/tmp}" BATS_TMPDIR="${RUNNER_TEMP:-/tmp}"
+          bats --print-output-on-failure tests/
+
+  # ---------------------------------------------------------------------------
+  # Publish the GitHub Release with notes from CHANGELOG.md
+  # ---------------------------------------------------------------------------
+  release:
+    name: Publish GitHub Release
+    runs-on: ubuntu-latest
+    needs: validate
+    permissions:
+      contents: write   # create the release / tag notes
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Extract release notes from CHANGELOG
+        id: notes
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          ver="${tag#v}"
+          notes_file="$(mktemp)"
+          # Pull the '## [<ver>] ...' section up to the next '## [' heading.
+          awk -v ver="$ver" '
+            $0 ~ ("^## \\[" ver "\\]") { flag=1; print; next }
+            flag && /^## \[/ { exit }
+            flag { print }
+          ' CHANGELOG.md > "$notes_file"
+
+          if [ ! -s "$notes_file" ]; then
+            echo "No CHANGELOG section for ${ver}; GitHub will auto-generate notes."
+            echo "have_notes=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "have_notes=true" >> "$GITHUB_OUTPUT"
+          fi
+          echo "notes_file=${notes_file}" >> "$GITHUB_OUTPUT"
+
+          # Mark pre-releases (tags containing a hyphen, e.g. v1.3.0-rc1).
+          case "$tag" in
+            *-*) echo "prerelease=--prerelease" >> "$GITHUB_OUTPUT" ;;
+            *)   echo "prerelease=" >> "$GITHUB_OUTPUT" ;;
+          esac
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          if [ "${{ steps.notes.outputs.have_notes }}" = "true" ]; then
+            gh release create "$tag" \
+              --title "$tag" \
+              --notes-file "${{ steps.notes.outputs.notes_file }}" \
+              --verify-tag \
+              ${{ steps.notes.outputs.prerelease }}
+          else
+            gh release create "$tag" \
+              --title "$tag" \
+              --generate-notes \
+              --verify-tag \
+              ${{ steps.notes.outputs.prerelease }}
+          fi

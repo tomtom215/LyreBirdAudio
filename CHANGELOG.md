@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+_Nothing yet._
+
+## [1.3.0] - 2026-07-19
+
+First release to bundle the full Engineering Excellence Review (C1–C9, H1–H10)
+and the follow-up Reliability Hardening pass. A large correctness/reliability
+release for unattended 24/7 operation — no intentional breaking API change; the
+one script rename is handled by automatic migration. Suite: 528 tests, green;
+ShellCheck-clean. Highlights are grouped below.
+
 ### ⚠️ Breaking Changes
 - **Script Renamed**: `mediamtx-stream-manager.sh` → `lyrebird-stream-manager.sh`
   - Log file path changed: `/var/log/mediamtx-stream-manager.log` → `/var/log/lyrebird-stream-manager.log`
@@ -253,7 +263,9 @@ See `docs/ENGINEERING-REVIEW-2026-07.md` for the full finding-by-finding detail.
 
 ## Version Numbering
 
-Each component maintains its own version:
+The **suite** is released as a whole under a single `vX.Y.Z` git tag (the value
+`git describe --tags` returns); the current release is **v1.3.0**. Each component
+additionally tracks its own internal version, shown below:
 
 | Component | Current Version |
 |-----------|-----------------|
