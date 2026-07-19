@@ -14,6 +14,9 @@ setup() {
 
 teardown() {
     rm -rf "$E2E_TMP" 2>/dev/null || true
+    # Buffer dir for the storage test lives under /tmp (an allowed parent), so it
+    # is not under E2E_TMP; clean it up separately when a test created one.
+    [[ -n "${E2E_STORAGE_BUF:-}" ]] && rm -rf "$E2E_STORAGE_BUF" 2>/dev/null || true
 }
 
 # ---------------------------------------------------------------------------
@@ -153,10 +156,17 @@ fi
 DFEOF
     chmod +x "$E2E_TMP/bin/df"
     local rec="$E2E_TMP/rec"; mkdir -p "$rec"; : > "$rec/keep.wav"
+    mkdir -p "$E2E_TMP/logs"
+
+    # lyrebird-storage refuses to run unless BUFFER_DIR is under an allowed parent
+    # (/dev/shm, /tmp, /var/tmp, /run) -- a safety guard against deleting system
+    # files. `mktemp -d` honours TMPDIR, which on CI points outside those parents
+    # (e.g. /home/runner/work/_temp), so pin the buffer under /tmp explicitly.
+    E2E_STORAGE_BUF="$(mktemp -d /tmp/lyrebird-e2e-buffer.XXXXXX)"
 
     run env PROJECT_ROOT="$PROJECT_ROOT" PATH="$E2E_TMP/bin:$PATH" \
-        LYREBIRD_RECORDING_DIR="$rec" LYREBIRD_LOG_DIR="$(mktemp -d)" \
-        LYREBIRD_BUFFER_DIR="$(mktemp -d)" DRY_RUN=true \
+        LYREBIRD_RECORDING_DIR="$rec" LYREBIRD_LOG_DIR="$E2E_TMP/logs" \
+        LYREBIRD_BUFFER_DIR="$E2E_STORAGE_BUF" DRY_RUN=true \
         bash -c 'set -euo pipefail; source "$PROJECT_ROOT/lyrebird-storage.sh"; cmd_monitor 2>&1'
     [ "$status" -eq 0 ]
     [[ "$output" =~ EMERGENCY ]]        # a genuinely full disk is acted on...
