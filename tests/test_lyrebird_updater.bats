@@ -378,3 +378,61 @@ teardown() {
     [ ! -d "$LOCKFILE" ]
     rm -rf "$LOCKFILE" 2>/dev/null || true
 }
+
+# ============================================================================
+# Regression tests for version switching / self-update resume (UPD-H5 / UPD-5)
+# ============================================================================
+
+# Build a repo whose local 'main' is one commit BEHIND origin/main (the exact
+# post-fetch state that made a plain `git checkout main` a stale no-op).
+_setup_stale_repo() {
+    local base; base="$(mktemp -d)"
+    git init -q --bare "$base/origin.git"
+    git clone -q "$base/origin.git" "$base/work" 2>/dev/null
+    git -C "$base/work" config user.email t@t; git -C "$base/work" config user.name t
+    echo v1 > "$base/work/f"; git -C "$base/work" add f; git -C "$base/work" commit -qm c1
+    git -C "$base/work" branch -M main; git -C "$base/work" push -q origin main
+    echo v2 > "$base/work/f"; git -C "$base/work" commit -qam c2; git -C "$base/work" push -q origin main
+    git clone -q "$base/origin.git" "$base/local" 2>/dev/null
+    git -C "$base/local" config user.email t@t; git -C "$base/local" config user.name t
+    git -C "$base/local" reset -q --hard HEAD~1     # local main -> c1, origin/main stays c2
+    printf '%s' "$base/local"
+}
+
+@test "fast_forward_branch_to_origin advances a stale local branch [UPD-H5 regression]" {
+    local repo; repo="$(_setup_stale_repo)"
+    local origin_head; origin_head=$(git -C "$repo" rev-parse origin/main)
+    [ "$(git -C "$repo" rev-parse HEAD)" != "$origin_head" ]   # precondition: behind
+    ( cd "$repo" && fast_forward_branch_to_origin main ); local rc=$?
+    local after; after=$(git -C "$repo" rev-parse HEAD)
+    rm -rf "$(dirname "$repo")"
+    [ "$rc" -eq 0 ]
+    [ "$after" = "$origin_head" ]                              # fast-forwarded to origin
+}
+
+@test "fast_forward_branch_to_origin is a no-op (success) for a tag target [UPD-H5 regression]" {
+    local repo; repo="$(_setup_stale_repo)"
+    ( cd "$repo" && git tag v9.9.9 && fast_forward_branch_to_origin v9.9.9 ); local rc=$?
+    rm -rf "$(dirname "$repo")"
+    [ "$rc" -eq 0 ]
+}
+
+@test "fast_forward_branch_to_origin fails (does not silently ignore) a diverged branch [UPD-H5 regression]" {
+    local repo; repo="$(_setup_stale_repo)"
+    ( cd "$repo" && echo l > lf && git add lf && git commit -qm local )   # diverge from origin
+    ( cd "$repo" && fast_forward_branch_to_origin main ); local rc=$?
+    rm -rf "$(dirname "$repo")"
+    [ "$rc" -ne 0 ]
+}
+
+@test "check_prerequisites skips the root/sudo prompt when resuming a self-update [UPD-5 regression]" {
+    # SUDO_USER set makes the prompt fire; with no stdin the pre-fix code would
+    # EOF and return E_USER_ABORT. The resume flag must bypass the prompt.
+    SUDO_USER=someone RESUMED_POST_UPDATE=true run check_prerequisites </dev/null
+    [ "$status" -ne "$E_USER_ABORT" ]
+}
+
+@test "check_prerequisites still prompts (and aborts on EOF) when NOT resuming [UPD-5 regression]" {
+    SUDO_USER=someone RESUMED_POST_UPDATE=false run check_prerequisites </dev/null
+    [ "$status" -eq "$E_USER_ABORT" ]
+}

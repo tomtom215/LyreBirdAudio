@@ -1209,8 +1209,10 @@ restore_git_config() {
 check_prerequisites() {
     log_debug "Checking prerequisites..."
 
-    # IMPORTANT: Warn if running with sudo or as root
-    if [[ "${SUDO_USER:-}" != "" ]] || [[ "$EUID" -eq 0 ]]; then
+    # IMPORTANT: Warn if running with sudo or as root — but NOT when resuming a
+    # self-update (--post-update-*): the service is stopped and blocking on this
+    # prompt there risks stranding it down.
+    if { [[ "${SUDO_USER:-}" != "" ]] || [[ "$EUID" -eq 0 ]]; } && [[ "${RESUMED_POST_UPDATE:-false}" != "true" ]]; then
         log_warn "[!]  WARNING: This script is running with root/sudo privileges"
         log_warn "This may change file ownership in the repository"
         echo
@@ -1892,6 +1894,22 @@ validate_version_exists() {
     return 1
 }
 
+# If TARGET is a local branch that also exists on origin, fast-forward it to
+# origin/TARGET. `git fetch` advances only refs/remotes/origin/*, so after a
+# plain `git checkout <branch>` the working tree sits on the STALE local tip;
+# this brings it up to the fetched remote. Returns 0 when the branch is
+# fast-forwarded OR when TARGET is not a fast-forwardable branch (a tag/commit —
+# nothing to do). Returns 1 ONLY when TARGET is a branch that has DIVERGED from
+# origin (local commits the caller must be told about, not silently ignored).
+fast_forward_branch_to_origin() {
+    local target="$1"
+    # Not a local branch (tag/commit/detached target) -> nothing to fast-forward.
+    git show-ref --verify --quiet "refs/heads/${target}" || return 0
+    # No remote-tracking counterpart -> local-only branch, leave as-is.
+    git show-ref --verify --quiet "refs/remotes/origin/${target}" || return 0
+    git merge --ff-only "origin/${target}" >/dev/null 2>&1
+}
+
 switch_version_safe() {
     local target_version="$1"
 
@@ -2007,6 +2025,16 @@ switch_version_safe() {
     if ! checkout_output=$(git checkout "$target_version" 2>&1); then
         log_error "Failed to switch to version: $target_version"
         echo "$checkout_output" >&2
+        transaction_rollback
+        return "$E_GENERAL"
+    fi
+
+    # Fast-forward a branch target to origin (a plain checkout lands on the stale
+    # local tip). Without this, "Switch to Development / Latest" no-ops while
+    # reporting success and the box stays N commits behind forever.
+    if ! fast_forward_branch_to_origin "$target_version"; then
+        log_error "Cannot fast-forward ${target_version} to origin/${target_version}: local history has diverged"
+        log_info "To discard local commits and match the remote exactly, use the reset option in the menu."
         transaction_rollback
         return "$E_GENERAL"
     fi
@@ -2257,7 +2285,7 @@ list_available_releases() {
     # List stable releases (tags)
     echo "${BOLD}Stable Releases (numbered versions, tested and stable):${NC}"
 
-    if git tag -l 'v*' --sort=-creatordate | head -n "$TAG_LIST_LIMIT" | grep -q .; then
+    if git tag -l 'v*' --sort=-v:refname | head -n "$TAG_LIST_LIMIT" | grep -q .; then
         local counter=1
         while IFS= read -r tag; do
             local tag_date
@@ -2266,7 +2294,7 @@ list_available_releases() {
 
             AVAILABLE_VERSIONS+=("$tag")
             ((counter++)) || true
-        done < <(git tag -l 'v*' --sort=-creatordate | head -n "$TAG_LIST_LIMIT")
+        done < <(git tag -l 'v*' --sort=-v:refname | head -n "$TAG_LIST_LIMIT")
 
         local tag_count
         tag_count=$(git tag -l 'v*' | wc -l)
@@ -2374,7 +2402,7 @@ switch_to_latest_stable() {
 
     # Get latest tag by creation date
     local latest_tag
-    if ! latest_tag="$(git tag -l 'v*' --sort=-creatordate | head -n 1)"; then
+    if ! latest_tag="$(git tag -l 'v*' --sort=-v:refname | head -n 1)"; then
         log_error "No stable releases found"
         return "$E_GENERAL"
     fi
@@ -2574,7 +2602,7 @@ show_startup_diagnostics() {
 
     # Check for stable releases
     local latest_tag
-    latest_tag="$(git tag -l 'v*' --sort=-creatordate 2>/dev/null | head -n 1)"
+    latest_tag="$(git tag -l 'v*' --sort=-v:refname 2>/dev/null | head -n 1)"
 
     if [[ -n "$latest_tag" ]]; then
         local current_tag
@@ -2922,6 +2950,15 @@ main() {
         log_error "Failed to change to script directory: $SCRIPT_DIR"
         exit "$E_GENERAL"
     fi
+
+    # A self-update re-exec resumes here with --post-update-* . At that point the
+    # service is already stopped and only the completion/restore half remains.
+    # Mark the run as resumed so check_prerequisites skips the interactive
+    # root/ownership prompt: a non-interactive or walked-away re-exec would
+    # otherwise hit EOF on that prompt, abort, and leave the service down.
+    case "${1:-}" in
+        --post-update-complete | --post-update-restore) RESUMED_POST_UPDATE=true ;;
+    esac
 
     # Check prerequisites
     if ! check_prerequisites; then
