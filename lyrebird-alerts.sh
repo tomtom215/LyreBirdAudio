@@ -498,9 +498,15 @@ format_ntfy() {
         *) priority="default" ;;
     esac
 
-    # ntfy uses headers, not JSON body for simple messages
-    # Return special format that send_webhook will parse
-    echo "NTFY:${priority}:${title}:${message}"
+    # ntfy uses headers, not a JSON body. Pack the fields for send_webhook, but
+    # base64-encode title/message so a ":" (or newline) inside them cannot
+    # collide with the ":" field delimiter. Built-in titles like
+    # "Stream Down: <device>" contain ": " and were otherwise truncated to
+    # "Stream Down" with the device name spilling into the message body.
+    local b64_title b64_message
+    b64_title=$(printf '%s' "$title" | base64 | tr -d '\n')
+    b64_message=$(printf '%s' "$message" | base64 | tr -d '\n')
+    echo "NTFY:${priority}:${b64_title}:${b64_message}"
 }
 
 # Format message for Pushover
@@ -525,8 +531,20 @@ format_pushover() {
     encoded_message=$(url_encode "$message")
     encoded_title=$(url_encode "$title")
 
+    # Pushover REQUIRES retry+expire whenever priority=2 (Emergency); without
+    # them the API returns HTTP 400 and the alert is dropped — and priority 2 is
+    # exactly the critical class (MediaMTX down, disk critical) that matters most
+    # on an unattended recorder. Supply sane, overridable defaults (retry>=30,
+    # expire<=10800 per the Pushover contract).
+    local extra=""
+    if [[ "$priority" == "2" ]]; then
+        local retry="${LYREBIRD_PUSHOVER_RETRY:-60}"
+        local expire="${LYREBIRD_PUSHOVER_EXPIRE:-3600}"
+        extra="&retry=${retry}&expire=${expire}"
+    fi
+
     # Return form-encoded data
-    echo "token=${LYREBIRD_PUSHOVER_TOKEN}&user=${LYREBIRD_PUSHOVER_USER}&title=${encoded_title}&message=${encoded_message}&priority=${priority}"
+    echo "token=${LYREBIRD_PUSHOVER_TOKEN}&user=${LYREBIRD_PUSHOVER_USER}&title=${encoded_title}&message=${encoded_message}&priority=${priority}${extra}"
 }
 
 #=============================================================================
@@ -551,18 +569,24 @@ send_webhook() {
 
         case "$webhook_type" in
             ntfy)
-                # Parse ntfy format: NTFY:priority:title:message
-                if [[ "$payload" =~ ^NTFY:([^:]+):([^:]+):(.+)$ ]]; then
+                # Parse ntfy format: NTFY:priority:<b64 title>:<b64 message>.
+                # base64 fields contain no ":", so the split is unambiguous.
+                if [[ "$payload" =~ ^NTFY:([^:]+):([^:]*):([^:]*)$ ]]; then
                     local priority="${BASH_REMATCH[1]}"
-                    local title="${BASH_REMATCH[2]}"
-                    local message="${BASH_REMATCH[3]}"
+                    local title message
+                    # Strip control chars from the title: it becomes an HTTP
+                    # header, so a CR/LF would inject/split the header.
+                    title=$(printf '%s' "${BASH_REMATCH[2]}" | base64 -d 2>/dev/null | tr -d '\000-\037')
+                    message=$(printf '%s' "${BASH_REMATCH[3]}" | base64 -d 2>/dev/null)
                     local ntfy_url="${LYREBIRD_NTFY_SERVER}/${LYREBIRD_NTFY_TOPIC}"
 
+                    # --data-raw (not -d): a message beginning with "@" must be
+                    # sent literally, not interpreted by curl as a filename.
                     http_code=$(curl "${curl_args[@]}" \
                         -H "Title: ${title}" \
                         -H "Priority: ${priority}" \
                         -H "Tags: lyrebird" \
-                        -d "${message}" \
+                        --data-raw "${message}" \
                         "$ntfy_url" 2>/dev/null) || http_code="000"
                 else
                     log_error "Invalid ntfy payload format"
@@ -695,7 +719,7 @@ send_alert() {
     fi
 
     # Send to all configured webhooks
-    local any_success=false
+    local sent=0 failed=0
     for webhook_spec in "${webhooks[@]}"; do
         local url="${webhook_spec%:*}"
         local type="${webhook_spec##*:}"
@@ -721,12 +745,22 @@ send_alert() {
         esac
 
         if send_webhook "$url" "$type" "$payload"; then
-            any_success=true
+            ((sent++)) || true
+        else
+            ((failed++)) || true
+            log_error "Alert delivery to a ${type} destination failed: $(mask_url "$url")"
         fi
     done
 
-    if $any_success; then
-        # Update rate limit only on success
+    # Surface partial failures: without this, a working destination masks a
+    # broken one (any_success), the rate limit is then set, and the missed
+    # destination silently never sees the alert.
+    if (( failed > 0 && sent > 0 )); then
+        log_warn "Alert reached ${sent} destination(s) but ${failed} FAILED — check webhook configuration"
+    fi
+
+    if (( sent > 0 )); then
+        # Update rate limit once at least one destination accepted the alert.
         update_rate_limit "$alert_hash"
         # Clean up old state files periodically
         cleanup_state
