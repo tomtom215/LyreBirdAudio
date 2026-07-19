@@ -42,10 +42,26 @@ readonly MEDIAMTX_LOG_DIR="${MEDIAMTX_LOG%/*}"  # Directory containing MediaMTX 
 readonly TEMP_DIR="${LYREBIRD_TEMP_DIR:-/tmp}"
 readonly BUFFER_DIR="${LYREBIRD_BUFFER_DIR:-/dev/shm/lyrebird-buffer}"
 
+# Coerce a value to a non-negative base-10 integer, falling back to a default
+# when the input is not all digits. A non-numeric env value (e.g. an operator
+# setting RECORDING_RETENTION_DAYS=none/unlimited to "keep everything") would
+# otherwise make the arithmetic clamps below trip `nounset` and ABORT the whole
+# script at load — silently stopping the daily cleanup and hourly monitor crons
+# and letting the disk fill. Base-10 also stops values like 08/09 from being
+# misread as invalid octal later.
+_coerce_uint() {
+    local value="$1" default="$2"
+    if [[ "$value" =~ ^[0-9]+$ ]]; then
+        printf '%s' "$((10#$value))"
+    else
+        printf '%s' "$default"
+    fi
+}
+
 # Retention policies (in days) - must be positive integers
-_rec_ret=${RECORDING_RETENTION_DAYS:-30}
-_log_ret=${LOG_RETENTION_DAYS:-7}
-_tmp_ret=${TEMP_RETENTION_HOURS:-24}
+_rec_ret=$(_coerce_uint "${RECORDING_RETENTION_DAYS:-30}" 30)
+_log_ret=$(_coerce_uint "${LOG_RETENTION_DAYS:-7}" 7)
+_tmp_ret=$(_coerce_uint "${TEMP_RETENTION_HOURS:-24}" 24)
 
 # Ensure retention values are positive (minimum 1)
 (( _rec_ret < 1 )) && _rec_ret=1
@@ -58,16 +74,13 @@ readonly TEMP_RETENTION_HOURS="$_tmp_ret"
 unset _rec_ret _log_ret _tmp_ret
 
 # Disk thresholds (percentage) - validate bounds 0-100
-_disk_warning=${DISK_WARNING_PERCENT:-80}
-_disk_critical=${DISK_CRITICAL_PERCENT:-90}
-_disk_emergency=${DISK_EMERGENCY_PERCENT:-95}
+_disk_warning=$(_coerce_uint "${DISK_WARNING_PERCENT:-80}" 80)
+_disk_critical=$(_coerce_uint "${DISK_CRITICAL_PERCENT:-90}" 90)
+_disk_emergency=$(_coerce_uint "${DISK_EMERGENCY_PERCENT:-95}" 95)
 
 # Clamp percentage values to valid range
-(( _disk_warning < 0 )) && _disk_warning=0
 (( _disk_warning > 100 )) && _disk_warning=100
-(( _disk_critical < 0 )) && _disk_critical=0
 (( _disk_critical > 100 )) && _disk_critical=100
-(( _disk_emergency < 0 )) && _disk_emergency=0
 (( _disk_emergency > 100 )) && _disk_emergency=100
 
 readonly DISK_WARNING_PERCENT="$_disk_warning"
@@ -75,14 +88,16 @@ readonly DISK_CRITICAL_PERCENT="$_disk_critical"
 readonly DISK_EMERGENCY_PERCENT="$_disk_emergency"
 unset _disk_warning _disk_critical _disk_emergency
 
-# Minimum free space (MB) - must be positive
-_min_free=${MIN_FREE_SPACE_MB:-500}
-(( _min_free < 0 )) && _min_free=0
+# Minimum free space (MB) - must be a non-negative integer
+_min_free=$(_coerce_uint "${MIN_FREE_SPACE_MB:-500}" 500)
 readonly MIN_FREE_SPACE_MB="$_min_free"
 unset _min_free
 
 # Log file size limits (bytes)
-readonly MAX_LOG_SIZE="${MAX_LOG_SIZE:-104857600}"  # 100MB
+_max_log_size=$(_coerce_uint "${MAX_LOG_SIZE:-104857600}" 104857600)
+(( _max_log_size < 1 )) && _max_log_size=104857600
+readonly MAX_LOG_SIZE="$_max_log_size"  # default 100MB
+unset _max_log_size
 
 # Dry run mode (set to true to see what would be deleted)
 DRY_RUN="${DRY_RUN:-false}"
@@ -163,16 +178,29 @@ format_bytes() {
     fi
 }
 
-# Get disk usage percentage for a path
+# Get disk usage percentage for a path.
+# Uses POSIX `df -P`, which guarantees single-line output: a plain `df` wraps a
+# long filesystem name (LVM/LUKS/`/dev/mapper/...`, common on field boxes) onto
+# its own line, so `tail -1 | awk '{print $5}'` then reads the MOUNT POINT column
+# instead of Use%. That returned a non-numeric value ("/"), the threshold tests
+# (`[[ "/" -ge 95 ]]`) errored, and a FULL disk was silently reported "OK" with
+# no cleanup — a direct data-loss path. Emits an empty string if df can't be
+# parsed; callers must treat that as "unknown", never as "OK".
 get_disk_usage() {
-    local path="${1:-/}"
-    df "$path" 2>/dev/null | tail -1 | awk '{print $5}' | sed 's/%//'
+    local path="${1:-/}" out=""
+    # `|| out=""` keeps a df failure (path gone) from propagating out of the
+    # pipeline and aborting the caller under `set -euo pipefail`.
+    out=$(df -P "$path" 2>/dev/null | awk 'NR==2 {print $5}' | tr -cd '0-9') || out=""
+    printf '%s' "$out"
 }
 
-# Get free space in MB
+# Get free space in MB for a path (POSIX `df -Pk` → 1024-byte blocks).
+# Emits an empty string if df can't be parsed (caller treats as "unknown").
 get_free_space_mb() {
-    local path="${1:-/}"
-    df -BM "$path" 2>/dev/null | tail -1 | awk '{print $4}' | sed 's/M//'
+    local path="${1:-/}" kb=""
+    kb=$(df -Pk "$path" 2>/dev/null | awk 'NR==2 {print $4}' | tr -cd '0-9') || kb=""
+    [[ -n "$kb" ]] && printf '%s' "$((kb / 1024))"
+    return 0
 }
 
 # Get directory size in bytes
@@ -230,8 +258,12 @@ cleanup_recordings() {
         freed_bytes=$((freed_bytes + size))
     done < <(find "$RECORDING_DIR" -type f \( -name "*.wav" -o -name "*.mp3" -o -name "*.flac" -o -name "*.opus" -o -name "*.ogg" \) -mtime "+${RECORDING_RETENTION_DAYS}" -print0 2>/dev/null)
 
-    # Remove empty directories
-    find "$RECORDING_DIR" -type d -empty -delete 2>/dev/null || true
+    # Remove empty SUBdirectories. `-mindepth 1` is essential: without it, once
+    # retention removes the last recordings, find would delete "$RECORDING_DIR"
+    # itself, and if the recorder does not recreate it on the next write, every
+    # subsequent recording silently fails — permanent data loss on an
+    # unattended box.
+    find "$RECORDING_DIR" -mindepth 1 -type d -empty -delete 2>/dev/null || true
 
     log_info "Cleaned $count recording file(s), freed $(format_bytes $freed_bytes)"
 }
@@ -315,10 +347,17 @@ truncate_large_logs() {
         if [[ $size -gt $MAX_LOG_SIZE ]]; then
             log_warn "MediaMTX log oversized: $(format_bytes $size)"
             if [[ "$DRY_RUN" != "true" ]]; then
-                # Keep last 10MB
-                tail -c 10485760 "$MEDIAMTX_LOG" > "${MEDIAMTX_LOG}.tmp"
-                mv "${MEDIAMTX_LOG}.tmp" "$MEDIAMTX_LOG"
-                log_info "Truncated MediaMTX log"
+                # Keep last 10MB, truncating IN PLACE (preserve the inode). The
+                # old `mv tmp log` swapped in a new inode, so a process holding
+                # the log open (systemd `append:`, MediaMTX's stdout fd) kept
+                # writing to the now-unlinked old inode: its space was never
+                # reclaimed and it grew invisibly until the disk filled, while
+                # `stat` on the path still showed ~10MB so this never re-fired.
+                if tail -c 10485760 "$MEDIAMTX_LOG" > "${MEDIAMTX_LOG}.tmp" 2>/dev/null; then
+                    cat "${MEDIAMTX_LOG}.tmp" > "$MEDIAMTX_LOG" 2>/dev/null || true
+                    log_info "Truncated MediaMTX log"
+                fi
+                rm -f "${MEDIAMTX_LOG}.tmp" 2>/dev/null || true
             fi
         fi
     fi
@@ -332,9 +371,14 @@ truncate_large_logs() {
             if [[ $size -gt $MAX_LOG_SIZE ]]; then
                 log_warn "Log file oversized: $logfile ($(format_bytes $size))"
                 if [[ "$DRY_RUN" != "true" ]]; then
-                    tail -c 10485760 "$logfile" > "${logfile}.tmp"
-                    mv "${logfile}.tmp" "$logfile"
-                    log_info "Truncated $logfile"
+                    # Truncate in place (preserve inode) so a process holding
+                    # the file open keeps writing to the same inode. See the
+                    # MediaMTX-log note above.
+                    if tail -c 10485760 "$logfile" > "${logfile}.tmp" 2>/dev/null; then
+                        cat "${logfile}.tmp" > "$logfile" 2>/dev/null || true
+                        log_info "Truncated $logfile"
+                    fi
+                    rm -f "${logfile}.tmp" 2>/dev/null || true
                 fi
             fi
         done
@@ -355,7 +399,7 @@ emergency_cleanup() {
             safe_delete "$file" "emergency recording"
             ((++deleted))
             [[ $deleted -ge $max_delete ]] && break
-        done < <(find "$RECORDING_DIR" -type f \( -name "*.wav" -o -name "*.mp3" -o -name "*.flac" -o -name "*.opus" \) -printf '%T+ %p\n' 2>/dev/null | sort | head -n "$max_delete" | cut -d' ' -f2-)
+        done < <(find "$RECORDING_DIR" -type f \( -name "*.wav" -o -name "*.mp3" -o -name "*.flac" -o -name "*.opus" -o -name "*.ogg" \) -printf '%T+ %p\n' 2>/dev/null | sort | head -n "$max_delete" | cut -d' ' -f2-)
 
         log_info "Emergency: Deleted $deleted oldest recording(s)"
     fi
@@ -395,14 +439,19 @@ cmd_status() {
     echo "Disk Usage:"
     for path in "/" "/var" "/tmp"; do
         if [[ -d "$path" ]]; then
-            local usage
+            local usage free status
             usage=$(get_disk_usage "$path")
-            local free
             free=$(get_free_space_mb "$path")
-            local status="OK"
-            [[ $usage -ge $DISK_WARNING_PERCENT ]] && status="WARNING"
-            [[ $usage -ge $DISK_CRITICAL_PERCENT ]] && status="CRITICAL"
-            printf "  %-10s %3d%% used, %sMB free [%s]\n" "$path" "$usage" "$free" "$status"
+            if [[ "$usage" =~ ^[0-9]+$ ]]; then
+                status="OK"
+                [[ $usage -ge $DISK_WARNING_PERCENT ]] && status="WARNING"
+                [[ $usage -ge $DISK_CRITICAL_PERCENT ]] && status="CRITICAL"
+                printf "  %-10s %3d%% used, %sMB free [%s]\n" "$path" "$usage" "${free:-?}" "$status"
+            else
+                # Non-numeric usage => df output could not be parsed; never
+                # crash `status` on a printf %d error, just say so.
+                printf "  %-10s   unknown (df unparseable)\n" "$path"
+            fi
         fi
     done
     echo ""
@@ -460,10 +509,19 @@ cmd_cleanup() {
 
 # Monitor and cleanup if needed
 cmd_monitor() {
-    local usage
+    local usage free_mb
     usage=$(get_disk_usage "/")
-    local free_mb
     free_mb=$(get_free_space_mb "/")
+
+    # If the disk state can't be determined, do NOT guess. Treating it as "OK"
+    # would ignore a genuinely full disk; running the emergency path on garbage
+    # input would delete recordings indiscriminately. Log loudly and run only
+    # the safe, retention-based cleanup (which deletes solely by age).
+    if [[ ! "$usage" =~ ^[0-9]+$ ]] || [[ ! "$free_mb" =~ ^[0-9]+$ ]]; then
+        log_error "Could not determine disk usage for / (df unparseable: usage='${usage}', free='${free_mb}'MB); running standard cleanup only"
+        cmd_cleanup
+        return 0
+    fi
 
     log_debug "Disk usage: ${usage}%, free: ${free_mb}MB"
 
