@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+_Nothing yet._
+
+## [1.3.0] - 2026-07-19
+
+First release to bundle the full Engineering Excellence Review (C1–C9, H1–H10)
+and the follow-up Reliability Hardening pass. A large correctness/reliability
+release for unattended 24/7 operation — no intentional breaking API change; the
+one script rename is handled by automatic migration. Suite: 528 tests, green;
+ShellCheck-clean. Highlights are grouped below.
+
 ### ⚠️ Breaking Changes
 - **Script Renamed**: `mediamtx-stream-manager.sh` → `lyrebird-stream-manager.sh`
   - Log file path changed: `/var/log/mediamtx-stream-manager.log` → `/var/log/lyrebird-stream-manager.log`
@@ -66,6 +76,48 @@ with a regression test. Highlights (all verified against the code):
 - **Webhook/JSON output is now valid** for control characters and backslashes.
 - **Test suite repaired** — 159 tests silently never ran; source guards + `set -e`
   handling restored so all tests execute (and CI enforces them).
+
+### Fixed (Reliability Hardening pass, 2026-07)
+Deeper follow-up audit (6 parallel reviewers, every finding reproduced) closing
+the pending HIGH items and a large MEDIUM/LOW sweep. Every fix ships with a
+regression test; the suite is green (528 tests) and ShellCheck-clean.
+
+- **Storage / data-loss:** `df` output was misparsed on wrapped long device
+  names (LVM/`/dev/mapper`), so a FULL disk read as "OK" and cleanup never ran;
+  empty-dir cleanup could delete the recording directory itself; oversized-log
+  truncation swapped the inode out from under the writer (invisible unbounded
+  growth); a non-integer retention env value aborted the script at load (crons
+  silently stopped). Now POSIX `df -P` with guards, `-mindepth 1`, in-place
+  truncation, and validated numeric inputs.
+- **Metrics:** the Prometheus scrape silently aborted in the normal "streams up,
+  no listeners" state (unguarded `curl`/`grep|wc` under `set -euo pipefail`), so
+  `--file` mode served a STALE `.prom` with `up=1` — a dead recorder looked alive
+  for months. Guarded all collectors; label values are now escaped.
+- **Stream supervision:** the wrapper gave up after a LIFETIME (not windowed)
+  restart count, so streams died off one by one over weeks; a dead stream was
+  never resurrected under cron (now bounded per-stream resurrection); disk/memory
+  pressure triggered a 5-minute service-restart storm that freed nothing (now
+  degraded/alert-only). Generated logrotate now uses `copytruncate`.
+- **Installer/updater:** a failed `update` left MediaMTX stopped indefinitely
+  (rollback never restarted it); `update -V <ver>` ignored the pin and jumped to
+  latest; a branch switch never fast-forwarded (no-op "success"); a self-update
+  re-exec could strand the service on a prompt.
+- **Alerts:** every CRITICAL Pushover alert was rejected (missing retry/expire);
+  ntfy titles containing a colon were truncated. **Diagnostics:** a healthy-host
+  run could abort mid-way; several checks read false "healthy" (inotify, disk,
+  world-writable config perms, "recent crash", BusyBox reachability).
+- **USB mapper:** closed a udev-rule injection via `-u`; made VID:PID-only naming
+  visible; atomic rules-file write. **mic-check:** `--format=json` always emitted
+  an empty list; config could pick an unsupported channel count.
+- **Sample configs:** removed systemd `WatchdogSec` restart-loop traps (MediaMTX
+  can't feed it; the manager's ping is rejected under default `NotifyAccess`),
+  fixed the audio unit's `Type` (forking) and `StartLimit` placement, and made
+  logrotate use `copytruncate`. Added config-file validation tests.
+- **Tests/CI:** added a hardware-free end-to-end integration suite (stub MediaMTX
+  API, mock webhook, disk-full, device-config round-trip); bumped ShellCheck
+  0.10→0.11 (verified clean), shfmt 3.8→3.13.1, actions/checkout v4→v5.
+
+See `docs/ENGINEERING-REVIEW-2026-07.md` for the full finding-by-finding detail.
 
 ## [1.4.2] - 2025-12-19
 
@@ -211,7 +263,9 @@ with a regression test. Highlights (all verified against the code):
 
 ## Version Numbering
 
-Each component maintains its own version:
+The **suite** is released as a whole under a single `vX.Y.Z` git tag (the value
+`git describe --tags` returns); the current release is **v1.3.0**. Each component
+additionally tracks its own internal version, shown below:
 
 | Component | Current Version |
 |-----------|-----------------|

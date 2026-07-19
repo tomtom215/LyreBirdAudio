@@ -430,3 +430,68 @@ teardown() {
 @test "MEDIAMTX_GROUP is defined" {
     [ -n "$MEDIAMTX_GROUP" ]
 }
+
+# ============================================================================
+# Regression tests for update/rollback reliability (INST-1/4/6/8)
+# ============================================================================
+
+@test "execute_rollback restarts the service when it was running [INST-1 regression]" {
+    local marker; marker="$(mktemp)"
+    env PROJECT_ROOT="$PROJECT_ROOT" MARKER="$marker" DRY_RUN=true bash -c '
+        source "$PROJECT_ROOT/install_mediamtx.sh" 2>/dev/null || true
+        set +euo pipefail
+        # Stub the starter to record that (and how) it was invoked.
+        start_mediamtx() { echo "STARTED:$1" >> "$MARKER"; }
+        WAS_RUNNING=true
+        MANAGEMENT_MODE=systemd
+        BINARY_BACKUP=""          # nothing to restore; we only assert the restart
+        execute_rollback
+    '
+    local restarted=0
+    grep -q "STARTED:systemd" "$marker" && restarted=1
+    rm -f "$marker"
+    [ "$restarted" -eq 1 ]        # pre-fix rollback never restarted -> stayed down
+}
+
+@test "execute_rollback does NOT restart when nothing was running [INST-1 regression]" {
+    local marker; marker="$(mktemp)"
+    env PROJECT_ROOT="$PROJECT_ROOT" MARKER="$marker" DRY_RUN=true bash -c '
+        source "$PROJECT_ROOT/install_mediamtx.sh" 2>/dev/null || true
+        set +euo pipefail
+        start_mediamtx() { echo "STARTED:$1" >> "$MARKER"; }
+        WAS_RUNNING=false
+        MANAGEMENT_MODE=none
+        BINARY_BACKUP=""
+        execute_rollback
+    '
+    local restarted=0
+    [ -s "$marker" ] && restarted=1
+    rm -f "$marker"
+    [ "$restarted" -eq 0 ]        # a fresh install / uninstall must not resurrect
+}
+
+@test "version_compare treats an 'unknown' current version as older [INST-6 regression]" {
+    run version_compare "unknown" "1.15.0"
+    [ "$status" -eq 1 ]           # must NOT be >= MIN, so --upgrade is skipped
+}
+
+@test "verify_service_started returns 0 immediately when systemctl is active [INST-4 regression]" {
+    local bin; bin="$(mktemp -d)"
+    printf '#!/bin/bash\ncase "$1" in is-active) exit 0;; esac\nexit 0\n' > "$bin/systemctl"
+    chmod +x "$bin/systemctl"
+    DRY_RUN_MODE=false PATH="$bin:$PATH" run verify_service_started systemd
+    rm -rf "$bin"
+    [ "$status" -eq 0 ]
+}
+
+@test "release_lock preserves the lock file, removes only the pid file [INST-8 regression]" {
+    : > "${LOCK_FILE}.pid"
+    exec 200>"${LOCK_FILE}"
+    LOCK_FD=200
+    release_lock
+    local kept=0 pidgone=0
+    [ -f "${LOCK_FILE}" ] && kept=1
+    [ ! -f "${LOCK_FILE}.pid" ] && pidgone=1
+    [ "$kept" -eq 1 ]             # removing it reintroduces the flock+unlink race
+    [ "$pidgone" -eq 1 ]
+}

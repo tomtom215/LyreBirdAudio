@@ -538,14 +538,30 @@ if ! declare -f run_with_timeout &>/dev/null; then
         shift
 
         if lyrebird_command_exists timeout; then
-            timeout "${timeout}" "$@" 2>/dev/null || {
-                local exit_code=$?
-                [[ "${exit_code}" == 124 ]] && return 1
-                return "${exit_code}"
-            }
+            # Do NOT swallow the command's stderr — callers that need quiet
+            # operation can redirect it themselves; hiding it here masked real
+            # errors. 124 (timed out) is normalized to 1.
+            local exit_code=0
+            timeout "${timeout}" "$@" || exit_code=$?
+            [[ "${exit_code}" == 124 ]] && return 1
+            return "${exit_code}"
         else
-            # No timeout command, run directly
-            "$@" 2>/dev/null
+            # No `timeout` binary (minimal/BusyBox userland): emulate it with a
+            # background watchdog so a hung child cannot block forever on an
+            # unattended box (the old fallback ran with no time limit at all).
+            "$@" &
+            local cmd_pid=$!
+            (
+                sleep "${timeout}" 2>/dev/null
+                kill "${cmd_pid}" 2>/dev/null
+            ) &
+            local watch_pid=$!
+            local exit_code=0
+            wait "${cmd_pid}" 2>/dev/null || exit_code=$?
+            # Command returned (or was killed by the watchdog); cancel the watchdog.
+            kill "${watch_pid}" 2>/dev/null || true
+            wait "${watch_pid}" 2>/dev/null || true
+            return "${exit_code}"
         fi
     }
 fi
@@ -583,6 +599,11 @@ if ! declare -f lyrebird_spinner_start &>/dev/null; then
             local i=0
             local chars="${LYREBIRD_SPINNER_CHARS}"
             local len=${#chars}
+
+            # Restore the cursor if this subshell is killed/exits for ANY reason
+            # (e.g. the parent dies before calling spinner_stop) so the terminal
+            # is never left with a hidden cursor.
+            trap 'printf "\033[?25h"' EXIT INT TERM
 
             # Hide cursor
             printf '\033[?25l'

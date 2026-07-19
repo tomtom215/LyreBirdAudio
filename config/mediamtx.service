@@ -15,6 +15,12 @@ Documentation=https://github.com/bluenviron/mediamtx
 After=network-online.target
 Wants=network-online.target
 
+# Limit restart frequency (max 5 restarts in 300 seconds). These belong in
+# [Unit]; systemd IGNORES StartLimitIntervalSec in [Service], so the rate limit
+# there would silently not apply (a crash-looping binary could restart forever).
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
 [Service]
 Type=simple
 ExecStart=/usr/local/bin/mediamtx /etc/mediamtx/mediamtx.yml
@@ -32,16 +38,13 @@ Restart=always
 RestartSec=5
 RestartPreventExitStatus=SIGTERM SIGINT
 
-# Watchdog support for automatic recovery
-# MediaMTX will be restarted if it doesn't respond within 60 seconds
-WatchdogSec=60
+# NOTE: no WatchdogSec here on purpose. MediaMTX does not implement the systemd
+# sd_notify watchdog protocol, so a WatchdogSec would never receive a keep-alive
+# and systemd would kill+restart MediaMTX every interval (dropping every stream).
+# Recovery is handled by Restart=always plus the LyreBird cron health monitor.
 
 # Give time for graceful shutdown
 TimeoutStopSec=15
-
-# Limit restart frequency (max 5 restarts in 300 seconds)
-StartLimitIntervalSec=300
-StartLimitBurst=5
 
 # Increase file descriptor limit for many concurrent streams
 LimitNOFILE=65535

@@ -32,9 +32,9 @@ concurrency:
 
 env:
   # Shellcheck version (check https://github.com/koalaman/shellcheck/releases)
-  SHELLCHECK_VERSION: 'v0.10.0'
+  SHELLCHECK_VERSION: 'v0.11.0'
   # shfmt version (check https://github.com/mvdan/sh/releases)
-  SHFMT_VERSION: 'v3.8.0'
+  SHFMT_VERSION: 'v3.13.1'
 
 jobs:
   # ===========================================================================
@@ -48,7 +48,7 @@ jobs:
       script_count: ${{ steps.find-scripts.outputs.count }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Find shell scripts
         id: find-scripts
@@ -71,7 +71,7 @@ jobs:
     needs: discover-scripts
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Validate bash syntax (bash -n)
         run: |
@@ -112,7 +112,7 @@ jobs:
     needs: discover-scripts
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Install ShellCheck
         run: |
@@ -198,7 +198,7 @@ jobs:
     needs: discover-scripts
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Install shfmt
         run: |
@@ -257,7 +257,7 @@ jobs:
     needs: discover-scripts
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Install bashate
         run: |
@@ -310,7 +310,7 @@ jobs:
     needs: discover-scripts
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Basic security checks
         id: security
@@ -492,7 +492,7 @@ jobs:
     needs: discover-scripts
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Install bats
         run: |

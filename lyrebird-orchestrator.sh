@@ -588,8 +588,13 @@ refresh_system_state() {
 
         # Use efficient pgrep -c if available, otherwise limit output before counting
         if command_exists pgrep && pgrep --help 2>&1 | grep -q -- '-c'; then
-            # Modern pgrep supports -c for efficient counting
-            raw_count=$(pgrep -c -x ffmpeg 2>/dev/null || echo 0)
+            # Modern pgrep supports -c for efficient counting. Use `|| true`, not
+            # `|| echo 0`: `pgrep -c` already prints "0" when there is no match
+            # (and exits 1), so `|| echo 0` would append a SECOND 0, yielding the
+            # two-line "0\n0" that fails the numeric guard below and logs a false
+            # "invalid stream count" warning.
+            raw_count=$(pgrep -c -x ffmpeg 2>/dev/null || true)
+            raw_count="${raw_count:-0}"
         else
             # Fallback: limit output before counting to prevent DoS
             # head -n 1001 ensures we never process more than 1001 PIDs
@@ -628,6 +633,32 @@ refresh_system_state() {
 # Handles script execution with integrity checking, privilege management, and signal handling
 # ============================================================================
 
+# Return 0 if the on-disk script still matches the SHA256 recorded at discovery
+# (or if we have no baseline / no sha256sum). Single source of truth for the
+# TOCTOU integrity check so every invocation path uses the same logic.
+verify_script_integrity() {
+    local script_key="$1"
+    [[ -v "SCRIPT_CHECKSUMS[$script_key]" ]] || return 0
+    command_exists sha256sum || return 0
+    local actual
+    actual="$(sha256sum "${SCRIPT_PATHS[$script_key]}" 2>/dev/null | awk '{print $1}')"
+    [[ "$actual" == "${SCRIPT_CHECKSUMS[$script_key]}" ]]
+}
+
+# Recompute stored checksums for all discovered scripts. Call after an in-session
+# update rewrites scripts on disk, otherwise verify_script_integrity would reject
+# every subsequently-invoked script ("modified since validation") until the
+# orchestrator is restarted.
+recompute_script_checksums() {
+    command_exists sha256sum || return 0
+    local key sum
+    for key in "${!SCRIPT_PATHS[@]}"; do
+        sum="$(sha256sum "${SCRIPT_PATHS[$key]}" 2>/dev/null | awk '{print $1}')"
+        [[ -n "$sum" ]] && SCRIPT_CHECKSUMS["$key"]="$sum"
+    done
+    log "DEBUG" "Recomputed script checksums after update"
+}
+
 execute_script() {
     local script_key="$1"
     shift
@@ -644,19 +675,11 @@ execute_script() {
     script_name="$(basename "$script_path")"
 
     # Verify script integrity before execution (TOCTOU protection)
-    if [[ -v "SCRIPT_CHECKSUMS[$script_key]" ]] && command_exists sha256sum; then
-        local expected="${SCRIPT_CHECKSUMS[$script_key]}"
-        local actual
-        actual="$(sha256sum "$script_path" 2>/dev/null | awk '{print $1}')"
-
-        if [[ "$actual" != "$expected" ]]; then
-            error "SECURITY: Script modified since validation"
-            log "ERROR" "Integrity check failed: $script_path"
-            log "ERROR" "Expected: $expected"
-            log "ERROR" "Actual: $actual"
-            LAST_ERROR="Script integrity violation: $(basename "$script_path")"
-            return 1
-        fi
+    if ! verify_script_integrity "$script_key"; then
+        error "SECURITY: Script modified since validation"
+        log "ERROR" "Integrity check failed: $script_path"
+        LAST_ERROR="Script integrity violation: $(basename "$script_path")"
+        return 1
     fi
 
     log "INFO" "Executing: ${script_name} ${args[*]}"
@@ -737,6 +760,25 @@ execute_script() {
                 return ${exit_code}
                 ;;
         esac
+    fi
+
+    # Installer: preserve its REAL exit code. The installer exits 7 for "already
+    # installed"; collapsing that to 1 (like the general case below) made the
+    # Quick Setup wizard treat an already-installed MediaMTX as a fatal failure
+    # and abort at step 1, so setup was not idempotent / re-runnable.
+    if [[ "$script_key" == "installer" ]]; then
+        "${script_path}" "${args[@]}" </dev/tty &
+        CHILD_PID=$!
+        local exit_code=0
+        wait $CHILD_PID || exit_code=$?
+        CHILD_PID=""
+        if [[ $exit_code -eq 0 ]]; then
+            log "INFO" "${script_name} completed successfully"
+        else
+            log "WARN" "${script_name} exited with code ${exit_code}"
+            LAST_ERROR="${script_name} exited with code ${exit_code}"
+        fi
+        return $exit_code
     fi
 
     # All other scripts execute as root with child process tracking.
@@ -911,8 +953,15 @@ menu_quick_setup() {
     # Step 1: Install MediaMTX
     echo
     echo -e "${BOLD}Step 1/4: Installing MediaMTX...${NC}"
-    if execute_script "installer" install; then
+    local install_rc=0
+    execute_script "installer" install || install_rc=$?
+    if [[ $install_rc -eq 0 ]]; then
         success "MediaMTX installed successfully"
+    elif [[ $install_rc -eq 7 ]]; then
+        # Exit 7 = "already installed". The wizard must CONTINUE (to device
+        # mapping / stream start), not abort at step 1 — otherwise it can never
+        # be re-run on a box that already has MediaMTX.
+        info "MediaMTX is already installed; continuing with setup"
     else
         error "Failed to install MediaMTX"
         echo
@@ -952,7 +1001,7 @@ menu_quick_setup() {
     refresh_system_state
 
     echo
-    info "USB devices are now mapped to stable /dev/snd/by-usb-port/ paths"
+    info "USB devices are now mapped to stable /dev/snd/by-id/ paths"
     info "A reboot is recommended for udev rules to take full effect"
     echo
 
@@ -1235,7 +1284,7 @@ menu_usb_devices() {
                     echo "================================================================"
                     echo
                     info "Mapped device paths:"
-                    ls -la /dev/snd/by-usb-port/ 2>/dev/null || echo "  No devices currently mapped"
+                    ls -la /dev/snd/by-id/ 2>/dev/null || echo "  No devices currently mapped"
                 else
                     echo "  No device mappings configured"
                     echo "================================================================"
@@ -1675,8 +1724,16 @@ menu_diagnostics() {
                     echo
                 } >"${export_file}"
 
-                # Run full diagnostics, capturing output
+                # Run full diagnostics, capturing output. This path invokes the
+                # script directly (to tee into the report), bypassing
+                # execute_script — so apply the same TOCTOU integrity check here.
                 local diag_result=0
+                if ! verify_script_integrity "diagnostics"; then
+                    error "SECURITY: diagnostics script modified since validation; aborting export"
+                    pause
+                    refresh_system_state
+                    return
+                fi
                 "${SCRIPT_PATHS[diagnostics]}" "full" 2>&1 | tee -a "${export_file}" || diag_result=$?
 
                 echo
@@ -1745,6 +1802,10 @@ menu_versions() {
                 info "Launching interactive update manager..."
                 echo
                 execute_script "updater" || true
+                # The updater may have rewritten the other scripts on disk;
+                # refresh the integrity baseline so later actions in THIS session
+                # don't fail the "modified since validation" check.
+                recompute_script_checksums
                 echo
                 refresh_system_state
                 pause

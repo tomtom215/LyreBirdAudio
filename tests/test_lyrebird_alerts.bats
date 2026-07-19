@@ -393,3 +393,38 @@ teardown() {
     [ "$status" -eq 0 ]
     printf '%s' "$output" | python3 -c 'import json,sys; json.load(sys.stdin); print("valid")'
 }
+
+# ============================================================================
+# Regression tests for delivery correctness (ALERT-3/4)
+# ============================================================================
+
+@test "format_pushover adds retry+expire for critical (priority 2) [ALERT-3 regression]" {
+    export LYREBIRD_PUSHOVER_TOKEN="tok" LYREBIRD_PUSHOVER_USER="usr"
+    run format_pushover "critical" "MediaMTX down" "server unreachable" "mediamtx_down"
+    [ "$status" -eq 0 ]
+    # priority=2 without retry/expire is rejected by Pushover with HTTP 400.
+    [[ "$output" == *"priority=2"* ]]
+    [[ "$output" == *"retry="* ]]
+    [[ "$output" == *"expire="* ]]
+}
+
+@test "format_pushover does not add retry/expire below priority 2 [ALERT-3 regression]" {
+    export LYREBIRD_PUSHOVER_TOKEN="tok" LYREBIRD_PUSHOVER_USER="usr"
+    run format_pushover "warning" "Disk high" "80% used" "disk_warning"
+    [ "$status" -eq 0 ]
+    [[ "$output" != *"retry="* ]]
+    [[ "$output" != *"expire="* ]]
+}
+
+@test "format_ntfy round-trips a title/message containing colons [ALERT-4 regression]" {
+    run format_ntfy "urgent" "Stream Down: mydevice" "Stream 'mydevice' is down: no data" "stream_down"
+    [ "$status" -eq 0 ]
+    # Payload is NTFY:<priority>:<base64 title>:<base64 message>; base64 has no
+    # ':' so the field split is unambiguous. Decode and compare to the originals.
+    local tag prio b64t b64m
+    IFS=: read -r tag prio b64t b64m <<< "$output"
+    [ "$tag" = "NTFY" ]
+    [ "$prio" = "urgent" ]
+    [ "$(printf '%s' "$b64t" | base64 -d)" = "Stream Down: mydevice" ]
+    [ "$(printf '%s' "$b64m" | base64 -d)" = "Stream 'mydevice' is down: no data" ]
+}

@@ -729,10 +729,16 @@ parse_stream_file() {
                 # Handle discrete rates: 44100, 48000
                 IFS=',' read -ra rate_array <<<"$rates_str"
                 for rate in "${rate_array[@]}"; do
-                    # Strip whitespace and non-numeric characters
-                    rate="${rate//[^0-9]/}"
-                    if [[ -n "$rate" ]] && [[ ! " ${rates[*]} " == *" ${rate} "* ]]; then
-                        rates+=("$rate")
+                    # Accept ONLY a clean integer token (surrounding whitespace
+                    # allowed). A malformed range token like "8000 - 48000" (a
+                    # driver that omits the "(continuous)" marker) must be
+                    # discarded, NOT have its spaces/dash stripped and its digits
+                    # concatenated into a bogus rate such as 800048000.
+                    if [[ "$rate" =~ ^[[:space:]]*([0-9]+)[[:space:]]*$ ]]; then
+                        local r="${BASH_REMATCH[1]}"
+                        if [[ ! " ${rates[*]} " == *" ${r} "* ]]; then
+                            rates+=("$r")
+                        fi
                     fi
                 done
             fi
@@ -1220,27 +1226,29 @@ determine_optimal_settings() {
             ;;
     esac
 
-    # Determine optimal channels based on tier
+    # Determine optimal channels based on tier, choosing ONLY from the channel
+    # counts the hardware actually reports (hw_channels). Previously "low" always
+    # picked 1 and "normal/high" always picked 2 based only on the max, so a
+    # device that supports neither (e.g. a 4-channel-only mic, or a stereo-only
+    # mic on the "low" tier) was configured with an UNSUPPORTED channel count.
+    # (ALSA `plughw` masked this by resampling, but the recorded layout was wrong.)
     local optimal_channels
     case "$tier" in
         low)
-            # Prefer mono if available
-            if [[ $max_channels -ge 1 ]]; then
+            # Prefer mono if the hardware offers it, else the max it supports.
+            if [[ " ${hw_channels} " == *" 1 "* ]]; then
                 optimal_channels=1
             else
                 optimal_channels=$max_channels
             fi
             ;;
-        normal | high)
-            # Prefer stereo if available
-            if [[ $max_channels -ge 2 ]]; then
+        normal | high | *)
+            # Prefer stereo if offered, else the max supported.
+            if [[ " ${hw_channels} " == *" 2 "* ]]; then
                 optimal_channels=2
             else
                 optimal_channels=$max_channels
             fi
-            ;;
-        *)
-            optimal_channels=2
             ;;
     esac
 
@@ -1492,6 +1500,16 @@ restore_config_backup() {
         fi
     fi
 
+    # Snapshot the CURRENT config before overwriting it, so an operator who
+    # selects the wrong backup timestamp can still recover the config that was
+    # live. generate_config backs up before writing; restore previously did not,
+    # silently discarding the working config with no recovery path.
+    if [[ "$MODE_NO_BACKUP" != true ]] && [[ -f "$CONFIG_FILE" ]]; then
+        if ! create_config_backup; then
+            log_warn "Could not back up the current config before restore; continuing anyway"
+        fi
+    fi
+
     # Perform restore using temp file for atomic operation
     local temp_restore
     temp_restore=$(mktemp "${CONFIG_FILE}.restore.XXXXXXXXXX" 2>/dev/null) || {
@@ -1557,8 +1575,17 @@ check_root_access() {
 check_disk_space() {
     local required_kb="$1"
 
+    # POSIX df (-P avoids wrapping; -k forces 1K blocks). GNU-only
+    # `--output=avail` aborts the whole config generation on BusyBox/embedded df
+    # under set -euo pipefail. If the value can't be parsed, skip the check with
+    # a warning rather than aborting (or crashing on a non-numeric `[[ -lt ]]`).
     local available_kb
-    available_kb=$(df --output=avail "$CONFIG_DIR" | tail -1)
+    available_kb=$(df -Pk "$CONFIG_DIR" 2>/dev/null | awk 'NR==2 {print $4}' | tr -cd '0-9')
+
+    if [[ ! "$available_kb" =~ ^[0-9]+$ ]]; then
+        log_warn "Could not determine free space in $CONFIG_DIR; skipping disk-space check"
+        return 0
+    fi
 
     if [[ $available_kb -lt $required_kb ]]; then
         log_error "Insufficient disk space in $CONFIG_DIR"
@@ -2231,12 +2258,14 @@ output_json() {
     echo "{"
     echo '  "devices": ['
 
-    while IFS='=' read -r key value || [[ -n "$key" ]]; do
-        # Skip empty lines
-        [[ -z "$key" ]] && continue
-
-        # Detect device headers
-        if [[ "$key" =~ ^===.*Card.*===$ ]]; then
+    # Read WHOLE lines. Device headers ("=== Card N: name ===") contain '=', so
+    # they must be matched before any key=value split; the old `IFS='=' read key
+    # value` split the header into an empty key and skipped it, so in_device
+    # never became true and every --format=json run emitted an empty list.
+    local line key value
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        # Detect device headers first
+        if [[ "$line" =~ ^===.*Card.*===$ ]]; then
             # Close previous device object if exists
             if [[ "$in_device" = true ]]; then
                 # Remove trailing comma from last line
@@ -2254,14 +2283,25 @@ output_json() {
             json_lines=()
 
             # Extract device name from header
-            device_name="${key#*: }"
+            device_name="${line#*: }"
             device_name="${device_name% ===}"
+            # Escape the header for use as a JSON string value.
+            local esc_header="${line//\\/\\\\}"
+            esc_header="${esc_header//\"/\\\"}"
             echo "    {"
-            json_lines+=("      \"_header\": \"$key\",")
+            json_lines+=("      \"_header\": \"$esc_header\",")
             continue
         fi
 
+        # Skip blank lines and any line that is not key=value
+        [[ -z "$line" ]] && continue
+        [[ "$line" != *=* ]] && continue
+
         if [[ "$in_device" = true ]]; then
+            key="${line%%=*}"
+            value="${line#*=}"
+            [[ -z "$key" ]] && continue
+
             # Escape for JSON: backslash FIRST (else a trailing '\' escapes the
             # closing quote and produces invalid JSON), then quotes and the
             # common control characters.

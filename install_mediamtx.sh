@@ -124,6 +124,14 @@ SERVICE_BACKUP=""
 CONFIG_BACKUP=""
 STATE_DIR_CREATED=false
 
+# Whether MediaMTX was running before an update, and how it is managed. These
+# are module-level (not update_mediamtx locals) so execute_rollback can bring
+# the service back up after restoring the binary — otherwise a failure between
+# "stop" and the success-path "start" leaves MediaMTX stopped indefinitely on an
+# unattended box.
+WAS_RUNNING=false
+MANAGEMENT_MODE="none"
+
 # Download command
 DOWNLOAD_CMD=""
 
@@ -303,14 +311,18 @@ acquire_lock() {
     log_debug "Lock acquired (PID: ${SCRIPT_PID})"
 }
 
-# FIX 1.1: Remove lock file in release_lock()
 release_lock() {
     if [[ -n "${LOCK_FD}" ]]; then
         flock -u "${LOCK_FD}" 2>/dev/null || true
         exec 200>&- 2>/dev/null || true
-        rm -f "${LOCK_FILE}.pid" "${LOCK_FILE}" 2>/dev/null || true
+        # Do NOT remove the lock file itself. Deleting it while another
+        # invocation may still hold the same inode open lets a third invocation
+        # create a fresh inode and flock it immediately, so two runs proceed
+        # concurrently (flock+unlink race). The lock lives on tmpfs and clears on
+        # reboot; the .pid file is only informational and is safe to remove.
+        rm -f "${LOCK_FILE}.pid" 2>/dev/null || true
         LOCK_FD=""
-        log_debug "Lock released and file removed"
+        log_debug "Lock released"
     fi
 }
 
@@ -417,6 +429,17 @@ execute_rollback() {
         log_warn "Removing state directory created during failed operation..."
         rm -rf "${STATE_DIR}" 2>/dev/null || true
     fi
+
+    # Bring MediaMTX back up if it was running before the failed update. Without
+    # this, an update that failed anywhere between "stop" and the success-path
+    # "start" (a network blip fetching the release, a checksum mismatch, a bad
+    # new binary) leaves the server STOPPED indefinitely — the operator sees
+    # "Executing rollback…" and reasonably assumes the box was returned to a
+    # running state, while the audio stream is dead until someone visits it.
+    if [[ "${WAS_RUNNING}" == "true" ]] && [[ "${MANAGEMENT_MODE}" != "none" ]]; then
+        log_warn "Restarting MediaMTX after rollback..."
+        start_mediamtx "${MANAGEMENT_MODE}" || log_error "Rollback restart failed; start MediaMTX manually"
+    fi
 }
 
 # ============================================================================
@@ -504,6 +527,14 @@ version_compare() {
     # Validate inputs - empty versions are an error
     if [[ -z "$v1" ]] || [[ -z "$v2" ]]; then
         log_error "version_compare: empty version string (v1='$v1', v2='$v2')"
+        return 1
+    fi
+
+    # Treat a non-numeric v1 (e.g. "unknown" from a failed/corrupt `--version`)
+    # as OLDER than any real version. Otherwise `sort -V` orders "unknown" AFTER
+    # numeric versions, version_compare returns "newer", and the --upgrade gate
+    # fires against a broken binary. Comparing on the base (pre-release stripped).
+    if [[ ! "${v1%%-*}" =~ ^[0-9]+(\.[0-9]+)*$ ]]; then
         return 1
     fi
 
@@ -1283,43 +1314,49 @@ update_mediamtx() {
         return 0
     fi
 
-    # Detect management mode
-    local management_mode
-    management_mode=$(detect_management_mode)
-    local was_running=false
-    [[ "${management_mode}" != "none" ]] && was_running=true
+    # Detect management mode. Recorded module-level (not as locals) so that
+    # execute_rollback can restart the service on any failure after this point.
+    MANAGEMENT_MODE=$(detect_management_mode)
+    WAS_RUNNING=false
+    [[ "${MANAGEMENT_MODE}" != "none" ]] && WAS_RUNNING=true
 
     # Stop MediaMTX
-    stop_mediamtx "${management_mode}"
+    stop_mediamtx "${MANAGEMENT_MODE}"
 
     # Create backup
     BINARY_BACKUP="${INSTALL_DIR}/mediamtx.backup.$(date +%Y%m%d-%H%M%S)"
     cp "${INSTALL_DIR}/mediamtx" "${BINARY_BACKUP}"
     log_info "Current binary backed up to: ${BINARY_BACKUP}"
 
-    # Try built-in upgrade if supported
+    # Try MediaMTX's built-in `--upgrade` ONLY when the operator did not pin a
+    # specific version: `--upgrade` always jumps to MediaMTX's own idea of latest
+    # and ignores RELEASE_VERSION, so a pinned `update -V vX.Y.Z` would silently
+    # install a different (untested) release. A pinned target must go through the
+    # manual, checksum-verified, atomic path below.
     local upgrade_success=false
-    if version_compare "${current_version}" "${MIN_UPGRADE_VERSION}"; then
+    if [[ -z "${TARGET_VERSION}" ]] && version_compare "${current_version}" "${MIN_UPGRADE_VERSION}"; then
         log_info "Attempting built-in upgrade (--upgrade)..."
 
         if "${INSTALL_DIR}/mediamtx" --upgrade 2>&1 | tee -a "${LOG_FILE}"; then
-            # Verify the upgrade actually worked
+            # Verify the upgrade reached the intended release (normalize leading v)
             local new_version
             if new_version=$("${INSTALL_DIR}/mediamtx" --version 2>&1 | grep -oE 'v?[0-9]+\.[0-9]+\.[0-9]+' | head -1); then
-                if [[ "${new_version}" != "${current_version}" ]]; then
+                if [[ "${new_version#v}" == "${RELEASE_VERSION#v}" ]]; then
                     upgrade_success=true
                     log_info "Built-in upgrade completed successfully (${current_version} -> ${new_version})"
+                elif [[ "${new_version}" != "${current_version}" ]]; then
+                    log_warn "Built-in upgrade produced ${new_version} but expected ${RELEASE_VERSION}; falling back to manual update"
                 else
-                    log_warn "Built-in upgrade reported success but version unchanged"
+                    log_warn "Built-in upgrade reported success but version unchanged; falling back to manual update"
                 fi
             else
-                log_warn "Could not verify new version after upgrade"
+                log_warn "Could not verify new version after upgrade; falling back to manual update"
             fi
         else
             log_warn "Built-in upgrade failed, falling back to manual update"
         fi
     else
-        log_debug "Version ${current_version} does not support --upgrade (requires ${MIN_UPGRADE_VERSION}+), using manual update"
+        log_debug "Using manual update (pinned target, or version ${current_version} predates --upgrade support ${MIN_UPGRADE_VERSION}+)"
     fi
 
     # Manual update if upgrade failed or not supported
@@ -1361,13 +1398,40 @@ update_mediamtx() {
         fi
     fi
 
-    # Restart if it was running
-    if [[ "${was_running}" == "true" ]]; then
-        start_mediamtx "${management_mode}"
+    # Restart if it was running, and VERIFY it actually came back up. If the new
+    # binary fails to start, fatal-exit: the EXIT-trap rollback then restores the
+    # previous binary AND restarts it, so the recorder stays on last-known-good
+    # rather than reporting "updated successfully" while the server is down.
+    if [[ "${WAS_RUNNING}" == "true" ]]; then
+        start_mediamtx "${MANAGEMENT_MODE}"
+        if ! verify_service_started "${MANAGEMENT_MODE}"; then
+            fatal "MediaMTX did not come back up after the update; rolling back to the previous binary" 7
+        fi
     fi
 
     log_info "MediaMTX updated successfully!"
-    show_post_update_guidance "${management_mode}"
+    show_post_update_guidance "${MANAGEMENT_MODE}"
+}
+
+# Verify MediaMTX actually came up after a (re)start. Polls briefly because the
+# service needs a moment to bind. Returns 0 as soon as it is up, 1 on timeout.
+verify_service_started() {
+    local mode="$1"
+    [[ "${DRY_RUN_MODE}" == "true" ]] && return 0
+    local i
+    for i in 1 2 3 4 5 6; do
+        case "${mode}" in
+            systemd)
+                systemctl is-active --quiet mediamtx && return 0
+                ;;
+            *)
+                # stream-manager / manual: a mediamtx process must exist
+                pgrep -x mediamtx >/dev/null 2>&1 && return 0
+                ;;
+        esac
+        sleep 1
+    done
+    return 1
 }
 
 stop_mediamtx() {

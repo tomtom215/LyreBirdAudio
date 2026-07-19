@@ -39,7 +39,6 @@ readonly PROC_ASOUND_CARDS="/proc/asound/cards"
 readonly DEFAULT_DEBUG="false"
 readonly MAX_CARD_NUMBER=99
 readonly MAX_NAME_LENGTH=32
-readonly TEMP_DIR="${TMPDIR:-/tmp}"
 
 # Global variables
 DEBUG="${DEBUG:-$DEFAULT_DEBUG}"
@@ -214,25 +213,18 @@ is_valid_usb_path() {
         return 1
     fi
 
-    # Check if path contains expected USB path components
-    if [[ "$path" == *"usb"* ]] && [[ "$path" == *":"* ]]; then
-        return 0
-    # Match USB port path format: [bus]-[port](.[hub_port])*
-    # Examples: "1-2", "1-2.3", "usb-1-2.3.4", "3-1.4.2"
-    # Format breakdown:
-    #   - (usb-)? : Optional "usb-" prefix
-    #   - [0-9]+  : Bus number (e.g., "1", "3")
-    #   - -       : Separator
-    #   - [0-9]+  : Root port number (e.g., "2")
-    #   - (\.[0-9]+)* : Zero or more hub port suffixes (e.g., ".3", ".3.4")
-    elif [[ "$path" =~ ^(usb-)?[0-9]+-[0-9]+(\.[0-9]+)*$ ]]; then
-        return 0
-    elif [[ "$path" == *"-"* ]]; then
-        # More permissive for compatibility
-        return 0
-    else
-        return 1
-    fi
+    # Accept ONLY a well-formed USB bus-port path: [usb-]BUS-PORT(.HUBPORT)* .
+    # Examples: "1-2", "1-2.3", "usb-1-2.3.4", "3-1.4.2".
+    #
+    # SECURITY: this value is spliced verbatim into a root udev rule as
+    # KERNELS=="$path". The previous permissive fall-throughs — "contains 'usb'
+    # and ':'" and "contains a hyphen" — accepted almost anything, so an
+    # operator-supplied -u/--usb-port value containing a newline (or quotes/`;`)
+    # could inject an active `RUN+=` line executed as root. A value that is not a
+    # clean port path is rejected here; the caller then falls back to VID:PID
+    # matching rather than emitting an attacker-controlled rule. The synthetic
+    # "bus<N>-dev<M>" fallback also fails this (it is not a real KERNELS value).
+    [[ "$path" =~ ^(usb-)?[0-9]+-[0-9]+(\.[0-9]+)*$ ]]
 }
 
 # Function to get USB physical port path for a device (v1.0.0 logic - FIXED)
@@ -639,7 +631,13 @@ generate_udev_rules() {
         debug "Using USB port path for rule: $simple_port"
         rules_content+=", KERNELS==\"$simple_port\""
     else
-        debug "No port criteria available - matching by vendor/product ID only"
+        # No usable port/platform discriminator (none detected, or the detected
+        # value was the synthetic bus-dev fallback that udev can't match). The
+        # rule will match by VID:PID ONLY, which cannot distinguish multiple
+        # IDENTICAL devices — they would all receive this same name and symlink.
+        # Make that visible so an operator with a mic array knows to pass -u.
+        warning "No stable USB port for '${friendly_name}' (${vendor_id}:${product_id}); rule will match by vendor/product ID only."
+        warning "If you have more than one identical device, supply its physical port with -u/--usb-port so each is named uniquely."
     fi
 
     # Complete the rule
@@ -670,9 +668,15 @@ write_rules_atomic() {
         friendly_name="${BASH_REMATCH[1]}"
     fi
 
-    # Create temporary file
-    local temp_file
-    if ! temp_file=$(mktemp "${TEMP_DIR}/usb-soundcard-rules.XXXXXX" 2>&1); then
+    # Create the temp file in the SAME directory as the destination so the final
+    # `mv` is an atomic same-filesystem rename. Creating it under /tmp (usually
+    # tmpfs) made `mv` a copy-then-unlink ACROSS filesystems: a power cut
+    # mid-copy — routine in 24/7 field deployments — could leave a truncated
+    # rules file at the destination and corrupt persistent naming on next boot.
+    # The leading dot + no `.rules` suffix means udev ignores any stray temp.
+    local rules_dir temp_file
+    rules_dir="$(dirname "$rules_file")"
+    if ! temp_file=$(mktemp "${rules_dir}/.usb-soundcard-rules.XXXXXX" 2>&1); then
         error_exit "Failed to create temporary file: ${temp_file:-unknown error}"
     fi
     CLEANUP_FILES+=("$temp_file")

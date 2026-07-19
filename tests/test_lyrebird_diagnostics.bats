@@ -562,3 +562,46 @@ EOF
     run grep -nE 'grep -[a-z]*c[a-z]* [^|]*\|\| echo 0' "$PROJECT_ROOT/lyrebird-diagnostics.sh"
     [ "$status" -ne 0 ]
 }
+
+# ============================================================================
+# Regression tests (DIAG-3 grep -c 0\n0, DIAG-5 df misparse)
+# ============================================================================
+
+@test "get_tcp_timewait_connections returns a single value, never '0\\n0' [DIAG-3 regression]" {
+    local bin; bin="$(mktemp -d)"
+    printf '#!/bin/bash\necho "State Recv-Q Send-Q Local Peer"\necho "ESTAB 0 0 a b"\n' > "$bin/ss"
+    chmod +x "$bin/ss"
+    run env PROJECT_ROOT="$PROJECT_ROOT" PATH="$bin:$PATH" bash -c '
+        set +euo pipefail
+        source "$PROJECT_ROOT/lyrebird-diagnostics.sh" >/dev/null 2>&1
+        get_tcp_timewait_connections
+    '
+    rm -rf "$bin"
+    [ "$status" -eq 0 ]
+    [ "$(printf '%s\n' "$output" | grep -c .)" -eq 1 ]
+    [ "$output" = "0" ]
+}
+
+@test "get_disk_usage_percent parses a wrapped/long device name [DIAG-5 regression]" {
+    local bin; bin="$(mktemp -d)"
+    cat > "$bin/df" <<'DFEOF'
+#!/bin/bash
+posix=0; for a in "$@"; do [[ "$a" == -*P* ]] && posix=1; done
+echo "Filesystem 1024-blocks Used Available Capacity Mounted on"
+if [[ $posix -eq 1 ]]; then
+  echo "/dev/mapper/vg--really--long--name 1000000 880000 120000 88% /"
+else
+  echo "/dev/mapper/vg--really--long--name"
+  echo "                                   1000000 880000 120000 88% /"
+fi
+DFEOF
+    chmod +x "$bin/df"
+    run env PROJECT_ROOT="$PROJECT_ROOT" PATH="$bin:$PATH" bash -c '
+        set +euo pipefail
+        source "$PROJECT_ROOT/lyrebird-diagnostics.sh" >/dev/null 2>&1
+        get_disk_usage_percent /
+    '
+    rm -rf "$bin"
+    [ "$status" -eq 0 ]
+    [ "$output" = "88" ]
+}

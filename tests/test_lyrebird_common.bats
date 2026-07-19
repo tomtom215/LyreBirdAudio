@@ -249,3 +249,23 @@ setup() {
     [ "$status" -eq 0 ]
     [[ "$output" =~ "Configuration file" ]]
 }
+
+# ============================================================================
+# Regression tests for run_with_timeout (COMMON-10)
+# ============================================================================
+
+@test "run_with_timeout preserves the command's real exit code [COMMON-10 regression]" {
+    run run_with_timeout 5 bash -c 'exit 3'
+    [ "$status" -eq 3 ]
+}
+
+@test "run_with_timeout returns 1 when the command times out [COMMON-10 regression]" {
+    run run_with_timeout 1 sleep 5
+    [ "$status" -eq 1 ]
+}
+
+@test "run_with_timeout does not swallow the command's stderr [COMMON-10 regression]" {
+    run run_with_timeout 5 bash -c 'echo boom >&2'
+    [ "$status" -eq 0 ]
+    [[ "$output" == *boom* ]]
+}

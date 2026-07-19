@@ -422,3 +422,120 @@ teardown() {
     [ "$gz" -eq 1 ]
     [ "$raw" -eq 1 ]
 }
+
+# --- STORAGE-1: df misparse on wrapped/long device names -> false "OK" --------
+
+# A fake `df` that mimics REAL GNU df with a long device name at 97% used /
+# 30000 KB free: without -P it WRAPS the long name onto its own line (so the old
+# `df | tail -1 | awk '{print $5}'` reads the mount point, not Use%); with -P it
+# stays single-line (so the fixed code parses columns correctly). This is what
+# makes the tests below fail against the pre-fix code and pass against the fix.
+_write_fake_df() {
+    local bin="$1"
+    cat > "$bin/df" <<'DFEOF'
+#!/bin/bash
+posix=0
+for a in "$@"; do [[ "$a" == -*P* ]] && posix=1; done
+echo "Filesystem                              1024-blocks    Used Available Capacity Mounted on"
+if [[ $posix -eq 1 ]]; then
+    echo "/dev/mapper/vg--data-really--long--name     1000000  970000     30000      97% /"
+else
+    echo "/dev/mapper/vg--data-really--long--name"
+    echo "                                            1000000  970000     30000      97% /"
+fi
+DFEOF
+    chmod +x "$bin/df"
+}
+
+@test "get_disk_usage returns the percent, not the mount point, for a long device name [STORAGE-1 regression]" {
+    local bin; bin="$(mktemp -d)"; _write_fake_df "$bin"
+    run env PROJECT_ROOT="$PROJECT_ROOT" PATH="$bin:$PATH" \
+        bash -c 'source "$PROJECT_ROOT/lyrebird-storage.sh"; get_disk_usage /'
+    rm -rf "$bin"
+    [ "$status" -eq 0 ]
+    [ "$output" = "97" ]
+}
+
+@test "get_free_space_mb returns free MB, not the Use% column, for a long device name [STORAGE-1 regression]" {
+    local bin; bin="$(mktemp -d)"; _write_fake_df "$bin"
+    run env PROJECT_ROOT="$PROJECT_ROOT" PATH="$bin:$PATH" \
+        bash -c 'source "$PROJECT_ROOT/lyrebird-storage.sh"; get_free_space_mb /'
+    rm -rf "$bin"
+    [ "$status" -eq 0 ]
+    [ "$output" = "29" ]                 # 30000 KB / 1024
+}
+
+@test "cmd_monitor detects a full disk hidden behind a wrapped df name [STORAGE-1 regression]" {
+    local bin; bin="$(mktemp -d)"; _write_fake_df "$bin"
+    # DRY_RUN=true: the EMERGENCY log still fires but nothing is deleted.
+    run env PROJECT_ROOT="$PROJECT_ROOT" PATH="$bin:$PATH" \
+        LYREBIRD_RECORDING_DIR="$(mktemp -d)" LYREBIRD_LOG_DIR="$(mktemp -d)" \
+        LYREBIRD_BUFFER_DIR="$(mktemp -d)" DRY_RUN=true \
+        bash -c 'source "$PROJECT_ROOT/lyrebird-storage.sh"; cmd_monitor 2>&1'
+    rm -rf "$bin"
+    [ "$status" -eq 0 ]
+    [[ "$output" =~ EMERGENCY ]]         # old code parsed usage as "/" -> "OK"
+}
+
+@test "cmd_monitor never runs emergency deletion on unparseable df [STORAGE-1 regression]" {
+    local bin; bin="$(mktemp -d)"
+    printf '#!/bin/bash\necho garbage-not-a-table\n' > "$bin/df"; chmod +x "$bin/df"
+    local rec; rec="$(mktemp -d)"; : > "$rec/keep.wav"   # fresh recording
+    run env PROJECT_ROOT="$PROJECT_ROOT" PATH="$bin:$PATH" LYREBIRD_RECORDING_DIR="$rec" \
+        LYREBIRD_LOG_DIR="$(mktemp -d)" DRY_RUN=false \
+        bash -c 'source "$PROJECT_ROOT/lyrebird-storage.sh"; cmd_monitor 2>&1'
+    local kept=0; [ -f "$rec/keep.wav" ] && kept=1
+    rm -rf "$rec" "$bin"
+    [ "$status" -eq 0 ]
+    [ "$kept" -eq 1 ]                    # emergency (age-blind) deletion must NOT run
+    [[ "$output" =~ [Cc]ould\ not\ determine ]]
+}
+
+# --- STORAGE-2: empty-dir cleanup deleting the recording root ------------------
+
+@test "cleanup_recordings keeps RECORDING_DIR itself after it empties [STORAGE-2 regression]" {
+    local rec; rec="$(mktemp -d)"
+    : > "$rec/old.wav"
+    touch -d "400 days ago" "$rec/old.wav" 2>/dev/null || touch "$rec/old.wav"
+    run env PROJECT_ROOT="$PROJECT_ROOT" LYREBIRD_RECORDING_DIR="$rec" DRY_RUN=false \
+        bash -c 'source "$PROJECT_ROOT/lyrebird-storage.sh"; cleanup_recordings'
+    local dir_exists=0 file_gone=0
+    [ -d "$rec" ] && dir_exists=1
+    [ ! -f "$rec/old.wav" ] && file_gone=1
+    rm -rf "$rec"
+    [ "$status" -eq 0 ]
+    [ "$dir_exists" -eq 1 ]              # dir must survive so recording can resume
+    [ "$file_gone" -eq 1 ]              # but the aged-out recording is removed
+}
+
+# --- STORAGE-3: in-place log truncation preserving the inode -------------------
+
+@test "truncate_large_logs truncates in place, preserving the inode [STORAGE-3 regression]" {
+    local logdir; logdir="$(mktemp -d)"; local log="$logdir/mediamtx.out"
+    head -c 5000 /dev/zero | tr '\0' 'x' > "$log"
+    local inode_before; inode_before=$(stat -c%i "$log")
+    run env PROJECT_ROOT="$PROJECT_ROOT" MEDIAMTX_LOG="$log" MAX_LOG_SIZE=1024 \
+        LYREBIRD_LOG_DIR="$(mktemp -d)" DRY_RUN=false \
+        bash -c 'source "$PROJECT_ROOT/lyrebird-storage.sh"; truncate_large_logs'
+    local inode_after; inode_after=$(stat -c%i "$log" 2>/dev/null || echo GONE)
+    rm -rf "$logdir"
+    [ "$status" -eq 0 ]
+    [ "$inode_before" = "$inode_after" ]   # old `mv tmp log` changed the inode
+}
+
+# --- STORAGE-4: non-integer env values aborting the script at load ------------
+
+@test "non-integer retention env does not abort the script at load [STORAGE-4 regression]" {
+    run env PROJECT_ROOT="$PROJECT_ROOT" RECORDING_RETENTION_DAYS=none LOG_RETENTION_DAYS=unlimited \
+        bash -c 'set -euo pipefail; source "$PROJECT_ROOT/lyrebird-storage.sh"; echo "rec=$RECORDING_RETENTION_DAYS log=$LOG_RETENTION_DAYS"'
+    [ "$status" -eq 0 ]
+    [[ "$output" =~ rec=30 ]]
+    [[ "$output" =~ log=7 ]]
+}
+
+@test "leading-zero retention env is coerced base-10, not octal-broken [STORAGE-4 regression]" {
+    run env PROJECT_ROOT="$PROJECT_ROOT" RECORDING_RETENTION_DAYS=08 \
+        bash -c 'set -euo pipefail; source "$PROJECT_ROOT/lyrebird-storage.sh"; echo "rec=$RECORDING_RETENTION_DAYS"'
+    [ "$status" -eq 0 ]
+    [[ "$output" =~ rec=8 ]]
+}

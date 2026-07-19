@@ -221,6 +221,50 @@ teardown() {
     [ "$(printf '%s\n' "$output" | grep -vc '^[[:space:]]*#')" -eq 1 ]
 }
 
+@test "is_valid_usb_path accepts real ports, rejects injection/synthetic/junk [USB-1/USB-2 regression]" {
+    run env PROJECT_ROOT="$PROJECT_ROOT" bash -c '
+        set +euo pipefail
+        source "$PROJECT_ROOT/usb-audio-mapper.sh" >/dev/null 2>&1
+        for good in "1-2" "1-2.3" "usb-1-2.3.4" "3-1.4.2"; do
+            is_valid_usb_path "$good" || { echo "REJECTED-GOOD:$good"; exit 1; }
+        done
+        evil=$(printf "1-2\" GOTO=\"end\nACTION==\"add\", RUN+=\"/bin/rm -rf /\"\nLABEL=\"end")
+        for bad in "$evil" "bus3-dev5" "a-b" "1-2;rm" "../etc" "1_2" ""; do
+            if is_valid_usb_path "$bad"; then echo "ACCEPTED-BAD:[$bad]"; exit 1; fi
+        done
+        echo ALLGOOD
+    '
+    [ "$status" -eq 0 ]
+    [[ "$output" == *ALLGOOD* ]]
+}
+
+@test "generate_udev_rules rejects an injection-laden port (no KERNELS/RUN) [USB-1 regression]" {
+    # An operator-supplied -u value with an embedded newline + RUN+= must not be
+    # spliced into a KERNELS== match; the rule falls back to VID:PID only.
+    run env PROJECT_ROOT="$PROJECT_ROOT" bash -c '
+        set +euo pipefail
+        source "$PROJECT_ROOT/usb-audio-mapper.sh" >/dev/null 2>&1
+        evilport=$(printf "1-2\" GOTO=\"end\nACTION==\"add\", RUN+=\"/bin/sh -c evil\"\nLABEL=\"end")
+        generate_udev_rules "0d8c" "0014" "mic" "Card" "$evilport" "" 2>/dev/null
+    '
+    [ "$status" -eq 0 ]
+    ! printf '%s\n' "$output" | grep -qE "RUN[+]=|PROGRAM==|IMPORT[{]|GOTO"
+    ! printf '%s\n' "$output" | grep -q "KERNELS"
+    # Exactly one active line: the VID:PID-only fallback rule.
+    [ "$(printf '%s\n' "$output" | grep -vc '^[[:space:]]*#')" -eq 1 ]
+}
+
+@test "generate_udev_rules omits a dead KERNELS for the synthetic bus-dev fallback [USB-2 regression]" {
+    run env PROJECT_ROOT="$PROJECT_ROOT" bash -c '
+        set +euo pipefail
+        source "$PROJECT_ROOT/usb-audio-mapper.sh" >/dev/null 2>&1
+        generate_udev_rules "0d8c" "0014" "mic" "Card" "bus3-dev5" "" 2>/dev/null
+    '
+    [ "$status" -eq 0 ]
+    # A KERNELS=="bus3-dev5" rule would never match any real device.
+    ! printf '%s\n' "$output" | grep -q 'KERNELS'
+}
+
 # ============================================================================
 # Device Detection Simulation Tests
 # ============================================================================

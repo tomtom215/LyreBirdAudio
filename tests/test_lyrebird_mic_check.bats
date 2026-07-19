@@ -327,3 +327,52 @@ teardown() {
     [ "$status" -eq 0 ]
     [ "$output" = "96000" ]
 }
+
+# ============================================================================
+# Regression tests (MIC-6 JSON, MIC-8 channels, MIC-10 disk check)
+# ============================================================================
+
+@test "output_json emits the devices, not an empty list, and valid JSON [MIC-6 regression]" {
+    local infile; infile="$(mktemp)"
+    printf '=== Card 0: Blue Yeti ===\nDEVICE_NAME=Blue_Yeti\nSAMPLE_RATE=48000\nCHANNELS=2\n=== Card 1: Rode ===\nDEVICE_NAME=Rode\n' > "$infile"
+    run output_json < "$infile"
+    rm -f "$infile"
+    [ "$status" -eq 0 ]
+    # The old `IFS='=' read` skipped the "=== Card ===" header, so devices was
+    # ALWAYS []. Must now be valid JSON with two devices.
+    printf '%s\n' "$output" | python3 -c 'import json,sys; d=json.load(sys.stdin); assert len(d["devices"])==2, d; print("OK")'
+}
+
+@test "determine_optimal_settings low tier picks a SUPPORTED channel count (stereo-only mic) [MIC-8 regression]" {
+    PARSED_CAPS[sample_rates]="48000"
+    PARSED_CAPS[channels]="2"
+    local out; out=$(determine_optimal_settings low 2>/dev/null)
+    # output: "<rate> <channels> <bitrate>"; must be 2 (supported), not mono.
+    [ "$(printf '%s' "$out" | awk '{print $2}')" = "2" ]
+}
+
+@test "determine_optimal_settings normal tier falls back to a supported count (4ch-only mic) [MIC-8 regression]" {
+    PARSED_CAPS[sample_rates]="48000"
+    PARSED_CAPS[channels]="4"
+    local out; out=$(determine_optimal_settings normal 2>/dev/null)
+    # 2 is unsupported here -> must pick a supported value (max=4), not 2.
+    [ "$(printf '%s' "$out" | awk '{print $2}')" = "4" ]
+}
+
+@test "check_disk_space does not abort on a non-GNU df lacking --output [MIC-10 regression]" {
+    local bin; bin="$(mktemp -d)"
+    cat > "$bin/df" <<'DFEOF'
+#!/bin/bash
+for a in "$@"; do case "$a" in --output*) echo "df: unrecognized option: $a" >&2; exit 1;; esac; done
+echo "Filesystem 1K-blocks Used Available Use% Mounted on"
+echo "/dev/sda1 1000000 200000 800000 20% /"
+DFEOF
+    chmod +x "$bin/df"
+    run env PROJECT_ROOT="$PROJECT_ROOT" PATH="$bin:$PATH" bash -c '
+        set -euo pipefail
+        source "$PROJECT_ROOT/lyrebird-mic-check.sh" >/dev/null 2>&1
+        check_disk_space 1000    # ~1MB needed, 800MB free
+    '
+    rm -rf "$bin"
+    [ "$status" -eq 0 ]     # old --output df would abort under set -euo pipefail
+}
