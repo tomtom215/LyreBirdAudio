@@ -173,8 +173,21 @@ echo "DEVPATH=/devices/platform/soc/fe00b840.mailbox/sound"
 exit 0
 EOF
     chmod +x "$PA_TMP/bin/udevadm"
-    mkdir -p /dev/bus/usb/990
-    : > /dev/bus/usb/990/991
+
+    # The function only consults udevadm when /dev/bus/usb/<bus>/<dev> exists.
+    # Creating that node needs root: do it directly when we are root, via
+    # non-interactive sudo on CI runners, and skip (with the reason) elsewhere
+    # rather than fail on an environment limitation.
+    if mkdir -p /dev/bus/usb/990 2>/dev/null; then
+        : > /dev/bus/usb/990/991
+        PA_DEV_SUDO=""
+    elif command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
+        sudo -n mkdir -p /dev/bus/usb/990
+        sudo -n touch /dev/bus/usb/990/991
+        PA_DEV_SUDO="sudo -n"
+    else
+        skip "cannot create /dev/bus/usb test node (needs root or passwordless sudo)"
+    fi
 
     run env PROJECT_ROOT="$PROJECT_ROOT" PATH="$PA_TMP/bin:$PATH" bash -c '
         set -euo pipefail
@@ -183,7 +196,7 @@ EOF
         get_usb_physical_port 990 991 || rc=$?
         echo "COMPLETED rc=$rc"
     '
-    rm -rf /dev/bus/usb/990
+    ${PA_DEV_SUDO} rm -rf /dev/bus/usb/990
     [ "$status" -eq 0 ]
     [[ "$output" == *"COMPLETED"* ]]
 }
