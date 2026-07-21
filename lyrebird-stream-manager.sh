@@ -1767,12 +1767,47 @@ mediamtx_get_path() {
     mediamtx_api_call GET "/paths/get/${path_name}"
 }
 
+# --- Tolerant JSON status parsing -------------------------------------------
+# MediaMTX deprecated the path "ready"/"bytesReceived"/"tracks" fields in favour
+# of "available"/"inboundBytes"/"tracks2" (still emitting both as of v1.19.x).
+# These helpers accept BOTH shapes so a future MediaMTX that drops "ready" does
+# not make every stream look dead. When both fields are present the NEW field
+# wins. They are also safe under set -euo pipefail: a zero-match grep must not
+# abort the caller (pipefail turns "0 ready paths" into exit 1 otherwise).
+
+# Count occurrences of a fixed pattern in a JSON blob; never fails, prints >= 0.
+_json_count_matches() {
+    local json="$1" pattern="$2" count
+    count=$(printf '%s' "$json" | grep -o "$pattern" | wc -l) || count=0
+    printf '%s' "${count:-0}"
+}
+
+# Is a single path's JSON "ready"? Tolerates deprecated and current shapes.
+mediamtx_json_path_ready() {
+    local json="$1"
+    if [[ "$json" == *'"available":'* ]]; then
+        [[ "$json" == *'"available":true'* ]]
+    else
+        [[ "$json" == *'"ready":true'* ]]
+    fi
+}
+
+# Count ready paths in a /v3/paths/list response, tolerant of both shapes.
+mediamtx_json_count_ready() {
+    local json="$1"
+    if [[ "$json" == *'"available":'* ]]; then
+        _json_count_matches "$json" '"available":true'
+    else
+        _json_count_matches "$json" '"ready":true'
+    fi
+}
+
 # Check if a path is ready (streaming)
 mediamtx_path_is_ready() {
     local path_name="$1"
     local path_info
     path_info=$(mediamtx_get_path "$path_name") || return 1
-    echo "$path_info" | grep -q '"ready":true'
+    mediamtx_json_path_ready "$path_info"
 }
 
 # -----------------------------------------------------------------------------
@@ -2017,7 +2052,7 @@ mediamtx_count_rtsp_sessions() {
     local sessions
     sessions=$(mediamtx_list_rtsp_sessions) || { echo "0"; return; }
     local count
-    count=$(echo "$sessions" | grep -o '"id"' | wc -l)
+    count=$(_json_count_matches "$sessions" '"id"')
     echo "${count:-0}"
 }
 
@@ -2033,25 +2068,25 @@ mediamtx_count_all_connections() {
     # RTSPS sessions
     local rtsps
     rtsps=$(mediamtx_list_rtsps_sessions 2>/dev/null) || rtsps=""
-    count=$(echo "$rtsps" | grep -o '"id"' | wc -l)
+    count=$(_json_count_matches "$rtsps" '"id"')
     total=$((total + count))
 
     # RTMP connections
     local rtmp
     rtmp=$(mediamtx_list_rtmp_conns 2>/dev/null) || rtmp=""
-    count=$(echo "$rtmp" | grep -o '"id"' | wc -l)
+    count=$(_json_count_matches "$rtmp" '"id"')
     total=$((total + count))
 
     # WebRTC sessions
     local webrtc
     webrtc=$(mediamtx_list_webrtc_sessions 2>/dev/null) || webrtc=""
-    count=$(echo "$webrtc" | grep -o '"id"' | wc -l)
+    count=$(_json_count_matches "$webrtc" '"id"')
     total=$((total + count))
 
     # SRT connections
     local srt
     srt=$(mediamtx_list_srt_conns 2>/dev/null) || srt=""
-    count=$(echo "$srt" | grep -o '"id"' | wc -l)
+    count=$(_json_count_matches "$srt" '"id"')
     total=$((total + count))
 
     echo "$total"
@@ -2062,7 +2097,7 @@ mediamtx_count_ready_paths() {
     local paths
     paths=$(mediamtx_list_paths) || { echo "0"; return; }
     local count
-    count=$(echo "$paths" | grep -o '"ready":true' | wc -l)
+    count=$(mediamtx_json_count_ready "$paths")
     echo "${count:-0}"
 }
 
@@ -2095,9 +2130,9 @@ mediamtx_get_status_summary() {
     local paths_json
     paths_json=$(mediamtx_list_paths 2>/dev/null) || paths_json=""
     local total_paths
-    total_paths=$(echo "$paths_json" | grep -o '"name"' | wc -l)
+    total_paths=$(_json_count_matches "$paths_json" '"name"')
     local ready_paths
-    ready_paths=$(echo "$paths_json" | grep -o '"ready":true' | wc -l)
+    ready_paths=$(mediamtx_json_count_ready "$paths_json")
 
     local rtsp_sessions
     rtsp_sessions=$(mediamtx_count_rtsp_sessions 2>/dev/null)
@@ -2767,7 +2802,7 @@ validate_stream() {
             local api_base api_response
             api_base=$(detect_mediamtx_api_version)
             local api_url="${api_base}/paths/get/${stream_path}"
-            if api_response=$(curl -s --max-time 2 "${api_url}" 2>/dev/null) && [[ "$api_response" == *'"ready":true'* ]]; then
+            if api_response=$(curl -s --max-time 2 "${api_url}" 2>/dev/null) && mediamtx_json_path_ready "$api_response"; then
                 log DEBUG "Stream $stream_path validated via API (attempt ${attempt})"
                 return 0
             fi

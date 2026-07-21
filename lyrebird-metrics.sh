@@ -365,9 +365,14 @@ collect_api_metrics() {
             path_count=$(echo "$paths_json" | grep -o '"name"' | wc -l || true)
             emit_metric "api_paths_total" "$path_count" "Total paths registered in MediaMTX"
 
-            # Count ready paths
+            # Count ready paths. MediaMTX deprecated "ready" in favour of
+            # "available"; accept both shapes, preferring the new field.
             local ready_count
-            ready_count=$(echo "$paths_json" | grep -o '"ready":true' | wc -l || true)
+            if [[ "$paths_json" == *'"available":'* ]]; then
+                ready_count=$(echo "$paths_json" | grep -o '"available":true' | wc -l || true)
+            else
+                ready_count=$(echo "$paths_json" | grep -o '"ready":true' | wc -l || true)
+            fi
             emit_metric "api_paths_ready" "$ready_count" "Paths with ready status"
         fi
 
