@@ -661,7 +661,7 @@ verify_checksum() {
 
     # Extract checksum
     local expected_checksum
-    expected_checksum=$(grep -F "${filename}" "${checksum_file}" 2>/dev/null | head -1 | awk '{print $1}')
+    expected_checksum=$(grep -F "${filename}" "${checksum_file}" 2>/dev/null | head -1 | awk '{print $1}') || true
 
     if [[ -z "${expected_checksum}" ]] || [[ ! "${expected_checksum}" =~ ^[a-f0-9]{64}$ ]]; then
         if [[ "${FORCE_MODE}" == "true" ]]; then
@@ -1296,7 +1296,7 @@ update_mediamtx() {
     # Get current version
     local current_version="unknown"
     if "${INSTALL_DIR}/mediamtx" --version &>/dev/null; then
-        current_version=$("${INSTALL_DIR}/mediamtx" --version 2>&1 | grep -oE 'v?[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+        current_version=$("${INSTALL_DIR}/mediamtx" --version 2>&1 | grep -oE 'v?[0-9]+\.[0-9]+\.[0-9]+' | head -1) || current_version="unknown"
     fi
 
     # Get target version
@@ -1378,7 +1378,7 @@ update_mediamtx() {
     # Verify new version
     if "${INSTALL_DIR}/mediamtx" --version &>/dev/null; then
         local new_version
-        new_version=$("${INSTALL_DIR}/mediamtx" --version 2>&1 | grep -oE 'v?[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+        new_version=$("${INSTALL_DIR}/mediamtx" --version 2>&1 | grep -oE 'v?[0-9]+\.[0-9]+\.[0-9]+' | head -1) || new_version="unknown"
         log_info "Updated to version: ${new_version}"
     fi
 
@@ -1609,7 +1609,7 @@ show_status() {
 
         local version="unknown"
         if "${INSTALL_DIR}/mediamtx" --version &>/dev/null; then
-            version=$("${INSTALL_DIR}/mediamtx" --version 2>&1 | grep -oE 'v?[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+            version=$("${INSTALL_DIR}/mediamtx" --version 2>&1 | grep -oE 'v?[0-9]+\.[0-9]+\.[0-9]+' | head -1) || version="unknown"
         fi
         echo "Version: ${version}"
     else

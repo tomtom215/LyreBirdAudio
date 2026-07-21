@@ -2135,7 +2135,7 @@ mediamtx_get_status_summary() {
     }
 
     local version
-    version=$(echo "$info" | grep -o '"version":"[^"]*"' | cut -d'"' -f4)
+    version=$(echo "$info" | grep -o '"version":"[^"]*"' | cut -d'"' -f4) || true
 
     local paths_json
     paths_json=$(mediamtx_list_paths 2>/dev/null) || paths_json=""
@@ -2223,7 +2223,7 @@ check_audio_level() {
 
     # Parse max volume from output (format: "max_volume: -XX.X dB")
     local max_volume
-    max_volume=$(echo "$ffmpeg_output" | grep -o "max_volume: [0-9.-]*" | grep -o "[0-9.-]*" | head -1)
+    max_volume=$(echo "$ffmpeg_output" | grep -o "max_volume: [0-9.-]*" | grep -o "[0-9.-]*" | head -1) || true
 
     if [[ -z "$max_volume" ]]; then
         log DEBUG "Could not parse audio level for $stream_name"

@@ -121,7 +121,7 @@ collect_mediamtx_metrics() {
     # Check if MediaMTX is running
     if pgrep -f "mediamtx" >/dev/null 2>&1; then
         mediamtx_running=1
-        mediamtx_pid=$(pgrep -f "mediamtx" | head -1)
+        mediamtx_pid=$(pgrep -f "mediamtx" | head -1) || true
     fi
 
     emit_metric "mediamtx_up" "$mediamtx_running" "MediaMTX server running (1=up, 0=down)"

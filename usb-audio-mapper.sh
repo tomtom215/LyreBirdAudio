@@ -317,7 +317,7 @@ get_usb_physical_port() {
                     debug "Processing udevadm DEVPATH: $devpath_from_udev"
 
                     # Extract the LAST USB port pattern (most specific)
-                    base_port_path=$(echo "$devpath_from_udev" | grep -oE '[0-9]+-[0-9]+(\.[0-9]+)*' | tail -n1)
+                    base_port_path=$(echo "$devpath_from_udev" | grep -oE '[0-9]+-[0-9]+(\.[0-9]+)*' | tail -n1) || true
 
                     if [ -n "$base_port_path" ]; then
                         debug "Extracted port from udevadm: $base_port_path"
