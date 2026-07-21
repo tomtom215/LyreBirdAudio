@@ -73,6 +73,18 @@ readonly LOG_RETENTION_DAYS="$_log_ret"
 readonly TEMP_RETENTION_HOURS="$_tmp_ret"
 unset _rec_ret _log_ret _tmp_ret
 
+# Clock-sanity floor for age-based recording deletion. An RTC-less Pi boots
+# with its clock in 1970 until NTP syncs; recordings captured in that window
+# carry mtimes decades in the past, and the moment the clock steps to the real
+# date `find -mtime +N` sees minutes-old data as 56 years old and deletes it.
+# No recording can legitimately predate the project, so any mtime before this
+# epoch (default 2025-01-01) means "written with a broken clock, real age
+# unknown" -- age-based cleanup must keep it. Emergency size-based cleanup is
+# deliberately NOT gated on this: a full disk must still be freed.
+_clock_floor=$(_coerce_uint "${LYREBIRD_CLOCK_SANE_EPOCH:-1735689600}" 1735689600)
+readonly CLOCK_SANE_EPOCH="$_clock_floor"
+unset _clock_floor
+
 # Disk thresholds (percentage) - validate bounds 0-100
 _disk_warning=$(_coerce_uint "${DISK_WARNING_PERCENT:-80}" 80)
 _disk_critical=$(_coerce_uint "${DISK_CRITICAL_PERCENT:-90}" 90)
@@ -246,17 +258,39 @@ cleanup_recordings() {
         return 0
     fi
 
+    # With an unsynced clock every file age is meaningless -- defer age-based
+    # deletion until the clock is sane (the next cron run after NTP syncs).
+    local now_epoch
+    now_epoch=$(date +%s)
+    if [[ "$now_epoch" -lt "$CLOCK_SANE_EPOCH" ]]; then
+        log_warn "System clock ($now_epoch) predates ${CLOCK_SANE_EPOCH} (not yet NTP-synced?); skipping age-based recording cleanup"
+        return 0
+    fi
+
     local count=0
     local freed_bytes=0
+    local kept_broken_clock=0
 
     # Find and delete old recording files
     while IFS= read -r -d '' file; do
+        # A pre-CLOCK_SANE_EPOCH mtime means the file was written while the
+        # clock was broken; its real age is unknown and it may be minutes old.
+        local mtime
+        mtime=$(stat -c%Y "$file" 2>/dev/null || echo 0)
+        if [[ "$mtime" -lt "$CLOCK_SANE_EPOCH" ]]; then
+            ((++kept_broken_clock))
+            continue
+        fi
         local size
         size=$(stat -c%s "$file" 2>/dev/null || echo 0)
         safe_delete "$file" "recording"
         ((++count))
         freed_bytes=$((freed_bytes + size))
     done < <(find "$RECORDING_DIR" -type f \( -name "*.wav" -o -name "*.mp3" -o -name "*.flac" -o -name "*.opus" -o -name "*.ogg" \) -mtime "+${RECORDING_RETENTION_DAYS}" -print0 2>/dev/null)
+
+    if [[ $kept_broken_clock -gt 0 ]]; then
+        log_warn "Kept $kept_broken_clock recording(s) with pre-${CLOCK_SANE_EPOCH} mtimes (written before NTP sync; real age unknown)"
+    fi
 
     # Remove empty SUBdirectories. `-mindepth 1` is essential: without it, once
     # retention removes the last recordings, find would delete "$RECORDING_DIR"
