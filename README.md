@@ -474,6 +474,14 @@ sudo ./lyrebird-diagnostics.sh full
 sudo ./lyrebird-stream-manager.sh install  # Creates cron job
 ```
 
+The cron monitor performs a **deep** health check: besides verifying each
+stream's supervisor process exists, it asks the MediaMTX API whether the
+stream is actually publishing audio. A stream that stays silent-side-up for
+three consecutive checks (a hung FFmpeg, a stuck retry loop) is automatically
+restarted, within a per-hour budget that prevents restart storms. No
+configuration is needed — it is on by default and does nothing when the API
+is briefly unreachable, so it never adds churn.
+
 ---
 
 ## Configuration Guide
@@ -588,6 +596,15 @@ MAX_CONSECUTIVE_FAILURES=5
 INITIAL_RESTART_DELAY=10
 MAX_RESTART_DELAY=300
 
+# Health monitoring (cron monitor)
+DEEP_HEALTH_CHECK_ENABLED=true   # Also verify each stream is actually
+                                 # publishing via the MediaMTX API, not just
+                                 # that its supervisor process exists
+DEEP_HEALTH_MAX_STRIKES=3        # Consecutive "not publishing" checks before
+                                 # a stuck stream is restarted
+CRON_RESTART_MAX_PER_HOUR=6      # Per-stream restart budget under cron
+                                 # (prevents restart storms)
+
 # Audio defaults (when not in config file)
 DEFAULT_SAMPLE_RATE=48000
 DEFAULT_CHANNELS=2
@@ -628,6 +645,14 @@ FFMPEG_LOG_DIR=/mnt/storage/logs ./lyrebird-stream-manager.sh start
 # Increase startup delay for slow USB devices
 STREAM_STARTUP_DELAY=20 ./lyrebird-stream-manager.sh start
 ```
+
+**Typo-safe:** every numeric setting above is validated when the scripts
+start. A value that isn't a plain number (e.g. `MAX_RESTART_DELAY=5min` or
+`CRON_RESTART_MAX_PER_HOUR=unlimited`) is ignored and the built-in default is
+used instead — a mistyped setting can never stop monitoring or streaming. The
+same applies to the device config file: if it is ever corrupted (power loss
+mid-write, SD-card wear), streams still start with safe defaults rather than
+failing to come up.
 
 ### Multiplex Streaming
 
@@ -1446,13 +1471,13 @@ This modular design prevents duplicate business logic and ensures maintainabilit
 |--------|---------|---------|
 | lyrebird-orchestrator.sh | 2.1.2 | Unified management interface |
 | lyrebird-updater.sh | 1.5.1 | Version management with rollback |
-| lyrebird-stream-manager.sh | 1.4.3 | Stream lifecycle management |
+| lyrebird-stream-manager.sh | 1.5.0 | Stream lifecycle management |
 | usb-audio-mapper.sh | 1.2.1 | USB device persistence via udev |
 | lyrebird-mic-check.sh | 1.0.0 | Hardware capability detection |
 | lyrebird-diagnostics.sh | 1.0.2 | System diagnostics |
 | install_mediamtx.sh | 2.0.1 | MediaMTX installation/upgrade |
-| lyrebird-metrics.sh | 1.0.0 | Prometheus metrics export |
-| lyrebird-storage.sh | 1.0.0 | Storage management & cleanup |
+| lyrebird-metrics.sh | 1.2.0 | Prometheus metrics export |
+| lyrebird-storage.sh | 1.1.0 | Storage management & cleanup |
 | lyrebird-alerts.sh | 1.0.0 | Webhook alerting system |
 
 ### Configuration Files
@@ -2028,10 +2053,15 @@ LOG_DIR="/var/log/lyrebird"
 **Features:**
 - Configurable retention policies
 - Automatic cleanup of old recordings and logs
-- Disk usage monitoring with thresholds
+- Disk usage monitoring with thresholds — including **inode** exhaustion,
+  which many small recording files can hit long before disk space runs out
 - Emergency cleanup mode for critical situations
 - Integration with alerting system
 - Dry-run mode for testing
+- **Broken-clock protection**: a Pi without a battery-backed clock boots
+  thinking it is 1970 until it gets network time. Recordings captured in that
+  window are never deleted as "too old" once the clock corrects itself, and
+  age-based cleanup waits until the clock is sane
 
 **Automated Cleanup via Cron:**
 ```bash
