@@ -206,6 +206,18 @@ get_disk_usage() {
     printf '%s' "$out"
 }
 
+# Get inode usage percentage for a path (POSIX `df -Pi`). A recorder writing
+# many small files can exhaust INODES long before blocks: writes then fail
+# with ENOSPC while block-based monitoring still reports the disk "OK", so no
+# cleanup ever runs -- silent recording failure. Emits an empty string when
+# inode accounting is unavailable (e.g. btrfs reports "-"); callers treat that
+# as unknown, never as pressure.
+get_inode_usage() {
+    local path="${1:-/}" out=""
+    out=$(df -Pi "$path" 2>/dev/null | awk 'NR==2 {print $5}' | tr -cd '0-9') || out=""
+    printf '%s' "$out"
+}
+
 # Get free space in MB for a path (POSIX `df -Pk` → 1024-byte blocks).
 # Emits an empty string if df can't be parsed (caller treats as "unknown").
 get_free_space_mb() {
@@ -557,17 +569,26 @@ cmd_monitor() {
         return 0
     fi
 
-    log_debug "Disk usage: ${usage}%, free: ${free_mb}MB"
+    # Inode pressure counts as disk pressure: many small recordings exhaust
+    # inodes long before blocks, and every write then fails ENOSPC while the
+    # block percentage still looks healthy. Unknown ("-", unsupported fs) is
+    # treated as no pressure, never as an emergency.
+    local iusage
+    iusage=$(get_inode_usage "/")
+    [[ "$iusage" =~ ^[0-9]+$ ]] || iusage=0
 
-    if [[ $usage -ge $DISK_EMERGENCY_PERCENT ]] || [[ $free_mb -lt $MIN_FREE_SPACE_MB ]]; then
-        log_error "EMERGENCY: Disk ${usage}% full, ${free_mb}MB free"
+    log_debug "Disk usage: ${usage}%, inodes: ${iusage}%, free: ${free_mb}MB"
+
+    if [[ $usage -ge $DISK_EMERGENCY_PERCENT ]] || [[ $iusage -ge $DISK_EMERGENCY_PERCENT ]] \
+        || [[ $free_mb -lt $MIN_FREE_SPACE_MB ]]; then
+        log_error "EMERGENCY: Disk ${usage}% full, inodes ${iusage}% used, ${free_mb}MB free"
         emergency_cleanup
         cmd_cleanup
-    elif [[ $usage -ge $DISK_CRITICAL_PERCENT ]]; then
-        log_warn "CRITICAL: Disk ${usage}% full"
+    elif [[ $usage -ge $DISK_CRITICAL_PERCENT ]] || [[ $iusage -ge $DISK_CRITICAL_PERCENT ]]; then
+        log_warn "CRITICAL: Disk ${usage}% full, inodes ${iusage}% used"
         cmd_cleanup
-    elif [[ $usage -ge $DISK_WARNING_PERCENT ]]; then
-        log_warn "WARNING: Disk ${usage}% full"
+    elif [[ $usage -ge $DISK_WARNING_PERCENT ]] || [[ $iusage -ge $DISK_WARNING_PERCENT ]]; then
+        log_warn "WARNING: Disk ${usage}% full, inodes ${iusage}% used"
         cleanup_temp
         truncate_large_logs
     else
