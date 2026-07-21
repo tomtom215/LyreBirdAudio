@@ -265,30 +265,71 @@ readonly MAX_STREAM_NAME_LENGTH=48
 readonly MIN_STREAM_NAME_LENGTH=1
 readonly RESERVED_STREAM_NAMES="control|stats|api|metrics|health"
 
+# Coerce an env override to a non-negative base-10 integer, falling back to
+# the default when the value is not all digits. A non-numeric value (e.g.
+# CRON_RESTART_MAX_PER_HOUR=unlimited) otherwise reaches arithmetic evaluation
+# later and ABORTS the whole run under set -e -- silently killing every cron
+# monitor pass. Base-10 also stops 08/09 being misread as invalid octal.
+_uint_or() {
+    local value="${1:-}" default="$2"
+    if [[ "$value" =~ ^[0-9]+$ ]]; then
+        printf '%s' "$((10#$value))"
+    else
+        printf '%s' "$default"
+    fi
+}
+
+# Same, for integers that may carry a leading minus sign (dB thresholds).
+_int_or() {
+    local value="${1:-}" default="$2"
+    if [[ "$value" =~ ^-?[0-9]+$ ]]; then
+        printf '%s' "$value"
+    else
+        printf '%s' "$default"
+    fi
+}
+
 # Timing settings
-readonly STREAM_STARTUP_DELAY="${STREAM_STARTUP_DELAY:-10}"
-readonly STREAM_VALIDATION_ATTEMPTS="${STREAM_VALIDATION_ATTEMPTS:-3}"
-readonly STREAM_VALIDATION_DELAY="${STREAM_VALIDATION_DELAY:-5}"
-readonly USB_STABILIZATION_DELAY="${USB_STABILIZATION_DELAY:-5}"
-readonly RESTART_STABILIZATION_DELAY="${RESTART_STABILIZATION_DELAY:-15}"
+STREAM_STARTUP_DELAY=$(_uint_or "${STREAM_STARTUP_DELAY:-}" 10)
+readonly STREAM_STARTUP_DELAY
+STREAM_VALIDATION_ATTEMPTS=$(_uint_or "${STREAM_VALIDATION_ATTEMPTS:-}" 3)
+readonly STREAM_VALIDATION_ATTEMPTS
+STREAM_VALIDATION_DELAY=$(_uint_or "${STREAM_VALIDATION_DELAY:-}" 5)
+readonly STREAM_VALIDATION_DELAY
+USB_STABILIZATION_DELAY=$(_uint_or "${USB_STABILIZATION_DELAY:-}" 5)
+readonly USB_STABILIZATION_DELAY
+RESTART_STABILIZATION_DELAY=$(_uint_or "${RESTART_STABILIZATION_DELAY:-}" 15)
+readonly RESTART_STABILIZATION_DELAY
 
 # Resource monitoring thresholds
-readonly MAX_FD_WARNING="${MAX_FD_WARNING:-500}"
-readonly MAX_FD_CRITICAL="${MAX_FD_CRITICAL:-1000}"
-readonly MAX_CPU_WARNING="${MAX_CPU_WARNING:-20}"
-readonly MAX_CPU_CRITICAL="${MAX_CPU_CRITICAL:-40}"
-readonly MAX_WRAPPER_RESTARTS="${MAX_WRAPPER_RESTARTS:-50}"
-readonly WRAPPER_SUCCESS_DURATION="${WRAPPER_SUCCESS_DURATION:-300}"
+MAX_FD_WARNING=$(_uint_or "${MAX_FD_WARNING:-}" 500)
+readonly MAX_FD_WARNING
+MAX_FD_CRITICAL=$(_uint_or "${MAX_FD_CRITICAL:-}" 1000)
+readonly MAX_FD_CRITICAL
+MAX_CPU_WARNING=$(_uint_or "${MAX_CPU_WARNING:-}" 20)
+readonly MAX_CPU_WARNING
+MAX_CPU_CRITICAL=$(_uint_or "${MAX_CPU_CRITICAL:-}" 40)
+readonly MAX_CPU_CRITICAL
+MAX_WRAPPER_RESTARTS=$(_uint_or "${MAX_WRAPPER_RESTARTS:-}" 50)
+readonly MAX_WRAPPER_RESTARTS
+WRAPPER_SUCCESS_DURATION=$(_uint_or "${WRAPPER_SUCCESS_DURATION:-}" 300)
+readonly WRAPPER_SUCCESS_DURATION
 
 # Wrapper restart behavior (extracted from hardcoded values)
-readonly MAX_CONSECUTIVE_FAILURES="${MAX_CONSECUTIVE_FAILURES:-5}"
-readonly INITIAL_RESTART_DELAY="${INITIAL_RESTART_DELAY:-10}"
-readonly MAX_RESTART_DELAY="${MAX_RESTART_DELAY:-300}"
+MAX_CONSECUTIVE_FAILURES=$(_uint_or "${MAX_CONSECUTIVE_FAILURES:-}" 5)
+readonly MAX_CONSECUTIVE_FAILURES
+INITIAL_RESTART_DELAY=$(_uint_or "${INITIAL_RESTART_DELAY:-}" 10)
+readonly INITIAL_RESTART_DELAY
+MAX_RESTART_DELAY=$(_uint_or "${MAX_RESTART_DELAY:-}" 300)
+readonly MAX_RESTART_DELAY
 
 # Log rotation settings
-readonly MAIN_LOG_MAX_SIZE="${MAIN_LOG_MAX_SIZE:-104857600}"        # 100MB
-readonly FFMPEG_LOG_MAX_SIZE="${FFMPEG_LOG_MAX_SIZE:-10485760}"     # 10MB
-readonly MEDIAMTX_LOG_MAX_SIZE="${MEDIAMTX_LOG_MAX_SIZE:-52428800}" # 50MB
+MAIN_LOG_MAX_SIZE=$(_uint_or "${MAIN_LOG_MAX_SIZE:-}" 104857600)        # 100MB
+readonly MAIN_LOG_MAX_SIZE
+FFMPEG_LOG_MAX_SIZE=$(_uint_or "${FFMPEG_LOG_MAX_SIZE:-}" 10485760)     # 10MB
+readonly FFMPEG_LOG_MAX_SIZE
+MEDIAMTX_LOG_MAX_SIZE=$(_uint_or "${MEDIAMTX_LOG_MAX_SIZE:-}" 52428800) # 50MB
+readonly MEDIAMTX_LOG_MAX_SIZE
 
 # ============================================================================
 # Production Reliability Settings (v1.4.2 additions)
@@ -299,7 +340,8 @@ readonly MEDIAMTX_LOG_MAX_SIZE="${MEDIAMTX_LOG_MAX_SIZE:-52428800}" # 50MB
 # repeated failures) MUST be brought back under cron, or it stays down forever on
 # an unattended box (H8). The cap prevents a persistently-failing stream from
 # being restarted every 5 minutes indefinitely (a restart storm).
-readonly CRON_RESTART_MAX_PER_HOUR="${CRON_RESTART_MAX_PER_HOUR:-6}"
+CRON_RESTART_MAX_PER_HOUR=$(_uint_or "${CRON_RESTART_MAX_PER_HOUR:-}" 6)
+readonly CRON_RESTART_MAX_PER_HOUR
 readonly CRON_RESTART_STATE_DIR="${CRON_RESTART_STATE_DIR:-/run/lyrebird/cron-restarts}"
 
 # Deep health probe (H9): a live wrapper PID does not prove audio is flowing --
@@ -309,52 +351,70 @@ readonly CRON_RESTART_STATE_DIR="${CRON_RESTART_STATE_DIR:-/run/lyrebird/cron-re
 # for DEEP_HEALTH_MAX_STRIKES consecutive monitor runs is restarted. Strikes
 # live in /run (reset at boot). API-unreachable never strikes a stream.
 readonly DEEP_HEALTH_CHECK_ENABLED="${DEEP_HEALTH_CHECK_ENABLED:-true}"
-readonly DEEP_HEALTH_MAX_STRIKES="${DEEP_HEALTH_MAX_STRIKES:-3}"
+DEEP_HEALTH_MAX_STRIKES=$(_uint_or "${DEEP_HEALTH_MAX_STRIKES:-}" 3)
+readonly DEEP_HEALTH_MAX_STRIKES
 readonly DEEP_HEALTH_STATE_DIR="${DEEP_HEALTH_STATE_DIR:-/run/lyrebird/deep-health}"
 
 # Watchdog/Heartbeat settings
 # Heartbeat runs more frequently than cron for faster failure detection
-readonly HEARTBEAT_INTERVAL="${HEARTBEAT_INTERVAL:-30}"             # Seconds between heartbeats
+HEARTBEAT_INTERVAL=$(_uint_or "${HEARTBEAT_INTERVAL:-}" 30)             # Seconds between heartbeats
+readonly HEARTBEAT_INTERVAL
 readonly HEARTBEAT_FILE="${HEARTBEAT_FILE:-/run/mediamtx-audio.heartbeat}"
 readonly ENABLE_HARDWARE_WATCHDOG="${ENABLE_HARDWARE_WATCHDOG:-auto}" # auto, yes, no
 readonly HARDWARE_WATCHDOG_DEVICE="${HARDWARE_WATCHDOG_DEVICE:-/dev/watchdog}"
-readonly HARDWARE_WATCHDOG_TIMEOUT="${HARDWARE_WATCHDOG_TIMEOUT:-60}" # Seconds
+HARDWARE_WATCHDOG_TIMEOUT=$(_uint_or "${HARDWARE_WATCHDOG_TIMEOUT:-}" 60) # Seconds
+readonly HARDWARE_WATCHDOG_TIMEOUT
 
 # Disk space monitoring thresholds
-readonly DISK_SPACE_WARNING_PERCENT="${DISK_SPACE_WARNING_PERCENT:-80}"
-readonly DISK_SPACE_CRITICAL_PERCENT="${DISK_SPACE_CRITICAL_PERCENT:-95}"
-readonly DISK_SPACE_MIN_FREE_MB="${DISK_SPACE_MIN_FREE_MB:-100}"    # Minimum free MB
+DISK_SPACE_WARNING_PERCENT=$(_uint_or "${DISK_SPACE_WARNING_PERCENT:-}" 80)
+readonly DISK_SPACE_WARNING_PERCENT
+DISK_SPACE_CRITICAL_PERCENT=$(_uint_or "${DISK_SPACE_CRITICAL_PERCENT:-}" 95)
+readonly DISK_SPACE_CRITICAL_PERCENT
+DISK_SPACE_MIN_FREE_MB=$(_uint_or "${DISK_SPACE_MIN_FREE_MB:-}" 100)    # Minimum free MB
+readonly DISK_SPACE_MIN_FREE_MB
 
 # Memory monitoring and leak detection
-readonly MEM_WARNING_PERCENT="${MEM_WARNING_PERCENT:-80}"
-readonly MEM_CRITICAL_PERCENT="${MEM_CRITICAL_PERCENT:-95}"
-readonly MEM_GROWTH_THRESHOLD_MB="${MEM_GROWTH_THRESHOLD_MB:-100}"  # MB growth triggers restart
+MEM_WARNING_PERCENT=$(_uint_or "${MEM_WARNING_PERCENT:-}" 80)
+readonly MEM_WARNING_PERCENT
+MEM_CRITICAL_PERCENT=$(_uint_or "${MEM_CRITICAL_PERCENT:-}" 95)
+readonly MEM_CRITICAL_PERCENT
+MEM_GROWTH_THRESHOLD_MB=$(_uint_or "${MEM_GROWTH_THRESHOLD_MB:-}" 100)  # MB growth triggers restart
+readonly MEM_GROWTH_THRESHOLD_MB
 readonly MEM_SAMPLE_FILE="${MEM_SAMPLE_FILE:-/var/lib/mediamtx-ffmpeg/.mem_samples}"
 
 # Network connectivity monitoring
 readonly NETWORK_CHECK_ENABLED="${NETWORK_CHECK_ENABLED:-true}"
 readonly NETWORK_CHECK_TARGET="${NETWORK_CHECK_TARGET:-gateway}"    # gateway, specific IP, or hostname
-readonly NETWORK_CHECK_TIMEOUT="${NETWORK_CHECK_TIMEOUT:-5}"        # Seconds
-readonly NETWORK_FAIL_THRESHOLD="${NETWORK_FAIL_THRESHOLD:-3}"      # Consecutive failures before alert
+NETWORK_CHECK_TIMEOUT=$(_uint_or "${NETWORK_CHECK_TIMEOUT:-}" 5)        # Seconds
+readonly NETWORK_CHECK_TIMEOUT
+NETWORK_FAIL_THRESHOLD=$(_uint_or "${NETWORK_FAIL_THRESHOLD:-}" 3)      # Consecutive failures before alert
+readonly NETWORK_FAIL_THRESHOLD
 
 # Audio buffering (memory-based with optional disk persistence)
 # Memory buffering is done via FFmpeg's rtbufsize option (no SD card wear)
 readonly AUDIO_BUFFER_ENABLED="${AUDIO_BUFFER_ENABLED:-true}"       # Enable enhanced memory buffering
-readonly AUDIO_BUFFER_SIZE_MB="${AUDIO_BUFFER_SIZE_MB:-64}"         # Memory buffer size per stream (MB)
-readonly AUDIO_RTBUFSIZE="${AUDIO_RTBUFSIZE:-33554432}"             # Real-time buffer size in bytes (32MB default)
+AUDIO_BUFFER_SIZE_MB=$(_uint_or "${AUDIO_BUFFER_SIZE_MB:-}" 64)         # Memory buffer size per stream (MB)
+readonly AUDIO_BUFFER_SIZE_MB
+AUDIO_RTBUFSIZE=$(_uint_or "${AUDIO_RTBUFSIZE:-}" 33554432)             # Real-time buffer size in bytes (32MB default)
+readonly AUDIO_RTBUFSIZE
 # Local recording (ring buffer) - writes audio to tmpfs or disk alongside streaming
 readonly AUDIO_LOCAL_RECORDING="${AUDIO_LOCAL_RECORDING:-false}"    # Enable local recording backup
 readonly AUDIO_RECORDING_PATH="${AUDIO_RECORDING_PATH:-/dev/shm/lyrebird-buffer}" # Default to tmpfs (RAM)
-readonly AUDIO_RECORDING_SEGMENT_TIME="${AUDIO_RECORDING_SEGMENT_TIME:-300}" # 5 min segments
-readonly AUDIO_RECORDING_SEGMENTS="${AUDIO_RECORDING_SEGMENTS:-12}" # Keep last 12 segments (1 hour)
+AUDIO_RECORDING_SEGMENT_TIME=$(_uint_or "${AUDIO_RECORDING_SEGMENT_TIME:-}" 300) # 5 min segments
+readonly AUDIO_RECORDING_SEGMENT_TIME
+AUDIO_RECORDING_SEGMENTS=$(_uint_or "${AUDIO_RECORDING_SEGMENTS:-}" 12) # Keep last 12 segments (1 hour)
+readonly AUDIO_RECORDING_SEGMENTS
 readonly AUDIO_DISK_PERSIST="${AUDIO_DISK_PERSIST:-false}"          # Move segments to disk (SD card wear!)
 readonly AUDIO_DISK_PATH="${AUDIO_DISK_PATH:-/var/lib/mediamtx-ffmpeg/recordings}"
 
 # Audio level monitoring (detect dead/silent microphones)
 readonly AUDIO_LEVEL_CHECK_ENABLED="${AUDIO_LEVEL_CHECK_ENABLED:-true}"  # Enable silence detection
-readonly AUDIO_LEVEL_SAMPLE_DURATION="${AUDIO_LEVEL_SAMPLE_DURATION:-3}" # Seconds to sample for level check
-readonly AUDIO_SILENCE_THRESHOLD_DB="${AUDIO_SILENCE_THRESHOLD_DB:--60}" # dB below which is "silence"
-readonly AUDIO_SILENCE_WARN_DURATION="${AUDIO_SILENCE_WARN_DURATION:-60}" # Seconds of silence before warning
+AUDIO_LEVEL_SAMPLE_DURATION=$(_uint_or "${AUDIO_LEVEL_SAMPLE_DURATION:-}" 3) # Seconds to sample for level check
+readonly AUDIO_LEVEL_SAMPLE_DURATION
+AUDIO_SILENCE_THRESHOLD_DB=$(_int_or "${AUDIO_SILENCE_THRESHOLD_DB:-}" -60) # dB below which is "silence"
+readonly AUDIO_SILENCE_THRESHOLD_DB
+AUDIO_SILENCE_WARN_DURATION=$(_uint_or "${AUDIO_SILENCE_WARN_DURATION:-}" 60) # Seconds of silence before warning
+readonly AUDIO_SILENCE_WARN_DURATION
 
 # MediaMTX API version compatibility
 readonly MEDIAMTX_API_VERSION="${MEDIAMTX_API_VERSION:-auto}"       # auto, v3, v2, v1
@@ -362,7 +422,8 @@ readonly MEDIAMTX_API_FALLBACK="${MEDIAMTX_API_FALLBACK:-true}"     # Try older 
 
 # USB device health checks
 readonly USB_ALSA_CHECK_ENABLED="${USB_ALSA_CHECK_ENABLED:-true}"   # Check ALSA availability before restart
-readonly USB_DISCONNECT_GRACE_PERIOD="${USB_DISCONNECT_GRACE_PERIOD:-10}" # Seconds to wait after disconnect
+USB_DISCONNECT_GRACE_PERIOD=$(_uint_or "${USB_DISCONNECT_GRACE_PERIOD:-}" 10) # Seconds to wait after disconnect
+readonly USB_DISCONNECT_GRACE_PERIOD
 
 # Version compatibility
 readonly MIN_COMPATIBLE_COMMON_VERSION="1.0.0"
