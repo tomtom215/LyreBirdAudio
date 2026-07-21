@@ -557,6 +557,13 @@ generate_all_metrics() {
     echo ""
 
     collect_stream_metrics || true
+    echo ""
+
+    # In-band staleness marker. A textfile .prom left behind by a dead exporter
+    # is otherwise indistinguishable from a live one -- the node "looks alive"
+    # while recording nothing. Alert on:
+    #   time() - lyrebird_scrape_timestamp_seconds > <2x scrape interval>
+    emit_metric "scrape_timestamp_seconds" "$(date +%s)" "Unix time this scrape was generated (alert when stale)"
 }
 
 # Simple HTTP server using netcat (for basic metrics serving)
