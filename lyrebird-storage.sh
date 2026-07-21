@@ -22,11 +22,11 @@
 #   # Hourly monitoring
 #   0 * * * * /usr/local/bin/lyrebird-storage.sh monitor
 #
-# Version: 1.0.0
+# Version: 1.1.0 - Broken-clock retention guard + inode-exhaustion detection
 
 set -euo pipefail
 
-readonly VERSION="1.0.0"
+readonly VERSION="1.1.0"
 SCRIPT_NAME="$(basename "${BASH_SOURCE[0]}")"
 readonly SCRIPT_NAME
 

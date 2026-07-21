@@ -20,11 +20,11 @@
 # Integration with node_exporter:
 #   ./lyrebird-metrics.sh --file /var/lib/node_exporter/textfile_collector/lyrebird.prom
 #
-# Version: 1.1.0 - Enhanced MediaMTX API metrics coverage
+# Version: 1.2.0 - Tolerant readiness parsing, in-band staleness timestamp
 
 set -euo pipefail
 
-readonly VERSION="1.1.0"
+readonly VERSION="1.2.0"
 SCRIPT_NAME="$(basename "${BASH_SOURCE[0]}")"
 readonly SCRIPT_NAME
 

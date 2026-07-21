@@ -197,7 +197,7 @@ unset _LYREBIRD_COMMON _LYREBIRD_COMMON_EXPECTED_HASH
 unset -f _verify_common_library
 
 # Constants
-readonly VERSION="1.4.3"
+readonly VERSION="1.5.0"
 
 # Script identification
 SCRIPT_NAME="$(basename "${BASH_SOURCE[0]}")"
@@ -428,7 +428,7 @@ readonly USB_DISCONNECT_GRACE_PERIOD
 # Version compatibility
 readonly MIN_COMPATIBLE_COMMON_VERSION="1.0.0"
 # shellcheck disable=SC2034 # SCRIPT_COMPAT_VERSION exported for external version checking tools
-readonly SCRIPT_COMPAT_VERSION="1.4.3"
+readonly SCRIPT_COMPAT_VERSION="1.5.0"
 
 # Standard timing constants
 readonly QUICK_SLEEP=0.1
