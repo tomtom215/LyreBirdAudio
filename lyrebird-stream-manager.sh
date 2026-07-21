@@ -302,6 +302,16 @@ readonly MEDIAMTX_LOG_MAX_SIZE="${MEDIAMTX_LOG_MAX_SIZE:-52428800}" # 50MB
 readonly CRON_RESTART_MAX_PER_HOUR="${CRON_RESTART_MAX_PER_HOUR:-6}"
 readonly CRON_RESTART_STATE_DIR="${CRON_RESTART_STATE_DIR:-/run/lyrebird/cron-restarts}"
 
+# Deep health probe (H9): a live wrapper PID does not prove audio is flowing --
+# the wrapper may sit in endless backoff, or FFmpeg may hang with the path
+# never publishing. When the MediaMTX control API is reachable, monitor also
+# asks it whether each path is actually ready; a stream that stays not-ready
+# for DEEP_HEALTH_MAX_STRIKES consecutive monitor runs is restarted. Strikes
+# live in /run (reset at boot). API-unreachable never strikes a stream.
+readonly DEEP_HEALTH_CHECK_ENABLED="${DEEP_HEALTH_CHECK_ENABLED:-true}"
+readonly DEEP_HEALTH_MAX_STRIKES="${DEEP_HEALTH_MAX_STRIKES:-3}"
+readonly DEEP_HEALTH_STATE_DIR="${DEEP_HEALTH_STATE_DIR:-/run/lyrebird/deep-health}"
+
 # Watchdog/Heartbeat settings
 # Heartbeat runs more frequently than cron for faster failure detection
 readonly HEARTBEAT_INTERVAL="${HEARTBEAT_INTERVAL:-30}"             # Seconds between heartbeats
@@ -2556,6 +2566,73 @@ should_restart_stream() {
     return 1
 }
 
+# --- Deep health probe (H9) --------------------------------------------------
+# Ask the MediaMTX control API whether a path is actually publishing.
+# Returns: 0 = ready, 1 = not ready, 2 = unknown (curl absent/API unreachable).
+probe_stream_ready() {
+    local stream_path="$1"
+    command_exists curl || return 2
+    local api_base response
+    api_base=$(detect_mediamtx_api_version)
+    if ! response=$(curl -s --max-time 3 "${api_base}/paths/get/${stream_path}" 2>/dev/null) \
+        || [[ -z "$response" ]]; then
+        return 2
+    fi
+    if mediamtx_json_path_ready "$response"; then
+        return 0
+    fi
+    return 1
+}
+
+# Record a probe verdict for a stream. Not-ready increments a strike counter;
+# ready clears it; unknown leaves it untouched (an API blip must neither strike
+# a healthy stream nor forgive a stuck one). Returns 0 when the stream has been
+# not-ready for DEEP_HEALTH_MAX_STRIKES consecutive checks (caller restarts it,
+# counter resets so the next escalation needs a fresh streak).
+deep_health_note() {
+    local stream_path="$1" verdict="$2"
+    local strike_file="${DEEP_HEALTH_STATE_DIR}/${stream_path}.strikes"
+    case "$verdict" in
+        ready)
+            rm -f "$strike_file" 2>/dev/null || true
+            return 1
+            ;;
+        unknown)
+            return 1
+            ;;
+    esac
+    mkdir -p "${DEEP_HEALTH_STATE_DIR}" 2>/dev/null || true
+    local strikes=0
+    if [[ -f "$strike_file" ]]; then
+        strikes=$(cat "$strike_file" 2>/dev/null) || strikes=0
+    fi
+    [[ "$strikes" =~ ^[0-9]+$ ]] || strikes=0
+    strikes=$((strikes + 1))
+    printf '%s\n' "$strikes" >"$strike_file" 2>/dev/null || true
+    if ((strikes >= DEEP_HEALTH_MAX_STRIKES)); then
+        rm -f "$strike_file" 2>/dev/null || true
+        return 0
+    fi
+    log INFO "Stream $stream_path: wrapper alive but path not ready (strike ${strikes}/${DEEP_HEALTH_MAX_STRIKES})"
+    return 1
+}
+
+# Combined probe: 0 => the stream is confirmed stuck (alive wrapper, path
+# continuously not-ready) and should be restarted; 1 => leave it alone.
+deep_stream_unhealthy() {
+    local stream_path="$1"
+    [[ "${DEEP_HEALTH_CHECK_ENABLED}" == "true" ]] || return 1
+    local rc=0
+    probe_stream_ready "$stream_path" || rc=$?
+    local verdict
+    case "$rc" in
+        0) verdict="ready" ;;
+        1) verdict="notready" ;;
+        *) verdict="unknown" ;;
+    esac
+    deep_health_note "$stream_path" "$verdict"
+}
+
 # Stream health monitoring with automatic restart
 monitor_streams() {
     log INFO "Checking stream health..."
@@ -2655,6 +2732,24 @@ monitor_streams() {
                     ((streams_failed++)) || true
                     log WARN "Multiplex stream $stream_path PID $pid is stale (cron mode: not restarting)"
                 fi
+            elif deep_stream_unhealthy "$stream_path"; then
+                # Wrapper alive but the path has been continuously not-ready:
+                # a hung FFmpeg or endless backoff. Restart within the budget.
+                if should_restart_stream "$stream_path"; then
+                    log WARN "Multiplex stream $stream_path wrapper is alive but path is not ready - restarting"
+                    terminate_process_group "$pid" 5 || true
+                    rm -f "$pid_file"
+                    if start_ffmpeg_multiplex_stream "${devices[@]}"; then
+                        ((streams_restarted++)) || true
+                        log INFO "Successfully restarted multiplex stream $stream_path"
+                    else
+                        ((streams_failed++)) || true
+                        log ERROR "Failed to restart multiplex stream $stream_path"
+                    fi
+                else
+                    ((streams_failed++)) || true
+                    log WARN "Multiplex stream $stream_path is not ready (restart budget exhausted)"
+                fi
             else
                 ((streams_healthy++)) || true
                 log DEBUG "Multiplex stream $stream_path is healthy (PID: $pid)"
@@ -2747,6 +2842,33 @@ monitor_streams() {
                 else
                     ((streams_failed++)) || true
                     log WARN "Stream $stream_path PID $pid is stale (cron mode: not restarting)"
+                fi
+                continue
+            fi
+
+            # Wrapper PID alive: shallow-healthy. Deep probe (H9): a path that
+            # stays not-ready across consecutive checks while its wrapper is
+            # alive is a hung FFmpeg or endless backoff -- restart it.
+            if deep_stream_unhealthy "$stream_path"; then
+                if should_restart_stream "$stream_path"; then
+                    if ! check_alsa_device_available "$card_num"; then
+                        log WARN "Stream $stream_path: ALSA device not available (card $card_num), skipping restart"
+                        ((streams_failed++)) || true
+                        continue
+                    fi
+                    log WARN "Stream $stream_path wrapper (PID $pid) is alive but path is not ready - restarting"
+                    terminate_process_group "$pid" 5 || true
+                    rm -f "$pid_file"
+                    if start_ffmpeg_stream "$device_name" "$card_num" "$stream_path"; then
+                        ((streams_restarted++)) || true
+                        log INFO "Successfully restarted stream $stream_path"
+                    else
+                        ((streams_failed++)) || true
+                        log ERROR "Failed to restart stream $stream_path"
+                    fi
+                else
+                    ((streams_failed++)) || true
+                    log WARN "Stream $stream_path is not ready (restart budget exhausted)"
                 fi
                 continue
             fi
