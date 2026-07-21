@@ -2244,12 +2244,19 @@ check_audio_level() {
         if [[ -f "$silence_file" ]]; then
             silence_start=$(cat "$silence_file" 2>/dev/null || echo "0")
         else
-            silence_start=$(date +%s)
+            silence_start=$(_now_monotonic)
             echo "$silence_start" > "$silence_file" 2>/dev/null || true
         fi
 
         local now
-        now=$(date +%s)
+        now=$(_now_monotonic)
+        # A start value in the future means a stale wall-clock timestamp from a
+        # pre-monotonic run (or clock scale mismatch): restart tracking from now
+        # rather than silently never reaching the DEAD MIC threshold again.
+        if [[ ! "$silence_start" =~ ^[0-9]+$ ]] || ((silence_start > now)); then
+            silence_start=$now
+            echo "$silence_start" > "$silence_file" 2>/dev/null || true
+        fi
         local silence_duration=$((now - silence_start))
 
         if [[ $silence_duration -ge ${AUDIO_SILENCE_WARN_DURATION} ]]; then
@@ -2515,6 +2522,22 @@ is_cron_context() {
     return 1
 }
 
+# Monotonic seconds since boot. Wall-clock deltas (date +%s) are corrupted by
+# NTP steps, DST-adjacent RTC fixes and the first network clock set on an
+# RTC-less Pi; /proc/uptime never jumps. All boot-scoped timing state (backoff
+# runtimes, cron restart budgets, silence tracking -- kept under /run, which is
+# cleared at boot) uses this. Falls back to wall clock only when /proc/uptime
+# is unavailable.
+_now_monotonic() {
+    local up
+    if [[ -r /proc/uptime ]]; then
+        read -r up _ </proc/uptime
+        printf '%s' "${up%%.*}"
+    else
+        date +%s
+    fi
+}
+
 # --- Bounded cron resurrection (H8) -----------------------------------------
 # Count this stream's cron restarts within the last hour (read-only).
 _cron_restart_count() {
@@ -2522,7 +2545,7 @@ _cron_restart_count() {
     local state_file="${CRON_RESTART_STATE_DIR}/${stream_path}.restarts"
     [[ -f "$state_file" ]] || { printf '0'; return 0; }
     local now cutoff count=0 ts
-    now="$(date +%s)"
+    now="$(_now_monotonic)"
     cutoff=$((now - 3600))
     while read -r ts; do
         [[ "$ts" =~ ^[0-9]+$ ]] || continue
@@ -2537,7 +2560,7 @@ _record_cron_restart() {
     local state_file="${CRON_RESTART_STATE_DIR}/${stream_path}.restarts"
     mkdir -p "${CRON_RESTART_STATE_DIR}" 2>/dev/null || true
     local now cutoff kept="" ts
-    now="$(date +%s)"
+    now="$(_now_monotonic)"
     cutoff=$((now - 3600))
     if [[ -f "$state_file" ]]; then
         while read -r ts; do
@@ -3600,6 +3623,20 @@ log_critical() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STREAM:${STREAM_PATH}] $1" >> "${LOG_FILE}" 2>/dev/null || true
 }
 
+# Monotonic seconds since boot for run-time/backoff math. Wall-clock deltas
+# break on NTP steps (an RTC-less Pi can jump years when it first gets
+# network): a healthy multi-hour run would measure negative and count as a
+# consecutive failure, eventually killing the wrapper on a healthy stream.
+now_s() {
+    local up
+    if [[ -r /proc/uptime ]]; then
+        read -r up _ < /proc/uptime
+        printf '%s' "${up%%.*}"
+    else
+        date +%s
+    fi
+}
+
 # Cleanup handler
 cleanup_wrapper() {
     local exit_code=$?
@@ -3812,7 +3849,7 @@ while true; do
     
     log_message "Starting FFmpeg (attempt #$((RESTART_COUNT + 1)))"
     
-    START_TIME=$(date +%s)
+    START_TIME=$(now_s)
     
     if ! run_ffmpeg; then
         log_message "Failed to start FFmpeg"
@@ -3840,7 +3877,7 @@ while true; do
     
     FFMPEG_PID=""
     
-    END_TIME=$(date +%s)
+    END_TIME=$(now_s)
     RUN_TIME=$((END_TIME - START_TIME))
     
     log_message "FFmpeg exited with code ${exit_code} after ${RUN_TIME} seconds"
@@ -4038,6 +4075,20 @@ log_critical() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STREAM:${STREAM_PATH}] $1" >> "${LOG_FILE}" 2>/dev/null || true
 }
 
+# Monotonic seconds since boot for run-time/backoff math. Wall-clock deltas
+# break on NTP steps (an RTC-less Pi can jump years when it first gets
+# network): a healthy multi-hour run would measure negative and count as a
+# consecutive failure, eventually killing the wrapper on a healthy stream.
+now_s() {
+    local up
+    if [[ -r /proc/uptime ]]; then
+        read -r up _ < /proc/uptime
+        printf '%s' "${up%%.*}"
+    else
+        date +%s
+    fi
+}
+
 # Cleanup handler
 cleanup_wrapper() {
     local exit_code=$?
@@ -4228,7 +4279,7 @@ while true; do
     
     log_message "Starting FFmpeg (attempt #$((RESTART_COUNT + 1)))"
     
-    START_TIME=$(date +%s)
+    START_TIME=$(now_s)
     
     if ! run_ffmpeg; then
         log_message "Failed to start FFmpeg"
@@ -4256,7 +4307,7 @@ while true; do
     
     FFMPEG_PID=""
     
-    END_TIME=$(date +%s)
+    END_TIME=$(now_s)
     RUN_TIME=$((END_TIME - START_TIME))
     
     log_message "FFmpeg exited with code ${exit_code} after ${RUN_TIME} seconds"
