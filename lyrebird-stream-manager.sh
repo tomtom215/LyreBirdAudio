@@ -3247,10 +3247,33 @@ wait_for_mediamtx_ready() {
 
 # Device configuration
 load_device_config() {
-    if [[ -f "${DEVICE_CONFIG_FILE}" ]]; then
-        # shellcheck source=/dev/null
-        source "${DEVICE_CONFIG_FILE}"
+    [[ -f "${DEVICE_CONFIG_FILE}" ]] || return 0
+
+    # A device config truncated by a power loss mid-write, corrupted by SD-card
+    # bit-rot, or fat-fingered by an operator would otherwise be `source`d
+    # directly: a syntax error then aborts the WHOLE run under errexit, so
+    # `start` fails and NO streams come up on the next unattended boot -- a
+    # total outage triggered by one bad line. Validate syntax first and, on
+    # failure, fall back to built-in defaults (degrade, don't die).
+    if ! bash -n "${DEVICE_CONFIG_FILE}" 2>/dev/null; then
+        log ERROR "Device config ${DEVICE_CONFIG_FILE} is corrupt (syntax error); ignoring it and using defaults"
+        return 0
     fi
+
+    # Even syntactically valid config is sourced defensively: a `set -e`/command
+    # inside it must not abort or hang the manager. Source in the current shell
+    # (values must persist) but neutralise errexit for the duration.
+    local _had_errexit=0
+    [[ $- == *e* ]] && _had_errexit=1
+    set +e
+    # shellcheck source=/dev/null
+    source "${DEVICE_CONFIG_FILE}"
+    local _src_rc=$?
+    [[ $_had_errexit -eq 1 ]] && set -e
+    if [[ $_src_rc -ne 0 ]]; then
+        log WARN "Device config ${DEVICE_CONFIG_FILE} raised errors while loading (rc=${_src_rc}); continuing with whatever loaded plus defaults"
+    fi
+    return 0
 }
 
 save_device_config() {
