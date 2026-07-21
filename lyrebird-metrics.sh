@@ -20,11 +20,11 @@
 # Integration with node_exporter:
 #   ./lyrebird-metrics.sh --file /var/lib/node_exporter/textfile_collector/lyrebird.prom
 #
-# Version: 1.1.0 - Enhanced MediaMTX API metrics coverage
+# Version: 1.2.0 - Tolerant readiness parsing, in-band staleness timestamp
 
 set -euo pipefail
 
-readonly VERSION="1.1.0"
+readonly VERSION="1.2.0"
 SCRIPT_NAME="$(basename "${BASH_SOURCE[0]}")"
 readonly SCRIPT_NAME
 
@@ -121,7 +121,7 @@ collect_mediamtx_metrics() {
     # Check if MediaMTX is running
     if pgrep -f "mediamtx" >/dev/null 2>&1; then
         mediamtx_running=1
-        mediamtx_pid=$(pgrep -f "mediamtx" | head -1)
+        mediamtx_pid=$(pgrep -f "mediamtx" | head -1) || true
     fi
 
     emit_metric "mediamtx_up" "$mediamtx_running" "MediaMTX server running (1=up, 0=down)"
@@ -365,9 +365,14 @@ collect_api_metrics() {
             path_count=$(echo "$paths_json" | grep -o '"name"' | wc -l || true)
             emit_metric "api_paths_total" "$path_count" "Total paths registered in MediaMTX"
 
-            # Count ready paths
+            # Count ready paths. MediaMTX deprecated "ready" in favour of
+            # "available"; accept both shapes, preferring the new field.
             local ready_count
-            ready_count=$(echo "$paths_json" | grep -o '"ready":true' | wc -l || true)
+            if [[ "$paths_json" == *'"available":'* ]]; then
+                ready_count=$(echo "$paths_json" | grep -o '"available":true' | wc -l || true)
+            else
+                ready_count=$(echo "$paths_json" | grep -o '"ready":true' | wc -l || true)
+            fi
             emit_metric "api_paths_ready" "$ready_count" "Paths with ready status"
         fi
 
@@ -552,6 +557,13 @@ generate_all_metrics() {
     echo ""
 
     collect_stream_metrics || true
+    echo ""
+
+    # In-band staleness marker. A textfile .prom left behind by a dead exporter
+    # is otherwise indistinguishable from a live one -- the node "looks alive"
+    # while recording nothing. Alert on:
+    #   time() - lyrebird_scrape_timestamp_seconds > <2x scrape interval>
+    emit_metric "scrape_timestamp_seconds" "$(date +%s)" "Unix time this scrape was generated (alert when stale)"
 }
 
 # Simple HTTP server using netcat (for basic metrics serving)

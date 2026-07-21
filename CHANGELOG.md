@@ -7,7 +7,64 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-_Nothing yet._
+### Reliability Audit (2026-07, third pass)
+
+A third adversarial, hardware-free reliability pass focused on the long-horizon
+and cold-start failure modes an unattended field node hits over weeks/months.
+Every fix ships with a regression test that fails before and passes after; the
+suite grew from 528 to 579 tests, all green, ShellCheck-clean. See
+`docs/ENGINEERING-REVIEW-2026-07.md` §8 for the reproduced findings.
+
+Component versions bumped: `lyrebird-stream-manager.sh` 1.4.3 → 1.5.0,
+`lyrebird-metrics.sh` 1.1.0 → 1.2.0, `lyrebird-storage.sh` 1.0.0 → 1.1.0.
+
+#### Deferred trio — closed with simulation proof
+- **Deep health check (H9)**: `monitor_streams` now probes the MediaMTX control
+  API for each path's readiness, not just the wrapper's bash PID. A stream whose
+  path stays not-ready for `DEEP_HEALTH_MAX_STRIKES` (default 3) consecutive
+  monitor runs — a hung FFmpeg or endless backoff — is restarted within the
+  existing cron budget. An unreachable API neither strikes nor forgives a
+  stream; a ready probe resets the streak; `DEEP_HEALTH_CHECK_ENABLED=false`
+  restores the old shallow behavior.
+- **Deprecated MediaMTX JSON fields**: readiness parsing now accepts both the
+  deprecated (`ready`) and current (`available`) path-status shapes, preferring
+  the new field, across all five grep sites (stream-manager ×4, metrics ×1). A
+  future MediaMTX that drops `ready` no longer makes every stream look dead.
+- **Non-monotonic timing**: wrapper run-time/backoff, the cron restart budget,
+  and silence tracking now read `/proc/uptime` (monotonic) instead of wall-clock
+  `date +%s`. An NTP step on an RTC-less Pi no longer counts a healthy multi-hour
+  run as a failure, evaporates the anti-storm budget, or fires a false DEAD MIC.
+
+#### Fixed
+- **errexit/pipefail silent aborts**: swept 15 more `var=$(… | grep …)` sites
+  across seven scripts where a zero-match grep aborted the whole run under
+  `set -euo pipefail` (NTP probe on an unsynced daemon, audio-level check with no
+  volumedetect output, metrics scrape when MediaMTX exits mid-scrape, checksum
+  verification, service-env merge, and more). Idle-server counting in the stream
+  manager (`0 ready paths`/`0 sessions`) was aborting too.
+- **Corrupt device config aborted `start`**: a config truncated by power loss,
+  SD-card bit-rot, or a bad operator edit hit a syntax error that aborted the
+  whole run under errexit — no streams came up on the next unattended boot. The
+  config is now syntax-checked before sourcing and ignored if corrupt; a valid
+  config is sourced with errexit neutralised and still fully honored.
+- **Non-numeric env knobs aborted the cron monitor**: 37 numeric knobs in the
+  stream manager (e.g. `CRON_RESTART_MAX_PER_HOUR=unlimited`) reached bash
+  arithmetic and killed every cron pass with an "unbound variable" error. All
+  are now coerced to sane defaults at load; valid overrides are preserved.
+- **Broken-clock mass deletion**: age-based recording retention is skipped while
+  the system clock is pre-2025 (not yet NTP-synced), and any recording whose
+  mtime predates that epoch is kept — preventing minutes-old data from being
+  deleted as "56 years old" the moment the clock steps. Emergency size-based
+  cleanup is deliberately exempt.
+
+#### Added
+- **Inode-exhaustion detection** in storage monitoring: a recorder writing many
+  small files exhausts inodes long before blocks; `cmd_monitor` now applies the
+  warning/critical/emergency thresholds to `df -Pi` too. Filesystems without
+  inode accounting are treated as no pressure.
+- **In-band metrics staleness marker**: every scrape emits
+  `lyrebird_scrape_timestamp_seconds` so a `.prom` left behind by a dead exporter
+  ("dead recorder looks alive") is detectable via a Prometheus age alert.
 
 ## [1.3.0] - 2026-07-19
 

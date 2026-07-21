@@ -322,3 +322,17 @@ CURLEOF
     [ "$(printf '%s\n' "$output" | grep -c .)" -eq 1 ]     # exactly one line
     [[ "$output" == *'stream="AKG \"C414\""'* ]]
 }
+
+@test "scrape output carries an in-band staleness timestamp [stale-.prom detection]" {
+    # A .prom left behind by a dead exporter must be detectable: every scrape
+    # embeds the Unix time it was generated so Prometheus can alert on age.
+    run env PROJECT_ROOT="$PROJECT_ROOT" \
+        FFMPEG_PID_DIR="$(mktemp -d)" PID_FILE="$(mktemp)" HEARTBEAT_FILE="$(mktemp)" \
+        bash -c 'set -euo pipefail; source "$PROJECT_ROOT/lyrebird-metrics.sh"; generate_all_metrics'
+    [ "$status" -eq 0 ]
+    local ts now
+    ts=$(printf '%s\n' "$output" | awk '/^lyrebird_scrape_timestamp_seconds /{print $2}')
+    [[ "$ts" =~ ^[0-9]+$ ]]
+    now=$(date +%s)
+    (( now - ts < 120 ))     # fresh, not a stale leftover value
+}

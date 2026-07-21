@@ -17,8 +17,10 @@ teardown() {
 }
 
 # Extract the individual wrapper's restart loop (the 2nd "# Main restart loop"),
-# stopping before the heredoc terminator.
+# stopping before the heredoc terminator, plus the real now_s helper it calls.
 _extract_restart_loop() {
+    awk '/^now_s\(\) \{$/ { c++; if (c == 1) p = 1 } p { print } p && /^\}$/ { exit }' \
+        "$PROJECT_ROOT/lyrebird-stream-manager.sh"
     awk '
         /^# Main restart loop$/ { c++ }
         c == 2 { print }

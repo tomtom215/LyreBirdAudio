@@ -559,12 +559,12 @@ reinstall_service_with_customizations() {
         # Strategy: Insert custom env vars after the last Environment= line
         # This preserves the structure and ensures custom values override defaults
         local last_env_line_num
-        last_env_line_num=$(grep -n "^Environment=" "$service_file" | tail -n1 | cut -d: -f1)
+        last_env_line_num=$(grep -n "^Environment=" "$service_file" | tail -n1 | cut -d: -f1) || true
 
         if [[ -z "$last_env_line_num" ]]; then
             # No Environment= lines found - insert after WorkingDirectory
             local working_dir_line
-            working_dir_line=$(grep -n "^WorkingDirectory=" "$service_file" | tail -n1 | cut -d: -f1)
+            working_dir_line=$(grep -n "^WorkingDirectory=" "$service_file" | tail -n1 | cut -d: -f1) || true
 
             if [[ -n "$working_dir_line" ]]; then
                 # Insert after WorkingDirectory
@@ -2312,7 +2312,7 @@ list_available_releases() {
 
     local branch_counter=$((${#AVAILABLE_VERSIONS[@]} + 1))
     local git_branches
-    git_branches=$(git branch -r | grep -v HEAD | sed 's/origin\///' | sed 's/^[[:space:]]*//')
+    git_branches=$(git branch -r | grep -v HEAD | sed 's/origin\///' | sed 's/^[[:space:]]*//') || true
 
     if [[ -n "$git_branches" ]]; then
         while IFS= read -r branch; do

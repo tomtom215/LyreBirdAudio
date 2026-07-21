@@ -197,7 +197,7 @@ unset _LYREBIRD_COMMON _LYREBIRD_COMMON_EXPECTED_HASH
 unset -f _verify_common_library
 
 # Constants
-readonly VERSION="1.4.3"
+readonly VERSION="1.5.0"
 
 # Script identification
 SCRIPT_NAME="$(basename "${BASH_SOURCE[0]}")"
@@ -265,30 +265,71 @@ readonly MAX_STREAM_NAME_LENGTH=48
 readonly MIN_STREAM_NAME_LENGTH=1
 readonly RESERVED_STREAM_NAMES="control|stats|api|metrics|health"
 
+# Coerce an env override to a non-negative base-10 integer, falling back to
+# the default when the value is not all digits. A non-numeric value (e.g.
+# CRON_RESTART_MAX_PER_HOUR=unlimited) otherwise reaches arithmetic evaluation
+# later and ABORTS the whole run under set -e -- silently killing every cron
+# monitor pass. Base-10 also stops 08/09 being misread as invalid octal.
+_uint_or() {
+    local value="${1:-}" default="$2"
+    if [[ "$value" =~ ^[0-9]+$ ]]; then
+        printf '%s' "$((10#$value))"
+    else
+        printf '%s' "$default"
+    fi
+}
+
+# Same, for integers that may carry a leading minus sign (dB thresholds).
+_int_or() {
+    local value="${1:-}" default="$2"
+    if [[ "$value" =~ ^-?[0-9]+$ ]]; then
+        printf '%s' "$value"
+    else
+        printf '%s' "$default"
+    fi
+}
+
 # Timing settings
-readonly STREAM_STARTUP_DELAY="${STREAM_STARTUP_DELAY:-10}"
-readonly STREAM_VALIDATION_ATTEMPTS="${STREAM_VALIDATION_ATTEMPTS:-3}"
-readonly STREAM_VALIDATION_DELAY="${STREAM_VALIDATION_DELAY:-5}"
-readonly USB_STABILIZATION_DELAY="${USB_STABILIZATION_DELAY:-5}"
-readonly RESTART_STABILIZATION_DELAY="${RESTART_STABILIZATION_DELAY:-15}"
+STREAM_STARTUP_DELAY=$(_uint_or "${STREAM_STARTUP_DELAY:-}" 10)
+readonly STREAM_STARTUP_DELAY
+STREAM_VALIDATION_ATTEMPTS=$(_uint_or "${STREAM_VALIDATION_ATTEMPTS:-}" 3)
+readonly STREAM_VALIDATION_ATTEMPTS
+STREAM_VALIDATION_DELAY=$(_uint_or "${STREAM_VALIDATION_DELAY:-}" 5)
+readonly STREAM_VALIDATION_DELAY
+USB_STABILIZATION_DELAY=$(_uint_or "${USB_STABILIZATION_DELAY:-}" 5)
+readonly USB_STABILIZATION_DELAY
+RESTART_STABILIZATION_DELAY=$(_uint_or "${RESTART_STABILIZATION_DELAY:-}" 15)
+readonly RESTART_STABILIZATION_DELAY
 
 # Resource monitoring thresholds
-readonly MAX_FD_WARNING="${MAX_FD_WARNING:-500}"
-readonly MAX_FD_CRITICAL="${MAX_FD_CRITICAL:-1000}"
-readonly MAX_CPU_WARNING="${MAX_CPU_WARNING:-20}"
-readonly MAX_CPU_CRITICAL="${MAX_CPU_CRITICAL:-40}"
-readonly MAX_WRAPPER_RESTARTS="${MAX_WRAPPER_RESTARTS:-50}"
-readonly WRAPPER_SUCCESS_DURATION="${WRAPPER_SUCCESS_DURATION:-300}"
+MAX_FD_WARNING=$(_uint_or "${MAX_FD_WARNING:-}" 500)
+readonly MAX_FD_WARNING
+MAX_FD_CRITICAL=$(_uint_or "${MAX_FD_CRITICAL:-}" 1000)
+readonly MAX_FD_CRITICAL
+MAX_CPU_WARNING=$(_uint_or "${MAX_CPU_WARNING:-}" 20)
+readonly MAX_CPU_WARNING
+MAX_CPU_CRITICAL=$(_uint_or "${MAX_CPU_CRITICAL:-}" 40)
+readonly MAX_CPU_CRITICAL
+MAX_WRAPPER_RESTARTS=$(_uint_or "${MAX_WRAPPER_RESTARTS:-}" 50)
+readonly MAX_WRAPPER_RESTARTS
+WRAPPER_SUCCESS_DURATION=$(_uint_or "${WRAPPER_SUCCESS_DURATION:-}" 300)
+readonly WRAPPER_SUCCESS_DURATION
 
 # Wrapper restart behavior (extracted from hardcoded values)
-readonly MAX_CONSECUTIVE_FAILURES="${MAX_CONSECUTIVE_FAILURES:-5}"
-readonly INITIAL_RESTART_DELAY="${INITIAL_RESTART_DELAY:-10}"
-readonly MAX_RESTART_DELAY="${MAX_RESTART_DELAY:-300}"
+MAX_CONSECUTIVE_FAILURES=$(_uint_or "${MAX_CONSECUTIVE_FAILURES:-}" 5)
+readonly MAX_CONSECUTIVE_FAILURES
+INITIAL_RESTART_DELAY=$(_uint_or "${INITIAL_RESTART_DELAY:-}" 10)
+readonly INITIAL_RESTART_DELAY
+MAX_RESTART_DELAY=$(_uint_or "${MAX_RESTART_DELAY:-}" 300)
+readonly MAX_RESTART_DELAY
 
 # Log rotation settings
-readonly MAIN_LOG_MAX_SIZE="${MAIN_LOG_MAX_SIZE:-104857600}"        # 100MB
-readonly FFMPEG_LOG_MAX_SIZE="${FFMPEG_LOG_MAX_SIZE:-10485760}"     # 10MB
-readonly MEDIAMTX_LOG_MAX_SIZE="${MEDIAMTX_LOG_MAX_SIZE:-52428800}" # 50MB
+MAIN_LOG_MAX_SIZE=$(_uint_or "${MAIN_LOG_MAX_SIZE:-}" 104857600)        # 100MB
+readonly MAIN_LOG_MAX_SIZE
+FFMPEG_LOG_MAX_SIZE=$(_uint_or "${FFMPEG_LOG_MAX_SIZE:-}" 10485760)     # 10MB
+readonly FFMPEG_LOG_MAX_SIZE
+MEDIAMTX_LOG_MAX_SIZE=$(_uint_or "${MEDIAMTX_LOG_MAX_SIZE:-}" 52428800) # 50MB
+readonly MEDIAMTX_LOG_MAX_SIZE
 
 # ============================================================================
 # Production Reliability Settings (v1.4.2 additions)
@@ -299,52 +340,81 @@ readonly MEDIAMTX_LOG_MAX_SIZE="${MEDIAMTX_LOG_MAX_SIZE:-52428800}" # 50MB
 # repeated failures) MUST be brought back under cron, or it stays down forever on
 # an unattended box (H8). The cap prevents a persistently-failing stream from
 # being restarted every 5 minutes indefinitely (a restart storm).
-readonly CRON_RESTART_MAX_PER_HOUR="${CRON_RESTART_MAX_PER_HOUR:-6}"
+CRON_RESTART_MAX_PER_HOUR=$(_uint_or "${CRON_RESTART_MAX_PER_HOUR:-}" 6)
+readonly CRON_RESTART_MAX_PER_HOUR
 readonly CRON_RESTART_STATE_DIR="${CRON_RESTART_STATE_DIR:-/run/lyrebird/cron-restarts}"
+
+# Deep health probe (H9): a live wrapper PID does not prove audio is flowing --
+# the wrapper may sit in endless backoff, or FFmpeg may hang with the path
+# never publishing. When the MediaMTX control API is reachable, monitor also
+# asks it whether each path is actually ready; a stream that stays not-ready
+# for DEEP_HEALTH_MAX_STRIKES consecutive monitor runs is restarted. Strikes
+# live in /run (reset at boot). API-unreachable never strikes a stream.
+readonly DEEP_HEALTH_CHECK_ENABLED="${DEEP_HEALTH_CHECK_ENABLED:-true}"
+DEEP_HEALTH_MAX_STRIKES=$(_uint_or "${DEEP_HEALTH_MAX_STRIKES:-}" 3)
+readonly DEEP_HEALTH_MAX_STRIKES
+readonly DEEP_HEALTH_STATE_DIR="${DEEP_HEALTH_STATE_DIR:-/run/lyrebird/deep-health}"
 
 # Watchdog/Heartbeat settings
 # Heartbeat runs more frequently than cron for faster failure detection
-readonly HEARTBEAT_INTERVAL="${HEARTBEAT_INTERVAL:-30}"             # Seconds between heartbeats
+HEARTBEAT_INTERVAL=$(_uint_or "${HEARTBEAT_INTERVAL:-}" 30)             # Seconds between heartbeats
+readonly HEARTBEAT_INTERVAL
 readonly HEARTBEAT_FILE="${HEARTBEAT_FILE:-/run/mediamtx-audio.heartbeat}"
 readonly ENABLE_HARDWARE_WATCHDOG="${ENABLE_HARDWARE_WATCHDOG:-auto}" # auto, yes, no
 readonly HARDWARE_WATCHDOG_DEVICE="${HARDWARE_WATCHDOG_DEVICE:-/dev/watchdog}"
-readonly HARDWARE_WATCHDOG_TIMEOUT="${HARDWARE_WATCHDOG_TIMEOUT:-60}" # Seconds
+HARDWARE_WATCHDOG_TIMEOUT=$(_uint_or "${HARDWARE_WATCHDOG_TIMEOUT:-}" 60) # Seconds
+readonly HARDWARE_WATCHDOG_TIMEOUT
 
 # Disk space monitoring thresholds
-readonly DISK_SPACE_WARNING_PERCENT="${DISK_SPACE_WARNING_PERCENT:-80}"
-readonly DISK_SPACE_CRITICAL_PERCENT="${DISK_SPACE_CRITICAL_PERCENT:-95}"
-readonly DISK_SPACE_MIN_FREE_MB="${DISK_SPACE_MIN_FREE_MB:-100}"    # Minimum free MB
+DISK_SPACE_WARNING_PERCENT=$(_uint_or "${DISK_SPACE_WARNING_PERCENT:-}" 80)
+readonly DISK_SPACE_WARNING_PERCENT
+DISK_SPACE_CRITICAL_PERCENT=$(_uint_or "${DISK_SPACE_CRITICAL_PERCENT:-}" 95)
+readonly DISK_SPACE_CRITICAL_PERCENT
+DISK_SPACE_MIN_FREE_MB=$(_uint_or "${DISK_SPACE_MIN_FREE_MB:-}" 100)    # Minimum free MB
+readonly DISK_SPACE_MIN_FREE_MB
 
 # Memory monitoring and leak detection
-readonly MEM_WARNING_PERCENT="${MEM_WARNING_PERCENT:-80}"
-readonly MEM_CRITICAL_PERCENT="${MEM_CRITICAL_PERCENT:-95}"
-readonly MEM_GROWTH_THRESHOLD_MB="${MEM_GROWTH_THRESHOLD_MB:-100}"  # MB growth triggers restart
+MEM_WARNING_PERCENT=$(_uint_or "${MEM_WARNING_PERCENT:-}" 80)
+readonly MEM_WARNING_PERCENT
+MEM_CRITICAL_PERCENT=$(_uint_or "${MEM_CRITICAL_PERCENT:-}" 95)
+readonly MEM_CRITICAL_PERCENT
+MEM_GROWTH_THRESHOLD_MB=$(_uint_or "${MEM_GROWTH_THRESHOLD_MB:-}" 100)  # MB growth triggers restart
+readonly MEM_GROWTH_THRESHOLD_MB
 readonly MEM_SAMPLE_FILE="${MEM_SAMPLE_FILE:-/var/lib/mediamtx-ffmpeg/.mem_samples}"
 
 # Network connectivity monitoring
 readonly NETWORK_CHECK_ENABLED="${NETWORK_CHECK_ENABLED:-true}"
 readonly NETWORK_CHECK_TARGET="${NETWORK_CHECK_TARGET:-gateway}"    # gateway, specific IP, or hostname
-readonly NETWORK_CHECK_TIMEOUT="${NETWORK_CHECK_TIMEOUT:-5}"        # Seconds
-readonly NETWORK_FAIL_THRESHOLD="${NETWORK_FAIL_THRESHOLD:-3}"      # Consecutive failures before alert
+NETWORK_CHECK_TIMEOUT=$(_uint_or "${NETWORK_CHECK_TIMEOUT:-}" 5)        # Seconds
+readonly NETWORK_CHECK_TIMEOUT
+NETWORK_FAIL_THRESHOLD=$(_uint_or "${NETWORK_FAIL_THRESHOLD:-}" 3)      # Consecutive failures before alert
+readonly NETWORK_FAIL_THRESHOLD
 
 # Audio buffering (memory-based with optional disk persistence)
 # Memory buffering is done via FFmpeg's rtbufsize option (no SD card wear)
 readonly AUDIO_BUFFER_ENABLED="${AUDIO_BUFFER_ENABLED:-true}"       # Enable enhanced memory buffering
-readonly AUDIO_BUFFER_SIZE_MB="${AUDIO_BUFFER_SIZE_MB:-64}"         # Memory buffer size per stream (MB)
-readonly AUDIO_RTBUFSIZE="${AUDIO_RTBUFSIZE:-33554432}"             # Real-time buffer size in bytes (32MB default)
+AUDIO_BUFFER_SIZE_MB=$(_uint_or "${AUDIO_BUFFER_SIZE_MB:-}" 64)         # Memory buffer size per stream (MB)
+readonly AUDIO_BUFFER_SIZE_MB
+AUDIO_RTBUFSIZE=$(_uint_or "${AUDIO_RTBUFSIZE:-}" 33554432)             # Real-time buffer size in bytes (32MB default)
+readonly AUDIO_RTBUFSIZE
 # Local recording (ring buffer) - writes audio to tmpfs or disk alongside streaming
 readonly AUDIO_LOCAL_RECORDING="${AUDIO_LOCAL_RECORDING:-false}"    # Enable local recording backup
 readonly AUDIO_RECORDING_PATH="${AUDIO_RECORDING_PATH:-/dev/shm/lyrebird-buffer}" # Default to tmpfs (RAM)
-readonly AUDIO_RECORDING_SEGMENT_TIME="${AUDIO_RECORDING_SEGMENT_TIME:-300}" # 5 min segments
-readonly AUDIO_RECORDING_SEGMENTS="${AUDIO_RECORDING_SEGMENTS:-12}" # Keep last 12 segments (1 hour)
+AUDIO_RECORDING_SEGMENT_TIME=$(_uint_or "${AUDIO_RECORDING_SEGMENT_TIME:-}" 300) # 5 min segments
+readonly AUDIO_RECORDING_SEGMENT_TIME
+AUDIO_RECORDING_SEGMENTS=$(_uint_or "${AUDIO_RECORDING_SEGMENTS:-}" 12) # Keep last 12 segments (1 hour)
+readonly AUDIO_RECORDING_SEGMENTS
 readonly AUDIO_DISK_PERSIST="${AUDIO_DISK_PERSIST:-false}"          # Move segments to disk (SD card wear!)
 readonly AUDIO_DISK_PATH="${AUDIO_DISK_PATH:-/var/lib/mediamtx-ffmpeg/recordings}"
 
 # Audio level monitoring (detect dead/silent microphones)
 readonly AUDIO_LEVEL_CHECK_ENABLED="${AUDIO_LEVEL_CHECK_ENABLED:-true}"  # Enable silence detection
-readonly AUDIO_LEVEL_SAMPLE_DURATION="${AUDIO_LEVEL_SAMPLE_DURATION:-3}" # Seconds to sample for level check
-readonly AUDIO_SILENCE_THRESHOLD_DB="${AUDIO_SILENCE_THRESHOLD_DB:--60}" # dB below which is "silence"
-readonly AUDIO_SILENCE_WARN_DURATION="${AUDIO_SILENCE_WARN_DURATION:-60}" # Seconds of silence before warning
+AUDIO_LEVEL_SAMPLE_DURATION=$(_uint_or "${AUDIO_LEVEL_SAMPLE_DURATION:-}" 3) # Seconds to sample for level check
+readonly AUDIO_LEVEL_SAMPLE_DURATION
+AUDIO_SILENCE_THRESHOLD_DB=$(_int_or "${AUDIO_SILENCE_THRESHOLD_DB:-}" -60) # dB below which is "silence"
+readonly AUDIO_SILENCE_THRESHOLD_DB
+AUDIO_SILENCE_WARN_DURATION=$(_uint_or "${AUDIO_SILENCE_WARN_DURATION:-}" 60) # Seconds of silence before warning
+readonly AUDIO_SILENCE_WARN_DURATION
 
 # MediaMTX API version compatibility
 readonly MEDIAMTX_API_VERSION="${MEDIAMTX_API_VERSION:-auto}"       # auto, v3, v2, v1
@@ -352,12 +422,13 @@ readonly MEDIAMTX_API_FALLBACK="${MEDIAMTX_API_FALLBACK:-true}"     # Try older 
 
 # USB device health checks
 readonly USB_ALSA_CHECK_ENABLED="${USB_ALSA_CHECK_ENABLED:-true}"   # Check ALSA availability before restart
-readonly USB_DISCONNECT_GRACE_PERIOD="${USB_DISCONNECT_GRACE_PERIOD:-10}" # Seconds to wait after disconnect
+USB_DISCONNECT_GRACE_PERIOD=$(_uint_or "${USB_DISCONNECT_GRACE_PERIOD:-}" 10) # Seconds to wait after disconnect
+readonly USB_DISCONNECT_GRACE_PERIOD
 
 # Version compatibility
 readonly MIN_COMPATIBLE_COMMON_VERSION="1.0.0"
 # shellcheck disable=SC2034 # SCRIPT_COMPAT_VERSION exported for external version checking tools
-readonly SCRIPT_COMPAT_VERSION="1.4.3"
+readonly SCRIPT_COMPAT_VERSION="1.5.0"
 
 # Standard timing constants
 readonly QUICK_SLEEP=0.1
@@ -1767,12 +1838,47 @@ mediamtx_get_path() {
     mediamtx_api_call GET "/paths/get/${path_name}"
 }
 
+# --- Tolerant JSON status parsing -------------------------------------------
+# MediaMTX deprecated the path "ready"/"bytesReceived"/"tracks" fields in favour
+# of "available"/"inboundBytes"/"tracks2" (still emitting both as of v1.19.x).
+# These helpers accept BOTH shapes so a future MediaMTX that drops "ready" does
+# not make every stream look dead. When both fields are present the NEW field
+# wins. They are also safe under set -euo pipefail: a zero-match grep must not
+# abort the caller (pipefail turns "0 ready paths" into exit 1 otherwise).
+
+# Count occurrences of a fixed pattern in a JSON blob; never fails, prints >= 0.
+_json_count_matches() {
+    local json="$1" pattern="$2" count
+    count=$(printf '%s' "$json" | grep -o "$pattern" | wc -l) || count=0
+    printf '%s' "${count:-0}"
+}
+
+# Is a single path's JSON "ready"? Tolerates deprecated and current shapes.
+mediamtx_json_path_ready() {
+    local json="$1"
+    if [[ "$json" == *'"available":'* ]]; then
+        [[ "$json" == *'"available":true'* ]]
+    else
+        [[ "$json" == *'"ready":true'* ]]
+    fi
+}
+
+# Count ready paths in a /v3/paths/list response, tolerant of both shapes.
+mediamtx_json_count_ready() {
+    local json="$1"
+    if [[ "$json" == *'"available":'* ]]; then
+        _json_count_matches "$json" '"available":true'
+    else
+        _json_count_matches "$json" '"ready":true'
+    fi
+}
+
 # Check if a path is ready (streaming)
 mediamtx_path_is_ready() {
     local path_name="$1"
     local path_info
     path_info=$(mediamtx_get_path "$path_name") || return 1
-    echo "$path_info" | grep -q '"ready":true'
+    mediamtx_json_path_ready "$path_info"
 }
 
 # -----------------------------------------------------------------------------
@@ -2017,7 +2123,7 @@ mediamtx_count_rtsp_sessions() {
     local sessions
     sessions=$(mediamtx_list_rtsp_sessions) || { echo "0"; return; }
     local count
-    count=$(echo "$sessions" | grep -o '"id"' | wc -l)
+    count=$(_json_count_matches "$sessions" '"id"')
     echo "${count:-0}"
 }
 
@@ -2033,25 +2139,25 @@ mediamtx_count_all_connections() {
     # RTSPS sessions
     local rtsps
     rtsps=$(mediamtx_list_rtsps_sessions 2>/dev/null) || rtsps=""
-    count=$(echo "$rtsps" | grep -o '"id"' | wc -l)
+    count=$(_json_count_matches "$rtsps" '"id"')
     total=$((total + count))
 
     # RTMP connections
     local rtmp
     rtmp=$(mediamtx_list_rtmp_conns 2>/dev/null) || rtmp=""
-    count=$(echo "$rtmp" | grep -o '"id"' | wc -l)
+    count=$(_json_count_matches "$rtmp" '"id"')
     total=$((total + count))
 
     # WebRTC sessions
     local webrtc
     webrtc=$(mediamtx_list_webrtc_sessions 2>/dev/null) || webrtc=""
-    count=$(echo "$webrtc" | grep -o '"id"' | wc -l)
+    count=$(_json_count_matches "$webrtc" '"id"')
     total=$((total + count))
 
     # SRT connections
     local srt
     srt=$(mediamtx_list_srt_conns 2>/dev/null) || srt=""
-    count=$(echo "$srt" | grep -o '"id"' | wc -l)
+    count=$(_json_count_matches "$srt" '"id"')
     total=$((total + count))
 
     echo "$total"
@@ -2062,7 +2168,7 @@ mediamtx_count_ready_paths() {
     local paths
     paths=$(mediamtx_list_paths) || { echo "0"; return; }
     local count
-    count=$(echo "$paths" | grep -o '"ready":true' | wc -l)
+    count=$(mediamtx_json_count_ready "$paths")
     echo "${count:-0}"
 }
 
@@ -2090,14 +2196,14 @@ mediamtx_get_status_summary() {
     }
 
     local version
-    version=$(echo "$info" | grep -o '"version":"[^"]*"' | cut -d'"' -f4)
+    version=$(echo "$info" | grep -o '"version":"[^"]*"' | cut -d'"' -f4) || true
 
     local paths_json
     paths_json=$(mediamtx_list_paths 2>/dev/null) || paths_json=""
     local total_paths
-    total_paths=$(echo "$paths_json" | grep -o '"name"' | wc -l)
+    total_paths=$(_json_count_matches "$paths_json" '"name"')
     local ready_paths
-    ready_paths=$(echo "$paths_json" | grep -o '"ready":true' | wc -l)
+    ready_paths=$(mediamtx_json_count_ready "$paths_json")
 
     local rtsp_sessions
     rtsp_sessions=$(mediamtx_count_rtsp_sessions 2>/dev/null)
@@ -2178,7 +2284,7 @@ check_audio_level() {
 
     # Parse max volume from output (format: "max_volume: -XX.X dB")
     local max_volume
-    max_volume=$(echo "$ffmpeg_output" | grep -o "max_volume: [0-9.-]*" | grep -o "[0-9.-]*" | head -1)
+    max_volume=$(echo "$ffmpeg_output" | grep -o "max_volume: [0-9.-]*" | grep -o "[0-9.-]*" | head -1) || true
 
     if [[ -z "$max_volume" ]]; then
         log DEBUG "Could not parse audio level for $stream_name"
@@ -2199,12 +2305,19 @@ check_audio_level() {
         if [[ -f "$silence_file" ]]; then
             silence_start=$(cat "$silence_file" 2>/dev/null || echo "0")
         else
-            silence_start=$(date +%s)
+            silence_start=$(_now_monotonic)
             echo "$silence_start" > "$silence_file" 2>/dev/null || true
         fi
 
         local now
-        now=$(date +%s)
+        now=$(_now_monotonic)
+        # A start value in the future means a stale wall-clock timestamp from a
+        # pre-monotonic run (or clock scale mismatch): restart tracking from now
+        # rather than silently never reaching the DEAD MIC threshold again.
+        if [[ ! "$silence_start" =~ ^[0-9]+$ ]] || ((silence_start > now)); then
+            silence_start=$now
+            echo "$silence_start" > "$silence_file" 2>/dev/null || true
+        fi
         local silence_duration=$((now - silence_start))
 
         if [[ $silence_duration -ge ${AUDIO_SILENCE_WARN_DURATION} ]]; then
@@ -2470,6 +2583,22 @@ is_cron_context() {
     return 1
 }
 
+# Monotonic seconds since boot. Wall-clock deltas (date +%s) are corrupted by
+# NTP steps, DST-adjacent RTC fixes and the first network clock set on an
+# RTC-less Pi; /proc/uptime never jumps. All boot-scoped timing state (backoff
+# runtimes, cron restart budgets, silence tracking -- kept under /run, which is
+# cleared at boot) uses this. Falls back to wall clock only when /proc/uptime
+# is unavailable.
+_now_monotonic() {
+    local up
+    if [[ -r /proc/uptime ]]; then
+        read -r up _ </proc/uptime
+        printf '%s' "${up%%.*}"
+    else
+        date +%s
+    fi
+}
+
 # --- Bounded cron resurrection (H8) -----------------------------------------
 # Count this stream's cron restarts within the last hour (read-only).
 _cron_restart_count() {
@@ -2477,7 +2606,7 @@ _cron_restart_count() {
     local state_file="${CRON_RESTART_STATE_DIR}/${stream_path}.restarts"
     [[ -f "$state_file" ]] || { printf '0'; return 0; }
     local now cutoff count=0 ts
-    now="$(date +%s)"
+    now="$(_now_monotonic)"
     cutoff=$((now - 3600))
     while read -r ts; do
         [[ "$ts" =~ ^[0-9]+$ ]] || continue
@@ -2492,7 +2621,7 @@ _record_cron_restart() {
     local state_file="${CRON_RESTART_STATE_DIR}/${stream_path}.restarts"
     mkdir -p "${CRON_RESTART_STATE_DIR}" 2>/dev/null || true
     local now cutoff kept="" ts
-    now="$(date +%s)"
+    now="$(_now_monotonic)"
     cutoff=$((now - 3600))
     if [[ -f "$state_file" ]]; then
         while read -r ts; do
@@ -2519,6 +2648,73 @@ should_restart_stream() {
     fi
     log WARN "cron: $stream_path is down but its restart budget (${CRON_RESTART_MAX_PER_HOUR}/hour) is exhausted; not restarting"
     return 1
+}
+
+# --- Deep health probe (H9) --------------------------------------------------
+# Ask the MediaMTX control API whether a path is actually publishing.
+# Returns: 0 = ready, 1 = not ready, 2 = unknown (curl absent/API unreachable).
+probe_stream_ready() {
+    local stream_path="$1"
+    command_exists curl || return 2
+    local api_base response
+    api_base=$(detect_mediamtx_api_version)
+    if ! response=$(curl -s --max-time 3 "${api_base}/paths/get/${stream_path}" 2>/dev/null) \
+        || [[ -z "$response" ]]; then
+        return 2
+    fi
+    if mediamtx_json_path_ready "$response"; then
+        return 0
+    fi
+    return 1
+}
+
+# Record a probe verdict for a stream. Not-ready increments a strike counter;
+# ready clears it; unknown leaves it untouched (an API blip must neither strike
+# a healthy stream nor forgive a stuck one). Returns 0 when the stream has been
+# not-ready for DEEP_HEALTH_MAX_STRIKES consecutive checks (caller restarts it,
+# counter resets so the next escalation needs a fresh streak).
+deep_health_note() {
+    local stream_path="$1" verdict="$2"
+    local strike_file="${DEEP_HEALTH_STATE_DIR}/${stream_path}.strikes"
+    case "$verdict" in
+        ready)
+            rm -f "$strike_file" 2>/dev/null || true
+            return 1
+            ;;
+        unknown)
+            return 1
+            ;;
+    esac
+    mkdir -p "${DEEP_HEALTH_STATE_DIR}" 2>/dev/null || true
+    local strikes=0
+    if [[ -f "$strike_file" ]]; then
+        strikes=$(cat "$strike_file" 2>/dev/null) || strikes=0
+    fi
+    [[ "$strikes" =~ ^[0-9]+$ ]] || strikes=0
+    strikes=$((strikes + 1))
+    printf '%s\n' "$strikes" >"$strike_file" 2>/dev/null || true
+    if ((strikes >= DEEP_HEALTH_MAX_STRIKES)); then
+        rm -f "$strike_file" 2>/dev/null || true
+        return 0
+    fi
+    log INFO "Stream $stream_path: wrapper alive but path not ready (strike ${strikes}/${DEEP_HEALTH_MAX_STRIKES})"
+    return 1
+}
+
+# Combined probe: 0 => the stream is confirmed stuck (alive wrapper, path
+# continuously not-ready) and should be restarted; 1 => leave it alone.
+deep_stream_unhealthy() {
+    local stream_path="$1"
+    [[ "${DEEP_HEALTH_CHECK_ENABLED}" == "true" ]] || return 1
+    local rc=0
+    probe_stream_ready "$stream_path" || rc=$?
+    local verdict
+    case "$rc" in
+        0) verdict="ready" ;;
+        1) verdict="notready" ;;
+        *) verdict="unknown" ;;
+    esac
+    deep_health_note "$stream_path" "$verdict"
 }
 
 # Stream health monitoring with automatic restart
@@ -2620,6 +2816,24 @@ monitor_streams() {
                     ((streams_failed++)) || true
                     log WARN "Multiplex stream $stream_path PID $pid is stale (cron mode: not restarting)"
                 fi
+            elif deep_stream_unhealthy "$stream_path"; then
+                # Wrapper alive but the path has been continuously not-ready:
+                # a hung FFmpeg or endless backoff. Restart within the budget.
+                if should_restart_stream "$stream_path"; then
+                    log WARN "Multiplex stream $stream_path wrapper is alive but path is not ready - restarting"
+                    terminate_process_group "$pid" 5 || true
+                    rm -f "$pid_file"
+                    if start_ffmpeg_multiplex_stream "${devices[@]}"; then
+                        ((streams_restarted++)) || true
+                        log INFO "Successfully restarted multiplex stream $stream_path"
+                    else
+                        ((streams_failed++)) || true
+                        log ERROR "Failed to restart multiplex stream $stream_path"
+                    fi
+                else
+                    ((streams_failed++)) || true
+                    log WARN "Multiplex stream $stream_path is not ready (restart budget exhausted)"
+                fi
             else
                 ((streams_healthy++)) || true
                 log DEBUG "Multiplex stream $stream_path is healthy (PID: $pid)"
@@ -2716,6 +2930,33 @@ monitor_streams() {
                 continue
             fi
 
+            # Wrapper PID alive: shallow-healthy. Deep probe (H9): a path that
+            # stays not-ready across consecutive checks while its wrapper is
+            # alive is a hung FFmpeg or endless backoff -- restart it.
+            if deep_stream_unhealthy "$stream_path"; then
+                if should_restart_stream "$stream_path"; then
+                    if ! check_alsa_device_available "$card_num"; then
+                        log WARN "Stream $stream_path: ALSA device not available (card $card_num), skipping restart"
+                        ((streams_failed++)) || true
+                        continue
+                    fi
+                    log WARN "Stream $stream_path wrapper (PID $pid) is alive but path is not ready - restarting"
+                    terminate_process_group "$pid" 5 || true
+                    rm -f "$pid_file"
+                    if start_ffmpeg_stream "$device_name" "$card_num" "$stream_path"; then
+                        ((streams_restarted++)) || true
+                        log INFO "Successfully restarted stream $stream_path"
+                    else
+                        ((streams_failed++)) || true
+                        log ERROR "Failed to restart stream $stream_path"
+                    fi
+                else
+                    ((streams_failed++)) || true
+                    log WARN "Stream $stream_path is not ready (restart budget exhausted)"
+                fi
+                continue
+            fi
+
             ((streams_healthy++)) || true
             log DEBUG "Stream $stream_path is healthy (PID: $pid)"
         done
@@ -2767,7 +3008,7 @@ validate_stream() {
             local api_base api_response
             api_base=$(detect_mediamtx_api_version)
             local api_url="${api_base}/paths/get/${stream_path}"
-            if api_response=$(curl -s --max-time 2 "${api_url}" 2>/dev/null) && [[ "$api_response" == *'"ready":true'* ]]; then
+            if api_response=$(curl -s --max-time 2 "${api_url}" 2>/dev/null) && mediamtx_json_path_ready "$api_response"; then
                 log DEBUG "Stream $stream_path validated via API (attempt ${attempt})"
                 return 0
             fi
@@ -3006,10 +3247,33 @@ wait_for_mediamtx_ready() {
 
 # Device configuration
 load_device_config() {
-    if [[ -f "${DEVICE_CONFIG_FILE}" ]]; then
-        # shellcheck source=/dev/null
-        source "${DEVICE_CONFIG_FILE}"
+    [[ -f "${DEVICE_CONFIG_FILE}" ]] || return 0
+
+    # A device config truncated by a power loss mid-write, corrupted by SD-card
+    # bit-rot, or fat-fingered by an operator would otherwise be `source`d
+    # directly: a syntax error then aborts the WHOLE run under errexit, so
+    # `start` fails and NO streams come up on the next unattended boot -- a
+    # total outage triggered by one bad line. Validate syntax first and, on
+    # failure, fall back to built-in defaults (degrade, don't die).
+    if ! bash -n "${DEVICE_CONFIG_FILE}" 2>/dev/null; then
+        log ERROR "Device config ${DEVICE_CONFIG_FILE} is corrupt (syntax error); ignoring it and using defaults"
+        return 0
     fi
+
+    # Even syntactically valid config is sourced defensively: a `set -e`/command
+    # inside it must not abort or hang the manager. Source in the current shell
+    # (values must persist) but neutralise errexit for the duration.
+    local _had_errexit=0
+    [[ $- == *e* ]] && _had_errexit=1
+    set +e
+    # shellcheck source=/dev/null
+    source "${DEVICE_CONFIG_FILE}"
+    local _src_rc=$?
+    [[ $_had_errexit -eq 1 ]] && set -e
+    if [[ $_src_rc -ne 0 ]]; then
+        log WARN "Device config ${DEVICE_CONFIG_FILE} raised errors while loading (rc=${_src_rc}); continuing with whatever loaded plus defaults"
+    fi
+    return 0
 }
 
 save_device_config() {
@@ -3443,6 +3707,20 @@ log_critical() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STREAM:${STREAM_PATH}] $1" >> "${LOG_FILE}" 2>/dev/null || true
 }
 
+# Monotonic seconds since boot for run-time/backoff math. Wall-clock deltas
+# break on NTP steps (an RTC-less Pi can jump years when it first gets
+# network): a healthy multi-hour run would measure negative and count as a
+# consecutive failure, eventually killing the wrapper on a healthy stream.
+now_s() {
+    local up
+    if [[ -r /proc/uptime ]]; then
+        read -r up _ < /proc/uptime
+        printf '%s' "${up%%.*}"
+    else
+        date +%s
+    fi
+}
+
 # Cleanup handler
 cleanup_wrapper() {
     local exit_code=$?
@@ -3655,7 +3933,7 @@ while true; do
     
     log_message "Starting FFmpeg (attempt #$((RESTART_COUNT + 1)))"
     
-    START_TIME=$(date +%s)
+    START_TIME=$(now_s)
     
     if ! run_ffmpeg; then
         log_message "Failed to start FFmpeg"
@@ -3683,7 +3961,7 @@ while true; do
     
     FFMPEG_PID=""
     
-    END_TIME=$(date +%s)
+    END_TIME=$(now_s)
     RUN_TIME=$((END_TIME - START_TIME))
     
     log_message "FFmpeg exited with code ${exit_code} after ${RUN_TIME} seconds"
@@ -3881,6 +4159,20 @@ log_critical() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] [STREAM:${STREAM_PATH}] $1" >> "${LOG_FILE}" 2>/dev/null || true
 }
 
+# Monotonic seconds since boot for run-time/backoff math. Wall-clock deltas
+# break on NTP steps (an RTC-less Pi can jump years when it first gets
+# network): a healthy multi-hour run would measure negative and count as a
+# consecutive failure, eventually killing the wrapper on a healthy stream.
+now_s() {
+    local up
+    if [[ -r /proc/uptime ]]; then
+        read -r up _ < /proc/uptime
+        printf '%s' "${up%%.*}"
+    else
+        date +%s
+    fi
+}
+
 # Cleanup handler
 cleanup_wrapper() {
     local exit_code=$?
@@ -4071,7 +4363,7 @@ while true; do
     
     log_message "Starting FFmpeg (attempt #$((RESTART_COUNT + 1)))"
     
-    START_TIME=$(date +%s)
+    START_TIME=$(now_s)
     
     if ! run_ffmpeg; then
         log_message "Failed to start FFmpeg"
@@ -4099,7 +4391,7 @@ while true; do
     
     FFMPEG_PID=""
     
-    END_TIME=$(date +%s)
+    END_TIME=$(now_s)
     RUN_TIME=$((END_TIME - START_TIME))
     
     log_message "FFmpeg exited with code ${exit_code} after ${RUN_TIME} seconds"

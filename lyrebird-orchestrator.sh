@@ -598,7 +598,7 @@ refresh_system_state() {
         else
             # Fallback: limit output before counting to prevent DoS
             # head -n 1001 ensures we never process more than 1001 PIDs
-            raw_count=$(pgrep -x ffmpeg 2>/dev/null | head -n 1001 | wc -l)
+            raw_count=$(pgrep -x ffmpeg 2>/dev/null | head -n 1001 | wc -l) || true
         fi
 
         # Validate count with overflow protection

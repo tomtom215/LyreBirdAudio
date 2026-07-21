@@ -606,12 +606,12 @@ get_script_version() {
         return
     fi
 
-    version=$(grep -m1 "^readonly SCRIPT_VERSION=" "${script_path}" 2>/dev/null | cut -d'"' -f2)
+    version=$(grep -m1 "^readonly SCRIPT_VERSION=" "${script_path}" 2>/dev/null | cut -d'"' -f2) || true
     if [[ -z "${version}" ]]; then
-        version=$(grep -m1 "^SCRIPT_VERSION=" "${script_path}" 2>/dev/null | cut -d'"' -f2)
+        version=$(grep -m1 "^SCRIPT_VERSION=" "${script_path}" 2>/dev/null | cut -d'"' -f2) || true
     fi
     if [[ -z "${version}" ]]; then
-        version=$(grep -m1 "# Version:" "${script_path}" 2>/dev/null | awk '{print $3}')
+        version=$(grep -m1 "# Version:" "${script_path}" 2>/dev/null | awk '{print $3}') || true
     fi
 
     echo "${version:-unknown}"
@@ -1307,7 +1307,7 @@ get_fd_usage_percent() {
 
     local fd_limit
     if [[ -f "/proc/${pid}/limits" ]]; then
-        fd_limit=$(grep "Max open files" "/proc/${pid}/limits" 2>/dev/null | awk '{print $4}')
+        fd_limit=$(grep "Max open files" "/proc/${pid}/limits" 2>/dev/null | awk '{print $4}') || true
     fi
 
     # FIXED: Explicit zero-check guard
@@ -1395,7 +1395,7 @@ get_tcp_ephemeral_status() {
 get_ntp_offset_ms() {
     if command -v ntpq >/dev/null 2>&1; then
         local offset
-        offset=$(ntpq -p 2>/dev/null | grep -E '^\*|^o' | head -1 | awk '{print $(NF-2)}')
+        offset=$(ntpq -p 2>/dev/null | grep -E '^\*|^o' | head -1 | awk '{print $(NF-2)}') || true
 
         if [[ -n "${offset}" ]] && [[ "${offset}" =~ ^-?[0-9]+\. ]]; then
             echo "${offset}"
@@ -1404,7 +1404,7 @@ get_ntp_offset_ms() {
         fi
     elif command -v chronyc >/dev/null 2>&1; then
         local offset
-        offset=$(chronyc tracking 2>/dev/null | grep "Frequency offset" | awk '{print $(NF-1)}')
+        offset=$(chronyc tracking 2>/dev/null | grep "Frequency offset" | awk '{print $(NF-1)}') || true
 
         [[ -n "${offset}" ]] && echo "${offset}" || echo "unknown"
     else

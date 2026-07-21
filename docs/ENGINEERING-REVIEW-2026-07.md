@@ -301,3 +301,43 @@ backup prune no-ops on BSD; INT/TERM handler `return`s and gates rollback on `$?
 
 Every fix is verified against the actual code; line numbers are from the state
 at review time and may shift as fixes land.
+
+---
+
+## 8. Third audit pass — long-horizon & cold-start (2026-07)
+
+A third adversarial, **hardware-free** pass. Focus: the failure modes an
+unattended field node hits over weeks/months (clock steps, corrupt config,
+resource exhaustion) and the three items the second pass deferred. Every finding
+below was **reproduced with a runnable artifact** (a PATH-shim, a stub API, or a
+bats test that fails before the fix) — no speculative entries. Suite: **528 →
+579 tests**, green, ShellCheck-clean at `--severity=warning`.
+
+**Deferred trio — closed with simulation proof:**
+
+| # | Sev | Component | Failure (state → wrong outcome) | Repro | Fix | Test |
+|---|-----|-----------|---------------------------------|-------|-----|------|
+| D1 | HIGH | stream-manager `monitor_streams` | Health check verified only the wrapper bash PID → a hung FFmpeg / endless-backoff stream whose MediaMTX path never publishes reports healthy forever; node looks alive while recording nothing (H9). | Live fake wrapper process + stub `/v3/paths/get` returning `ready:false`; pre-fix `monitor_streams` never restarts. | Deep readiness probe: path not-ready for `DEEP_HEALTH_MAX_STRIKES` consecutive runs → restart within the cron budget; API-unreachable never strikes; ready resets the streak. | `test_deep_health_check.bats` (6) |
+| D2 | HIGH | stream-manager ×4, metrics ×1 | Readiness parsed by grepping `"ready":true`, a field MediaMTX **deprecated** in favour of `available` → a future server dropping `ready` makes every stream read dead / every ready count 0. | Stub API returning the new `{"available":true}` shape; pre-fix `path_is_ready`/`count_ready`/`validate_stream`/metrics all fail. | Tolerant parser accepting both shapes, preferring the new field, centralised in `mediamtx_json_*`. | `test_mediamtx_json_compat.bats` (12) |
+| D3 | HIGH | stream-manager wrapper + cron budget + silence | Backoff run-time, cron restart budget and silence tracking used wall-clock `date +%s` → an NTP step on an RTC-less Pi makes a healthy multi-hour run measure negative (counted as a failure until the wrapper gives up), ages the restart budget out (anti-storm brake evaporates), and turns minutes of silence into a false DEAD MIC. | PATH-shim `date` jumping ±5000s / ±2h between calls; pre-fix 3 of 4 assertions fail. | All boot-scoped timers read `/proc/uptime` (monotonic); state lives under `/run` (cleared at boot). | `test_monotonic_timing.bats` (4) |
+
+**New findings (same failure classes, new instances):**
+
+| # | Sev | Component | Failure (state → wrong outcome) | Repro | Fix | Test |
+|---|-----|-----------|---------------------------------|-------|-----|------|
+| N1 | HIGH | stream-manager API counts | `count=$(echo "$json" \| grep -o … \| wc -l)` under pipefail → an **idle** server (0 ready paths / 0 sessions) aborts `mediamtx_count_ready_paths`, `_count_rtsp_sessions`, `_count_all_connections`, `get_status_summary` mid-run. | Stub API with empty item lists; pre-fix each function exits non-zero. | Centralised `_json_count_matches` that never fails. | in `test_mediamtx_json_compat.bats` |
+| N2 | HIGH | 7 scripts, 15 sites | `var=$(cmd \| grep PAT \| …)` under `set -euo pipefail` aborts the whole run when grep matches nothing — even though the next line handles the empty result (NTP probe on an unsynced daemon, audio-level check with no volumedetect output, metrics scrape when MediaMTX exits mid-scrape → stale `.prom`, checksum verify, service-env merge, …). | Per-function fakes driving each into its empty-match path; pre-fix 8 of 11 abort. | `|| true` / explicit `|| default` guards preserving the intended fallback. | `test_pipefail_aborts.bats` (11) |
+| N3 | CRITICAL | stream-manager `load_device_config` | Device config `source`d directly → a config truncated by power loss / SD-card bit-rot / a bad operator edit hits a syntax error that aborts `start` under errexit; **no streams come up** on the next unattended boot — total outage from one bad line. | Truncated (unterminated-array) config; pre-fix `load_device_config` exits 2, `start` aborts. | `bash -n` validate before sourcing → ignore & use defaults if corrupt; source valid config with errexit neutralised (restored after). | `test_config_crash_safety.bats` (4) |
+| N4 | HIGH | stream-manager numeric env | Any non-numeric override of a numeric knob (e.g. `CRON_RESTART_MAX_PER_HOUR=unlimited`) reaches bash arithmetic → `set -u` "unbound variable" kills **every cron monitor pass**. | Sourcing with `CRON_RESTART_MAX_PER_HOUR=unlimited` then calling `should_restart_stream`; pre-fix aborts. | 37 knobs coerced (base-10, sane default on garbage) at load; valid overrides preserved. | `test_numeric_env_hardening.bats` (5) |
+| N5 | HIGH | storage retention | `find -mtime +N` after an NTP step sees minutes-old recordings (written with a 1970 clock) as ~56 years old → **mass-deletes fresh data**. | `touch -d @1000000` recording + real retention run; pre-fix it is deleted. | Skip age-based cleanup while the clock is pre-`CLOCK_SANE_EPOCH`; keep any file with a pre-epoch mtime; emergency size cleanup exempt (proven). | `test_storage_clock_sanity.bats` (4) |
+| N6 | HIGH | storage monitoring | Only block usage was checked → a recorder exhausting **inodes** (many small files) fails every write with ENOSPC while monitoring reports "OK"; no cleanup runs. | Stub `df` with 40% blocks / 99% inodes; pre-fix `cmd_monitor` stays quiet. | `df -Pi` inode usage subject to the same warn/critical/emergency thresholds; unknown accounting = no pressure. | `test_storage_inodes.bats` (4) |
+| N7 | MEDIUM | metrics | A `.prom` left by a dead exporter is indistinguishable from a live one → "dead recorder looks alive". | — (feature gap). | Emit `lyrebird_scrape_timestamp_seconds`; alert on age. | in `test_lyrebird_metrics.bats` |
+
+**Still deferred (one line each, with the specific blocker):**
+- MediaMTX supported-version string is already at `v1.19.x` in-code and the
+  installer fetches versions dynamically, so there is no hardcoded pin left to
+  bump; a live-server integration test against a real v1.19.x control API
+  remains out of reach without a running MediaMTX.
+- Silence/dead-mic **detection thresholds** (dB, durations) are validated for
+  clock-safety and abort-safety here but not for acoustic accuracy — that needs
+  a real microphone and is left to field calibration.
