@@ -9,10 +9,17 @@ setup() {
     TEST_DIR="$( cd "$( dirname "$BATS_TEST_FILENAME" )" && pwd )"
     PROJECT_ROOT="$( cd "$TEST_DIR/.." && pwd )"
 
-    # Create temp directories for testing
-    export RECORDING_DIR="$(mktemp -d)"
-    export LOG_DIR="$(mktemp -d)"
-    export TEMP_DIR="$(mktemp -d)"
+    # Create temp directories for testing. The script reads its paths from the
+    # LYREBIRD_* variables and makes RECORDING_DIR/LOG_DIR/TEMP_DIR readonly,
+    # overwriting any same-named value set here. Setting RECORDING_DIR etc.
+    # directly therefore pointed every test (and the teardown's rm -rf) at the
+    # REAL /var/lib/mediamtx-ffmpeg/recordings, /var/log/lyrebird and /tmp.
+    TEST_RECORDING_DIR="$(mktemp -d)"
+    TEST_LOG_DIR="$(mktemp -d)"
+    TEST_TEMP_DIR="$(mktemp -d)"
+    export LYREBIRD_RECORDING_DIR="$TEST_RECORDING_DIR"
+    export LYREBIRD_LOG_DIR="$TEST_LOG_DIR"
+    export LYREBIRD_TEMP_DIR="$TEST_TEMP_DIR"
 
     # Set conservative thresholds for testing
     export DISK_WARNING_PERCENT=80
@@ -31,12 +38,15 @@ setup() {
     set +euo pipefail
 }
 
-# Teardown - clean up temp directories
+# Teardown - remove only the directories this file created with mktemp
 teardown() {
-    rm -rf "$RECORDING_DIR" 2>/dev/null || true
-    rm -rf "$LOG_DIR" 2>/dev/null || true
-    rm -rf "$TEMP_DIR" 2>/dev/null || true
+    local d
+    for d in "${TEST_RECORDING_DIR:-}" "${TEST_LOG_DIR:-}" "${TEST_TEMP_DIR:-}"; do
+        [[ "$d" == "${TMPDIR:-/tmp}"/tmp.* ]] && rm -rf -- "$d"
+    done
+    return 0
 }
+
 
 # ============================================================================
 # Script Metadata Tests
