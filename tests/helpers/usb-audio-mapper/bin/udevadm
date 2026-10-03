@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+# Test stub for udevadm. Records every call in $STUB_LOG.
+#   verify:  delegates to the real udevadm ($REAL_UDEVADM) when available,
+#            unless STUB_VERIFY_FAIL=1.
+#   trigger: when STUB_RENAME="<sysfs-card-dir>=<name>", writes <name> to that
+#            card's id file, imitating udev applying an ATTR{id} rule.
+printf 'udevadm %s\n' "$*" >>"${STUB_LOG:-/dev/null}"
+case "${1:-}" in
+    verify)
+        if [[ "${2:-}" == "--help" ]]; then exit 0; fi
+        [[ "${STUB_VERIFY_FAIL:-0}" == 1 ]] && {
+            echo "stub: verify failed" >&2
+            exit 1
+        }
+        if [[ -n "${REAL_UDEVADM:-}" ]]; then exec "$REAL_UDEVADM" "$@"; fi
+        exit 0
+        ;;
+    test-builtin)
+        # path_id: <controller>-usb-0:<port without bus>:<interface>, as udev's
+        # path_id builds it for a sound card (e.g. pci-0000:00:14.0-usb-0:3.1:1.0).
+        [[ "${2:-}" == path_id && "${STUB_NO_PATHID:-0}" != 1 ]] || exit 1
+        intf=$(readlink -f "$3/device") || exit 1
+        dir=$intf
+        while [[ "$dir" != / && ! "$(basename "$dir")" =~ ^usb[0-9]+$ ]]; do dir=$(dirname "$dir"); done
+        [[ "$dir" != / ]] || exit 1
+        ctrl=$(basename "$(dirname "$dir")")
+        name=$(basename "$intf")
+        printf 'ID_PATH=pci-%s-usb-0:%s\n' "$ctrl" "${name#*-}"
+        ;;
+    trigger)
+        if [[ -n "${STUB_RENAME:-}" ]]; then
+            printf '%s\n' "${STUB_RENAME#*=}" >"${STUB_RENAME%%=*}/id"
+        fi
+        ;;
+esac
+exit 0
