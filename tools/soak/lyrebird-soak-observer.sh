@@ -173,6 +173,11 @@ cmd_run() {
             die "--power-every needs --power-off-cmd and --power-on-cmd"
         fi
     fi
+    # Usage errors first, whatever is installed.
+    local u
+    for u in "$@"; do
+        case "$u" in rtsp://* | rtsps://*) ;; *) die "not an RTSP URL: $u" ;; esac
+    done
     command -v ffmpeg >/dev/null 2>&1 || die "ffmpeg not found"
     [ -n "$SEED" ] || SEED=$(($(now) % 1000000))
     TIMEOUT_US=$((TIMEOUT * 1000000))
@@ -184,7 +189,6 @@ cmd_run() {
 
     local i=0 url pids=""
     for url in "$@"; do
-        case "$url" in rtsp://* | rtsps://*) ;; *) die "not an RTSP URL: $url" ;; esac
         i=$((i + 1))
         printf '%s\t%s\n' "$i" "$url" >>"$DIR/streams"
         reader "$i" "$url" &
