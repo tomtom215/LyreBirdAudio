@@ -47,18 +47,15 @@ sudo rm -f /run/mediamtx-audio.lock /run/mediamtx-audio.pid
 sudo ./lyrebird-stream-manager.sh start</code></pre>
 
     <h3>Device Not Found After Reboot</h3>
-    <pre><code># Re-scan and remap USB devices
-sudo ./usb-audio-mapper.sh --rescan
+    <pre><code># Show USB sound cards, their ports and mappings
+./usb-audio-mapper.sh --list
 
-# Reload udev rules (may not need reboot)
-sudo udevadm control --reload-rules
-sudo udevadm trigger
+# Re-map a card that lost its name (applied and verified immediately)
+sudo ./usb-audio-mapper.sh -n --card N -f NAME
 
-# Verify device symlinks exist
-ls -la /dev/snd/by-usb-port/
-
-# If symlinks missing: reboot is required
-sudo reboot</code></pre>
+# Verify the names and symlinks
+cat /proc/asound/cards
+ls -la /dev/sound/by-id/</code></pre>
 
     <h3>Complete System Recovery</h3>
     <p>Use this procedure when the system is in an unknown or corrupted state:</p>

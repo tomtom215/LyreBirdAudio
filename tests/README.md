@@ -8,7 +8,7 @@ Unit tests for LyreBirdAudio using the [Bats](https://github.com/bats-core/bats-
 |-----------|-----------|-------|---------------|
 | lyrebird-common.sh | test_lyrebird_common.bats | 47 | 80% |
 | lyrebird-stream-manager.sh | test_stream_manager.bats | 32 | 50% |
-| usb-audio-mapper.sh | test_usb_audio_mapper.bats | 33 | 65% |
+| usb-audio-mapper.sh | test_usb_audio_mapper.bats | 55 | not estimated (real script vs. fake sysfs; E2E in the standalone repo) |
 | lyrebird-diagnostics.sh | test_lyrebird_diagnostics.bats | 34 | 70% |
 | lyrebird-orchestrator.sh | test_lyrebird_orchestrator.bats | 44 | 70% |
 | lyrebird-alerts.sh | test_lyrebird_alerts.bats | 45 | 60% |
@@ -18,7 +18,7 @@ Unit tests for LyreBirdAudio using the [Bats](https://github.com/bats-core/bats-
 | install_mediamtx.sh | test_install_mediamtx.bats | 55 | 70% |
 | lyrebird-mic-check.sh | test_lyrebird_mic_check.bats | 45 | 70% |
 
-**Total: ~464 tests covering approximately 70% of critical paths**
+**Total: 615 tests (`bats --count tests/`).** Coverage percentages above are estimates, not measured. Caveat: the 321 tests in `test_install_mediamtx`, `test_lyrebird_alerts`, `test_lyrebird_metrics`, `test_lyrebird_mic_check`, `test_lyrebird_storage` and `test_lyrebird_updater` currently cannot fail (their sourced script replaces bats' EXIT trap; `docs/ENGINEERING-REVIEW-2026-07.md` §9, U9).
 
 ## Prerequisites
 
@@ -80,7 +80,7 @@ bats tests/ --filter "validation"
 |------|-------------|
 | `test_lyrebird_common.bats` | Tests for shared library functions (hashing, timestamps, exit codes, progress indicators, error helpers) |
 | `test_stream_manager.bats` | Tests for stream manager (sanitization, PID, locks, heartbeat, network) |
-| `test_usb_audio_mapper.bats` | Tests for USB device detection, sanitization, udev rules, port path parsing |
+| `test_usb_audio_mapper.bats` | USB audio mapper: rule generation and safety, name/port validation, sysfs discovery, every CLI path, migration, locking, interactive mode (real script against a fake sysfs; same tests as the standalone usb-audio-mapper repository, which also has the QEMU end-to-end suite) |
 | `test_lyrebird_diagnostics.bats` | Tests for diagnostic utilities (validation, port, disk, logs, system resources) |
 | `test_lyrebird_orchestrator.bats` | Tests for menu validation, version comparison, status display, service status, time formatting |
 | `test_lyrebird_alerts.bats` | Tests for webhook alerting (formatters, rate limiting, alert types) |
@@ -89,6 +89,7 @@ bats tests/ --filter "validation"
 | `test_lyrebird_updater.bats` | Tests for update system (git operations, transactions, service detection, backups) |
 | `test_install_mediamtx.bats` | Tests for MediaMTX installer (version comparison, platform detection, validation) |
 | `test_lyrebird_mic_check.bats` | Tests for mic check utility (device detection, capability testing, config generation) |
+| `test_storage_suite_safety.bats` | Guards `test_lyrebird_storage.bats` itself: its setup must point the storage script at private temp dirs, never at real recordings, logs or `/tmp` |
 
 ## Test Categories
 

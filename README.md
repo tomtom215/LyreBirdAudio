@@ -169,8 +169,8 @@ These diagrams show how LyreBirdAudio components work together to transform USB 
 +----------------------------------------------------------+
 |              Persistent Device Layer (udev)              |
 |  +----------------------------------------------------+  |
-|  | * /dev/snd/by-usb-port/Device_1 -> /dev/snd/pcmC0D0c |
-|  | * /dev/snd/by-usb-port/Device_2 -> /dev/snd/pcmC1D0c |
+|  | * card id mic-left -> hw:CARD=mic-left             |  |
+|  | * /dev/sound/by-id/mic-left -> ../snd/controlC0    |  |
 |  | * Consistent naming across reboots                 |  |
 |  +----------------------------------------------------+  |
 +--------------------+-------------------------------------+
@@ -215,7 +215,7 @@ These diagrams show how LyreBirdAudio components work together to transform USB 
           |       * Cron-based health checking
           |
           +----> usb-audio-mapper.sh
-          |       * USB device detection via lsusb
+          |       * USB device detection via sysfs
           |       * udev rule generation
           |       * Physical port mapping
           |       * Persistent naming across reboots
@@ -387,7 +387,7 @@ sudo ./lyrebird-diagnostics.sh quick
 # rtsp://your-ip:8554/device-name
 ```
 
-**Reboot Recommended:** After initial and after each individual USB device mapping, reboot for udev rules to take full effect. You will manually have to start the Orchestrator again after each reboot: cd LyreBirdAudio && sudo ./lyrebird-orchestrator.sh
+**No reboot needed for USB mapping:** `usb-audio-mapper.sh` (4.0.0+) applies each name immediately and confirms it with the kernel. Check the result with `./usb-audio-mapper.sh --list`.
 
 ### Post-Installation
 
@@ -841,15 +841,11 @@ sudo ./lyrebird-diagnostics.sh quick
 lsusb | grep -i audio
 arecord -l
 
-# Verify udev rules
-sudo cat /etc/udev/rules.d/99-usb-soundcards.rules
+# Show USB sound cards, their ports and mappings
+./usb-audio-mapper.sh --list
 
-# Remap devices
+# Remap devices (applied and verified immediately)
 sudo ./usb-audio-mapper.sh
-
-# Reload udev and reboot
-sudo udevadm control --reload-rules
-sudo reboot
 ```
 
 #### Streams Won't Start
@@ -876,16 +872,15 @@ sudo lsof /dev/snd/*
 
 **Diagnosis:**
 ```bash
-cat /etc/udev/rules.d/99-usb-soundcards.rules
-udevadm control --reload-rules
-udevadm trigger
-ls -la /dev/snd/by-usb-port/
+./usb-audio-mapper.sh --list     # cards, ports, mappings; flags pre-4.0 rules
+cat /proc/asound/cards           # mapped cards show their names here
+ls -la /dev/sound/by-id/
 ```
 
 **Solutions:**
-- Re-run USB mapper: `sudo ./usb-audio-mapper.sh`
-- Reboot system for udev rules to take effect
-- Verify physical USB port hasn't changed
+- Re-run the USB mapper for each device: `sudo ./usb-audio-mapper.sh -n --card N -f NAME`.
+  Rules written by mapper 1.2.1 and earlier never renamed any device; re-running replaces them.
+- Verify the physical USB port hasn't changed (names are tied to the port)
 
 #### Permission Errors
 
@@ -1469,10 +1464,10 @@ This modular design prevents duplicate business logic and ensures maintainabilit
 
 | Script | Version | Purpose |
 |--------|---------|---------|
-| lyrebird-orchestrator.sh | 2.1.2 | Unified management interface |
-| lyrebird-updater.sh | 1.5.1 | Version management with rollback |
+| lyrebird-orchestrator.sh | 2.1.3 | Unified management interface |
+| lyrebird-updater.sh | 1.6.0 | Version management with rollback |
 | lyrebird-stream-manager.sh | 1.5.0 | Stream lifecycle management |
-| usb-audio-mapper.sh | 1.2.1 | USB device persistence via udev |
+| usb-audio-mapper.sh | 4.0.0 | USB device persistence via udev |
 | lyrebird-mic-check.sh | 1.0.0 | Hardware capability detection |
 | lyrebird-diagnostics.sh | 1.0.2 | System diagnostics |
 | install_mediamtx.sh | 2.0.1 | MediaMTX installation/upgrade |
@@ -1700,44 +1695,54 @@ The systemd installation automatically creates a cron job at `/etc/cron.d/mediam
 
 ### USB Audio Mapper (usb-audio-mapper.sh)
 
-**Purpose:** Create persistent udev rules for USB audio devices
+**Purpose:** Give each USB sound card a permanent ALSA name, tied to the USB port it is plugged into, so identical microphones keep their names across reboots.
+
+Shared with the standalone [usb-audio-mapper](https://github.com/tomtom215/usb-audio-mapper) project, whose README and DOCUMENTATION.md cover it in full.
 
 **Usage:**
 ```bash
+# List USB sound cards, ports and mappings (no root needed)
+./usb-audio-mapper.sh --list
+
 # Interactive mode
 sudo ./usb-audio-mapper.sh
 
-# Non-interactive
-sudo ./usb-audio-mapper.sh -n -d "Device" -v XXXX -p YYYY -f friendly-name
+# Non-interactive: name ALSA card 1 (vendor, product and port read from it)
+sudo ./usb-audio-mapper.sh -n --card 1 -f mic-left
 
-# Test detection
-sudo ./usb-audio-mapper.sh --test
+# Non-interactive by vendor/product id, choosing the port
+sudo ./usb-audio-mapper.sh -n -v XXXX -p YYYY -u 1-2 -f mic-right
+
+# Remove a mapping
+sudo ./usb-audio-mapper.sh --remove mic-left
 ```
-
-**Output:** `/etc/udev/rules.d/99-usb-soundcards.rules`
 
 **Options:**
 - `-i, --interactive`: Run in interactive mode (default)
 - `-n, --non-interactive`: Run in non-interactive mode
-- `-d, --device <name>`: Device name for logging
+- `-c, --card <N>`: ALSA card number of a connected USB device
 - `-v, --vendor <id>`: Vendor ID (4-digit hex)
 - `-p, --product <id>`: Product ID (4-digit hex)
-- `-u, --usb-port <path>`: USB port path (optional)
-- `-f, --friendly <name>`: Friendly device name
-- `-t, --test`: Test USB port detection
+- `-u, --usb-port <port>`: Physical port such as `1-2` or `1-2.3` (see `--list`)
+- `--any-port`: Match the device on any port (only with a single such device)
+- `-f, --friendly <name>`: Name: lowercase letters, digits, hyphens; starts with a letter; at most 15 characters
+- `-d, --device <text>`: Description stored in the rule comment (optional)
+- `-l, --list`: List USB sound cards, ports and mappings
+- `-t, --test`: List every USB device with its port
+- `-r, --remove <name>`: Remove a mapping
+- `--dry-run`, `--no-apply`: Print rules only / write without triggering udev
 - `-D, --debug`: Enable debug output
 
 **Features:**
-- Physical USB port mapping
-- Platform ID path support for complex topologies
-- Handles multiple identical devices
-- Interactive device selection wizard
-- Non-interactive mode for automation
-- Backwards compatibility (no serial number suffixes)
+- Names follow the physical USB port, so identical devices are told apart (also behind hubs)
+- Applies each name immediately and verifies it with the kernel (exit 6 if it did not take)
+- Refuses ambiguous requests (several identical devices, no port given)
+- Replaces rules from older versions automatically; atomic, locked writes
 
 **Generated Files:**
 - `/etc/udev/rules.d/99-usb-soundcards.rules`: udev rules
-- `/dev/snd/by-usb-port/Device_N`: Device symlinks (post-reboot)
+- ALSA card id `<name>` (in `/proc/asound/cards`, usable as `hw:CARD=<name>`)
+- `/dev/sound/by-id/<name>`: symlink to the card's control device
 
 ---
 
@@ -2257,15 +2262,15 @@ sudo ./lyrebird-stream-manager.sh start
 ### Device Not Found After Reboot
 
 ```bash
-# Re-scan and remap USB devices
-sudo ./usb-audio-mapper.sh --rescan
+# Show USB sound cards, their ports and mappings
+./usb-audio-mapper.sh --list
 
-# Reload udev rules
-sudo udevadm control --reload-rules
-sudo udevadm trigger
+# Re-map a card that lost its name (applied and verified immediately)
+sudo ./usb-audio-mapper.sh -n --card N -f NAME
 
-# Verify device appears
-ls -la /dev/snd/by-usb-port/
+# Verify
+cat /proc/asound/cards
+ls -la /dev/sound/by-id/
 ```
 
 ### Complete System Recovery

@@ -70,19 +70,14 @@ arecord -l
 # Step 2: Check ALSA device enumeration
 cat /proc/asound/cards
 
-# Step 3: Verify udev rules exist
-sudo cat /etc/udev/rules.d/99-usb-soundcards.rules
+# Step 3: See USB sound cards, their ports and mappings
+./usb-audio-mapper.sh --list
 
-# Step 4: Reload udev and check symlinks
-sudo udevadm control --reload-rules
-sudo udevadm trigger
-ls -la /dev/snd/by-usb-port/
+# Step 4: Check the mapped names and symlinks
+ls -la /dev/sound/by-id/
 
-# Step 5: Re-run device mapping
-sudo ./usb-audio-mapper.sh
-
-# Step 6: Reboot (required for udev rules)
-sudo reboot</code></pre>
+# Step 5: Re-run device mapping (applies and verifies immediately)
+sudo ./usb-audio-mapper.sh</code></pre>
 
     <div class="callout tip">
       <span class="callout-icon">💡</span>
@@ -131,27 +126,21 @@ sudo rm -f /run/mediamtx-audio.lock /run/mediamtx-audio.pid</code></pre>
     <h2 id="device-names">Device Names Change After Reboot</h2>
     <p><strong>Symptom:</strong> <code>Device_1</code> becomes <code>Device_2</code> after reboot, or devices swap names.</p>
 
-    <pre><code># Verify udev rules are in place
-cat /etc/udev/rules.d/99-usb-soundcards.rules
+    <pre><code># Show cards, ports and mappings; flags rules from older versions
+./usb-audio-mapper.sh --list
 
-# Check if symlinks exist
-ls -la /dev/snd/by-usb-port/
+# Check the mapped names and symlinks
+cat /proc/asound/cards
+ls -la /dev/sound/by-id/
 
-# Reload udev
-sudo udevadm control --reload-rules
-sudo udevadm trigger
-
-# Re-run mapper if rules are missing/incorrect
-sudo ./usb-audio-mapper.sh
-
-# Reboot to apply
-sudo reboot</code></pre>
+# Re-run the mapper for any card that is not named (applies immediately)
+sudo ./usb-audio-mapper.sh -n --card N -f NAME</code></pre>
 
     <div class="callout info">
       <span class="callout-icon">ℹ️</span>
       <div class="callout-body">
         <strong>USB Port Changes</strong>
-        <p>If you physically moved a microphone to a different USB port, you must re-run <code>sudo ./usb-audio-mapper.sh</code> and reboot. udev rules are tied to the physical USB port path, not the device itself.</p>
+        <p>If you physically moved a microphone to a different USB port, re-run <code>sudo ./usb-audio-mapper.sh</code> for it. Names are tied to the physical USB port, not the device itself. Rules written by mapper v1.2.1 and earlier never renamed any device; <code>--list</code> reports them, and re-running the mapper replaces them.</p>
       </div>
     </div>
 

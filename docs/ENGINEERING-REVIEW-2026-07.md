@@ -51,7 +51,7 @@ This class is the highest-leverage thing to fix and to guard with tests.
 | Item | Status |
 |------|--------|
 | Test harness (159 hidden tests, `set -e` leak) + CI wiring | ✅ fixed |
-| C1 udev rules commented out + H7 sanitizer injection | ✅ fixed |
+| C1 udev rules commented out + H7 sanitizer injection | ✅ fixed — but rules still never matched; see §9 (U1), fixed 2026-10 |
 | C2/C3 FFmpeg wrapper auto-restart (`wait`, parent-PID) | ✅ fixed (+ E2E) |
 | C4 mic-check ↔ stream-manager device-config case | ✅ fixed |
 | C5 ntfy/Pushover alerts dropped | ✅ fixed |
@@ -341,3 +341,40 @@ bats test that fails before the fix) — no speculative entries. Suite: **528 �
 - Silence/dead-mic **detection thresholds** (dB, durations) are validated for
   clock-safety and abort-safety here but not for acoustic accuracy — that needs
   a real microphone and is left to field calibration.
+
+---
+
+## 9. Fourth pass — USB audio mapper, end to end (2026-10)
+
+C1 (2026-07) turned the mapper's rule from a comment into an active line, but
+nothing had ever checked that the active rule renames a device. This pass ran
+the mapper against **real Linux kernels and real systemd-udevd**: QEMU guests
+with emulated `usb-audio` devices driven by the real `snd-usb-audio`, three
+identical devices on ports `1-1`, `1-2` and `1-3.1` (behind a hub). The harness
+and scenarios live in the standalone
+[usb-audio-mapper](https://github.com/tomtom215/usb-audio-mapper) repository
+(`tests/e2e/`), which now shares this script (4.0.0).
+
+| # | Sev | Failure (state → wrong outcome) | Repro | Fix | Test |
+|---|-----|---------------------------------|-------|-----|------|
+| U1 | CRITICAL | Whenever udev knew the device's `ID_PATH` (always, with systemd's stock rules), the rule matched `ENV{ID_PATH}` read from the USB device node (`…-usb-0:1`); the sound card's own `ID_PATH` carries the interface (`…-usb-0:1:1.0`), so the rule never matched. Non-interactive mode also took that value from the first `lsusb` line with the vendor/product id, so identical devices all got device 1's rule and `-u` was ignored. **USB persistent naming still never worked.** | QEMU, kernel 6.8, udev 255, this repo's post-C1 mapper: 0 of 3 cards renamed after mapping and replug. | Match the sound card's own `ID_PATH` (imported in the rule, read at mapping time with `udevadm test-builtin path_id`) plus `ATTRS{idVendor/idProduct}`. | E2E: 3 of 3 renamed immediately, after replug/flapping/hub replug, udevd restart, system-wide triggers, and at boot (coldplug); udev 241/245/247/255/262, kernels 6.1/6.8 |
+| U1b | CRITICAL | (found while fixing U1) A port rule `KERNELS=="<bus>-<port>"` contains the USB bus number, which changes between boots when host-controller drivers register in a different order → the rule names a **different** identical microphone. | QEMU: xHCI + OHCI, one identical device each; mapped with xHCI first, rebooted with OHCI first: OHCI mic got the xHCI mic's name, xHCI mic got none. | `ID_PATH` (controller + port chain, no bus number); `KERNELS` only when the device is unplugged at mapping time, with a warning. | E2E bus-renumbering step: both names correct in both load orders, coldplug and hotplug |
+| U2 | HIGH | Kernel `id_store` truncates card ids to 15 characters and still reports success; ids starting with `card` or equal to a reserved word (`pcm`, `oss`, …) fail with EEXIST. Names up to 32 characters were accepted, and the wizard's fallback suggestion was `card-…`. | Direct sysfs writes in QEMU: `abcdefghijklmnopq` → `abcdefghijklmno`; `card-test`, `pcm` → "File exists". | Validate names against the kernel's rules before writing. | bats (name rules), mutation check |
+| U3 | MEDIUM | The rule had no `KERNEL==` gate: udev logged failed `ATTR{id}` writes on `controlC*`/`pcm*` (and on the card during removal) at every event, and several nodes competed for the symlink; re-writing an unchanged id fails with EEXIST. | QEMU with the old rule shape: failed writes logged for `controlC0`, `pcmC0D0p`, `card0`; both `controlC0` and `pcmC0D0p` claimed the link; second write of the same id → EEXIST. | `KERNEL=="card*"` for the rename, `KERNEL=="controlC*"` for the link, `ACTION=="add\|change"`, `ATTR{id}!=` guard. | E2E: no udev errors about the rules |
+| U4 | MEDIUM | An invalid `-u` was ignored with a warning, producing a vendor/product-only rule that gives every identical device the same name; with several identical devices and no port, the first `lsusb` match was used silently. | Code reading; unit tests reproduce the new refusals. | Invalid port → exit 2; ambiguous id → exit 5; `--card N` resolves the device from the card itself. | bats, mutation check |
+| U5 | MEDIUM | Concurrent runs read-modify-write the rules file without a lock → lost mappings. | Mutation check: removing the lock makes the 8-way concurrency test fail 10 of 10 times. | `flock` around the update. | bats |
+| U6 | LOW | Docs and orchestrator described outputs that do not exist (`/dev/snd/by-usb-port/Device_N`, `--rescan`) and required a reboot after mapping. The ORCH-7 regression test asserted `/dev/snd/by-id/` was "what the mapper creates"; that directory holds systemd's own `usb-<serial>` links. | Reading + E2E (mapper output is the card id and `/dev/sound/by-id/<name>`). | Docs/orchestrator corrected; mapper applies and verifies names immediately; ORCH-7 test asserts the real paths. | `test_lyrebird_orchestrator.bats` |
+| U7 | LOW | `tests/test_usb_audio_mapper.bats`: 14 of 19 tests exercised functions defined inside the test file, not the script. | Reading. | Replaced by a 55-test suite that runs the real script against a fake sysfs. | `test_usb_audio_mapper.bats` |
+
+Found while running the suite for this pass (not mapper code):
+
+| # | Sev | Failure (state → wrong outcome) | Repro | Fix | Test |
+|---|-----|---------------------------------|-------|-----|------|
+| U8 | CRITICAL | `tests/test_lyrebird_storage.bats` set `RECORDING_DIR`/`LOG_DIR`/`TEMP_DIR` and then sourced `lyrebird-storage.sh`, which overwrites them with readonly defaults. Every test, and the teardown's `rm -rf`, then used `/var/lib/mediamtx-ffmpeg/recordings`, `/var/log/lyrebird` and `/tmp`: **running the test suite as root on a deployed node deletes all recordings and logs, and empties `/tmp`.** | Sourcing with `TEMP_DIR=/var/tmp/x` yields `TEMP_DIR=/tmp` (all three overwritten); canary files in `/tmp` vanished after this file ran, and the run aborted after 1 of 59 tests (bats' own temp files deleted). | Set the script's real knobs (`LYREBIRD_*_DIR`); teardown deletes only its own `mktemp` dirs. | `test_storage_suite_safety.bats` (fails on the old setup) |
+| U9 | HIGH | Six files cannot fail at all: `test_install_mediamtx`, `test_lyrebird_alerts`, `test_lyrebird_metrics`, `test_lyrebird_mic_check`, `test_lyrebird_storage`, `test_lyrebird_updater` (321 tests). Their `setup()` sources a script that installs its own `EXIT` trap, replacing the one bats uses to report results (and turns errexit off). | A test containing only `false`, appended to each file with the file's own setup: `ok` in these six, `not ok` in every other file. | **Not fixed here** (outside the mapper; fixing will surface real failures in six components). Suggested: save `trap -p EXIT` before sourcing and restore it after, keep `set -e`. | — |
+
+Also corrected: C1 above says the bug left `/dev/snd/by-id/<name>` uncreated;
+the mapper's link is `/dev/sound/by-id/<name>`.
+
+**Not covered:** physical USB hardware and ARM boards (all runs are x86-64 with
+emulated devices), eudev, and systemd older than 241.
