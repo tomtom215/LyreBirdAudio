@@ -8,10 +8,16 @@
 # Copyright: Tom F and LyreBirdAudio contributors
 # License: Apache 2.0
 #
-# Version: 2.1.2
+# Version: 2.1.3
 # Description: Production-grade orchestrator providing unified access to all
 #              LyreBirdAudio components with comprehensive functionality,
 #              intuitive navigation, and robust error handling.
+#
+# v2.1.3 USB mapping:
+#   - Fixed: after mapping, no longer claims names live in /dev/snd/by-id/ or
+#            asks for a reboot; usb-audio-mapper 4.0.0 applies and verifies
+#            names immediately (/proc/asound/cards, /dev/sound/by-id/).
+#   - Changed: "show mappings" uses usb-audio-mapper.sh --list.
 #
 # v2.1.2 Integration Fixes:
 #   - Fixed: MediaMTX reinstall now correctly uses '-f install' instead of
@@ -85,7 +91,7 @@ unset _LYREBIRD_COMMON
 # Constants and Configuration
 # ============================================================================
 
-readonly SCRIPT_VERSION="2.1.2"
+readonly SCRIPT_VERSION="2.1.3"
 
 # Initialize constants safely (separate declaration from assignment to catch errors)
 SCRIPT_NAME=""
@@ -1001,29 +1007,10 @@ menu_quick_setup() {
     refresh_system_state
 
     echo
-    info "USB devices are now mapped to stable /dev/snd/by-id/ paths"
-    info "A reboot is recommended for udev rules to take full effect"
-    echo
-
-    # Handle EOF / stdin closed
-    if ! read -rp "Reboot now? (y/n): " -n 1; then
-        echo
-        info "Input stream closed - continuing without reboot"
-        log "INFO" "Reboot prompt aborted due to EOF"
-    else
-        flush_stdin # Consume trailing newline from -n 1 read
-        echo
-        if [[ "$REPLY" =~ ^[Yy]$ ]]; then
-            info "System will reboot now. Run this script again after reboot to continue setup."
-            sleep 2
-            /sbin/reboot # Use absolute path for security
-            exit 0
-        fi
-    fi
-
-    echo
-    info "Continuing setup without reboot..."
-    info "Note: If streams fail to start, a reboot may be required"
+    # usb-audio-mapper >= 4.0.0 applies each name immediately and verifies it
+    # with the kernel, so no reboot is needed here.
+    info "USB device names take effect immediately (no reboot needed)"
+    info "Names: /proc/asound/cards (hw:CARD=<name>); links: /dev/sound/by-id/<name>"
     echo
 
     # Handle EOF / stdin closed
@@ -1283,8 +1270,11 @@ menu_usb_devices() {
                     echo
                     echo "================================================================"
                     echo
-                    info "Mapped device paths:"
-                    ls -la /dev/snd/by-id/ 2>/dev/null || echo "  No devices currently mapped"
+                    info "USB sound cards and their mapped names:"
+                    execute_script "usb_mapper" --list || true
+                    echo
+                    info "Name links (/dev/sound/by-id/):"
+                    ls -la /dev/sound/by-id/ 2>/dev/null || echo "  No devices currently mapped"
                 else
                     echo "  No device mappings configured"
                     echo "================================================================"
