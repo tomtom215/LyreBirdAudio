@@ -290,25 +290,50 @@ Tests use [BATS](https://github.com/bats-core/bats-core) (Bash Automated Testing
 
 ```bash
 #!/usr/bin/env bats
+load bats_shell_state
+load scratch_tmpdir
+
+setup() {
+    scratch_setup     # private TMPDIR for this test, removed in teardown
+    PROJECT_ROOT="$(cd "$(dirname "$BATS_TEST_FILENAME")/.." && pwd)"
+    bats_save_shell_state
+    source "$PROJECT_ROOT/script.sh"
+    bats_restore_shell_state
+}
+
+teardown() {
+    scratch_teardown
+}
 
 @test "function returns expected value" {
-    source ../script.sh
-    result=$(my_function "input")
-    [[ "$result" == "expected" ]]
-}
-
-@test "function handles errors" {
-    source ../script.sh
-    run my_function "bad_input"
-    [[ "$status" -ne 0 ]]
+    run my_function "input"
+    [ "$status" -eq 0 ]
+    [ "$output" = "expected" ]
 }
 ```
+
+Rules that keep tests honest:
+
+- Wrap any `source` of a script in `bats_save_shell_state` /
+  `bats_restore_shell_state`. Scripts set their own traps and shell options;
+  without the restore, a failing assertion in the middle of a test is ignored.
+  `tests/test_suite_can_fail.bats` fails if any file loses this.
+- Do not write `set +e` (or `set +euo pipefail`) in a test or its setup.
+- End negated assertions with `|| false` (`! grep -q x file || false`); bash
+  does not fail on a negated command in the middle of a test.
+- To check an exit status, capture it as `local rc=0; cmd || rc=$?`;
+  `cmd; rc=$?` aborts the test before `rc` is set.
+- Create temp files with `mktemp` under `scratch_setup`, never in fixed paths.
+  `tests/check_tmp_leaks.sh` (run by CI) fails if the suite leaves anything in
+  `TMPDIR`.
+- Never point a test at real system paths (`/var/lib/...`, `/var/log/...`):
+  override the script's own path variables (for example `LYREBIRD_*_DIR`).
 
 ### Running Tests
 
 ```bash
-cd tests
-bats *.bats
+bats tests/                    # whole suite
+tests/check_tmp_leaks.sh       # whole suite, plus the temp-file leak check (as CI)
 ```
 
 ### Test Coverage Goals

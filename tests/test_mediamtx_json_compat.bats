@@ -11,7 +11,10 @@
 # All tests drive the REAL functions from lyrebird-stream-manager.sh /
 # lyrebird-metrics.sh against a stub MediaMTX API (PATH-shim fake curl).
 
+load scratch_tmpdir
+
 setup() {
+    scratch_setup
     TEST_DIR="$( cd "$( dirname "$BATS_TEST_FILENAME" )" && pwd )"
     PROJECT_ROOT="$( cd "$TEST_DIR/.." && pwd )"
     JC_TMP="$(mktemp -d)"
@@ -20,6 +23,7 @@ setup() {
 
 teardown() {
     rm -rf "$JC_TMP" 2>/dev/null || true
+    scratch_teardown
 }
 
 # Write a fake curl that answers /v3/paths/list and /v3/paths/get/* with the

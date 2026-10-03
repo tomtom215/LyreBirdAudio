@@ -4,7 +4,10 @@
 # Note: These tests use function extraction, not the full script
 
 # Setup - extract and source testable functions
+load scratch_tmpdir
+
 setup() {
+    scratch_setup
     TEST_DIR="$( cd "$( dirname "$BATS_TEST_FILENAME" )" && pwd )"
     PROJECT_ROOT="$( cd "$TEST_DIR/.." && pwd )"
 
@@ -15,6 +18,10 @@ setup() {
     if ! declare -f log &>/dev/null; then
         log() { :; }
     fi
+}
+
+teardown() {
+    scratch_teardown
 }
 
 # ============================================================================

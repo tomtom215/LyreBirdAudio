@@ -707,9 +707,16 @@ teardown() {
     [[ "$output" == *ALLOK* ]]
 }
 
-@test "orchestrator references /dev/snd/by-id (what the mapper creates), not by-usb-port [ORCH-7 regression]" {
+@test "orchestrator points at what usb-audio-mapper creates (/dev/sound/by-id, --list), not by-usb-port [ORCH-7 regression]" {
+    # The mapper names cards (ATTR{id}) and links /dev/sound/by-id/<name>;
+    # /dev/snd/by-id/ holds systemd's own usb-<serial> links, and
+    # /dev/snd/by-usb-port/ is created by nothing.
     run grep -c "by-usb-port" "$PROJECT_ROOT/lyrebird-orchestrator.sh"
     [ "$output" -eq 0 ]
-    run grep -c "/dev/snd/by-id/" "$PROJECT_ROOT/lyrebird-orchestrator.sh"
+    run grep -c "/dev/sound/by-id/" "$PROJECT_ROOT/lyrebird-orchestrator.sh"
     [ "$output" -ge 2 ]
+    run grep -c 'execute_script "usb_mapper" --list' "$PROJECT_ROOT/lyrebird-orchestrator.sh"
+    [ "$output" -eq 1 ]
+    run grep -c "Reboot now?" "$PROJECT_ROOT/lyrebird-orchestrator.sh"
+    [ "$output" -eq 0 ]
 }

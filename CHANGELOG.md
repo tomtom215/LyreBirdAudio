@@ -7,6 +7,127 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Soak testing and current MediaMTX (2026-10)
+
+Component versions bumped: `lyrebird-stream-manager.sh` 1.5.0 → 1.5.1.
+
+#### Added
+- `tools/soak/`: a soak-test harness for field-like long runs.
+  `lyrebird-soak.sh` runs on the node (systemd service), checks device names
+  against the usb-audio-mapper rules, stream liveness and stalls, services and
+  resource trends, injects faults on a seeded schedule (process kills, udev
+  restarts, USB unplug, network loss, full disk, clock steps, reboots and
+  hard resets; each undo armed as a systemd timer before the fault), and
+  reports PASS/FAIL. `lyrebird-soak-observer.sh` watches the streams from a
+  second machine (bash 3.2 or later), can cut the node's power through
+  commands you supply, and reports gaps and time to audio. See
+  `tools/soak/README.md`.
+- Live tests against real MediaMTX releases (`tests/fetch_mediamtx.sh`
+  downloads checksum-pinned 1.15.0, 1.18.0, 1.19.0 and 1.21.1), run by a new
+  CI job.
+
+#### Fixed
+- **MediaMTX 1.19.0 and later opened three extra ports.** Those versions start
+  a MoQ (Media over QUIC) server unless told not to, so the generated
+  `mediamtx.yml` left `:8892/tcp`, `:8892/udp` and `:8893/udp` listening on
+  every interface (allowed origins `*`), and MediaMTX wrote a generated
+  key/certificate pair into its working directory. The installer installs the
+  latest release by default, so new installs were affected. The config now
+  says `moq: no` when the installed MediaMTX is 1.19.0 or later; 1.15–1.18
+  refuse to start with that key, so it is left out for them and when the
+  version cannot be read. Verified with the real binaries of every release
+  from 1.15.0 to 1.21.1.
+
+### USB Audio Mapper 4.0.0 (2026-10)
+
+`usb-audio-mapper.sh` is now the same file as the standalone
+[usb-audio-mapper](https://github.com/tomtom215/usb-audio-mapper) 4.0.0 (its
+version number replaces this repository's 1.2.1). Tested end to end with real
+Linux kernels and real systemd-udevd in QEMU; see
+`docs/ENGINEERING-REVIEW-2026-07.md` §9.
+
+Component versions bumped: `usb-audio-mapper.sh` 1.2.1 → 4.0.0,
+`lyrebird-orchestrator.sh` 2.1.2 → 2.1.3, `lyrebird-updater.sh` 1.6.0 → 1.6.1,
+`lyrebird-mic-check.sh` 1.0.0 → 1.0.1, `lyrebird-alerts.sh` 1.0.0 → 1.0.1.
+
+#### Fixed
+- **USB persistent naming still never worked (critical).** The 2026-07 fix (C1)
+  made the rule an active line, but whenever udev knew the device's `ID_PATH`
+  the rule matched `ENV{ID_PATH}` taken from the USB *device* node, which never
+  equals the sound card's `ID_PATH` (the card's carries the interface suffix,
+  e.g. `-usb-0:1:1.0`). In non-interactive mode the value also came from the
+  first `lsusb` line with the vendor/product id, so identical devices all got
+  the first device's rule and `-u` was ignored. Reproduced with three identical
+  devices: 0 of 3 renamed. Rules now match the sound card's own `ID_PATH`
+  (imported in the rule), gated to the card device; 3 of 3 renamed, immediately,
+  after replug, after udevd restarts and system-wide triggers, and at boot.
+- **Wrong microphone named after USB bus renumbering (critical).** A port rule
+  such as `KERNELS=="1-1"` contains the USB bus number, which changes between
+  boots when host-controller drivers register in a different order; in a test
+  with two controllers one microphone got the other's name. `ID_PATH` omits the
+  bus number and kept both names in every load order.
+- **Names the kernel truncates or refuses**: ALSA card ids hold 15 characters
+  (longer names were silently cut), and ids starting with `card` (the
+  wizard's own fallback suggestion) or reserved words like `pcm` are refused.
+- **Rule side effects**: the rule also matched `controlC*`/`pcm*` nodes, so
+  udev logged failed `ATTR{id}` writes on every event and several nodes
+  competed for the symlink; re-applying an unchanged id fails with `EEXIST`.
+  Rules are now gated (`KERNEL=="card*"` / `"controlC*"`,
+  `ACTION=="add|change"`) with an `ATTR{id}!=` guard.
+- An invalid `-u` value no longer silently falls back to a vendor/product rule
+  that names every identical device the same; several identical devices with
+  no port given are refused (exit 5).
+- Concurrent mapper runs no longer lose updates (`flock`).
+- `-u usb-<controller>-<port>` (the form in `/proc/asound/cards`) was refused
+  when the controller name contains `-`, as on dwc3 ARM boards
+  (`usb-xhci-hcd.0.auto-1.2`).
+
+- **Test suite could delete recordings and logs.** `tests/test_lyrebird_storage.bats`
+  exported `RECORDING_DIR`/`LOG_DIR`/`TEMP_DIR`, which `lyrebird-storage.sh`
+  overwrites with its readonly defaults when sourced, so the teardown's
+  `rm -rf` hit `/var/lib/mediamtx-ffmpeg/recordings`, `/var/log/lyrebird` and
+  `/tmp`. Run as root on a node, the test suite deleted all recordings and
+  logs. The setup now uses the `LYREBIRD_*_DIR` variables; regression test in
+  `tests/test_storage_suite_safety.bats`.
+
+- **321 tests could not fail.** Six test files sourced a script in `setup()`
+  that replaced bats' `EXIT` trap and then switched errexit off, so a failing
+  assertion was ignored. A helper now restores bats' traps and options after
+  sourcing, and `tests/test_suite_can_fail.bats` checks every test file.
+  This surfaced 28 failures; 25 were wrong tests, corrected to the scripts'
+  actual behaviour (`docs/ENGINEERING-REVIEW-2026-07.md` §9, U9–U13).
+- The test suite left 27 temp files and directories behind per run. Test files
+  that create temp files now give each test a private `TMPDIR`
+  (`tests/scratch_tmpdir.bash`), and CI runs `tests/check_tmp_leaks.sh`, which
+  fails on any leftover.
+- `lyrebird-mic-check.sh -g` wrote `DEFAULT_SAMPLE_RATE`, `DEFAULT_CHANNELS`
+  and `DEFAULT_BITRATE` into `audio-devices.conf`, where the stream manager
+  ignores them (they are readonly by then) and logs `readonly variable` on
+  every load. They are now written as comments; set them in the stream
+  manager's environment instead. README corrected.
+- `lyrebird-alerts.sh`: level colours and prefixes were lost when the script
+  was sourced from a function.
+- `lyrebird-updater.sh --help` now lists the command-line options.
+- `lyrebird-stream-manager.sh` header said version 1.4.4 (it is 1.5.0), which
+  `lyrebird-diagnostics.sh` reported.
+
+#### Added
+- `--card N`, `--list`, `--remove NAME`, `--dry-run`, `--no-apply`,
+  `--any-port`; immediate application with kernel verification (exit 6 when
+  the name did not take, naming the card that holds it); automatic migration
+  of rules written by earlier versions; documented exit codes.
+
+#### Changed
+- Orchestrator: no reboot prompt after mapping (not needed any more); messages
+  name the real outputs (`/proc/asound/cards`, `/dev/sound/by-id/`); "show
+  mappings" uses `usb-audio-mapper.sh --list`.
+- Docs: removed references to `/dev/snd/by-usb-port/Device_N` and
+  `--rescan`, neither of which existed, and to reboots after mapping.
+- `tests/test_usb_audio_mapper.bats` replaced: the old file had 19 tests, 14 of
+  which tested copies of functions defined inside the test file rather than the
+  script. The new suite (56 tests) runs the real script against a fake sysfs.
+  The QEMU end-to-end suite lives in the standalone repository.
+
 ### Reliability Audit (2026-07, third pass)
 
 A third adversarial, hardware-free reliability pass focused on the long-horizon
@@ -326,16 +447,16 @@ additionally tracks its own internal version, shown below:
 
 | Component | Current Version |
 |-----------|-----------------|
-| lyrebird-orchestrator.sh | 2.1.2 |
-| lyrebird-stream-manager.sh | 1.4.4 |
+| lyrebird-orchestrator.sh | 2.1.3 |
+| lyrebird-stream-manager.sh | 1.5.0 |
 | lyrebird-updater.sh | 1.6.0 |
-| usb-audio-mapper.sh | 1.2.1 |
+| usb-audio-mapper.sh | 4.0.0 |
 | lyrebird-diagnostics.sh | 1.0.2 |
 | install_mediamtx.sh | 2.0.1 |
 | lyrebird-mic-check.sh | 1.0.0 |
 | lyrebird-common.sh | 1.0.0 |
-| lyrebird-metrics.sh | 1.0.0 |
-| lyrebird-storage.sh | 1.0.0 |
+| lyrebird-metrics.sh | 1.2.0 |
+| lyrebird-storage.sh | 1.1.0 |
 | lyrebird-alerts.sh | 1.0.0 |
 
 ## Links

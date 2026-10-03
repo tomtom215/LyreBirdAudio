@@ -188,8 +188,8 @@ sudo ./install_mediamtx.sh install
 # Step 2: Map USB devices (interactive)
 sudo ./usb-audio-mapper.sh
 
-# Step 3: Reboot for udev rules to take effect
-sudo reboot
+# Step 3: Check the names (applied immediately; no reboot needed)
+./usb-audio-mapper.sh --list
 
 # Step 4: Generate optimal configuration
 sudo ./lyrebird-mic-check.sh -g

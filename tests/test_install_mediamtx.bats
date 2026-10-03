@@ -4,42 +4,48 @@
 # Install bats: sudo apt-get install bats
 
 # Setup - source the installer script
+load bats_shell_state
+
 setup() {
     # Get the directory of this test file
     TEST_DIR="$( cd "$( dirname "$BATS_TEST_FILENAME" )" && pwd )"
     PROJECT_ROOT="$( cd "$TEST_DIR/.." && pwd )"
 
     # Create temp directories for testing
-    export TEMP_DIR="$(mktemp -d)"
-    export LOCK_FILE="$(mktemp)"
-    export CONFIG_FILE="$(mktemp)"
+    # The installer resets TEMP_DIR/CONFIG_FILE to "" and makes LOCK_FILE a
+    # readonly system path when sourced, so keep this file's own paths in
+    # TEST_* variables and delete only those (deleting "$LOCK_FILE" removed
+    # the real /run/lock/mediamtx-installer.lock after every test).
+    TEST_TEMP_DIR="$(mktemp -d)"
+    TEST_LOCK_FILE="$(mktemp)"
+    TEST_CONFIG_FILE="$(mktemp)"
+    export TEMP_DIR="$TEST_TEMP_DIR" LOCK_FILE="$TEST_LOCK_FILE" CONFIG_FILE="$TEST_CONFIG_FILE"
 
     # Set dry-run mode to avoid actual system changes
     export DRY_RUN=true
 
     # Source the installer script
+    bats_save_shell_state
     source "$PROJECT_ROOT/install_mediamtx.sh"
-
-    # The script enables `set -euo pipefail`, which leaks into the bats shell and
-    # turns failing assertions / unset-var reads into silent aborts. Restore
-    # bats' own error handling so failures report as "not ok".
-    set +euo pipefail
+    bats_restore_shell_state
 }
 
 # Teardown - clean up temp files
 teardown() {
-    rm -rf "$TEMP_DIR" 2>/dev/null || true
-    rm -f "$LOCK_FILE" 2>/dev/null || true
-    rm -f "$CONFIG_FILE" 2>/dev/null || true
+    local f
+    for f in "${TEST_TEMP_DIR:-}" "${TEST_LOCK_FILE:-}" "${TEST_CONFIG_FILE:-}"; do
+        [[ "$f" == "${TMPDIR:-/tmp}"/tmp.* ]] && rm -rf -- "$f"
+    done
+    return 0
 }
 
 # ============================================================================
 # Script Metadata Tests
 # ============================================================================
 
-@test "VERSION is defined" {
-    [ -n "$VERSION" ]
-    [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+@test "SCRIPT_VERSION is defined" {
+    [ -n "$SCRIPT_VERSION" ]
+    [[ "$SCRIPT_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
 }
 
 @test "SCRIPT_NAME is defined" {
@@ -188,34 +194,44 @@ teardown() {
     [ "$status" -eq 0 ]
 }
 
+# version_compare is a predicate: exit 0 iff v1 >= v2 (see its caller in
+# the --upgrade gate). It prints nothing on success.
 @test "version_compare: 1.0.0 < 2.0.0" {
     run version_compare "1.0.0" "2.0.0"
-    [ "$status" -eq 0 ]
-    [ "$output" = "-1" ]
+    [ "$status" -eq 1 ]
+    [ -z "$output" ]
 }
 
 @test "version_compare: 2.0.0 > 1.0.0" {
     run version_compare "2.0.0" "1.0.0"
     [ "$status" -eq 0 ]
-    [ "$output" = "1" ]
+    [ -z "$output" ]
 }
 
 @test "version_compare: 1.0.0 = 1.0.0" {
     run version_compare "1.0.0" "1.0.0"
     [ "$status" -eq 0 ]
-    [ "$output" = "0" ]
 }
 
 @test "version_compare: 1.10.0 > 1.9.0" {
     run version_compare "1.10.0" "1.9.0"
     [ "$status" -eq 0 ]
-    [ "$output" = "1" ]
+    run version_compare "1.9.0" "1.10.0"
+    [ "$status" -eq 1 ]
 }
 
 @test "version_compare: 1.0.10 > 1.0.9" {
     run version_compare "1.0.10" "1.0.9"
     [ "$status" -eq 0 ]
-    [ "$output" = "1" ]
+    run version_compare "1.0.9" "1.0.10"
+    [ "$status" -eq 1 ]
+}
+
+@test "version_compare: leading v is ignored" {
+    run version_compare "v1.2.0" "1.1.9"
+    [ "$status" -eq 0 ]
+    run version_compare "1.1.9" "v1.2.0"
+    [ "$status" -eq 1 ]
 }
 
 # ============================================================================
@@ -241,14 +257,14 @@ teardown() {
     [ "$status" -eq 0 ]
 }
 
-@test "detect_platform sets PLATFORM variable" {
+@test "detect_platform sets PLATFORM_OS" {
     detect_platform
-    [ -n "$PLATFORM" ]
+    [ "$PLATFORM_OS" = "linux" ]
 }
 
-@test "detect_platform sets ARCH variable" {
+@test "detect_platform sets PLATFORM_ARCH" {
     detect_platform
-    [ -n "$ARCH" ]
+    [[ "$PLATFORM_ARCH" =~ ^(amd64|386|arm64|armv7|armv6)$ ]]
 }
 
 # ============================================================================
@@ -423,12 +439,16 @@ teardown() {
     [ -n "$DEFAULT_INSTALL_PREFIX" ]
 }
 
-@test "MEDIAMTX_USER is defined" {
-    [ -n "$MEDIAMTX_USER" ]
+@test "SERVICE_USER and SERVICE_GROUP default to mediamtx" {
+    run env -u MEDIAMTX_USER -u MEDIAMTX_GROUP bash -c \
+        'source "$1" >/dev/null 2>&1; echo "$SERVICE_USER:$SERVICE_GROUP"' _ "$PROJECT_ROOT/install_mediamtx.sh"
+    [ "$output" = "mediamtx:mediamtx" ]
 }
 
-@test "MEDIAMTX_GROUP is defined" {
-    [ -n "$MEDIAMTX_GROUP" ]
+@test "MEDIAMTX_USER and MEDIAMTX_GROUP override the service account" {
+    run env MEDIAMTX_USER=svcuser MEDIAMTX_GROUP=svcgroup bash -c \
+        'source "$1" >/dev/null 2>&1; echo "$SERVICE_USER:$SERVICE_GROUP"' _ "$PROJECT_ROOT/install_mediamtx.sh"
+    [ "$output" = "svcuser:svcgroup" ]
 }
 
 # ============================================================================

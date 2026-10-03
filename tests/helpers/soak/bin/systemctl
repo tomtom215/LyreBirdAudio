@@ -1,0 +1,12 @@
+#!/bin/bash
+# Stub systemctl: a service is inactive if $STUB_DIR/inactive.<name> exists.
+echo "systemctl $*" >>"$STUB_DIR/calls"
+case "$1" in
+    is-active)
+        svc="${*: -1}"
+        [[ -e "$STUB_DIR/inactive.$svc" ]] && exit 3
+        exit 0
+        ;;
+    show) echo "${STUB_RESTARTS:-0}" ;;
+esac
+exit 0

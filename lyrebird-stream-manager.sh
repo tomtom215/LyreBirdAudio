@@ -10,15 +10,24 @@
 # This script automatically detects USB microphones and creates MediaMTX
 # configurations for continuous 24/7 RTSP audio streams.
 #
-# Version: 1.4.4 - Robustness improvements
-# Compatible with MediaMTX v1.15.0 through at least v1.19.x. The /v3 REST API
-# endpoints used here are unchanged across that range. NOTE: the path status
+# Version: 1.5.1
+# Compatible with MediaMTX v1.15.0 through at least v1.21.1. The generated
+# mediamtx.yml, stream start-up and readiness probing are tested against the
+# real 1.15.0, 1.18.0, 1.19.0 and 1.21.1 binaries (tests/test_mediamtx_live.bats;
+# 1.16.0, 1.17.0, 1.20.0 and 1.21.0 were also run once). NOTE: the path status
 # fields parsed below ("ready", "bytesReceived", "tracks") are DEPRECATED as of
 # v1.16/v1.17 in favour of "available"/"online"/"inboundBytes"/"tracks2" -- they
 # are still returned today, but a JSON-field migration (with real-hardware
 # validation) is advisable before a future MediaMTX major release removes them.
 #
 # Version History:
+# v1.5.1 - Generated mediamtx.yml disables the MoQ server that MediaMTX
+#          >= 1.19.0 starts by default (key written only for >= 1.19.0, which
+#          older versions reject)
+#
+# v1.5.0 - Reliability audit, third pass (see CHANGELOG.md, "Reliability Audit
+#          (2026-07, third pass)")
+#
 # v1.4.4 - Robustness improvements
 #   - Restructured API validation to preserve curl exit status for better error detection
 #   - curl|grep pattern replaced with explicit exit code checking
@@ -197,7 +206,7 @@ unset _LYREBIRD_COMMON _LYREBIRD_COMMON_EXPECTED_HASH
 unset -f _verify_common_library
 
 # Constants
-readonly VERSION="1.5.0"
+readonly VERSION="1.5.1"
 
 # Script identification
 SCRIPT_NAME="$(basename "${BASH_SOURCE[0]}")"
@@ -1840,7 +1849,7 @@ mediamtx_get_path() {
 
 # --- Tolerant JSON status parsing -------------------------------------------
 # MediaMTX deprecated the path "ready"/"bytesReceived"/"tracks" fields in favour
-# of "available"/"inboundBytes"/"tracks2" (still emitting both as of v1.19.x).
+# of "available"/"inboundBytes"/"tracks2" (still emitting both as of v1.21.1).
 # These helpers accept BOTH shapes so a future MediaMTX that drops "ready" does
 # not make every stream look dead. When both fields are present the NEW field
 # wins. They are also safe under set -euo pipefail: a zero-match grep must not
@@ -4594,6 +4603,21 @@ stop_all_ffmpeg_streams() {
     pkill -f "^ffmpeg.*rtsp://${MEDIAMTX_HOST}:8554" 2>/dev/null || true
 }
 
+# Does the installed MediaMTX accept the top-level "moq" key (>= 1.19.0)?
+# Fails when the binary is missing or its version cannot be read.
+mediamtx_supports_moq_key() {
+    local ver
+    [[ -x "${MEDIAMTX_BIN}" ]] || return 1
+    if command_exists timeout; then
+        ver=$(timeout 10 "${MEDIAMTX_BIN}" --version 2>/dev/null | head -n 1) || return 1
+    else
+        ver=$("${MEDIAMTX_BIN}" --version 2>/dev/null | head -n 1) || return 1
+    fi
+    [[ "$ver" =~ ^v?([0-9]+)\.([0-9]+)\.[0-9]+ ]] || return 1
+    local major=$((10#${BASH_REMATCH[1]})) minor=$((10#${BASH_REMATCH[2]}))
+    ((major > 1 || (major == 1 && minor >= 19)))
+}
+
 # Generate MediaMTX configuration without subshell locking
 generate_mediamtx_config() {
     log INFO "Generating MediaMTX configuration"
@@ -4670,9 +4694,16 @@ rtmp: no
 hls: no
 webrtc: no
 srt: no
-
-paths:
 EOF
+
+    # MediaMTX >= 1.19.0 also starts a MoQ (Media over QUIC) server by default:
+    # :8892/tcp, :8892/udp and :8893/udp on every interface. Turn it off, but
+    # only where the key exists -- 1.15-1.18 reject an unknown "moq" key and
+    # refuse to start, so an unknown version leaves the key out.
+    if mediamtx_supports_moq_key; then
+        printf 'moq: no\n' >>"$tmp_config"
+    fi
+    printf '\npaths:\n' >>"$tmp_config"
 
     # Add paths based on stream mode
     if [[ "${STREAM_MODE}" == "multiplex" ]]; then

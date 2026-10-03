@@ -4,15 +4,27 @@
 # Install bats: sudo apt-get install bats
 
 # Setup - source the storage script
+load bats_shell_state
+
+load scratch_tmpdir
+
 setup() {
+    scratch_setup
     # Get the directory of this test file
     TEST_DIR="$( cd "$( dirname "$BATS_TEST_FILENAME" )" && pwd )"
     PROJECT_ROOT="$( cd "$TEST_DIR/.." && pwd )"
 
-    # Create temp directories for testing
-    export RECORDING_DIR="$(mktemp -d)"
-    export LOG_DIR="$(mktemp -d)"
-    export TEMP_DIR="$(mktemp -d)"
+    # Create temp directories for testing. The script reads its paths from the
+    # LYREBIRD_* variables and makes RECORDING_DIR/LOG_DIR/TEMP_DIR readonly,
+    # overwriting any same-named value set here. Setting RECORDING_DIR etc.
+    # directly therefore pointed every test (and the teardown's rm -rf) at the
+    # REAL /var/lib/mediamtx-ffmpeg/recordings, /var/log/lyrebird and /tmp.
+    TEST_RECORDING_DIR="$(mktemp -d)"
+    TEST_LOG_DIR="$(mktemp -d)"
+    TEST_TEMP_DIR="$(mktemp -d)"
+    export LYREBIRD_RECORDING_DIR="$TEST_RECORDING_DIR"
+    export LYREBIRD_LOG_DIR="$TEST_LOG_DIR"
+    export LYREBIRD_TEMP_DIR="$TEST_TEMP_DIR"
 
     # Set conservative thresholds for testing
     export DISK_WARNING_PERCENT=80
@@ -22,33 +34,33 @@ setup() {
     export LOG_MAX_SIZE_MB=50
 
     # Source the storage script
+    bats_save_shell_state
     source "$PROJECT_ROOT/lyrebird-storage.sh"
-
-    # The script enables `set -euo pipefail`, which leaks into the bats test
-    # shell and turns failing assertions / unset-var reads into silent aborts
-    # (bats loses control of errexit and stops emitting results). Restore bats'
-    # own error handling so failures report as "not ok" instead of vanishing.
-    set +euo pipefail
+    bats_restore_shell_state
 }
 
-# Teardown - clean up temp directories
+# Teardown - remove only the directories this file created with mktemp
 teardown() {
-    rm -rf "$RECORDING_DIR" 2>/dev/null || true
-    rm -rf "$LOG_DIR" 2>/dev/null || true
-    rm -rf "$TEMP_DIR" 2>/dev/null || true
+    local d
+    for d in "${TEST_RECORDING_DIR:-}" "${TEST_LOG_DIR:-}" "${TEST_TEMP_DIR:-}"; do
+        [[ "$d" == "${TMPDIR:-/tmp}"/tmp.* ]] && rm -rf -- "$d"
+    done
+    scratch_teardown
+    return 0
 }
+
 
 # ============================================================================
 # Script Metadata Tests
 # ============================================================================
 
-@test "SCRIPT_VERSION is defined" {
-    [ -n "$SCRIPT_VERSION" ]
-    [[ "$SCRIPT_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+@test "VERSION is defined" {
+    [ -n "$VERSION" ]
+    [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
 }
 
-@test "SCRIPT_NAME is lyrebird-storage" {
-    [ "$SCRIPT_NAME" = "lyrebird-storage" ]
+@test "SCRIPT_NAME is lyrebird-storage.sh" {
+    [ "$SCRIPT_NAME" = "lyrebird-storage.sh" ]
 }
 
 # ============================================================================
@@ -467,12 +479,15 @@ DFEOF
 
 @test "cmd_monitor detects a full disk hidden behind a wrapped df name [STORAGE-1 regression]" {
     local bin; bin="$(mktemp -d)"; _write_fake_df "$bin"
+    # The storage script only accepts a buffer under /dev/shm, /tmp, /var/tmp
+    # or /run, wherever TMPDIR points (CI: the runner's work directory).
+    local buf; buf="$(mktemp -d /tmp/lyrebird-test-buffer.XXXXXX)"
     # DRY_RUN=true: the EMERGENCY log still fires but nothing is deleted.
     run env PROJECT_ROOT="$PROJECT_ROOT" PATH="$bin:$PATH" \
         LYREBIRD_RECORDING_DIR="$(mktemp -d)" LYREBIRD_LOG_DIR="$(mktemp -d)" \
-        LYREBIRD_BUFFER_DIR="$(mktemp -d)" DRY_RUN=true \
+        LYREBIRD_BUFFER_DIR="$buf" DRY_RUN=true \
         bash -c 'source "$PROJECT_ROOT/lyrebird-storage.sh"; cmd_monitor 2>&1'
-    rm -rf "$bin"
+    rm -rf "$bin" "$buf"
     [ "$status" -eq 0 ]
     [[ "$output" =~ EMERGENCY ]]         # old code parsed usage as "/" -> "OK"
 }

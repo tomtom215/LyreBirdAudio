@@ -164,41 +164,28 @@ EOF
     [[ "$output" == *"STATE-REFRESHED streams=0"* ]]
 }
 
-@test "usb-mapper: get_usb_physical_port survives a DEVPATH with no usb port pattern" {
-    # udevadm answers with a platform-bus DEVPATH (no N-N.N segment): the
-    # extraction grep matches nothing and must fall through, not abort.
-    cat > "$PA_TMP/bin/udevadm" <<'EOF'
-#!/bin/bash
-echo "DEVPATH=/devices/platform/soc/fe00b840.mailbox/sound"
-exit 0
-EOF
-    chmod +x "$PA_TMP/bin/udevadm"
+@test "usb-mapper: card_usb_port survives a platform (non-USB) sound card under pipefail" {
+    # A platform-bus sound card has no <bus>-<port> ancestor: the upward walk
+    # must end with "not USB" (status 1), not abort the run under errexit.
+    # (usb-audio-mapper 4.0.0 reads sysfs directly; this replaces the old
+    # get_usb_physical_port/udevadm DEVPATH case.)
+    local sys="$PA_TMP/sys"
+    mkdir -p "$sys/devices/platform/soc/fe00b840.mailbox/sound/card0" "$sys/class/sound"
+    ln -s ../.. "$sys/devices/platform/soc/fe00b840.mailbox/sound/card0/device"
+    ln -s ../../devices/platform/soc/fe00b840.mailbox/sound/card0 "$sys/class/sound/card0"
 
-    # The function only consults udevadm when /dev/bus/usb/<bus>/<dev> exists.
-    # Creating that node needs root: do it directly when we are root, via
-    # non-interactive sudo on CI runners, and skip (with the reason) elsewhere
-    # rather than fail on an environment limitation.
-    if mkdir -p /dev/bus/usb/990 2>/dev/null; then
-        : > /dev/bus/usb/990/991
-        PA_DEV_SUDO=""
-    elif command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
-        sudo -n mkdir -p /dev/bus/usb/990
-        sudo -n touch /dev/bus/usb/990/991
-        PA_DEV_SUDO="sudo -n"
-    else
-        skip "cannot create /dev/bus/usb test node (needs root or passwordless sudo)"
-    fi
-
-    run env PROJECT_ROOT="$PROJECT_ROOT" PATH="$PA_TMP/bin:$PATH" bash -c '
+    run env PROJECT_ROOT="$PROJECT_ROOT" USB_AUDIO_MAPPER_SYSFS="$sys" bash -c '
         set -euo pipefail
         source "$PROJECT_ROOT/usb-audio-mapper.sh" >/dev/null 2>&1
         rc=0
-        get_usb_physical_port 990 991 || rc=$?
+        card_usb_port 0 || rc=$?
         echo "COMPLETED rc=$rc"
+        ports=$(find_ports_by_id dead beef)
+        echo "EMPTY-SEARCH-OK [$ports]"
     '
-    ${PA_DEV_SUDO} rm -rf /dev/bus/usb/990
     [ "$status" -eq 0 ]
-    [[ "$output" == *"COMPLETED"* ]]
+    [[ "$output" == *"COMPLETED rc=1"* ]]
+    [[ "$output" == *"EMPTY-SEARCH-OK []"* ]]
 }
 
 @test "installer: verify_checksum reports a MISSING checksum entry instead of aborting" {

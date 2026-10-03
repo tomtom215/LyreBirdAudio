@@ -4,7 +4,12 @@
 # Install bats: sudo apt-get install bats
 
 # Setup - source the metrics script
+load bats_shell_state
+
+load scratch_tmpdir
+
 setup() {
+    scratch_setup
     # Get the directory of this test file
     TEST_DIR="$( cd "$( dirname "$BATS_TEST_FILENAME" )" && pwd )"
     PROJECT_ROOT="$( cd "$TEST_DIR/.." && pwd )"
@@ -15,12 +20,9 @@ setup() {
     export PID_FILE="$(mktemp)"
 
     # Source the metrics script
+    bats_save_shell_state
     source "$PROJECT_ROOT/lyrebird-metrics.sh"
-
-    # The script enables `set -euo pipefail`, which leaks into the bats shell and
-    # turns failing assertions / unset-var reads into silent aborts. Restore
-    # bats' own error handling so failures report as "not ok".
-    set +euo pipefail
+    bats_restore_shell_state
 }
 
 # Teardown - clean up temp files
@@ -28,6 +30,7 @@ teardown() {
     rm -rf "$FFMPEG_PID_DIR" 2>/dev/null || true
     rm -f "$HEARTBEAT_FILE" 2>/dev/null || true
     rm -f "$PID_FILE" 2>/dev/null || true
+    scratch_teardown
 }
 
 # ============================================================================

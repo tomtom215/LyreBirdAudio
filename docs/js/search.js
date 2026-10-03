@@ -103,7 +103,7 @@
       title: 'USB Audio Mapper',
       section: 'Components',
       file: 'components.html#usb-mapper',
-      keywords: 'usb audio mapper usb-audio-mapper.sh udev persistent device names symlinks reboot'
+      keywords: 'usb audio mapper usb-audio-mapper.sh udev persistent device names card id port symlinks list remove'
     },
     {
       title: 'Capability Checker',

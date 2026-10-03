@@ -7,7 +7,7 @@
 # Copyright: Tom F and LyreBirdAudio contributors
 # License: Apache 2.0
 #
-# Version: 1.0.0
+# Version: 1.0.1
 #
 # DESCRIPTION:
 #   Pure-bash webhook alerting system for remote monitoring of LyreBirdAudio
@@ -64,7 +64,7 @@ set -euo pipefail
 #=============================================================================
 
 readonly SCRIPT_NAME="lyrebird-alerts"
-readonly SCRIPT_VERSION="1.0.0"
+readonly SCRIPT_VERSION="1.0.1"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly SCRIPT_DIR
 
@@ -142,7 +142,7 @@ readonly ALERT_LEVEL_ERROR="error"
 readonly ALERT_LEVEL_CRITICAL="critical"
 
 # Colors for each level (for Discord/Slack)
-declare -A ALERT_COLORS=(
+declare -gA ALERT_COLORS=(
     [info]=3447003      # Blue
     [warning]=16776960  # Yellow
     [error]=15158332    # Orange
@@ -150,7 +150,7 @@ declare -A ALERT_COLORS=(
 )
 
 # Text prefixes for each alert level
-declare -A ALERT_PREFIX=(
+declare -gA ALERT_PREFIX=(
     [info]="[INFO]"
     [warning]="[WARN]"
     [error]="[ERROR]"

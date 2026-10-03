@@ -7,7 +7,7 @@
 # Copyright: Tom F and LyreBirdAudio contributors
 # License: Apache 2.0
 #
-# Version: 1.6.0 - Post-Update Migrations
+# Version: 1.6.1
 #
 # NEW in v1.6.0:
 #   - Automatic post-update migrations for breaking changes
@@ -77,7 +77,7 @@ SCRIPT_NAME="$(basename "${BASH_SOURCE[0]}")"
 readonly SCRIPT_NAME
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly SCRIPT_DIR
-readonly VERSION="1.6.0"
+readonly VERSION="1.6.1"
 readonly LOCKFILE="${SCRIPT_DIR}/.lyrebird-updater.lock"
 
 # Repository configuration
@@ -2650,6 +2650,14 @@ show_help() {
 ================================================================================
    LyreBirdAudio Version Manager - Help Guide
 ================================================================================
+
+USAGE:
+  ${SCRIPT_NAME}              Interactive menu (described below)
+  ${SCRIPT_NAME} --status     Show current version, branch and sync status (-s)
+  ${SCRIPT_NAME} --list       Fetch and list available versions (-l)
+  ${SCRIPT_NAME} --migrate    Run post-update migrations
+  ${SCRIPT_NAME} --version    Print the updater version (-v)
+  ${SCRIPT_NAME} --help       Show this help (-h)
 
 BRANCH TYPES:
   - Stable Releases (tags like v1.2.0)

@@ -1,0 +1,5 @@
+#!/bin/bash
+# Stub curl: serves $STUB_DIR/paths.json, fails if $STUB_DIR/api-down exists.
+echo "curl $*" >>"$STUB_DIR/calls"
+[[ -e "$STUB_DIR/api-down" ]] && exit 7
+cat "$STUB_DIR/paths.json"

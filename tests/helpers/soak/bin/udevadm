@@ -1,0 +1,16 @@
+#!/bin/bash
+# Stub udevadm for the soak tests. ID_PATH per card comes from
+# $STUB_DIR/idpath.cardN; every call is logged to $STUB_DIR/calls.
+echo "udevadm $*" >>"$STUB_DIR/calls"
+case "$1" in
+    --version) echo 255 ;;
+    info)
+        for a in "$@"; do
+            case "$a" in --path=*) p="${a#--path=}" ;; esac
+        done
+        f="$STUB_DIR/idpath.${p##*/}"
+        [[ -f "$f" ]] && echo "ID_PATH=$(cat "$f")"
+        echo "SUBSYSTEM=sound"
+        ;;
+esac
+exit 0

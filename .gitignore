@@ -144,3 +144,6 @@ config.local.*
 *.orig
 *.bkp
 .review-tmp/
+
+# Test downloads (tests/fetch_mediamtx.sh)
+.cache/

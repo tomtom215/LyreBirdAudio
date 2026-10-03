@@ -16,7 +16,10 @@
 # Test Setup and Teardown
 # ============================================================================
 
+load scratch_tmpdir
+
 setup() {
+    scratch_setup
     TEST_DIR="$( cd "$( dirname "$BATS_TEST_FILENAME" )" && pwd )"
     PROJECT_ROOT="$( cd "$TEST_DIR/.." && pwd )"
 
@@ -44,6 +47,7 @@ teardown() {
 
     # Ensure no orphaned processes from tests
     pkill -f "test-mediamtx" 2>/dev/null || true
+    scratch_teardown
 }
 
 # ============================================================================
@@ -85,24 +89,10 @@ EOF
 # USB Hot-Plug Simulation Tests
 # ============================================================================
 
-@test "INTEGRATION: USB mapper detects simulated device addition" {
-    skip "Integration test - requires udev simulation"
-
-    # This would require:
-    # 1. Creating a mock udev event
-    # 2. Triggering the USB mapper
-    # 3. Verifying the device was detected
-
-    # Placeholder for future implementation
-    [[ true ]]
-}
-
-@test "INTEGRATION: USB mapper handles device removal" {
-    skip "Integration test - requires udev simulation"
-
-    # Placeholder for device removal test
-    [[ true ]]
-}
+# USB hot-plug is covered by the QEMU end-to-end suite of the standalone
+# usb-audio-mapper repository (tests/e2e/): real kernel, real systemd-udevd,
+# emulated USB audio devices plugged, unplugged and re-plugged. The two
+# placeholder tests that used to be here only called `skip`.
 
 # ============================================================================
 # API Interaction Tests

@@ -1,0 +1,7 @@
+#!/bin/bash
+# Stub systemd-run: logs the call together with the state the fault will
+# change (STUB_WATCH file content), to prove the undo is armed first.
+w="-"
+[[ -n "${STUB_WATCH:-}" && -e "$STUB_WATCH" ]] && w=$(cat "$STUB_WATCH")
+echo "systemd-run watch=$w $*" >>"$STUB_DIR/calls"
+exit 0

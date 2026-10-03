@@ -4,6 +4,8 @@
 # Install bats: sudo apt-get install bats
 
 # Setup - source the mic check script
+load bats_shell_state
+
 setup() {
     # Get the directory of this test file
     TEST_DIR="$( cd "$( dirname "$BATS_TEST_FILENAME" )" && pwd )"
@@ -15,12 +17,9 @@ setup() {
     export CONFIG_BACKUP_DIR="$(mktemp -d)"
 
     # Source the mic check script
+    bats_save_shell_state
     source "$PROJECT_ROOT/lyrebird-mic-check.sh"
-
-    # The script enables `set -euo pipefail`, which leaks into the bats shell and
-    # turns failing assertions / unset-var reads into silent aborts. Restore
-    # bats' own error handling so failures report as "not ok".
-    set +euo pipefail
+    bats_restore_shell_state
 }
 
 # Teardown - clean up temp files
@@ -34,9 +33,9 @@ teardown() {
 # Script Metadata Tests
 # ============================================================================
 
-@test "SCRIPT_VERSION is defined" {
-    [ -n "$SCRIPT_VERSION" ]
-    [[ "$SCRIPT_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+@test "VERSION is defined" {
+    [ -n "$VERSION" ]
+    [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
 }
 
 @test "SCRIPT_NAME is defined" {
@@ -103,17 +102,18 @@ teardown() {
     [[ ! "$output" =~ " " ]]
 }
 
-@test "sanitize_device_name converts to lowercase" {
-    run sanitize_device_name "USB_DEVICE"
+# Case is preserved on purpose: the output must equal stream-manager's
+# sanitize_device_name, and both sides uppercase it when building DEVICE_* keys.
+@test "sanitize_device_name preserves case" {
+    run sanitize_device_name "USB_Device"
     [ "$status" -eq 0 ]
-    [[ "$output" =~ ^[a-z0-9_-]+$ ]]
+    [ "$output" = "USB_Device" ]
 }
 
 @test "sanitize_device_name handles special characters" {
     run sanitize_device_name "Device (USB) v2.0"
     [ "$status" -eq 0 ]
-    # Should only contain safe characters
-    [[ "$output" =~ ^[a-z0-9_-]+$ ]]
+    [ "$output" = "Device_USB_v2_0" ]
 }
 
 # ============================================================================
@@ -287,18 +287,34 @@ teardown() {
 # Default Values Tests
 # ============================================================================
 
-@test "DEFAULT_SAMPLE_RATE is defined" {
-    [ -n "$DEFAULT_SAMPLE_RATE" ]
-    [ "$DEFAULT_SAMPLE_RATE" -gt 0 ]
-}
-
-@test "DEFAULT_CHANNELS is defined" {
-    [ -n "$DEFAULT_CHANNELS" ]
-    [ "$DEFAULT_CHANNELS" -gt 0 ]
-}
-
-@test "PROC_ASOUND_CARDS path is defined" {
-    [ -n "$PROC_ASOUND_CARDS" ]
+@test "generated config loads into stream-manager without readonly errors" {
+    # The generated header used to assign DEFAULT_SAMPLE_RATE/CHANNELS/BITRATE,
+    # which stream-manager has already made readonly: each load logged
+    # "readonly variable" and the values were ignored. Capture the real header
+    # (generate_config deletes it when no USB card exists) and load it.
+    local work; work="$(mktemp -d)"
+    run env PROJECT_ROOT="$PROJECT_ROOT" WORK="$work" bash -c '
+        source "$PROJECT_ROOT/lyrebird-mic-check.sh" >/dev/null 2>&1
+        set +eu
+        check_root_access() { :; }
+        check_disk_space() { :; }
+        CONFIG_FILE="$WORK/audio-devices.conf" MODE_FORCE=true MODE_NO_BACKUP=true
+        rm() { [[ -n "$TEMP_CONFIG_FILE" && -f "$TEMP_CONFIG_FILE" ]] && cp "$TEMP_CONFIG_FILE" "$WORK/captured.conf"; command rm "$@"; }
+        generate_config >/dev/null 2>&1
+        [[ -f "$CONFIG_FILE" ]] && cp "$CONFIG_FILE" "$WORK/captured.conf"
+        [[ -s "$WORK/captured.conf" ]] && echo CAPTURED
+    '
+    [ "$output" = "CAPTURED" ]
+    grep -q 'DEFAULT_SAMPLE_RATE' "$work/captured.conf"
+    run env PROJECT_ROOT="$PROJECT_ROOT" MEDIAMTX_DEVICE_CONFIG="$work/captured.conf" bash -c '
+        source "$PROJECT_ROOT/lyrebird-stream-manager.sh" >/dev/null 2>&1
+        log() { :; }
+        load_device_config
+        echo "rate=$DEFAULT_SAMPLE_RATE"
+    '
+    rm -rf "$work"
+    [ "$status" -eq 0 ]
+    [ "$output" = "rate=48000" ]
 }
 
 # ============================================================================

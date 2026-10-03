@@ -605,3 +605,21 @@ DFEOF
     [ "$status" -eq 0 ]
     [ "$output" = "88" ]
 }
+
+# get_script_version reads SCRIPT_VERSION, then the "# Version:" header. For
+# scripts that only define VERSION it relied on the header, which had drifted
+# (stream-manager reported 1.4.4 while running 1.5.0).
+@test "get_script_version matches each script's version variable" {
+    local f expected reported mismatches=()
+    for f in "$PROJECT_ROOT"/*.sh; do
+        expected=$(grep -m1 -E '^(readonly )?(SCRIPT_)?VERSION="[0-9]+\.[0-9]+\.[0-9]+"' "$f" | cut -d'"' -f2) || true
+        [[ -n "$expected" ]] || continue
+        reported=$(bash -c 'source "$1" >/dev/null 2>&1; get_script_version "$2"' _ \
+            "$PROJECT_ROOT/lyrebird-diagnostics.sh" "$f")
+        [[ "$reported" == "$expected" ]] || mismatches+=("${f##*/}: reported $reported, defines $expected")
+    done
+    if ((${#mismatches[@]})); then
+        printf '%s\n' "${mismatches[@]}"
+        false
+    fi
+}

@@ -1,0 +1,25 @@
+# LyreBirdAudio soak test (tools/soak/README.md)
+#
+# Samples the node and, if SOAK_FAULTS is set in /etc/lyrebird-soak.conf,
+# injects faults. Restart=always and WantedBy=multi-user.target make it resume
+# after the reboots it causes or detects. Run `lyrebird-soak init` first.
+
+[Unit]
+Description=LyreBirdAudio soak test
+After=network.target mediamtx.service mediamtx-audio.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/lyrebird-soak run
+# Undo any fault still in effect when the service stops for any reason.
+ExecStopPost=/usr/local/bin/lyrebird-soak restore
+Restart=always
+RestartSec=5
+# Fault injection needs root: sysfs, ip, date, kill, systemctl.
+User=root
+# Measure the node, do not compete with it.
+Nice=5
+IOSchedulingClass=idle
+
+[Install]
+WantedBy=multi-user.target

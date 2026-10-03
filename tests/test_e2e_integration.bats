@@ -6,7 +6,10 @@
 # hardware, no running MediaMTX, no network. They complement the per-file unit
 # regression tests by exercising whole flows the way the field does.
 
+load scratch_tmpdir
+
 setup() {
+    scratch_setup
     TEST_DIR="$( cd "$( dirname "$BATS_TEST_FILENAME" )" && pwd )"
     PROJECT_ROOT="$( cd "$TEST_DIR/.." && pwd )"
     E2E_TMP="$(mktemp -d)"
@@ -17,6 +20,7 @@ teardown() {
     # Buffer dir for the storage test lives under /tmp (an allowed parent), so it
     # is not under E2E_TMP; clean it up separately when a test created one.
     [[ -n "${E2E_STORAGE_BUF:-}" ]] && rm -rf "$E2E_STORAGE_BUF" 2>/dev/null || true
+    scratch_teardown
 }
 
 # ---------------------------------------------------------------------------

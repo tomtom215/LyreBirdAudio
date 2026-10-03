@@ -47,16 +47,16 @@
           <tr><th>Script</th><th>Version</th><th>Purpose</th></tr>
         </thead>
         <tbody>
-          <tr><td><code>lyrebird-orchestrator.sh</code></td><td><span class="version-badge">2.1.2</span></td><td>Unified management interface</td></tr>
-          <tr><td><code>lyrebird-stream-manager.sh</code></td><td><span class="version-badge">1.4.3</span></td><td>Stream lifecycle management</td></tr>
-          <tr><td><code>usb-audio-mapper.sh</code></td><td><span class="version-badge">1.2.1</span></td><td>USB device persistence via udev</td></tr>
+          <tr><td><code>lyrebird-orchestrator.sh</code></td><td><span class="version-badge">2.1.3</span></td><td>Unified management interface</td></tr>
+          <tr><td><code>lyrebird-stream-manager.sh</code></td><td><span class="version-badge">1.5.0</span></td><td>Stream lifecycle management</td></tr>
+          <tr><td><code>usb-audio-mapper.sh</code></td><td><span class="version-badge">4.0.0</span></td><td>USB device persistence via udev</td></tr>
           <tr><td><code>lyrebird-mic-check.sh</code></td><td><span class="version-badge">1.0.0</span></td><td>Hardware capability detection</td></tr>
           <tr><td><code>lyrebird-diagnostics.sh</code></td><td><span class="version-badge">1.0.2</span></td><td>System health diagnostics</td></tr>
           <tr><td><code>install_mediamtx.sh</code></td><td><span class="version-badge">2.0.1</span></td><td>MediaMTX installation &amp; upgrade</td></tr>
           <tr><td><code>lyrebird-alerts.sh</code></td><td><span class="version-badge">1.0.0</span></td><td>Webhook alerting system</td></tr>
-          <tr><td><code>lyrebird-metrics.sh</code></td><td><span class="version-badge">1.0.0</span></td><td>Prometheus metrics export</td></tr>
-          <tr><td><code>lyrebird-storage.sh</code></td><td><span class="version-badge">1.0.0</span></td><td>Storage management &amp; cleanup</td></tr>
-          <tr><td><code>lyrebird-updater.sh</code></td><td><span class="version-badge">1.5.1</span></td><td>Version management &amp; rollback</td></tr>
+          <tr><td><code>lyrebird-metrics.sh</code></td><td><span class="version-badge">1.2.0</span></td><td>Prometheus metrics export</td></tr>
+          <tr><td><code>lyrebird-storage.sh</code></td><td><span class="version-badge">1.1.0</span></td><td>Storage management &amp; cleanup</td></tr>
+          <tr><td><code>lyrebird-updater.sh</code></td><td><span class="version-badge">1.6.0</span></td><td>Version management &amp; rollback</td></tr>
           <tr><td><code>lyrebird-common.sh</code></td><td>—</td><td>Shared utility library</td></tr>
         </tbody>
       </table>
@@ -166,21 +166,26 @@ sudo ./lyrebird-stream-manager.sh -m multiplex -n studio start</code></pre>
     <h2 id="usb-mapper">🔌 USB Audio Mapper</h2>
     <p>
       <strong><code>usb-audio-mapper.sh</code></strong> — Creates persistent udev rules that give
-      USB audio devices stable names across reboots, even when USB enumeration order changes.
+      each USB audio device a fixed ALSA card name, tied to the USB port it is plugged into, so
+      identical microphones keep their names across reboots whatever the enumeration order.
     </p>
 
     <h3>Usage</h3>
-    <pre><code># Interactive mode (guided wizard)
+    <pre><code># List USB sound cards, their ports and existing mappings (no root needed)
+./usb-audio-mapper.sh --list
+
+# Interactive mode (guided wizard)
 sudo ./usb-audio-mapper.sh
 
-# Non-interactive (for automation)
-sudo ./usb-audio-mapper.sh -n -d "Device" -v XXXX -p YYYY -f friendly-name
+# Non-interactive: name ALSA card 1 (vendor, product and port read from it)
+sudo ./usb-audio-mapper.sh -n --card 1 -f mic-left
 
-# Test USB port detection
-sudo ./usb-audio-mapper.sh --test
+# Non-interactive by vendor/product id, choosing the port
+sudo ./usb-audio-mapper.sh -n -v XXXX -p YYYY -u 1-2 -f mic-right
 
-# Debug mode
-sudo ./usb-audio-mapper.sh --debug</code></pre>
+# Remove a mapping / preview rules without writing
+sudo ./usb-audio-mapper.sh --remove mic-left
+./usb-audio-mapper.sh -n --card 1 -f mic-left --dry-run</code></pre>
 
     <h3>Options</h3>
     <div class="table-wrapper">
@@ -189,11 +194,17 @@ sudo ./usb-audio-mapper.sh --debug</code></pre>
         <tbody>
           <tr><td><code>-i, --interactive</code></td><td>Run in interactive mode (default)</td></tr>
           <tr><td><code>-n, --non-interactive</code></td><td>Skip all prompts</td></tr>
-          <tr><td><code>-d, --device &lt;name&gt;</code></td><td>Device label for logging</td></tr>
+          <tr><td><code>-c, --card &lt;N&gt;</code></td><td>ALSA card number of a connected USB device</td></tr>
           <tr><td><code>-v, --vendor &lt;id&gt;</code></td><td>4-digit hex vendor ID</td></tr>
           <tr><td><code>-p, --product &lt;id&gt;</code></td><td>4-digit hex product ID</td></tr>
-          <tr><td><code>-f, --friendly &lt;name&gt;</code></td><td>Friendly name for the stream</td></tr>
-          <tr><td><code>-t, --test</code></td><td>Test USB port detection without making changes</td></tr>
+          <tr><td><code>-u, --usb-port &lt;port&gt;</code></td><td>Physical port, e.g. <code>1-2</code> or <code>1-2.3</code> (see <code>--list</code>)</td></tr>
+          <tr><td><code>--any-port</code></td><td>Match the device on any port (single device only)</td></tr>
+          <tr><td><code>-f, --friendly &lt;name&gt;</code></td><td>Name: lowercase letters, digits, hyphens; starts with a letter; at most 15 characters</td></tr>
+          <tr><td><code>-d, --device &lt;text&gt;</code></td><td>Description stored in the rule comment (optional)</td></tr>
+          <tr><td><code>-l, --list</code></td><td>List USB sound cards, ports and mappings</td></tr>
+          <tr><td><code>-t, --test</code></td><td>List every USB device with its port (no changes)</td></tr>
+          <tr><td><code>-r, --remove &lt;name&gt;</code></td><td>Remove a mapping</td></tr>
+          <tr><td><code>--dry-run</code> / <code>--no-apply</code></td><td>Print rules only / write rules without triggering udev</td></tr>
           <tr><td><code>-D, --debug</code></td><td>Enable debug output</td></tr>
         </tbody>
       </table>
@@ -203,14 +214,15 @@ sudo ./usb-audio-mapper.sh --debug</code></pre>
     <p>The script creates:</p>
     <ul>
       <li><code>/etc/udev/rules.d/99-usb-soundcards.rules</code> — udev rules file</li>
-      <li><code>/dev/snd/by-usb-port/Device_N</code> — Persistent symlinks (after reboot)</li>
+      <li>The ALSA card id (shown in <code>/proc/asound/cards</code>, usable as <code>hw:CARD=&lt;name&gt;</code>)</li>
+      <li><code>/dev/sound/by-id/&lt;name&gt;</code> — symlink to the card's control device</li>
     </ul>
 
-    <div class="callout warning">
-      <span class="callout-icon">⚠️</span>
+    <div class="callout info">
+      <span class="callout-icon">ℹ️</span>
       <div class="callout-body">
-        <strong>Reboot Required</strong>
-        <p>After mapping devices, a reboot is required for udev rules to take effect and persistent symlinks to be created. Do not skip this step.</p>
+        <strong>No Reboot Needed</strong>
+        <p>Since v4.0.0 the mapper applies each mapping immediately and reads the card name back from the kernel to confirm it; it exits with status 6 and an explanation if the name did not take effect. Mappings written by v1.2.1 and earlier renamed no device; re-run the mapper once per device to replace them.</p>
       </div>
     </div>
 

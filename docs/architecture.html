@@ -113,8 +113,8 @@
 +----------------------------------------------------------+
 |              Persistent Device Layer (udev)              |
 |  ┌────────────────────────────────────────────────────┐  |
-|  │  /dev/snd/by-usb-port/Device_1 → /dev/snd/pcmC0D0c│  |
-|  │  /dev/snd/by-usb-port/Device_2 → /dev/snd/pcmC1D0c│  |
+|  │  card id mic-left → hw:CARD=mic-left               │  |
+|  │  /dev/sound/by-id/mic-left → ../snd/controlC0      │  |
 |  │  Consistent naming across reboots                  │  |
 |  └────────────────────────────────────────────────────┘  |
 +--------------------+-------------------------------------+
@@ -144,7 +144,7 @@
 │     Individual + multiplex modes
 │
 ├── usb-audio-mapper.sh
-│     USB device detection via lsusb
+│     USB device detection via sysfs
 │     udev rule generation
 │     Persistent naming across reboots
 │
@@ -181,7 +181,7 @@
     <h3>Stream Startup Sequence</h3>
     <ol>
       <li>Stream manager reads <code>/etc/mediamtx/audio-devices.conf</code></li>
-      <li>Scans <code>/dev/snd/by-usb-port/</code> for available devices</li>
+      <li>Scans <code>/dev/snd/by-id/</code> (falling back to <code>/proc/asound/cards</code>) for available devices</li>
       <li>For each device, looks up config (friendly name → full ID → defaults)</li>
       <li>Starts MediaMTX if not running</li>
       <li>Launches FFmpeg wrapper for each device</li>
@@ -202,12 +202,12 @@ After MAX_CONSECUTIVE_FAILURES: alert and stop retrying</code></pre>
 
     <h3>USB Device Persistence Flow</h3>
     <ol>
-      <li>USB device connected to physical port</li>
-      <li>Kernel assigns <code>/dev/snd/pcmC0D0c</code> (order may vary)</li>
-      <li>udev rule matches: <code>SUBSYSTEM=="sound", ATTRS{idVendor}=="XXXX", ENV{ID_PATH}=="..."</code></li>
-      <li>udev creates symlink: <code>/dev/snd/by-usb-port/Device_1 → ../pcmC0D0c</code></li>
-      <li>FFmpeg uses symlink path — always <code>/dev/snd/by-usb-port/Device_1</code></li>
-      <li>On next boot: symlink is recreated in same location regardless of enumeration order</li>
+      <li>USB device connected to a physical port</li>
+      <li>Kernel registers sound card <code>N</code> (the number may vary between boots)</li>
+      <li>udev rule matches the card: <code>SUBSYSTEM=="sound", KERNEL=="card*", ATTRS{idVendor}=="XXXX", ATTRS{idProduct}=="YYYY", IMPORT{builtin}="path_id", ENV{ID_PATH}=="pci-0000:00:14.0-usb-0:2:1.0"</code> — the card's physical position (controller + port), independent of USB bus and card numbering</li>
+      <li>udev sets the ALSA card id: <code>ATTR{id}="mic-left"</code>, so the card is <code>hw:CARD=mic-left</code> and appears as <code>mic-left</code> in <code>/proc/asound/cards</code></li>
+      <li>A second rule links <code>/dev/sound/by-id/mic-left</code> to <code>controlC&lt;N&gt;</code></li>
+      <li>On every boot or replug the same port gets the same name, regardless of enumeration order</li>
     </ol>
 
     <h2 id="adrs">Architecture Decision Records</h2>
