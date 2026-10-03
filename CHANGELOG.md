@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.4.0] - 2026-10-03
+
 ### Soak testing and current MediaMTX (2026-10)
 
 Component versions bumped: `lyrebird-stream-manager.sh` 1.5.0 → 1.5.1.
@@ -297,7 +299,7 @@ regression test; the suite is green (528 tests) and ShellCheck-clean.
 
 See `docs/ENGINEERING-REVIEW-2026-07.md` for the full finding-by-finding detail.
 
-## [1.4.2] - 2025-12-19
+## [1.4.2] - 2025-12-19 (Stream Manager)
 
 ### Added
 - Prometheus metrics export (`lyrebird-metrics.sh`)
@@ -319,7 +321,7 @@ See `docs/ENGINEERING-REVIEW-2026-07.md` for the full finding-by-finding detail.
 - README updated with new scripts and configuration files
 - Comprehensive audit report documenting 64 issues
 
-## [1.4.1] - 2025-12
+## [1.4.1] - 2025-12 (Stream Manager)
 
 ### Added
 - Friendly name support for device configuration in stream manager
@@ -328,7 +330,7 @@ See `docs/ENGINEERING-REVIEW-2026-07.md` for the full finding-by-finding detail.
 ### Fixed
 - Device configuration lookup now tries friendly name first, then full ID
 
-## [1.4.0] - 2025-12
+## [1.4.0] - 2025-12 (Stream Manager)
 
 ### Added
 - Production stability and monitoring enhancements
@@ -340,7 +342,7 @@ See `docs/ENGINEERING-REVIEW-2026-07.md` for the full finding-by-finding detail.
 - Improved stream recovery with exponential backoff
 - Better cron-based health monitoring
 
-## [1.3.4] - 2025-12
+## [1.3.4] - 2025-12 (Stream Manager)
 
 ### Fixed
 - Resolved persistent stream failure issues
@@ -442,22 +444,22 @@ See `docs/ENGINEERING-REVIEW-2026-07.md` for the full finding-by-finding detail.
 ## Version Numbering
 
 The **suite** is released as a whole under a single `vX.Y.Z` git tag (the value
-`git describe --tags` returns); the current release is **v1.3.0**. Each component
+`git describe --tags` returns); the current release is **v1.4.0**. Each component
 additionally tracks its own internal version, shown below:
 
 | Component | Current Version |
 |-----------|-----------------|
 | lyrebird-orchestrator.sh | 2.1.3 |
-| lyrebird-stream-manager.sh | 1.5.0 |
-| lyrebird-updater.sh | 1.6.0 |
+| lyrebird-stream-manager.sh | 1.5.1 |
+| lyrebird-updater.sh | 1.6.1 |
 | usb-audio-mapper.sh | 4.0.0 |
 | lyrebird-diagnostics.sh | 1.0.2 |
 | install_mediamtx.sh | 2.0.1 |
-| lyrebird-mic-check.sh | 1.0.0 |
+| lyrebird-mic-check.sh | 1.0.1 |
 | lyrebird-common.sh | 1.0.0 |
 | lyrebird-metrics.sh | 1.2.0 |
 | lyrebird-storage.sh | 1.1.0 |
-| lyrebird-alerts.sh | 1.0.0 |
+| lyrebird-alerts.sh | 1.0.1 |
 
 ## Links
 
