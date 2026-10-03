@@ -16,7 +16,10 @@
 # Test Setup and Teardown
 # ============================================================================
 
+load scratch_tmpdir
+
 setup() {
+    scratch_setup
     TEST_DIR="$( cd "$( dirname "$BATS_TEST_FILENAME" )" && pwd )"
     PROJECT_ROOT="$( cd "$TEST_DIR/.." && pwd )"
 
@@ -44,6 +47,7 @@ teardown() {
 
     # Ensure no orphaned processes from tests
     pkill -f "test-mediamtx" 2>/dev/null || true
+    scratch_teardown
 }
 
 # ============================================================================

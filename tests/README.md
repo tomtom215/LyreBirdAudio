@@ -44,6 +44,11 @@ sudo ./install.sh /usr/local
 bats tests/
 ```
 
+**Run all tests and check for leaked temp files (what CI runs):**
+```bash
+tests/check_tmp_leaks.sh
+```
+
 **Run specific test file:**
 ```bash
 bats tests/test_lyrebird_common.bats

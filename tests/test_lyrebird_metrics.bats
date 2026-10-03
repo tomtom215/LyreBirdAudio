@@ -6,7 +6,10 @@
 # Setup - source the metrics script
 load bats_shell_state
 
+load scratch_tmpdir
+
 setup() {
+    scratch_setup
     # Get the directory of this test file
     TEST_DIR="$( cd "$( dirname "$BATS_TEST_FILENAME" )" && pwd )"
     PROJECT_ROOT="$( cd "$TEST_DIR/.." && pwd )"
@@ -27,6 +30,7 @@ teardown() {
     rm -rf "$FFMPEG_PID_DIR" 2>/dev/null || true
     rm -f "$HEARTBEAT_FILE" 2>/dev/null || true
     rm -f "$PID_FILE" 2>/dev/null || true
+    scratch_teardown
 }
 
 # ============================================================================

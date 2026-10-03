@@ -62,6 +62,10 @@ Component versions bumped: `usb-audio-mapper.sh` 1.2.1 → 4.0.0,
   sourcing, and `tests/test_suite_can_fail.bats` checks every test file.
   This surfaced 28 failures; 25 were wrong tests, corrected to the scripts'
   actual behaviour (`docs/ENGINEERING-REVIEW-2026-07.md` §9, U9–U13).
+- The test suite left 27 temp files and directories behind per run. Test files
+  that create temp files now give each test a private `TMPDIR`
+  (`tests/scratch_tmpdir.bash`), and CI runs `tests/check_tmp_leaks.sh`, which
+  fails on any leftover.
 - `lyrebird-mic-check.sh -g` wrote `DEFAULT_SAMPLE_RATE`, `DEFAULT_CHANNELS`
   and `DEFAULT_BITRATE` into `audio-devices.conf`, where the stream manager
   ignores them (they are readonly by then) and logs `readonly variable` on

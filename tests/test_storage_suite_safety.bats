@@ -18,12 +18,13 @@ storage_setup_dirs() {
     local f="$PROJECT_ROOT/tests/test_lyrebird_storage.bats"
     bash -c '
         source "${1%/*}/bats_shell_state.bash"   # what `load bats_shell_state` does
+        source "${1%/*}/scratch_tmpdir.bash"     # and `load scratch_tmpdir`
         eval "$(sed -n "/^setup() {/,/^}/p" "$1")"
         BATS_TEST_FILENAME="$1"
         setup >/dev/null 2>&1
         trap - EXIT
         printf "%s\n%s\n%s\n" "$RECORDING_DIR" "$LOG_DIR" "$TEMP_DIR"
-        rm -rf -- "$TEST_RECORDING_DIR" "$TEST_LOG_DIR" "$TEST_TEMP_DIR"
+        rm -rf -- "$TEST_RECORDING_DIR" "$TEST_LOG_DIR" "$TEST_TEMP_DIR" "$TEST_SCRATCH"
     ' _ "$f"
 }
 

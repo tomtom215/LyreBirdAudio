@@ -6,7 +6,10 @@
 # Setup - source the storage script
 load bats_shell_state
 
+load scratch_tmpdir
+
 setup() {
+    scratch_setup
     # Get the directory of this test file
     TEST_DIR="$( cd "$( dirname "$BATS_TEST_FILENAME" )" && pwd )"
     PROJECT_ROOT="$( cd "$TEST_DIR/.." && pwd )"
@@ -42,6 +45,7 @@ teardown() {
     for d in "${TEST_RECORDING_DIR:-}" "${TEST_LOG_DIR:-}" "${TEST_TEMP_DIR:-}"; do
         [[ "$d" == "${TMPDIR:-/tmp}"/tmp.* ]] && rm -rf -- "$d"
     done
+    scratch_teardown
     return 0
 }
 

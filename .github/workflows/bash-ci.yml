@@ -506,12 +506,12 @@ jobs:
           echo "============================================"
           # Keep bats' working files off any shared /tmp cleanup path
           export TMPDIR="${RUNNER_TEMP:-/tmp}"
-          export BATS_TMPDIR="${RUNNER_TEMP:-/tmp}"
 
-          if bats --print-output-on-failure --timing tests/; then
+          # Runs the suite in a fresh TMPDIR and also fails on leaked temp files
+          if tests/check_tmp_leaks.sh; then
             echo "All bats tests passed"
           else
-            echo "::error::Bats tests failed"
+            echo "::error::Bats tests failed or left temp files behind"
             exit 1
           fi
 
