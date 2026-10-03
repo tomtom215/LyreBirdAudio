@@ -479,12 +479,15 @@ DFEOF
 
 @test "cmd_monitor detects a full disk hidden behind a wrapped df name [STORAGE-1 regression]" {
     local bin; bin="$(mktemp -d)"; _write_fake_df "$bin"
+    # The storage script only accepts a buffer under /dev/shm, /tmp, /var/tmp
+    # or /run, wherever TMPDIR points (CI: the runner's work directory).
+    local buf; buf="$(mktemp -d /tmp/lyrebird-test-buffer.XXXXXX)"
     # DRY_RUN=true: the EMERGENCY log still fires but nothing is deleted.
     run env PROJECT_ROOT="$PROJECT_ROOT" PATH="$bin:$PATH" \
         LYREBIRD_RECORDING_DIR="$(mktemp -d)" LYREBIRD_LOG_DIR="$(mktemp -d)" \
-        LYREBIRD_BUFFER_DIR="$(mktemp -d)" DRY_RUN=true \
+        LYREBIRD_BUFFER_DIR="$buf" DRY_RUN=true \
         bash -c 'source "$PROJECT_ROOT/lyrebird-storage.sh"; cmd_monitor 2>&1'
-    rm -rf "$bin"
+    rm -rf "$bin" "$buf"
     [ "$status" -eq 0 ]
     [[ "$output" =~ EMERGENCY ]]         # old code parsed usage as "/" -> "OK"
 }
