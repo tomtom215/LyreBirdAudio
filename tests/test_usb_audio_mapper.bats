@@ -107,6 +107,18 @@ setup() {
     [ "$(fn normalize_usb_port usb-0000:00:14.0-3.1)" = 1-3.1 ]
 }
 
+@test "normalize_usb_port resolves /proc/asound/cards form for a platform controller with '-' in its name" {
+    # ARM boards with dwc3 report the controller as e.g. xhci-hcd.0.auto, so
+    # /proc/asound/cards shows usb-xhci-hcd.0.auto-1.2.
+    mkdir -p "$SYS/devices/platform/xhci-hcd.0.auto/usb2"
+    ln -s ../../../devices/platform/xhci-hcd.0.auto/usb2 "$SYS/bus/usb/devices/usb2"
+    add_usb_device 2-1 0409 55aa "Hub"
+    add_usb_device 2-1.2 46f4 0002 "Mic"
+    [ "$(fn normalize_usb_port usb-xhci-hcd.0.auto-1.2)" = 2-1.2 ]
+    [ "$(fn normalize_usb_port usb-xhci-hcd.0.auto-1)" = 2-1 ]
+    ! fn normalize_usb_port usb-xhci-hcd.0.auto-3 2>/dev/null || false
+}
+
 @test "normalize_usb_port rejects injection, synthetic and malformed ports" {
     evil=$(printf '1-2" GOTO="end\nRUN+="/bin/rm -rf /"\nLABEL="end')
     for bad in "$evil" bus3-dev5 3 a-b 1-2:1.0 "" usb-3.4 ../1-2 "1-2 " 1-2. usb-0000:00:14.0-9; do

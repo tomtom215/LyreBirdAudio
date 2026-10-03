@@ -47,6 +47,9 @@ Component versions bumped: `usb-audio-mapper.sh` 1.2.1 → 4.0.0,
   that names every identical device the same; several identical devices with
   no port given are refused (exit 5).
 - Concurrent mapper runs no longer lose updates (`flock`).
+- `-u usb-<controller>-<port>` (the form in `/proc/asound/cards`) was refused
+  when the controller name contains `-`, as on dwc3 ARM boards
+  (`usb-xhci-hcd.0.auto-1.2`).
 
 - **Test suite could delete recordings and logs.** `tests/test_lyrebird_storage.bats`
   exported `RECORDING_DIR`/`LOG_DIR`/`TEMP_DIR`, which `lyrebird-storage.sh`
@@ -91,7 +94,7 @@ Component versions bumped: `usb-audio-mapper.sh` 1.2.1 → 4.0.0,
   `--rescan`, neither of which existed, and to reboots after mapping.
 - `tests/test_usb_audio_mapper.bats` replaced: the old file had 19 tests, 14 of
   which tested copies of functions defined inside the test file rather than the
-  script. The new suite (55 tests) runs the real script against a fake sysfs.
+  script. The new suite (56 tests) runs the real script against a fake sysfs.
   The QEMU end-to-end suite lives in the standalone repository.
 
 ### Reliability Audit (2026-07, third pass)

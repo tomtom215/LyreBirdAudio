@@ -8,7 +8,7 @@ Unit tests for LyreBirdAudio using the [Bats](https://github.com/bats-core/bats-
 |-----------|-----------|-------|---------------|
 | lyrebird-common.sh | test_lyrebird_common.bats | 40 | 80% |
 | lyrebird-stream-manager.sh | test_stream_manager.bats | 39 | 50% |
-| usb-audio-mapper.sh | test_usb_audio_mapper.bats | 55 | not estimated (real script vs. fake sysfs; E2E in the standalone repo) |
+| usb-audio-mapper.sh | test_usb_audio_mapper.bats | 56 | not estimated (real script vs. fake sysfs; E2E in the standalone repo) |
 | lyrebird-diagnostics.sh | test_lyrebird_diagnostics.bats | 37 | 70% |
 | lyrebird-orchestrator.sh | test_lyrebird_orchestrator.bats | 48 | 70% |
 | lyrebird-alerts.sh | test_lyrebird_alerts.bats | 54 | 60% |
@@ -18,7 +18,7 @@ Unit tests for LyreBirdAudio using the [Bats](https://github.com/bats-core/bats-
 | install_mediamtx.sh | test_install_mediamtx.bats | 66 | 70% |
 | lyrebird-mic-check.sh | test_lyrebird_mic_check.bats | 45 | 70% |
 
-**Total: 617 tests (`bats --count tests/`).** Coverage percentages above are estimates, not measured. `test_suite_can_fail.bats` checks that every test file reports a failing assertion, so a file whose `setup()` disables bats' error handling fails the suite (`docs/ENGINEERING-REVIEW-2026-07.md` §9, U9).
+**Total: 618 tests (`bats --count tests/`).** Coverage percentages above are estimates, not measured. `test_suite_can_fail.bats` checks that every test file reports a failing assertion, so a file whose `setup()` disables bats' error handling fails the suite (`docs/ENGINEERING-REVIEW-2026-07.md` §9, U9).
 
 ## Prerequisites
 

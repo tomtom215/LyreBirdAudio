@@ -220,8 +220,9 @@ sanitize_desc() {
 # Accepts:
 #   1-2, 1-2.3                  (kernel name, as shown by --list)
 #   usb-1-2                     (legacy prefix; stripped)
-#   usb-0000:00:14.0-2.3        (the form printed in /proc/asound/cards; needs
-#                                the device connected to resolve the bus number)
+#   usb-0000:00:14.0-2.3        (the form printed in /proc/asound/cards; also
+#   usb-xhci-hcd.0.auto-1.2      platform controllers; needs the device
+#                                connected to resolve the bus number)
 # Prints the normalized port; fails (with a reason on stderr) otherwise.
 normalize_usb_port() {
     local input="${1:-}" port
@@ -236,7 +237,9 @@ normalize_usb_port() {
             return 0
         fi
     fi
-    if [[ "$input" =~ ^usb-([0-9A-Za-z:._]+)-([0-9]+(\.[0-9]+)*)$ ]]; then
+    # The controller name may itself contain '-' (xhci-hcd.0.auto on dwc3
+    # boards); the greedy group leaves only the trailing port chain.
+    if [[ "$input" =~ ^usb-([0-9A-Za-z:._-]+)-([0-9]+(\.[0-9]+)*)$ ]]; then
         local controller="${BASH_REMATCH[1]}" devpath="${BASH_REMATCH[2]}" hub ctrl bus
         for hub in "$SYSFS_ROOT"/bus/usb/devices/usb[0-9]*; do
             [[ -e "$hub" ]] || continue
