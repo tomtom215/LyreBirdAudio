@@ -514,12 +514,13 @@ DEVICE_USB_MICROPHONE_CODEC=opus
 DEVICE_USB_MANUFACTURER_MODEL_SERIAL_00000000_SAMPLE_RATE=48000
 DEVICE_USB_MANUFACTURER_MODEL_SERIAL_00000000_CHANNELS=2
 
-# Fallback defaults
-DEFAULT_SAMPLE_RATE=48000
-DEFAULT_CHANNELS=2
-DEFAULT_BITRATE=128k
-DEFAULT_CODEC=opus
 ```
+
+Settings without a device-specific value fall back to `DEFAULT_SAMPLE_RATE`,
+`DEFAULT_CHANNELS`, `DEFAULT_BITRATE` and `DEFAULT_CODEC`. These are read from
+the stream manager's environment (see
+[Environment Variables](#environment-variables)), not from this file; setting
+them here has no effect.
 
 **Available settings:**
 - `SAMPLE_RATE` - Sample rate in Hz (e.g., 48000, 44100, 16000)
@@ -803,13 +804,10 @@ DEVICE_USB_MICROPHONE_BITRATE=128k
 DEVICE_USB_MANUFACTURER_MODEL_SERIAL_00000000_SAMPLE_RATE=48000
 DEVICE_USB_MANUFACTURER_MODEL_SERIAL_00000000_CHANNELS=2
 DEVICE_USB_MANUFACTURER_MODEL_SERIAL_00000000_BITRATE=128k
-
-# Fallback defaults (used when device-specific config not found)
-DEFAULT_SAMPLE_RATE=48000
-DEFAULT_CHANNELS=2
-DEFAULT_BITRATE=128k
-DEFAULT_CODEC=opus
 ```
+
+Fallback defaults (`DEFAULT_SAMPLE_RATE` and so on) come from the stream
+manager's environment, not from this file.
 
 Format explanation:
 - Device names are sanitized: special characters become underscores, converted to UPPERCASE
@@ -1465,15 +1463,15 @@ This modular design prevents duplicate business logic and ensures maintainabilit
 | Script | Version | Purpose |
 |--------|---------|---------|
 | lyrebird-orchestrator.sh | 2.1.3 | Unified management interface |
-| lyrebird-updater.sh | 1.6.0 | Version management with rollback |
+| lyrebird-updater.sh | 1.6.1 | Version management with rollback |
 | lyrebird-stream-manager.sh | 1.5.0 | Stream lifecycle management |
 | usb-audio-mapper.sh | 4.0.0 | USB device persistence via udev |
-| lyrebird-mic-check.sh | 1.0.0 | Hardware capability detection |
+| lyrebird-mic-check.sh | 1.0.1 | Hardware capability detection |
 | lyrebird-diagnostics.sh | 1.0.2 | System diagnostics |
 | install_mediamtx.sh | 2.0.1 | MediaMTX installation/upgrade |
 | lyrebird-metrics.sh | 1.2.0 | Prometheus metrics export |
 | lyrebird-storage.sh | 1.1.0 | Storage management & cleanup |
-| lyrebird-alerts.sh | 1.0.0 | Webhook alerting system |
+| lyrebird-alerts.sh | 1.0.1 | Webhook alerting system |
 
 ### Configuration Files
 

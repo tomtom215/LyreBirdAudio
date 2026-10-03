@@ -10,7 +10,7 @@
 # This script automatically detects USB microphones and creates MediaMTX
 # configurations for continuous 24/7 RTSP audio streams.
 #
-# Version: 1.4.4 - Robustness improvements
+# Version: 1.5.0
 # Compatible with MediaMTX v1.15.0 through at least v1.19.x. The /v3 REST API
 # endpoints used here are unchanged across that range. NOTE: the path status
 # fields parsed below ("ready", "bytesReceived", "tracks") are DEPRECATED as of
@@ -19,6 +19,9 @@
 # validation) is advisable before a future MediaMTX major release removes them.
 #
 # Version History:
+# v1.5.0 - Reliability audit, third pass (see CHANGELOG.md, "Reliability Audit
+#          (2026-07, third pass)")
+#
 # v1.4.4 - Robustness improvements
 #   - Restructured API validation to preserve curl exit status for better error detection
 #   - curl|grep pattern replaced with explicit exit code checking

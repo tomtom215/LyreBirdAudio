@@ -3,9 +3,10 @@
 # RECORDING_DIR/LOG_DIR/TEMP_DIR, which lyrebird-storage.sh overwrites with
 # readonly defaults when sourced, so every test and the teardown's rm -rf hit
 # the REAL /var/lib/mediamtx-ffmpeg/recordings, /var/log/lyrebird and /tmp.
-# These checks live in their own file because a test inside
-# test_lyrebird_storage.bats cannot fail: the sourced script replaces bats'
-# EXIT trap (see docs/ENGINEERING-REVIEW-2026-07.md §9, U8).
+# These checks live in their own file because, when they were written, a test
+# inside test_lyrebird_storage.bats could not fail: the sourced script replaced
+# bats' EXIT trap (see docs/ENGINEERING-REVIEW-2026-07.md §9, U8 and U9; fixed
+# by tests/bats_shell_state.bash).
 
 setup() {
     PROJECT_ROOT="$(cd "$(dirname "$BATS_TEST_FILENAME")/.." && pwd)"
@@ -16,6 +17,7 @@ setup() {
 storage_setup_dirs() {
     local f="$PROJECT_ROOT/tests/test_lyrebird_storage.bats"
     bash -c '
+        source "${1%/*}/bats_shell_state.bash"   # what `load bats_shell_state` does
         eval "$(sed -n "/^setup() {/,/^}/p" "$1")"
         BATS_TEST_FILENAME="$1"
         setup >/dev/null 2>&1

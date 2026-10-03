@@ -4,6 +4,8 @@
 # Install bats: sudo apt-get install bats
 
 # Setup - source the storage script
+load bats_shell_state
+
 setup() {
     # Get the directory of this test file
     TEST_DIR="$( cd "$( dirname "$BATS_TEST_FILENAME" )" && pwd )"
@@ -29,13 +31,9 @@ setup() {
     export LOG_MAX_SIZE_MB=50
 
     # Source the storage script
+    bats_save_shell_state
     source "$PROJECT_ROOT/lyrebird-storage.sh"
-
-    # The script enables `set -euo pipefail`, which leaks into the bats test
-    # shell and turns failing assertions / unset-var reads into silent aborts
-    # (bats loses control of errexit and stops emitting results). Restore bats'
-    # own error handling so failures report as "not ok" instead of vanishing.
-    set +euo pipefail
+    bats_restore_shell_state
 }
 
 # Teardown - remove only the directories this file created with mktemp
@@ -52,13 +50,13 @@ teardown() {
 # Script Metadata Tests
 # ============================================================================
 
-@test "SCRIPT_VERSION is defined" {
-    [ -n "$SCRIPT_VERSION" ]
-    [[ "$SCRIPT_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+@test "VERSION is defined" {
+    [ -n "$VERSION" ]
+    [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
 }
 
-@test "SCRIPT_NAME is lyrebird-storage" {
-    [ "$SCRIPT_NAME" = "lyrebird-storage" ]
+@test "SCRIPT_NAME is lyrebird-storage.sh" {
+    [ "$SCRIPT_NAME" = "lyrebird-storage.sh" ]
 }
 
 # ============================================================================

@@ -16,7 +16,8 @@ Linux kernels and real systemd-udevd in QEMU; see
 `docs/ENGINEERING-REVIEW-2026-07.md` §9.
 
 Component versions bumped: `usb-audio-mapper.sh` 1.2.1 → 4.0.0,
-`lyrebird-orchestrator.sh` 2.1.2 → 2.1.3.
+`lyrebird-orchestrator.sh` 2.1.2 → 2.1.3, `lyrebird-updater.sh` 1.6.0 → 1.6.1,
+`lyrebird-mic-check.sh` 1.0.0 → 1.0.1, `lyrebird-alerts.sh` 1.0.0 → 1.0.1.
 
 #### Fixed
 - **USB persistent naming still never worked (critical).** The 2026-07 fix (C1)
@@ -55,10 +56,22 @@ Component versions bumped: `usb-audio-mapper.sh` 1.2.1 → 4.0.0,
   logs. The setup now uses the `LYREBIRD_*_DIR` variables; regression test in
   `tests/test_storage_suite_safety.bats`.
 
-#### Known issue (not fixed)
-- Six test files cannot report a failure: their `setup()` sources a script
-  whose `EXIT` trap replaces bats' own (`docs/ENGINEERING-REVIEW-2026-07.md`
-  §9, U9). Their 321 tests pass regardless of the code under test.
+- **321 tests could not fail.** Six test files sourced a script in `setup()`
+  that replaced bats' `EXIT` trap and then switched errexit off, so a failing
+  assertion was ignored. A helper now restores bats' traps and options after
+  sourcing, and `tests/test_suite_can_fail.bats` checks every test file.
+  This surfaced 28 failures; 25 were wrong tests, corrected to the scripts'
+  actual behaviour (`docs/ENGINEERING-REVIEW-2026-07.md` §9, U9–U13).
+- `lyrebird-mic-check.sh -g` wrote `DEFAULT_SAMPLE_RATE`, `DEFAULT_CHANNELS`
+  and `DEFAULT_BITRATE` into `audio-devices.conf`, where the stream manager
+  ignores them (they are readonly by then) and logs `readonly variable` on
+  every load. They are now written as comments; set them in the stream
+  manager's environment instead. README corrected.
+- `lyrebird-alerts.sh`: level colours and prefixes were lost when the script
+  was sourced from a function.
+- `lyrebird-updater.sh --help` now lists the command-line options.
+- `lyrebird-stream-manager.sh` header said version 1.4.4 (it is 1.5.0), which
+  `lyrebird-diagnostics.sh` reported.
 
 #### Added
 - `--card N`, `--list`, `--remove NAME`, `--dry-run`, `--no-apply`,

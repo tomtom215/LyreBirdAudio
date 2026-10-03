@@ -8,7 +8,7 @@
 # Author: Tom F (https://github.com/tomtom215)
 # License: Apache 2.0
 #
-# Version: 1.0.0
+# Version: 1.0.1
 #
 #
 # DESCRIPTION:
@@ -109,7 +109,7 @@ _LYREBIRD_COMMON="${BASH_SOURCE[0]%/*}/lyrebird-common.sh"
 unset _LYREBIRD_COMMON
 
 # Version
-readonly VERSION="1.0.0"
+readonly VERSION="1.0.1"
 SCRIPT_NAME="$(basename "${BASH_SOURCE[0]}")"
 readonly SCRIPT_NAME
 
@@ -375,7 +375,7 @@ EOF
 # Sanitize device name for use in configuration variables
 #
 # CRITICAL: This function MUST produce identical output to the sanitize_device_name()
-# function in lyrebird-stream-manager.sh (lines 1642-1656). Any deviation will cause
+# function in lyrebird-stream-manager.sh. Any deviation will cause
 # configuration variable lookup failures.
 #
 # Transformation rules (must match lyrebird-stream-manager.sh):
@@ -393,12 +393,13 @@ EOF
 #   $1 = Raw device name
 #
 # Returns:
-#   stdout: Sanitized device name (lowercase, alphanumeric + underscore only)
+#   stdout: Sanitized device name (original case, alphanumeric + underscore only;
+#           callers uppercase it when building DEVICE_* keys)
 #
-# Integration Test:
-#   Input: "Blue Yeti" -> Output: "blue_yeti" (NOT "BLUE_YETI")
-#   Input: "usb-audio-device" -> Output: "usb_audio_device" (NOT "DEVICE")
-#   Input: "123device" -> Output: "dev_123device" (NOT "DEV_123DEVICE")
+# Examples:
+#   Input: "Blue Yeti" -> Output: "Blue_Yeti"
+#   Input: "usb-audio-device" -> Output: "usb_audio_device" (prefix kept)
+#   Input: "123device" -> Output: "dev_123device"
 #
 sanitize_device_name() {
     local name="$1"
@@ -1716,11 +1717,14 @@ generate_config() {
 #   DEVICE_BLUE_YETI_CHANNELS=2
 #   DEVICE_BLUE_YETI_BITRATE=192k
 #
-# Fallback Defaults (used when device-specific config not found):
-
-DEFAULT_SAMPLE_RATE=48000
-DEFAULT_CHANNELS=2
-DEFAULT_BITRATE=128k
+# Fallback defaults (used when no device-specific value is set) are NOT read
+# from this file: the stream manager fixes them at startup from its
+# environment (DEFAULT_SAMPLE_RATE, DEFAULT_CHANNELS, DEFAULT_BITRATE, ...),
+# and assigning them here only logs "readonly variable" on every load.
+# Built-in values:
+#   DEFAULT_SAMPLE_RATE=48000
+#   DEFAULT_CHANNELS=2
+#   DEFAULT_BITRATE=128k
 
 # ============================================================================
 # Device-Specific Configurations

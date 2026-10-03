@@ -4,6 +4,8 @@
 # Install bats: sudo apt-get install bats
 
 # Setup - source the alerts script
+load bats_shell_state
+
 setup() {
     # Get the directory of this test file
     TEST_DIR="$( cd "$( dirname "$BATS_TEST_FILENAME" )" && pwd )"
@@ -19,12 +21,9 @@ setup() {
     export LYREBIRD_WEBHOOK_URL=""
 
     # Source the alerts script (functions only, don't run main)
+    bats_save_shell_state
     source "$PROJECT_ROOT/lyrebird-alerts.sh"
-
-    # The script enables `set -euo pipefail`, which leaks into the bats shell and
-    # turns failing assertions / unset-var reads into silent aborts. Restore
-    # bats' own error handling so failures report as "not ok".
-    set +euo pipefail
+    bats_restore_shell_state
 }
 
 # Teardown - clean up temp files
@@ -99,8 +98,18 @@ teardown() {
     [ -n "${ALERT_COLORS[critical]}" ]
 }
 
-@test "ALERT_EMOJI array has warning emoji" {
-    [ -n "${ALERT_EMOJI[warning]}" ]
+@test "ALERT_PREFIX array has warning prefix" {
+    [ "${ALERT_PREFIX[warning]}" = "[WARN]" ]
+}
+
+# The maps are declared with -g so they survive being sourced from a function
+# (as bats setup() does). With plain declare -A they were local to setup(), and
+# every level silently fell back to the info color and prefix.
+@test "level maps survive sourcing from a function" {
+    run get_alert_prefix critical
+    [ "$output" = "[CRITICAL]" ]
+    run format_discord "critical" "T" "M" "t"
+    [[ "$output" =~ \"color\":\ *15548997 ]]
 }
 
 # ============================================================================
@@ -151,11 +160,13 @@ teardown() {
 # ============================================================================
 
 @test "ensure_state_dir creates directory if missing" {
-    local new_dir="${LYREBIRD_ALERT_STATE_DIR}/subdir"
-    export LYREBIRD_ALERT_STATE_DIR="$new_dir"
+    # ALERT_STATE_DIR is readonly, fixed from LYREBIRD_ALERT_STATE_DIR when
+    # the script was sourced; remove it and check it is recreated.
+    [ "$ALERT_STATE_DIR" = "$LYREBIRD_ALERT_STATE_DIR" ]
+    rmdir "$ALERT_STATE_DIR"
     run ensure_state_dir
     [ "$status" -eq 0 ]
-    [ -d "$new_dir" ]
+    [ -d "$ALERT_STATE_DIR" ]
 }
 
 # ============================================================================
@@ -417,7 +428,7 @@ teardown() {
 }
 
 @test "format_ntfy round-trips a title/message containing colons [ALERT-4 regression]" {
-    run format_ntfy "urgent" "Stream Down: mydevice" "Stream 'mydevice' is down: no data" "stream_down"
+    run format_ntfy "critical" "Stream Down: mydevice" "Stream 'mydevice' is down: no data" "stream_down"
     [ "$status" -eq 0 ]
     # Payload is NTFY:<priority>:<base64 title>:<base64 message>; base64 has no
     # ':' so the field split is unambiguous. Decode and compare to the originals.

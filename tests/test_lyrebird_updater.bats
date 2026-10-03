@@ -4,6 +4,8 @@
 # Install bats: sudo apt-get install bats
 
 # Setup - source the updater script
+load bats_shell_state
+
 setup() {
     # Get the directory of this test file
     TEST_DIR="$( cd "$( dirname "$BATS_TEST_FILENAME" )" && pwd )"
@@ -14,16 +16,18 @@ setup() {
     export BACKUP_DIR="$(mktemp -d)"
     export SERVICE_BACKUP_DIR="$(mktemp -d)"
 
+    # Keep the git fixtures independent of the developer's git config (e.g.
+    # commit.gpgsign or push.negotiate would break the fixture commits/pushes).
+    export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1
+
     # Disable actual git operations
     export DRY_RUN=true
     export FORCE_MODE=false
 
     # Source the updater script
+    bats_save_shell_state
     source "$PROJECT_ROOT/lyrebird-updater.sh"
-
-    # The script enables errexit, which leaks into the bats shell and turns
-    # failing assertions into silent aborts. Restore bats' own error handling.
-    set +euo pipefail
+    bats_restore_shell_state
 }
 
 # Teardown - clean up temp files
@@ -37,9 +41,9 @@ teardown() {
 # Script Metadata Tests
 # ============================================================================
 
-@test "SCRIPT_VERSION is defined" {
-    [ -n "$SCRIPT_VERSION" ]
-    [[ "$SCRIPT_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+@test "VERSION is defined" {
+    [ -n "$VERSION" ]
+    [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
 }
 
 @test "SCRIPT_NAME is defined" {
@@ -326,7 +330,12 @@ teardown() {
 @test "show_help outputs usage information" {
     run show_help
     [ "$status" -eq 0 ]
-    [[ "$output" =~ "Usage" ]] || [[ "$output" =~ "USAGE" ]] || [[ "$output" =~ "usage" ]]
+    [[ "$output" == *"USAGE:"* ]]
+    # Every user-facing flag main() accepts is documented.
+    local flag
+    for flag in --status --list --migrate --version --help; do
+        [[ "$output" == *"$flag"* ]]
+    done
 }
 
 # ============================================================================
@@ -388,6 +397,9 @@ teardown() {
 _setup_stale_repo() {
     local base; base="$(mktemp -d)"
     git init -q --bare "$base/origin.git"
+    # Point the bare repo at main regardless of init.defaultBranch, or the
+    # second clone below has no checkout.
+    git -C "$base/origin.git" symbolic-ref HEAD refs/heads/main
     git clone -q "$base/origin.git" "$base/work" 2>/dev/null
     git -C "$base/work" config user.email t@t; git -C "$base/work" config user.name t
     echo v1 > "$base/work/f"; git -C "$base/work" add f; git -C "$base/work" commit -qm c1
@@ -403,7 +415,7 @@ _setup_stale_repo() {
     local repo; repo="$(_setup_stale_repo)"
     local origin_head; origin_head=$(git -C "$repo" rev-parse origin/main)
     [ "$(git -C "$repo" rev-parse HEAD)" != "$origin_head" ]   # precondition: behind
-    ( cd "$repo" && fast_forward_branch_to_origin main ); local rc=$?
+    local rc=0; ( cd "$repo" && fast_forward_branch_to_origin main ) || rc=$?
     local after; after=$(git -C "$repo" rev-parse HEAD)
     rm -rf "$(dirname "$repo")"
     [ "$rc" -eq 0 ]
@@ -412,7 +424,7 @@ _setup_stale_repo() {
 
 @test "fast_forward_branch_to_origin is a no-op (success) for a tag target [UPD-H5 regression]" {
     local repo; repo="$(_setup_stale_repo)"
-    ( cd "$repo" && git tag v9.9.9 && fast_forward_branch_to_origin v9.9.9 ); local rc=$?
+    local rc=0; ( cd "$repo" && git tag v9.9.9 && fast_forward_branch_to_origin v9.9.9 ) || rc=$?
     rm -rf "$(dirname "$repo")"
     [ "$rc" -eq 0 ]
 }
@@ -420,7 +432,7 @@ _setup_stale_repo() {
 @test "fast_forward_branch_to_origin fails (does not silently ignore) a diverged branch [UPD-H5 regression]" {
     local repo; repo="$(_setup_stale_repo)"
     ( cd "$repo" && echo l > lf && git add lf && git commit -qm local )   # diverge from origin
-    ( cd "$repo" && fast_forward_branch_to_origin main ); local rc=$?
+    local rc=0; ( cd "$repo" && fast_forward_branch_to_origin main ) || rc=$?
     rm -rf "$(dirname "$repo")"
     [ "$rc" -ne 0 ]
 }
