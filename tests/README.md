@@ -17,8 +17,11 @@ Unit tests for LyreBirdAudio using the [Bats](https://github.com/bats-core/bats-
 | lyrebird-updater.sh | test_lyrebird_updater.bats | 58 | 75% |
 | install_mediamtx.sh | test_install_mediamtx.bats | 66 | 70% |
 | lyrebird-mic-check.sh | test_lyrebird_mic_check.bats | 45 | 70% |
+| lyrebird-stream-manager.sh vs. MediaMTX versions | test_mediamtx_config_versions.bats, test_mediamtx_live.bats | 4 + 1 live | not estimated |
+| tools/soak/lyrebird-soak.sh | test_soak.bats, test_soak_live.bats | 31 + 1 live | not estimated |
+| tools/soak/lyrebird-soak-observer.sh | test_soak_observer.bats | 9 (2 live) | not estimated |
 
-**Total: 618 tests (`bats --count tests/`).** Coverage percentages above are estimates, not measured. `test_suite_can_fail.bats` checks that every test file reports a failing assertion, so a file whose `setup()` disables bats' error handling fails the suite (`docs/ENGINEERING-REVIEW-2026-07.md` §9, U9).
+**Total: 664 tests (`bats --count tests/`); the 4 marked live are skipped unless `LYREBIRD_TEST_MEDIAMTX_BINS` is set (see below).** Coverage percentages above are estimates, not measured. `test_suite_can_fail.bats` checks that every test file reports a failing assertion, so a file whose `setup()` disables bats' error handling fails the suite (`docs/ENGINEERING-REVIEW-2026-07.md` §9, U9).
 
 ## Prerequisites
 
@@ -48,6 +51,16 @@ bats tests/
 ```bash
 tests/check_tmp_leaks.sh
 ```
+
+**Run the live tests against real MediaMTX releases** (downloads checksum-pinned
+1.15.0, 1.18.0, 1.19.0 and 1.21.1 for linux amd64 into `.cache/mediamtx`; needs
+ffmpeg, curl, jq and free ports 8554/9997; refuses to run while another
+MediaMTX or RTSP ffmpeg is running):
+```bash
+LYREBIRD_TEST_MEDIAMTX_BINS="$(tests/fetch_mediamtx.sh)" \
+    bats tests/test_mediamtx_live.bats tests/test_soak_live.bats tests/test_soak_observer.bats
+```
+Without `LYREBIRD_TEST_MEDIAMTX_BINS` those live tests are skipped.
 
 **Run specific test file:**
 ```bash

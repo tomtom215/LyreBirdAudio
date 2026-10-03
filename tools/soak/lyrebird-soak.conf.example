@@ -1,0 +1,81 @@
+# /etc/lyrebird-soak.conf - settings for lyrebird-soak (tools/soak/README.md)
+# KEY=value, one per line. Environment variables override these.
+# Fault settings take effect at the next fault; the rest at the next start.
+
+# Where the run is recorded (samples, events, baseline, state).
+#SOAK_DIR=/var/lib/lyrebird-soak
+
+# Seconds between samples. Recovery times are measured to this resolution.
+#SOAK_INTERVAL=10
+
+# A stream whose byte counter does not move for this many samples is stalled.
+#SOAK_STALL_SAMPLES=3
+
+# MediaMTX control API.
+#SOAK_API_URL=http://127.0.0.1:9997
+
+# Services that must stay active (default: mediamtx and mediamtx-audio, if
+# active at init). Streams to watch (default: every live stream at init).
+#SOAK_SERVICES=
+#SOAK_STREAMS=
+
+# The usb-audio-mapper rules: the intended device names.
+#SOAK_RULES_FILE=/etc/udev/rules.d/99-usb-soundcards.rules
+
+# Filesystem whose fill level is tracked and filled by disk-fill
+# (default: /var/lib/mediamtx-ffmpeg if present, else /).
+#SOAK_DISK_PATH=
+
+# Directory whose size is tracked.
+#SOAK_LOG_DIR=/var/log
+
+# A disk, inode or memory trend that runs out within this many days fails.
+#SOAK_EXHAUSTION_DAYS=30
+
+# --- Faults (none by default) ---------------------------------------------
+# Comma-separated, from: kill-ffmpeg kill-mediamtx kill-manager restart-udev
+# udev-trigger usb-replug net-down disk-fill clock-jump reboot hard-reset
+#SOAK_FAULTS=kill-ffmpeg,kill-mediamtx,kill-manager,restart-udev,udev-trigger,usb-replug,reboot
+
+# Seed for the fault schedule (same seed, same sequence). Default: set at init.
+#SOAK_SEED=
+
+# No faults during the first SOAK_WARMUP seconds; then one every
+# SOAK_FAULT_MIN_GAP..SOAK_FAULT_MAX_GAP seconds.
+#SOAK_WARMUP=600
+#SOAK_FAULT_MIN_GAP=1800
+#SOAK_FAULT_MAX_GAP=7200
+
+# A fault must be recovered from this many seconds after it ends. The stream
+# manager's restart back-off reaches 300 s and its cron monitor runs every
+# 5 minutes, so less than about 360 s fails by design.
+#SOAK_RECOVERY_DEADLINE=360
+# After a reboot, streams must be healthy this many seconds after boot.
+#SOAK_REBOOT_DEADLINE=300
+
+# usb-replug: "authorized" (logical unplug via sysfs, works everywhere) or
+# "uhubctl" (real power cycle of the hub port; needs uhubctl and a hub with
+# per-port power switching; on boards whose Ethernet sits on the same USB hub,
+# such as the Raspberry Pi 3, it can cut the network too).
+#SOAK_USB_METHOD=authorized
+#SOAK_USB_OFF_SECONDS=10
+
+# net-down: required interface; it comes back up after SOAK_NET_DOWN_SECONDS
+# (a systemd timer guarantees it, even if this harness dies).
+#SOAK_NET_IFACE=eth0
+#SOAK_NET_DOWN_SECONDS=60
+
+# disk-fill: fill to this percentage, hold, then delete the fill file. Never
+# leaves less than SOAK_DISK_MIN_FREE_MB free. The storage manager's emergency
+# cleanup may delete recordings: use a test node.
+#SOAK_DISK_FILL_PERCENT=97
+#SOAK_DISK_FILL_SECONDS=600
+#SOAK_DISK_MIN_FREE_MB=64
+
+# clock-jump: step the wall clock by this many seconds (negative = back) and
+# restore it after SOAK_CLOCK_JUMP_HOLD seconds. NTP may correct it sooner.
+#SOAK_CLOCK_JUMP_SECONDS=3600
+#SOAK_CLOCK_JUMP_HOLD=300
+
+# Print fault actions instead of performing them.
+#SOAK_DRY_RUN=0

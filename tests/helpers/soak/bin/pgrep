@@ -1,0 +1,10 @@
+#!/bin/bash
+# Stub pgrep: mediamtx PID from $STUB_DIR/pid.mediamtx, ffmpeg PIDs from
+# $STUB_DIR/pid.ffmpeg (one per line).
+case "$*" in
+    *mediamtx*) f="$STUB_DIR/pid.mediamtx" ;;
+    *ffmpeg*) f="$STUB_DIR/pid.ffmpeg" ;;
+    *) exit 1 ;;
+esac
+[[ -s "$f" ]] || exit 1
+cat "$f"

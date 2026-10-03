@@ -1464,7 +1464,7 @@ This modular design prevents duplicate business logic and ensures maintainabilit
 |--------|---------|---------|
 | lyrebird-orchestrator.sh | 2.1.3 | Unified management interface |
 | lyrebird-updater.sh | 1.6.1 | Version management with rollback |
-| lyrebird-stream-manager.sh | 1.5.0 | Stream lifecycle management |
+| lyrebird-stream-manager.sh | 1.5.1 | Stream lifecycle management |
 | usb-audio-mapper.sh | 4.0.0 | USB device persistence via udev |
 | lyrebird-mic-check.sh | 1.0.1 | Hardware capability detection |
 | lyrebird-diagnostics.sh | 1.0.2 | System diagnostics |
@@ -2524,9 +2524,14 @@ Test on:
 - Multiple USB device configurations
 - Both Raspberry Pi and x86_64
 
+Before trusting a node in the field, soak-test it on the same hardware for
+weeks with faults injected: see [tools/soak/README.md](tools/soak/README.md).
+
 **Validation:**
 - [ ] `bash -n script.sh` (syntax check)
 - [ ] `shellcheck script.sh` (linting)
+- [ ] `tests/check_tmp_leaks.sh` (bats suite, no leaked temp files)
+- [ ] `LYREBIRD_TEST_MEDIAMTX_BINS="$(tests/fetch_mediamtx.sh)" bats tests/test_mediamtx_live.bats tests/test_soak_live.bats tests/test_soak_observer.bats` (real MediaMTX)
 - [ ] Backward compatibility maintained
 - [ ] Documentation updated
 - [ ] Exit codes documented

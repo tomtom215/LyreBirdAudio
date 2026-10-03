@@ -380,5 +380,14 @@ Found while running the suite for this pass (not mapper code):
 Also corrected: C1 above says the bug left `/dev/snd/by-id/<name>` uncreated;
 the mapper's link is `/dev/sound/by-id/<name>`.
 
+Found while checking MediaMTX currency (newest release v1.21.1, from
+`git ls-remote --tags`, 2026-10-03; the installer installs the latest):
+
+| # | Sev | Failure (state → wrong outcome) | Repro | Fix | Test |
+|---|-----|---------------------------------|-------|-----|------|
+| U14 | MEDIUM | MediaMTX ≥ 1.19.0 starts a MoQ server by default. The generated `mediamtx.yml` does not disable it, so new installs listen on `:8892/tcp`, `:8892/udp`, `:8893/udp` on every interface (`moqAllowOrigins: ["*"]`) and write `auto.key`/`auto.crt` into MediaMTX's working directory. `moq: no` cannot simply be added: 1.15–1.18 reject the unknown key and do not start. | Each real binary 1.15.0–1.21.1 started with the generated config: MoQ listeners from 1.19.0 on; `moq: no` → `json: unknown field "moq"` and exit 1 on 1.15.0–1.18.0. | Write `moq: no` only when `mediamtx --version` is ≥ 1.19.0; leave it out for older or unreadable versions. | `test_mediamtx_config_versions.bats` (stub versions), `test_mediamtx_live.bats` (real 1.15.0, 1.18.0, 1.19.0, 1.21.1: starts, no MoQ, readiness probe sees a stream come and go) |
+
 **Not covered:** physical USB hardware and ARM boards (all runs are x86-64 with
-emulated devices), eudev, and systemd older than 241.
+emulated devices), eudev, and systemd older than 241. `tools/soak/` is the means to cover
+physical hardware, ARM boards and long runs; it has been tested against a fake
+node and against real MediaMTX and ffmpeg, but not yet run on field hardware.

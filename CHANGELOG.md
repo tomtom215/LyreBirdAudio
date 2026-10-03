@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Soak testing and current MediaMTX (2026-10)
+
+Component versions bumped: `lyrebird-stream-manager.sh` 1.5.0 → 1.5.1.
+
+#### Added
+- `tools/soak/`: a soak-test harness for field-like long runs.
+  `lyrebird-soak.sh` runs on the node (systemd service), checks device names
+  against the usb-audio-mapper rules, stream liveness and stalls, services and
+  resource trends, injects faults on a seeded schedule (process kills, udev
+  restarts, USB unplug, network loss, full disk, clock steps, reboots and
+  hard resets; each undo armed as a systemd timer before the fault), and
+  reports PASS/FAIL. `lyrebird-soak-observer.sh` watches the streams from a
+  second machine (bash 3.2 or later), can cut the node's power through
+  commands you supply, and reports gaps and time to audio. See
+  `tools/soak/README.md`.
+- Live tests against real MediaMTX releases (`tests/fetch_mediamtx.sh`
+  downloads checksum-pinned 1.15.0, 1.18.0, 1.19.0 and 1.21.1), run by a new
+  CI job.
+
+#### Fixed
+- **MediaMTX 1.19.0 and later opened three extra ports.** Those versions start
+  a MoQ (Media over QUIC) server unless told not to, so the generated
+  `mediamtx.yml` left `:8892/tcp`, `:8892/udp` and `:8893/udp` listening on
+  every interface (allowed origins `*`), and MediaMTX wrote a generated
+  key/certificate pair into its working directory. The installer installs the
+  latest release by default, so new installs were affected. The config now
+  says `moq: no` when the installed MediaMTX is 1.19.0 or later; 1.15–1.18
+  refuse to start with that key, so it is left out for them and when the
+  version cannot be read. Verified with the real binaries of every release
+  from 1.15.0 to 1.21.1.
+
 ### USB Audio Mapper 4.0.0 (2026-10)
 
 `usb-audio-mapper.sh` is now the same file as the standalone
