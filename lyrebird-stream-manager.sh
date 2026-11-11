@@ -239,7 +239,11 @@ readonly LOCK_FILE="${MEDIAMTX_LOCK_FILE:-/run/mediamtx-audio.lock}"
 #   age- or process-name-based staleness (LOCK_STALE_THRESHOLD is ignored)
 # - Separate monitor lock (/run/mediamtx-monitor.lock) used by cron
 #   to avoid contention with service lock during start/stop operations
-readonly LOG_FILE="${MEDIAMTX_LOG_FILE:-/var/log/lyrebird-stream-manager.log}"
+# Two different files, two different variables: the manager's own log
+# (STREAM_MANAGER_LOG_FILE) and the output of the MediaMTX process it starts
+# (MEDIAMTX_LOG_FILE). Both used to be read from MEDIAMTX_LOG_FILE, so setting it
+# sent the manager's messages into MediaMTX's file as well.
+readonly LOG_FILE="${STREAM_MANAGER_LOG_FILE:-/var/log/lyrebird-stream-manager.log}"
 readonly MEDIAMTX_LOG_FILE="${MEDIAMTX_LOG_FILE:-/var/log/mediamtx.out}"
 readonly MEDIAMTX_BIN="${MEDIAMTX_BINARY:-/usr/local/bin/mediamtx}"
 readonly MEDIAMTX_HOST="${MEDIAMTX_HOST:-localhost}"
@@ -5403,8 +5407,8 @@ Commands:
 Configuration files:
     Device config: ${DEVICE_CONFIG_FILE}
     MediaMTX config: ${CONFIG_FILE}
-    System log: ${LOG_FILE}
-    MediaMTX log: ${MEDIAMTX_LOG_FILE}
+    System log: ${LOG_FILE} (STREAM_MANAGER_LOG_FILE)
+    MediaMTX log: ${MEDIAMTX_LOG_FILE} (MEDIAMTX_LOG_FILE)
 
 Multiplex Mode Usage:
     Individual mode (default):

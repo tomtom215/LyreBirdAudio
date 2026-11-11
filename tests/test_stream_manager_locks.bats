@@ -32,7 +32,8 @@ setup() {
     # Private paths for everything the script writes
     export LB_REAL_SCRIPT="$PROJECT_ROOT/lyrebird-stream-manager.sh"
     export MEDIAMTX_LOCK_FILE="$LK/run.lock"
-    export MEDIAMTX_LOG_FILE="$LK/sm.log"
+    export STREAM_MANAGER_LOG_FILE="$LK/sm.log"
+    export MEDIAMTX_LOG_FILE="$LK/mtx.out"
     export MEDIAMTX_CONFIG_DIR="$LK/cfg"
     export MEDIAMTX_PID_FILE="$LK/mtx.pid"
     export MEDIAMTX_FFMPEG_DIR="$LK/ff"
@@ -194,7 +195,7 @@ _wait_nonempty() {
     done
     echo "timed out waiting for $file" >&2
     cat "$LK"/bg.*.out >&2 2>/dev/null || true
-    tail -n 20 "$MEDIAMTX_LOG_FILE" >&2 2>/dev/null || true
+    tail -n 20 "$STREAM_MANAGER_LOG_FILE" >&2 2>/dev/null || true
     return 1
 }
 
@@ -473,15 +474,15 @@ _t_sigkill() {
         printf "first=%s second=%s\n" "$a" "$b"'
     [[ "$output" == *"first=1 second=1"* ]]
     local lines
-    lines="$(grep -c 'LOCK_STALE_THRESHOLD is deprecated and ignored' "$MEDIAMTX_LOG_FILE")"
+    lines="$(grep -c 'LOCK_STALE_THRESHOLD is deprecated and ignored' "$STREAM_MANAGER_LOG_FILE")"
     [ "$lines" -eq 1 ]
     _stop_holder
 
     # Without the variable there is no deprecation line at all
-    : >"$MEDIAMTX_LOG_FILE"
+    : >"$STREAM_MANAGER_LOG_FILE"
     run bash "$ROLE" try 1
     [[ "$output" == *"rc=0"* ]]
-    ! grep -q 'LOCK_STALE_THRESHOLD' "$MEDIAMTX_LOG_FILE" || false
+    ! grep -q 'LOCK_STALE_THRESHOLD' "$STREAM_MANAGER_LOG_FILE" || false
 }
 
 @test "a process that already holds the lock keeps it when it acquires again (restart = stop + start) [D2]" {
@@ -500,8 +501,8 @@ _t_sigkill() {
     [ "$status" -eq 0 ]
     [ "$output" = "rc=1 rc=1 same-file" ]
     # The second call kept the lock instead of releasing and re-taking it
-    [ "$(grep -c 'Acquired lock' "$MEDIAMTX_LOG_FILE")" -eq 1 ]
-    grep -q 'Lock already held' "$MEDIAMTX_LOG_FILE"
+    [ "$(grep -c 'Acquired lock' "$STREAM_MANAGER_LOG_FILE")" -eq 1 ]
+    grep -q 'Lock already held' "$STREAM_MANAGER_LOG_FILE"
 }
 
 @test "acquiring and releasing locks leaves the shell's stderr alone [X-06]" {
@@ -911,5 +912,5 @@ _assert_child_holds_no_lock() {
     [[ "$output" == *"stop rc=0 mediamtx-alive=no"* ]]
     # The old code waited out 5 s for the lock its own child kept alive and
     # then went ahead without it
-    ! grep -q 'Could not acquire lock\|Failed to acquire lock\|Refusing to stop' "$MEDIAMTX_LOG_FILE" || false
+    ! grep -q 'Could not acquire lock\|Failed to acquire lock\|Refusing to stop' "$STREAM_MANAGER_LOG_FILE" || false
 }

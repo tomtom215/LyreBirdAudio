@@ -66,7 +66,8 @@ _run_monitor() {
     env PROJECT_ROOT="$PROJECT_ROOT" PATH="$DH_TMP/bin:$PATH" \
         MEDIAMTX_PID_FILE="$DH_TMP/mediamtx.pid" \
         MEDIAMTX_FFMPEG_DIR="$DH_TMP/pids" \
-        MEDIAMTX_LOG_FILE="$DH_TMP/manager.log" \
+        STREAM_MANAGER_LOG_FILE="$DH_TMP/manager.log" \
+        MEDIAMTX_LOG_FILE="$DH_TMP/mediamtx.out" \
         MEDIAMTX_API_VERSION=v3 \
         DEEP_HEALTH_STATE_DIR="$DH_TMP/strikes" \
         DEEP_HEALTH_MAX_STRIKES=3 \
@@ -169,7 +170,8 @@ _stream_path_for_mic1() {
         run env PROJECT_ROOT="$PROJECT_ROOT" PATH="$DH_TMP/bin:$PATH" \
             MEDIAMTX_PID_FILE="$DH_TMP/mediamtx.pid" \
             MEDIAMTX_FFMPEG_DIR="$DH_TMP/pids" \
-            MEDIAMTX_LOG_FILE="$DH_TMP/manager.log" \
+            STREAM_MANAGER_LOG_FILE="$DH_TMP/manager.log" \
+            MEDIAMTX_LOG_FILE="$DH_TMP/mediamtx.out" \
             MEDIAMTX_API_VERSION=v3 \
             DEEP_HEALTH_CHECK_ENABLED=false \
             DEEP_HEALTH_STATE_DIR="$DH_TMP/strikes" \
