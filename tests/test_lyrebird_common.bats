@@ -269,3 +269,76 @@ setup() {
     [ "$status" -eq 0 ]
     [[ "$output" == *boom* ]]
 }
+
+# ============================================================================
+# lyrebird_atomic_write (durable atomic replacement, decision D14)
+# ============================================================================
+
+@test "lyrebird_atomic_write writes stdin to the destination byte for byte" {
+    local d="$BATS_TEST_TMPDIR/aw1"
+    mkdir -p "$d"
+    printf 'line one\nline two with $dollar and "quotes"' | lyrebird_atomic_write "$d/out.conf"
+    [ "$(cat "$d/out.conf")" = $'line one\nline two with $dollar and "quotes"' ]
+}
+
+@test "lyrebird_atomic_write applies the requested mode, 0644 by default" {
+    local d="$BATS_TEST_TMPDIR/aw2"
+    mkdir -p "$d"
+    echo a | lyrebird_atomic_write "$d/default"
+    echo b | lyrebird_atomic_write "$d/private" 0600
+    [ "$(stat -c %a "$d/default")" = "644" ]
+    [ "$(stat -c %a "$d/private")" = "600" ]
+}
+
+@test "lyrebird_atomic_write replaces an existing file and leaves no temp file" {
+    local d="$BATS_TEST_TMPDIR/aw3"
+    mkdir -p "$d"
+    echo old >"$d/out"
+    echo new | lyrebird_atomic_write "$d/out"
+    [ "$(cat "$d/out")" = "new" ]
+    [ "$(find "$d" -mindepth 1 | wc -l)" -eq 1 ]
+}
+
+@test "lyrebird_atomic_write fails and touches nothing when the directory does not exist" {
+    run bash -c 'source "$1"; echo data | lyrebird_atomic_write "$2/missing/out"' _ "$PROJECT_ROOT/lyrebird-common.sh" "$BATS_TEST_TMPDIR"
+    [ "$status" -ne 0 ]
+    [ ! -e "$BATS_TEST_TMPDIR/missing" ]
+}
+
+@test "lyrebird_atomic_write keeps the old content when the writer is killed mid-write" {
+    local d="$BATS_TEST_TMPDIR/aw4"
+    mkdir -p "$d"
+    echo old >"$d/out"
+    mkfifo "$d/fifo"
+    # The writer reads the FIFO; we hold the other end open so it blocks mid-write.
+    setsid bash -c 'source "$1"; lyrebird_atomic_write "$2" <"$3"' _ "$PROJECT_ROOT/lyrebird-common.sh" "$d/out" "$d/fifo" &
+    local pid=$!
+    exec 9>"$d/fifo"
+    echo partial >&9
+    sleep 1
+    kill -KILL -- "-$pid"
+    exec 9>&-
+    wait "$pid" 2>/dev/null || true
+    [ "$(cat "$d/out")" = "old" ]
+}
+
+@test "lyrebird_atomic_write flushes the temp file before the rename and the directory after it" {
+    local d="$BATS_TEST_TMPDIR/aw5" shim="$BATS_TEST_TMPDIR/aw5shim"
+    mkdir -p "$d" "$shim"
+    echo old >"$d/out"
+    cat >"$shim/sync" <<'SHIM'
+#!/bin/bash
+[[ "$1" == "--" ]] && shift
+printf 'path=%s exists=%s dest=%s\n' "$1" "$([[ -e "$1" ]] && echo y || echo n)" "$(cat "$AW_DEST" 2>/dev/null)" >>"$AW_LOG"
+SHIM
+    chmod +x "$shim/sync"
+    AW_DEST="$d/out" AW_LOG="$BATS_TEST_TMPDIR/aw5.log" PATH="$shim:$PATH" \
+        bash -c 'source "$1"; echo new | lyrebird_atomic_write "$2"' _ "$PROJECT_ROOT/lyrebird-common.sh" "$d/out"
+    mapfile -t calls <"$BATS_TEST_TMPDIR/aw5.log"
+    [ "${#calls[@]}" -eq 2 ]
+    # first: the hidden temp file, still present, destination still old
+    [[ "${calls[0]}" == "path=$d/.out."* ]]
+    [[ "${calls[0]}" == *"exists=y dest=old" ]]
+    # second: the directory, after the rename made the new content visible
+    [[ "${calls[1]}" == "path=$d exists=y dest=new" ]]
+}

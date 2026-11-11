@@ -7,7 +7,7 @@
 # Copyright: Tom F and LyreBirdAudio contributors
 # License: Apache 2.0
 #
-# Version: 1.0.0
+# Version: 1.1.0
 #
 # DESCRIPTION:
 #   This library provides shared utility functions used across all LyreBirdAudio
@@ -58,7 +58,7 @@ if [[ -n "${_LYREBIRD_COMMON_LOADED:-}" ]]; then
 fi
 
 # Version of the common library (declared after guard to avoid readonly error on re-source)
-readonly LYREBIRD_COMMON_VERSION="1.0.0"
+readonly LYREBIRD_COMMON_VERSION="1.1.0"
 readonly _LYREBIRD_COMMON_LOADED=true
 
 #=============================================================================
@@ -198,6 +198,46 @@ if ! declare -f compute_hash &>/dev/null; then
         lyrebird_compute_hash "$@"
     }
 fi
+
+#=============================================================================
+# Durable Atomic File Replacement
+#=============================================================================
+
+# Flush one file or directory to stable storage. coreutils >= 8.24 syncs only
+# the named path; older and minimal systems fall back to a global sync.
+# Usage: lyrebird_fsync_path PATH
+lyrebird_fsync_path() {
+    sync -- "$1" 2>/dev/null || sync
+}
+
+# Replace DEST with the content of stdin, atomically and durably: write a
+# hidden temp file in DEST's own directory, fsync it, rename it over DEST, then
+# fsync the directory. A reader or a crash sees either the complete old content
+# or the complete new content; once this returns 0 both the data and the rename
+# have been requested from stable storage. Whether the medium honours that
+# request is up to the storage stack (flash media included). If DEST is a
+# symbolic link, the link itself is replaced.
+# Usage: lyrebird_atomic_write DEST [MODE] < content
+# Returns: 0 on success; 1 on any failure, with DEST untouched and the temp
+#          file removed (a SIGKILL can still leave a ".<name>.XXXXXX" temp file
+#          behind, which is never read as DEST).
+lyrebird_atomic_write() {
+    local dest="${1:?lyrebird_atomic_write: destination required}"
+    local mode="${2:-0644}"
+    local dir base tmp
+    dir="$(dirname -- "$dest")"
+    base="$(basename -- "$dest")"
+    tmp="$(mktemp "${dir}/.${base}.XXXXXX")" || return 1
+    if ! cat >"$tmp" \
+        || ! chmod "$mode" -- "$tmp" \
+        || ! lyrebird_fsync_path "$tmp" \
+        || ! mv -f -- "$tmp" "$dest"; then
+        rm -f -- "$tmp"
+        return 1
+    fi
+    lyrebird_fsync_path "$dir"
+    return 0
+}
 
 # Portable hash with length parameter (used in usb-audio-mapper)
 if ! declare -f get_portable_hash &>/dev/null; then
