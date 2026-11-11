@@ -1,0 +1,420 @@
+{
+  "schema": 1,
+  "statuses": [
+    "open",
+    "fixed",
+    "documented-hw",
+    "wontfix"
+  ],
+  "note": "status 'fixed' requires every listed test name to exist as an @test in tests/*.bats; 'documented-hw' = fixed in software, residual validation needs hardware (see REMEDIATION-2026-11.md section 4)",
+  "items": [
+    {
+      "id": "LB-01",
+      "title": "start is not idempotent: cleanup runs before the running check",
+      "severity": "P1",
+      "phase": 3,
+      "status": "open",
+      "tests": []
+    },
+    {
+      "id": "LB-02",
+      "title": "two MediaMTX ownership models (manager vs mediamtx.service)",
+      "severity": "P1",
+      "phase": 3,
+      "status": "open",
+      "tests": []
+    },
+    {
+      "id": "LB-03",
+      "title": "start reports success when streams fail",
+      "severity": "P1",
+      "phase": 3,
+      "status": "open",
+      "tests": []
+    },
+    {
+      "id": "LB-04",
+      "title": "multiplex stream name differs between publisher and MediaMTX config",
+      "severity": "P1",
+      "phase": 4,
+      "status": "open",
+      "tests": []
+    },
+    {
+      "id": "LB-05",
+      "title": "flock lock is unlinked/judged stale while live",
+      "severity": "P1",
+      "phase": 2,
+      "status": "open",
+      "tests": []
+    },
+    {
+      "id": "LB-06",
+      "title": "default listeners and open RTSP; installer leaves SRT/MoQ on",
+      "severity": "P1",
+      "phase": 4,
+      "status": "open",
+      "tests": []
+    },
+    {
+      "id": "LB-07",
+      "title": "late/zero USB devices at boot exhaust retries and never recover",
+      "severity": "P1",
+      "phase": 3,
+      "status": "open",
+      "tests": []
+    },
+    {
+      "id": "LB-08",
+      "title": "device config is sourced as executable shell",
+      "severity": "P1",
+      "phase": 4,
+      "status": "open",
+      "tests": []
+    },
+    {
+      "id": "LB-09",
+      "title": "generated wrappers interpolate unescaped config values",
+      "severity": "P2",
+      "phase": 4,
+      "status": "open",
+      "tests": []
+    },
+    {
+      "id": "LB-10",
+      "title": "process cleanup by name/pattern can kill unrelated processes",
+      "severity": "P2",
+      "phase": 3,
+      "status": "open",
+      "tests": []
+    },
+    {
+      "id": "LB-11",
+      "title": "sample unit: invalid reload, incomplete writable paths, missing workdir",
+      "severity": "P1",
+      "phase": 5,
+      "status": "open",
+      "tests": []
+    },
+    {
+      "id": "LB-12",
+      "title": "start-limit keys under [Service] (non-canonical placement)",
+      "severity": "P3",
+      "phase": 5,
+      "status": "open",
+      "tests": []
+    },
+    {
+      "id": "LB-13",
+      "title": "readiness accepts any HTTP response",
+      "severity": "P2",
+      "phase": 4,
+      "status": "open",
+      "tests": []
+    },
+    {
+      "id": "LB-14",
+      "title": "silence detection configured but never run",
+      "severity": "P2",
+      "phase": 5,
+      "status": "open",
+      "tests": []
+    },
+    {
+      "id": "LB-15",
+      "title": "heartbeat/hardware watchdog have no owner and are advertised",
+      "severity": "P2",
+      "phase": 5,
+      "status": "open",
+      "tests": []
+    },
+    {
+      "id": "LB-16",
+      "title": "AUDIO_DISK_PERSIST does not persist",
+      "severity": "P2",
+      "phase": 5,
+      "status": "open",
+      "tests": []
+    },
+    {
+      "id": "LB-17",
+      "title": "alert dedup/partial delivery not failure-atomic",
+      "severity": "P2",
+      "phase": 6,
+      "status": "open",
+      "tests": []
+    },
+    {
+      "id": "LB-18",
+      "title": "metrics publication/netcat listener races and limits",
+      "severity": "P2",
+      "phase": 6,
+      "status": "open",
+      "tests": []
+    },
+    {
+      "id": "LB-19",
+      "title": "CI path filter and non-required jobs",
+      "severity": "P3",
+      "phase": 6,
+      "status": "open",
+      "tests": []
+    },
+    {
+      "id": "LB-20",
+      "title": "live MediaMTX matrix lags newest release",
+      "severity": "P3",
+      "phase": 6,
+      "status": "open",
+      "tests": []
+    },
+    {
+      "id": "LB-21",
+      "title": "orchestrator/wizard status semantics",
+      "severity": "P2",
+      "phase": 6,
+      "status": "open",
+      "tests": []
+    },
+    {
+      "id": "LB-22",
+      "title": "manager rewrites MediaMTX config every start without backup",
+      "severity": "P1",
+      "phase": 4,
+      "status": "open",
+      "tests": []
+    },
+    {
+      "id": "LB-23",
+      "title": "atomic write without fsync in manager",
+      "severity": "P2",
+      "phase": 4,
+      "status": "open",
+      "tests": []
+    },
+    {
+      "id": "LB-24",
+      "title": "capture assumed to be ALSA PCM 0",
+      "severity": "P2",
+      "phase": 4,
+      "status": "open",
+      "tests": []
+    },
+    {
+      "id": "X-01",
+      "title": "monitor restarts revert per-device settings to defaults",
+      "severity": "P1",
+      "phase": 4,
+      "status": "open",
+      "tests": []
+    },
+    {
+      "id": "X-02",
+      "title": "lock FD inherited by child processes",
+      "severity": "P1",
+      "phase": 2,
+      "status": "open",
+      "tests": []
+    },
+    {
+      "id": "X-03",
+      "title": "empty device list counted as stable",
+      "severity": "P1",
+      "phase": 3,
+      "status": "open",
+      "tests": []
+    },
+    {
+      "id": "X-04",
+      "title": "cron restart budget charged before ALSA availability check",
+      "severity": "P1",
+      "phase": 3,
+      "status": "open",
+      "tests": []
+    },
+    {
+      "id": "X-05",
+      "title": "check_all_audio_levels counts probe failure as silence",
+      "severity": "P2",
+      "phase": 5,
+      "status": "open",
+      "tests": []
+    },
+    {
+      "id": "X-06",
+      "title": "exec redirection leaves stderr on /dev/null",
+      "severity": "P2",
+      "phase": 4,
+      "status": "open",
+      "tests": []
+    },
+    {
+      "id": "X-09",
+      "title": "restart path skips config validation",
+      "severity": "P1",
+      "phase": 4,
+      "status": "open",
+      "tests": []
+    },
+    {
+      "id": "X-10",
+      "title": "individual wrapper not syntax-checked; wrappers written in place",
+      "severity": "P2",
+      "phase": 4,
+      "status": "open",
+      "tests": []
+    },
+    {
+      "id": "X-11",
+      "title": "YAML and systemd Environment injection via stream name",
+      "severity": "P2",
+      "phase": 4,
+      "status": "open",
+      "tests": []
+    },
+    {
+      "id": "X-12",
+      "title": "unit reload signals not handled by MediaMTX",
+      "severity": "P2",
+      "phase": 5,
+      "status": "open",
+      "tests": []
+    },
+    {
+      "id": "X-13",
+      "title": "heartbeat_healthy threshold vs 5-minute writer",
+      "severity": "P2",
+      "phase": 6,
+      "status": "open",
+      "tests": []
+    },
+    {
+      "id": "X-14",
+      "title": "storage cleanup misses .aac; eviction edge cases untested",
+      "severity": "P3",
+      "phase": 6,
+      "status": "open",
+      "tests": []
+    },
+    {
+      "id": "X-15",
+      "title": "LOG_FILE and MEDIAMTX_LOG_FILE alias",
+      "severity": "P3",
+      "phase": 4,
+      "status": "open",
+      "tests": []
+    },
+    {
+      "id": "X-16",
+      "title": "release workflow publish step not idempotent",
+      "severity": "P3",
+      "phase": 6,
+      "status": "open",
+      "tests": []
+    },
+    {
+      "id": "X-17",
+      "title": "metrics serve: bind, framing, busy loop, broad pkill",
+      "severity": "P2",
+      "phase": 6,
+      "status": "open",
+      "tests": []
+    },
+    {
+      "id": "X-18",
+      "title": "tests re-define functions inline instead of testing real code",
+      "severity": "P3",
+      "phase": 6,
+      "status": "open",
+      "tests": []
+    },
+    {
+      "id": "X-19",
+      "title": "documented MEDIAMTX_*_PORT variables ignored",
+      "severity": "P2",
+      "phase": 4,
+      "status": "open",
+      "tests": []
+    },
+    {
+      "id": "X-20",
+      "title": "amix normalize needs FFmpeg 4.4; amerge+opus channel limits; docs",
+      "severity": "P1",
+      "phase": 4,
+      "status": "open",
+      "tests": []
+    },
+    {
+      "id": "X-21",
+      "title": "updater --history/--rollback documented but missing; .conf.bak; tag guidance",
+      "severity": "P2",
+      "phase": 6,
+      "status": "open",
+      "tests": []
+    },
+    {
+      "id": "X-22",
+      "title": "CI summary does not require all jobs; unpinned Actions and tools",
+      "severity": "P3",
+      "phase": 6,
+      "status": "open",
+      "tests": []
+    },
+    {
+      "id": "X-25",
+      "title": "FFmpeg logs deleted on every start",
+      "severity": "P3",
+      "phase": 3,
+      "status": "open",
+      "tests": []
+    },
+    {
+      "id": "X-26",
+      "title": "read_pid_safe comm allowlist deletes live PID files",
+      "severity": "P3",
+      "phase": 3,
+      "status": "open",
+      "tests": []
+    },
+    {
+      "id": "X-27",
+      "title": "devices without controlC silently skipped",
+      "severity": "P3",
+      "phase": 3,
+      "status": "open",
+      "tests": []
+    },
+    {
+      "id": "DOC-01",
+      "title": "SECURITY-GUIDE: literal password, regex prefix, bind scope, WebRTC",
+      "severity": "P1",
+      "phase": 7,
+      "status": "open",
+      "tests": []
+    },
+    {
+      "id": "DOC-02",
+      "title": "README claims: watchdog, normalization, platform, install-from-tag, serve syntax",
+      "severity": "P2",
+      "phase": 7,
+      "status": "open",
+      "tests": []
+    },
+    {
+      "id": "DOC-03",
+      "title": "tools/soak/README: silence detection and macOS claims",
+      "severity": "P3",
+      "phase": 7,
+      "status": "open",
+      "tests": []
+    },
+    {
+      "id": "DOC-04",
+      "title": "SECURITY.md support table; CHANGELOG version table",
+      "severity": "P2",
+      "phase": 7,
+      "status": "open",
+      "tests": []
+    }
+  ]
+}
