@@ -3159,9 +3159,19 @@ reset_to_clean_state() {
 
     log_step "Resetting to clean state: $target"
 
+    # A reset changes the installed version like an update does: it goes into the
+    # history (and --rollback can return to where it started)
+    local from_head from_label reset_note=""
+    from_head="$(git rev-parse HEAD 2>/dev/null || true)"
+    from_label="$(commit_label "$from_head" "$(git symbolic-ref -q --short HEAD 2>/dev/null || true)")"
+    if [[ -n "$(git status --porcelain 2>/dev/null || true)" ]]; then
+        reset_note="uncommitted changes discarded"
+    fi
+
     # Perform reset
     if ! git_worktree reset --hard "$target" >/dev/null 2>&1; then
         log_error "Failed to reset to $target"
+        history_record reset failed "$from_head" "$from_label" "$from_head" "$target" "git reset failed" || true
         return "$E_GENERAL"
     fi
 
@@ -3171,6 +3181,7 @@ reset_to_clean_state() {
     fi
 
     log_success "Reset complete. Your changes are gone. Repository is clean."
+    history_record reset ok "$from_head" "$from_label" "$(git rev-parse HEAD 2>/dev/null || true)" "$target" "$reset_note" || true
 
     # Set script permissions
     set_script_permissions

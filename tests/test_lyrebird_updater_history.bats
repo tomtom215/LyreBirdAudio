@@ -106,6 +106,29 @@ teardown() {
     grep -q 'saved changes kept in the stash' "$HISTORY"
 }
 
+@test "a reset (menu 6) is recorded, and --rollback goes back to where it started" {
+    updater_checkout v1.1.0
+    echo "to be discarded" >>"$REPO/config.txt"
+    local from
+    from="$(git -C "$REPO" rev-parse HEAD)"
+    updater_stdin 6 2 yes "" q
+    updater_run
+    [ "$status" -eq 0 ]
+    [ "$(git -C "$REPO" rev-parse HEAD)" != "$from" ]
+    [ "$(wc -l <"$HISTORY")" -eq 1 ]
+    local ts kind result f_commit f_label t_commit t_label note
+    IFS=$'\t' read -r ts kind result f_commit f_label t_commit t_label note <"$HISTORY"
+    [ "$kind" = "reset" ]
+    [ "$result" = "ok" ]
+    [ "$f_commit" = "$from" ]
+    [ "$f_label" = "v1.1.0" ]
+    [ "$t_label" = "origin/main" ]
+    [ "$note" = "uncommitted changes discarded" ]
+    updater_run --rollback
+    [ "$status" -eq 0 ]
+    [ "$(git -C "$REPO" rev-parse HEAD)" = "$from" ]
+}
+
 # ============================================================================
 # --history
 # ============================================================================
