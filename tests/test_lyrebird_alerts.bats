@@ -439,3 +439,49 @@ teardown() {
     [ "$(printf '%s' "$b64t" | base64 -d)" = "Stream Down: mydevice" ]
     [ "$(printf '%s' "$b64m" | base64 -d)" = "Stream 'mydevice' is down: no data" ]
 }
+
+# ============================================================================
+# LB-17: delivery state (rate limit / de-duplication) correctness
+# ============================================================================
+
+# Write a delivery stamp as if the delivery happened AGE seconds ago: the
+# recorded epoch and the file's mtime both go back, as they would in real life.
+make_old_stamp() {
+    local file="$1" age="$2" then
+    then=$(($(date +%s) - age))
+    printf '%s\n' "$then" >"$file"
+    touch -d "@$then" "$file"
+}
+
+@test "cleanup_state keeps state for the rate-limit window when it exceeds the dedup window [LB-17]" {
+    # RATE_LIMIT (7200) > DEDUP_WINDOW (60): the stamp is only 50 minutes old, so
+    # the identical alert must still be suppressed. cleanup_state used to expire
+    # on DEDUP_WINDOW alone and deleted it, silently shortening the rate limit.
+    LYREBIRD_ALERT_RATE_LIMIT=7200
+    LYREBIRD_ALERT_DEDUP_WINDOW=60
+    make_old_stamp "${ALERT_STATE_DIR}/aaaa.last" 3000
+    cleanup_state
+    [ -f "${ALERT_STATE_DIR}/aaaa.last" ]
+    run is_rate_limited aaaa
+    [ "$status" -eq 0 ]
+}
+
+@test "cleanup_state rounds retention up so a stamp is never deleted before its rate limit ends [LB-17]" {
+    # 90 s limit, 60 s dedup window: a 70 s old stamp is still inside the limit.
+    # Truncating 90 s to 1 minute would delete anything older than 60 s.
+    LYREBIRD_ALERT_RATE_LIMIT=90
+    LYREBIRD_ALERT_DEDUP_WINDOW=60
+    make_old_stamp "${ALERT_STATE_DIR}/bbbb.last" 70
+    cleanup_state
+    [ -f "${ALERT_STATE_DIR}/bbbb.last" ]
+}
+
+@test "cleanup_state still removes state older than both windows [LB-17]" {
+    LYREBIRD_ALERT_RATE_LIMIT=300
+    LYREBIRD_ALERT_DEDUP_WINDOW=3600
+    make_old_stamp "${ALERT_STATE_DIR}/old.last" 4000
+    make_old_stamp "${ALERT_STATE_DIR}/fresh.last" 100
+    cleanup_state
+    [ ! -e "${ALERT_STATE_DIR}/old.last" ]
+    [ -f "${ALERT_STATE_DIR}/fresh.last" ]
+}

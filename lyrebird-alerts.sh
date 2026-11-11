@@ -325,13 +325,19 @@ update_rate_limit() {
     date +%s >"$state_file" 2>/dev/null || true
 }
 
-# Clean old state files
+# Clean old state files.
+# State is what enforces the rate limit, so it must outlive LYREBIRD_ALERT_RATE_LIMIT:
+# the retention is the larger of that and LYREBIRD_ALERT_DEDUP_WINDOW, rounded UP to
+# whole minutes (find -mmin compares in minutes, and rounding down would delete a stamp
+# before its rate-limit window has elapsed).
 cleanup_state() {
-    local max_age="${LYREBIRD_ALERT_DEDUP_WINDOW}"
+    local dedup_window="${LYREBIRD_ALERT_DEDUP_WINDOW}"
+    local rate_limit="${LYREBIRD_ALERT_RATE_LIMIT}"
+    local retain=$((dedup_window > rate_limit ? dedup_window : rate_limit))
 
     ensure_state_dir || return 0
 
-    find "$ALERT_STATE_DIR" -name "*.last" -mmin "+$((max_age / 60))" -delete 2>/dev/null || true
+    find "$ALERT_STATE_DIR" -name "*.last" -mmin "+$(((retain + 59) / 60))" -delete 2>/dev/null || true
 }
 
 #=============================================================================
