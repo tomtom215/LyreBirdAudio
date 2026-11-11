@@ -3811,8 +3811,16 @@ wait_for_usb_stabilization() {
     log INFO "Waiting for USB audio subsystem to stabilize (max ${max_wait}s)..."
 
     while [[ $elapsed -lt $max_wait ]]; do
-        local current_device_hash
-        current_device_hash="$(detect_audio_devices | sort | compute_hash)"
+        local current_device_hash current_devices
+        current_devices="$(detect_audio_devices | sort)"
+        # No devices is "not yet", never "stable". The digest of an empty list
+        # looks like any other (sha256 of nothing), so the first two empty scans
+        # used to count as a stable subsystem (X-03).
+        if [[ -z "$current_devices" ]]; then
+            current_device_hash=""
+        else
+            current_device_hash="$(printf '%s\n' "$current_devices" | compute_hash)"
+        fi
 
         if [[ "$current_device_hash" == "$last_device_hash" ]] && [[ -n "$current_device_hash" ]]; then
             ((stable_count++)) || true
@@ -3835,6 +3843,12 @@ wait_for_usb_stabilization() {
     device_count="$(detect_audio_devices | wc -l)"
     if [[ $device_count -gt 0 ]]; then
         log WARN "USB stabilization timeout, proceeding with $device_count devices"
+        return 0
+    elif allow_empty_start; then
+        # Waited for the first device up to the deadline; a node without devices
+        # is a legitimate state (D5): the start goes on and the monitor starts a
+        # stream for each device that appears
+        log INFO "No USB audio devices detected after ${max_wait} seconds; continuing without (they are started when they appear)"
         return 0
     else
         log ERROR "No USB audio devices detected after ${max_wait} seconds"
@@ -5414,6 +5428,38 @@ is_mediamtx_running() {
 }
 
 # ============================================================================
+# Start settings (D4, D5)
+# ============================================================================
+# Read where they are used, so that sourcing the script never fails on a bad
+# value; start_settings_check refuses one before anything is touched.
+
+# Print true or false for a boolean setting value; fail for anything else
+_bool_setting() {
+    case "${1,,}" in
+        true | yes | 1 | on) printf 'true' ;;
+        false | no | 0 | off) printf 'false' ;;
+        *) return 1 ;;
+    esac
+}
+
+# LYREBIRD_ALLOW_EMPTY_START (default true): with no USB audio device `start`
+# still brings MediaMTX up and waits for devices; false keeps the old refusal
+# (exit E_USB_NO_DEVICES, MediaMTX is not started)
+allow_empty_start() {
+    local value
+    value="$(_bool_setting "${LYREBIRD_ALLOW_EMPTY_START:-true}")" || value=true
+    [[ "$value" == "true" ]]
+}
+
+# Exit E_CONFIG_ERROR, saying what is accepted, when a start setting is invalid
+start_settings_check() {
+    if ! _bool_setting "${LYREBIRD_ALLOW_EMPTY_START:-true}" >/dev/null; then
+        SKIP_CLEANUP=true
+        error_exit "Invalid LYREBIRD_ALLOW_EMPTY_START '${LYREBIRD_ALLOW_EMPTY_START:-}': use true or false" "${E_CONFIG_ERROR}"
+    fi
+}
+
+# ============================================================================
 # What a run has started, and taking it down again
 # ============================================================================
 
@@ -5481,6 +5527,9 @@ rollback_failed_start() {
 # missing. Cleanup runs only when the recorded ownership is not provably intact
 # (the PID is dead, was reused, or is not MediaMTX) or on a restart.
 start_mediamtx() {
+    # An invalid setting is refused before anything is touched
+    start_settings_check
+
     if ! acquire_lock; then
         # Nothing was started or stopped, so there is nothing to clean up: an
         # exit marker here would make the NEXT start tear down the healthy
@@ -5505,11 +5554,11 @@ start_mediamtx() {
         log INFO "MediaMTX is already running (PID: ${owned_pid}) and owned by this manager; leaving it and its streams alone"
         local running_devices=()
         readarray -t running_devices < <(detect_audio_devices)
-        if [[ ${#running_devices[@]} -eq 0 ]]; then
-            log WARN "No USB audio devices detected; no stream to start"
-            return 0
+        if [[ ${#running_devices[@]} -eq 0 ]] && ! allow_empty_start; then
+            log ERROR "No USB audio devices detected; no stream to start"
+            return "${E_USB_NO_DEVICES}"
         fi
-        start_streams_and_report "${running_devices[@]}"
+        start_streams_and_report ${running_devices[@]+"${running_devices[@]}"}
         return $?
     fi
 
@@ -5542,8 +5591,11 @@ start_mediamtx() {
     readarray -t devices < <(detect_audio_devices)
 
     if [[ ${#devices[@]} -eq 0 ]]; then
-        log ERROR "No USB audio devices detected"
-        return "${E_USB_NO_DEVICES}"
+        if ! allow_empty_start; then
+            log ERROR "No USB audio devices detected"
+            return "${E_USB_NO_DEVICES}"
+        fi
+        log WARN "No USB audio devices detected; starting MediaMTX anyway and waiting for devices (LYREBIRD_ALLOW_EMPTY_START=false refuses to)"
     fi
 
     if ! generate_mediamtx_config; then
@@ -5617,7 +5669,7 @@ start_mediamtx() {
 
     log INFO "MediaMTX started successfully (PID: $pid)"
 
-    start_streams_and_report "${devices[@]}"
+    start_streams_and_report ${devices[@]+"${devices[@]}"}
 }
 
 # Start the streams of DEVICES (one per device, or the single multiplexed
@@ -5626,15 +5678,24 @@ start_mediamtx() {
 start_streams_and_report() {
     local devices=("$@")
 
-    # Start streams based on mode
-    if [[ "${STREAM_MODE}" == "multiplex" ]]; then
-        # Validate device count before starting multiplex stream
-        if [[ ${#devices[@]} -eq 0 ]]; then
-            log ERROR "Multiplex mode requires devices but none detected"
-            stop_mediamtx
+    if [[ ${#devices[@]} -eq 0 ]]; then
+        # No device: MediaMTX is up and waits for them (D5); the monitor starts
+        # a stream for each one that appears
+        if ! allow_empty_start; then
+            log ERROR "No USB audio devices detected"
+            rollback_failed_start || true
             return "${E_USB_NO_DEVICES}"
         fi
+        log INFO "No USB audio devices detected; MediaMTX is running and waiting for devices"
+        echo "No USB audio devices detected: MediaMTX is running and waiting for devices."
+        RUN_STARTED_STREAMS=()
+        RUN_STARTED_MEDIAMTX=""
+        RUN_DIRTY=false
+        return 0
+    fi
 
+    # Start streams based on mode
+    if [[ "${STREAM_MODE}" == "multiplex" ]]; then
         log INFO "Multiplex mode - starting single multiplexed stream to ${MULTIPLEX_STREAM_NAME}"
         echo "Starting multiplexed stream (${#devices[@]} devices): ${MULTIPLEX_STREAM_NAME}..."
         # Start single multiplex stream with all devices
