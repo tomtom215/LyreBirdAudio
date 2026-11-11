@@ -22,11 +22,15 @@
 #   # Hourly monitoring
 #   0 * * * * /usr/local/bin/lyrebird-storage.sh monitor
 #
-# Version: 1.1.0 - Broken-clock retention guard + inode-exhaustion detection
+# Exit status: 0 success, 1 usage error, 3 finished but at least one deletion
+# failed (permission, immutable file, read-only filesystem; see the ERROR lines).
+#
+# Version: 1.2.0 - Every recording codec covered, empty/active segment handling,
+#                  failed deletions surfaced, deterministic emergency eviction
 
 set -euo pipefail
 
-readonly VERSION="1.1.0"
+readonly VERSION="1.2.0"
 SCRIPT_NAME="$(basename "${BASH_SOURCE[0]}")"
 readonly SCRIPT_NAME
 
@@ -836,6 +840,18 @@ Environment Variables:
   MIN_FREE_SPACE_MB          Minimum free space (default: 500)
   LYREBIRD_RECORDING_DIR     Recording directory path
   LYREBIRD_LOG_DIR           Log directory path
+  LYREBIRD_ACTIVE_SEGMENT_SECONDS
+                             A file written this recently belongs to a stream that
+                             is recording now: emergency cleanup never deletes it,
+                             and an empty segment younger than this is not removed
+                             (default: 900, minimum: 60)
+
+Recordings are files ending in: ${RECORDING_EXTENSIONS[*]}
+
+Exit status:
+  0  success
+  1  usage error
+  3  finished, but at least one deletion failed (see the ERROR lines)
 
 Examples:
   ${SCRIPT_NAME} status

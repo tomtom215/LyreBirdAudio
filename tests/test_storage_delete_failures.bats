@@ -245,3 +245,13 @@ EOF
     [ -f "$ST_REC/pinned.wav" ]
     [ ! -e "$ST_REC/free.wav" ]
 }
+
+@test "--help states the exit statuses, the active-segment variable and the recording extensions" {
+    run env LYREBIRD_BUFFER_DIR="$ST_BUF" bash "$PROJECT_ROOT/lyrebird-storage.sh" --help
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"Exit status:"* ]]
+    [[ "$output" == *"3  finished, but at least one deletion failed"* ]]
+    [[ "$output" == *"LYREBIRD_ACTIVE_SEGMENT_SECONDS"* ]]
+    # The extension line is built from the one list, not typed a second time.
+    [[ "$output" == *"Recordings are files ending in: $(storage_value RECORDING_EXTENSIONS | tr '\n' ' ' | sed 's/ $//')"* ]]
+}
