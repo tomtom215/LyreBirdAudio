@@ -159,3 +159,46 @@ _updater_vars() {
     [ "$status" -eq 7 ]
     [[ "$output" == *"Lock held by process $holder"* ]]
 }
+
+# ============================================================================
+# Dirty-tree detection and the transaction stash
+# ============================================================================
+
+@test "a chmod of a tracked file after the last index refresh is not reported as a local modification" {
+    updater_checkout v1.1.0
+    git -C "$REPO" status --porcelain >/dev/null # refresh the index: stat data now matches
+    sleep 1.1                                    # git compares timestamps to the second
+    chmod 755 "$REPO/lyrebird-common.sh"         # same mode, new ctime: what the updater's own chmod leaves behind
+    # the plumbing the updater used to ask ("git diff-index") reports that stale stat data as a change
+    ! git -C "$REPO" diff-index --quiet HEAD || false
+    updater_run --status
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"Ready (no local modifications)"* ]]
+}
+
+@test "a self-update does not leave the node looking modified" {
+    updater_checkout v1.1.0
+    updater_stdin 3 v1.3.0 "" q
+    updater_run
+    [ "$status" -eq 0 ]
+    [ "$(updater_head)" = "v1.3.0" ]
+    [[ "$output" != *"local modifications"* ]]
+}
+
+@test "an update never adopts or pops a stash the operator made earlier" {
+    updater_checkout v1.1.0
+    echo "operator work" >"$REPO/operator-notes.txt"
+    git -C "$REPO" stash push -u -m operator-stash >/dev/null
+    # The updater believes the tree is dirty (a new untracked file) but its own
+    # `git stash push` saves nothing -- as when the operator removes the file in
+    # that instant. stash@{0} is then the operator's stash.
+    echo "scratch" >"$REPO/scratch.txt"
+    updater_inject stash-push before SKIP
+    updater_stdin 3 v1.2.0 y "" q
+    updater_run
+    [ "$status" -eq 0 ]
+    [ "$(updater_head)" = "v1.2.0" ]
+    [ "$(git -C "$REPO" stash list | wc -l)" -eq 1 ]
+    git -C "$REPO" stash list | grep -q operator-stash
+    [ ! -e "$REPO/operator-notes.txt" ]
+}

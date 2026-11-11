@@ -1693,9 +1693,13 @@ check_local_changes() {
         return 0
     fi
 
-    # Check for any changes
-    if ! git diff-index --quiet HEAD 2>/dev/null \
-        || git ls-files --others --exclude-standard 2>/dev/null | grep -q .; then
+    # Check for any changes. `git status` (not the plumbing `git diff-index`)
+    # because it refreshes stale stat data first: after the updater's own chmod
+    # of the scripts every one of them looked modified to diff-index, so a
+    # pristine clone reported "local modifications" and offered to stash
+    # nothing. A failing status is treated as "dirty" (the safe answer).
+    local porcelain=""
+    if ! porcelain="$(git status --porcelain 2>/dev/null)" || [[ -n "$porcelain" ]]; then
         HAS_LOCAL_CHANGES=true
         log_debug "Local modifications detected"
     else
@@ -1790,17 +1794,25 @@ transaction_stash_changes() {
     local stash_message
     stash_message="lyrebird-tx-${TRANSACTION_STATE[operation]}-${stash_nonce}"
 
+    # `git stash push` exits 0 without creating anything when there is nothing
+    # to save, so refs/stash must be compared before and after: taking
+    # `stash@{0}` blindly would adopt (and later pop) a stash the operator made
+    # earlier.
+    local stash_before="" stash_after="" stash_hash=""
+    stash_before="$(git rev-parse --verify --quiet refs/stash 2>/dev/null || true)"
+
     if ! git stash push -u -m "$stash_message" >/dev/null 2>&1; then
         log_error "Failed to save your changes"
         return "$E_GENERAL"
     fi
 
-    # Verify stash was created and get its hash
-    local stash_hash
-    if ! stash_hash="$(git rev-parse 'stash@{0}' 2>/dev/null)"; then
-        log_error "Failed to save your changes (couldn't verify save)"
-        return "$E_GENERAL"
+    stash_after="$(git rev-parse --verify --quiet refs/stash 2>/dev/null || true)"
+    if [[ -z "$stash_after" || "$stash_after" == "$stash_before" ]]; then
+        log_debug "Nothing to stash (no stash entry was created)"
+        TRANSACTION_STATE[stash_hash]=""
+        return 0
     fi
+    stash_hash="$stash_after"
 
     TRANSACTION_STATE[stash_hash]="$stash_hash"
     log_debug "Transaction stash created: $stash_hash"
