@@ -59,13 +59,19 @@ manager_codecs() {
 }
 
 @test "every extension in RECORDING_EXTENSIONS is retention-cleaned and emergency-evicted [X-14 regression]" {
+    # Per extension: a recording with audio and an empty segment, each aged, so
+    # every place that matches extensions (retention, its empty-segment sweep,
+    # emergency eviction of empties and of recordings) is exercised.
     local ext
     while IFS= read -r ext; do
         mkdir -p "$ST_REC/age" "$ST_REC/emerg"
-        touch -d "45 days ago" "$ST_REC/age/audio_000.$ext"
+        echo data >"$ST_REC/age/audio_000.$ext"
+        : >"$ST_REC/age/empty_001.$ext"
         echo data >"$ST_REC/emerg/audio_000.$ext"
-        touch -d "2 days ago" "$ST_REC/emerg/audio_000.$ext"
+        : >"$ST_REC/emerg/empty_001.$ext"
     done < <(storage_value RECORDING_EXTENSIONS)
+    find "$ST_REC/age" -type f -exec touch -d "45 days ago" {} +
+    find "$ST_REC/emerg" -type f -exec touch -d "2 days ago" {} +
     # Fresh files must survive retention (control).
     touch "$ST_REC/age/keep.aac"
 

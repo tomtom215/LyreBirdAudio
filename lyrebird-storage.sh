@@ -110,6 +110,21 @@ RECORDING_NAME_TEST=(\( "${RECORDING_NAME_TEST[@]}" \))
 readonly RECORDING_NAME_TEST
 unset _ext
 
+# How long a file may sit unmodified and still count as part of a stream that is
+# recording right now. Emergency eviction never touches such a file, and an
+# empty segment younger than this is a segment being opened, not debris.
+# Measured with ffmpeg 6.1.1 (the manager's tee + segment muxer): the segment in
+# progress is a 0-byte file whose mtime stays at its creation time until the
+# first 256 KiB chunk is flushed (16 s at 128 kb/s; 350 s at 6 kb/s, the lowest
+# useful audio rate), then the mtime advances once per chunk. 900 s is well
+# above that; a hard-killed FFmpeg leaves the in-progress segment at 0 bytes (or
+# cut at a 256 KiB boundary, which still decodes), so such debris ages past this
+# window and is removed. Floor 60 s so 0 cannot disable the protection.
+_active_window=$(_coerce_uint "${LYREBIRD_ACTIVE_SEGMENT_SECONDS:-900}" 900)
+((_active_window < 60)) && _active_window=60
+readonly ACTIVE_SEGMENT_SECONDS="$_active_window"
+unset _active_window
+
 # Disk thresholds (percentage) - validate bounds 0-100
 _disk_warning=$(_coerce_uint "${DISK_WARNING_PERCENT:-80}" 80)
 _disk_critical=$(_coerce_uint "${DISK_CRITICAL_PERCENT:-90}" 90)
@@ -355,6 +370,17 @@ _report_delete_failures() {
     return 0
 }
 
+# True when mtime $1 (epoch seconds) lies within ACTIVE_SEGMENT_SECONDS of now $2
+# (either side: a file dated in the future by more than the window cannot be an
+# active write, it was stamped by a clock that has since been corrected).
+_recently_modified() {
+    local age=$(($2 - $1))
+    if ((age < 0)); then
+        age=$((-age))
+    fi
+    ((age <= ACTIVE_SEGMENT_SECONDS))
+}
+
 # Regular files under $1 that match the find arguments after it, oldest first,
 # as NUL-terminated "<mtime> <path>" records. Equal mtimes are ordered by path
 # in byte order (LC_ALL=C), so the same tree is always evicted in the same
@@ -369,16 +395,26 @@ _list_oldest_first() {
 }
 
 # Delete the oldest files under $1, at most $2 attempts (0 = no limit), logging
-# each as $3 and passing the remaining arguments to find. Totals land in
-# EVICT_DELETED / EVICT_FAILED / EVICT_FREED (bytes).
+# each as $3 and passing the remaining arguments to find. A file modified within
+# ACTIVE_SEGMENT_SECONDS is never touched: it belongs to a stream that is
+# recording now, and deleting the open segment would lose its audio and free
+# nothing until FFmpeg closes it. Totals land in EVICT_DELETED / EVICT_FAILED /
+# EVICT_FREED (bytes) / EVICT_PROTECTED.
 _evict_oldest_first() {
-    local root="$1" max="$2" desc="$3" rec file size
+    local root="$1" max="$2" desc="$3" rec file size mtime now
     shift 3
     EVICT_DELETED=0
     EVICT_FAILED=0
     EVICT_FREED=0
+    EVICT_PROTECTED=0
+    now=$(date +%s)
     while IFS= read -r -d '' rec; do
+        mtime="${rec%% *}"
         file="${rec#* }"
+        if _recently_modified "${mtime%%.*}" "$now"; then
+            ((++EVICT_PROTECTED))
+            continue
+        fi
         size=$(stat -c%s -- "$file" 2>/dev/null || echo 0)
         if safe_delete "$file" "$desc"; then
             ((++EVICT_DELETED))
@@ -419,18 +455,36 @@ cleanup_recordings() {
     local freed_bytes=0
     local kept_broken_clock=0
     local failed=0
+    local empty_removed=0
+    local file mtime size
+
+    # Empty segments no stream has touched for ACTIVE_SEGMENT_SECONDS are debris
+    # (crash, ENOSPC, a muxer that refused the stream), not recordings: remove
+    # them now instead of letting them sit for the whole retention period. A
+    # younger empty file is a segment being opened (FFmpeg keeps the segment in
+    # progress at 0 bytes until its first flush). Same clock rule as below: a
+    # pre-CLOCK_SANE_EPOCH mtime has no known age, so it is kept.
+    while IFS= read -r -d '' file; do
+        mtime=$(stat -c%Y -- "$file" 2>/dev/null || echo 0)
+        if [[ "$mtime" -lt "$CLOCK_SANE_EPOCH" ]] || _recently_modified "$mtime" "$now_epoch"; then
+            continue
+        fi
+        if safe_delete "$file" "empty recording segment"; then
+            ((++empty_removed))
+        else
+            ((++failed))
+        fi
+    done < <(find "$RECORDING_DIR" -type f "${RECORDING_NAME_TEST[@]}" -empty -print0 2>/dev/null)
 
     # Find and delete old recording files
     while IFS= read -r -d '' file; do
         # A pre-CLOCK_SANE_EPOCH mtime means the file was written while the
         # clock was broken; its real age is unknown and it may be minutes old.
-        local mtime
         mtime=$(stat -c%Y "$file" 2>/dev/null || echo 0)
         if [[ "$mtime" -lt "$CLOCK_SANE_EPOCH" ]]; then
             ((++kept_broken_clock))
             continue
         fi
-        local size
         size=$(stat -c%s "$file" 2>/dev/null || echo 0)
         if safe_delete "$file" "recording"; then
             ((++count))
@@ -451,6 +505,9 @@ cleanup_recordings() {
     # unattended box.
     find "$RECORDING_DIR" -mindepth 1 -type d -empty -delete 2>/dev/null || true
 
+    if [[ $empty_removed -gt 0 ]]; then
+        log_info "Removed $empty_removed empty recording segment(s) idle for over ${ACTIVE_SEGMENT_SECONDS}s"
+    fi
     log_info "Cleaned $count recording file(s), freed $(format_bytes $freed_bytes)$(_failed_suffix "$failed")"
 }
 
@@ -552,8 +609,19 @@ emergency_cleanup() {
     # Delete oldest recordings first
     if [[ -d "$RECORDING_DIR" ]]; then
         log_info "Emergency: Removing oldest recordings..."
-        _evict_oldest_first "$RECORDING_DIR" "$EMERGENCY_MAX_DELETE" "emergency recording" "${RECORDING_NAME_TEST[@]}"
+        # 1. Empty segments (debris of a crash, ENOSPC or a muxer that refused the
+        #    stream): they hold no audio and cost an inode each.
+        _evict_oldest_first "$RECORDING_DIR" "$EMERGENCY_MAX_DELETE" "emergency empty segment" "${RECORDING_NAME_TEST[@]}" -empty
+        local empty_deleted=$EVICT_DELETED empty_failed=$EVICT_FAILED protected=$EVICT_PROTECTED
+        # 2. Then the oldest recordings that hold audio, truncated ones included
+        #    (a killed FFmpeg leaves a decodable prefix).
+        _evict_oldest_first "$RECORDING_DIR" "$EMERGENCY_MAX_DELETE" "emergency recording" "${RECORDING_NAME_TEST[@]}" ! -empty
+        protected=$((protected + EVICT_PROTECTED))
+        log_info "Emergency: Deleted $empty_deleted empty segment(s)$(_failed_suffix "$empty_failed")"
         log_info "Emergency: Deleted $EVICT_DELETED oldest recording(s)$(_failed_suffix "$EVICT_FAILED")"
+        if ((protected > 0)); then
+            log_info "Emergency: Left $protected file(s) written in the last ${ACTIVE_SEGMENT_SECONDS}s alone (active streams)"
+        fi
     fi
 
     # Delete rotated logs, temp files, and buffer contents.
@@ -622,11 +690,15 @@ cmd_status() {
     if [[ -d "$RECORDING_DIR" ]]; then
         local rec_size
         rec_size=$(get_dir_size "$RECORDING_DIR")
-        local rec_count
-        rec_count=$(find "$RECORDING_DIR" -type f 2>/dev/null | wc -l)
+        local rec_count empty_count
+        # `|| true`: find exits 1 on an unreadable subdirectory, which under
+        # pipefail would abort `status` before it printed anything.
+        rec_count=$({ find "$RECORDING_DIR" -type f "${RECORDING_NAME_TEST[@]}" ! -empty 2>/dev/null || true; } | wc -l)
+        empty_count=$({ find "$RECORDING_DIR" -type f "${RECORDING_NAME_TEST[@]}" -empty 2>/dev/null || true; } | wc -l)
         printf "  Path: %s\n" "$RECORDING_DIR"
         printf "  Size: %s\n" "$(format_bytes "$rec_size")"
         printf "  Files: %d\n" "$rec_count"
+        printf "  Empty segments: %d\n" "$empty_count"
         printf "  Retention: %d days\n" "$RECORDING_RETENTION_DAYS"
     else
         echo "  No recording directory"
