@@ -612,3 +612,89 @@ _start_live_mediamtx_standin() {
     [ "$status" -eq 0 ]
     [[ "$output" == *"Settings: 96000 Hz, 2 ch, aac 192k"* ]]
 }
+
+# ---------------------------------------------------------------------------
+# The writer: lyrebird-mic-check.sh writes what the parser accepts
+# ---------------------------------------------------------------------------
+
+# Run the REAL generate_config of lyrebird-mic-check.sh over a fake /proc/asound
+# tree (ASOUND_PROC_ROOT) with two USB cards. Stood in for: the two probes that
+# read the hardware's stream files (get_device_info, detect_device_capabilities)
+# and the root and disk checks. The scan loop, capability parsing, tier logic,
+# bitrate calculation and the writer itself are real.
+_mic_check_generate() {
+    local tier="$1"
+    mkdir -p "$SD/asound/card0" "$SD/asound/card3"
+    echo "b58e:9e84" >"$SD/asound/card0/usbid"
+    echo "19f7:0003" >"$SD/asound/card3/usbid"
+    run bash -c '
+        source "$PROJECT_ROOT/lyrebird-mic-check.sh" >/dev/null 2>&1
+        set +e
+        check_root_access() { :; }
+        check_disk_space() { :; }
+        get_device_info() {
+            case "$1" in
+                0) printf "card_number=0\ndevice_name=Blue Yeti\nusb_id=b58e:9e84\n" ;;
+                3) printf "card_number=3\ndevice_name=Rode NT-USB\nusb_id=19f7:0003\n" ;;
+            esac
+        }
+        detect_device_capabilities() {
+            case "$1" in
+                0) printf "is_usb=true\nsample_rates=44100 48000 96000\nchannels=1 2\ncapture_capable=true\n" ;;
+                3) printf "is_usb=true\nsample_rates=48000\nchannels=2\ncapture_capable=true\n" ;;
+            esac
+        }
+        ASOUND_PROC_ROOT="$SD/asound"
+        CONFIG_FILE="$SD/written.conf" MODE_FORCE=true MODE_NO_BACKUP=true QUALITY_TIER="$1"
+        generate_config >/dev/null 2>"$SD/generate.err"
+        echo "generate rc=$?"' _ "$tier"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"generate rc=0"* ]]
+}
+
+@test "the config lyrebird-mic-check writes is quoted and accepted by the manager's parser, for every quality tier [D3, writer]" {
+    local tier
+    for tier in low normal high; do
+        rm -f "$SD/written.conf"
+        _mic_check_generate "$tier"
+        grep -qE '^DEVICE_BLUE_YETI_SAMPLE_RATE="[0-9]+"$' "$SD/written.conf"
+        grep -qE '^DEVICE_BLUE_YETI_CHANNELS="[0-9]+"$' "$SD/written.conf"
+        grep -qE '^DEVICE_BLUE_YETI_BITRATE="[0-9]+k"$' "$SD/written.conf"
+        grep -qE '^DEVICE_RODE_NT_USB_BITRATE="[0-9]+k"$' "$SD/written.conf"
+        export MEDIAMTX_DEVICE_CONFIG="$SD/written.conf"
+        run smq "$_DUMP"
+        [ "${lines[0]}" = "rc=0 errors=0 warnings=0 settings=6" ] || { echo "$tier: $output"; return 1; }
+    done
+}
+
+@test "what lyrebird-mic-check writes is what get_device_config finds, by the device's friendly name [D3, C4, writer]" {
+    _mic_check_generate high
+    export MEDIAMTX_DEVICE_CONFIG="$SD/written.conf"
+    run smq '
+        echo "$(get_device_config "Blue Yeti" SAMPLE_RATE 1 "")"
+        echo "$(get_device_config "Blue Yeti" CHANNELS 9 "")"
+        echo "$(get_device_config "Rode NT-USB" BITRATE 1k "")"'
+    [ "$status" -eq 0 ]
+    [ "${lines[0]}" = "96000" ]
+    [ "${lines[1]}" = "2" ]
+    [[ "${lines[2]}" =~ ^[0-9]+k$ ]]
+    [ "${lines[2]}" != "1k" ]
+}
+
+@test "the writer's header is written, with no unbound variable in it, under the script's own set -u [D3, writer]" {
+    _mic_check_generate normal
+    # The header heredoc used to expand ${name^^} and ${param^^} in a comment: under
+    # set -u that is "unbound variable" and the whole header (quality tier, format
+    # description, defaults note) was silently missing from every generated config
+    ! grep -q 'unbound variable' "$SD/generate.err"
+    head -n 1 "$SD/written.conf" | grep -qF '# MediaMTX USB Audio Device Configuration'
+    grep -q '^# Quality Tier: normal$' "$SD/written.conf"
+    grep -qF '(DEVICE_<NAME>_<PARAMETER>, both upper-case)' "$SD/written.conf"
+}
+
+@test "the header the writer produces says the file is read as data and lists CODEC and THREAD_QUEUE [D3, writer]" {
+    _mic_check_generate normal
+    grep -qF 'It is data, never executed' "$SD/written.conf"
+    grep -qF 'CODEC (opus, aac or mp3), THREAD_QUEUE' "$SD/written.conf"
+    ! grep -q 'is sourced by' "$SD/written.conf"
+}

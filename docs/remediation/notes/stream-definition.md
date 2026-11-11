@@ -146,6 +146,24 @@ capture-PCM helpers, the multiplex graph) and, for the writer only,
   the manager no longer does that, so the test now calls `load_device_config`
   (`MEDIAMTX_DEVICE_CONFIG`). The assertion (96000 is honoured) is unchanged.
 
+## lyrebird-mic-check.sh: the writer (D3)
+
+- `generate_config` now writes quoted values (`DEVICE_BLUE_YETI_SAMPLE_RATE="48000"`,
+  `..._CHANNELS="2"`, `..._BITRATE="192k"`), so its output is exactly what the manager's
+  parser accepts; unquoted files written by earlier versions are still read (bare values are
+  accepted). `lyrebird-mic-check.sh --validate` still `source`s the file (a copy of it); that
+  part was not changed. Its header comments now say the file is read as data and list
+  `CODEC` and `THREAD_QUEUE` as settings you can add by hand.
+- The scan loop in `generate_config` reads the card directories from `ASOUND_PROC_ROOT`
+  (default `/proc/asound`) so tests can run the real writer over a fake tree.
+- **New defect fixed in the same place: the generated header was silently missing.** The header
+  heredoc is unquoted and contained `${name^^}` and `${param^^}` inside a comment (added by
+  the C4 fix); under the script's own `set -u` that is `name: unbound variable`, the `cat`
+  failed and the whole header (quality tier, format description, the note that `DEFAULT_*`
+  are not read from the file) was missing from every generated config. Reproduced with the
+  real `generate_config` over a fake card; the comment no longer expands anything. README
+  text that says the generated file "starts with a header describing ..." is true again.
+
 ## New defects found while verifying (not fixed here)
 
 - The cron line written by `install` (`.../lyrebird-stream-manager.sh monitor`) does not
