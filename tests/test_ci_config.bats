@@ -465,8 +465,9 @@ check_installer() {
 
     # The pin from the workflow is not the hash of this fake download: refused,
     # nothing installed.
+    # (LC_ALL=C: sha256sum prints a translated word for FAILED in other locales.)
     run_step "$job" "$step" PATH="$TEST_SCRATCH/bin:$PATH" RUNNER_TEMP="$TEST_SCRATCH/runner" \
-        FAKE_LOG="$TEST_SCRATCH/log" FAKE_DOWNLOAD="$TEST_SCRATCH/download"
+        FAKE_LOG="$TEST_SCRATCH/log" FAKE_DOWNLOAD="$TEST_SCRATCH/download" LC_ALL=C
     [ "$status" -ne 0 ] || {
         echo "$tool: a download that does not match the pin was accepted"
         return 1

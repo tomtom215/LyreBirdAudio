@@ -10,6 +10,8 @@
 #   - shellcheck: Static analysis (industry standard)
 #   - shfmt: Format/style consistency checking
 #   - bashate: OpenStack's bash style linter
+#   - actionlint: lints these workflows (and ShellCheck-checks every run: script)
+#   - bats: the test suite, and live tests against real MediaMTX releases
 #
 # Author: Tom F (https://github.com/tomtom215)
 # License: Apache 2.0
