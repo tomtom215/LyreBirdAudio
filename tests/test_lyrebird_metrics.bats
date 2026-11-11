@@ -441,6 +441,193 @@ _dead_pid() {
     [ "$(grep -c '^lyrebird_stream_cpu_percent{' "$TEST_SCRATCH/streams.prom")" -eq 2 ]
 }
 
+# A directory of symlinks to the tools a scrape needs, minus the ones named, to
+# stand in for a node where a tool is missing. Use as PATH together with "$BASH".
+_toolbox_without() {
+    local dir="$1" t omit src
+    shift
+    mkdir -p "$dir"
+    for t in date grep awk cat find wc ps df getconf curl head tr cut basename dirname \
+        sleep pgrep mktemp mv rm chmod mkfifo id uname nc ncat netcat; do
+        for omit in "$@"; do
+            [[ "$t" == "$omit" ]] && continue 2
+        done
+        src="$(command -v "$t" 2>/dev/null)" || continue
+        [[ "$src" == /* ]] || continue
+        ln -sf "$src" "$dir/$t"
+    done
+}
+
+# Run the real script once as a child process. Arguments are env assignments;
+# stdout goes to $TEST_SCRATCH/out, stderr to $TEST_SCRATCH/err, status to RUN_RC.
+_run_once() {
+    RUN_RC=0
+    env "$@" "$BASH" "$PROJECT_ROOT/lyrebird-metrics.sh" --once \
+        >"$TEST_SCRATCH/out" 2>"$TEST_SCRATCH/err" || RUN_RC=$?
+}
+
+# --- collector and scrape status (LB-18) --------------------------------------
+
+@test "a healthy scrape reports scrape_success 1 and collector_success 1 for each of the six collectors [LB-18]" {
+    _stub_curl "$TEST_SCRATCH/bin"
+    _run_once PATH="$TEST_SCRATCH/bin:$PATH" FFMPEG_PID_DIR="$FFMPEG_PID_DIR" PID_FILE="$PID_FILE" HEARTBEAT_FILE="$HEARTBEAT_FILE"
+    [ "$RUN_RC" -eq 0 ]
+    run prom_validate "$TEST_SCRATCH/out"
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    grep -qx 'lyrebird_scrape_success 1' "$TEST_SCRATCH/out"
+    # the label set is fixed and bounded: exactly these six collectors
+    local labels
+    labels="$(grep -o '^lyrebird_collector_success{collector="[a-z_]*"} 1$' "$TEST_SCRATCH/out" | sed 's/.*collector="\([a-z_]*\)".*/\1/' | tr '\n' ' ')"
+    [ "$labels" = "mediamtx stream_manager usb_audio system api streams " ] || { echo "labels: $labels"; return 1; }
+    [ "$(grep -c '^lyrebird_collector_success{' "$TEST_SCRATCH/out")" -eq 6 ]
+}
+
+@test "a failing collector gives scrape_success 0, its own collector_success 0, a valid document and status 3 [LB-18]" {
+    run env PROJECT_ROOT="$PROJECT_ROOT" FFMPEG_PID_DIR="$FFMPEG_PID_DIR" PID_FILE="$PID_FILE" HEARTBEAT_FILE="$HEARTBEAT_FILE" \
+        bash -c 'set -euo pipefail; source "$PROJECT_ROOT/lyrebird-metrics.sh"
+            collect_system_metrics() { emit_metric "partial_system" 7 "half of what it should have printed"; return 1; }
+            rc=0; generate_all_metrics 2>/dev/null || rc=$?
+            echo "RC=$rc"'
+    [ "$status" -eq 0 ]
+    local doc="$TEST_SCRATCH/degraded.prom"
+    printf '%s\n' "$output" | sed '/^RC=/d' >"$doc"
+    [[ "$output" == *"RC=3"* ]]
+    run prom_validate "$doc"
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    grep -qx 'lyrebird_scrape_success 0' "$doc"
+    grep -qx 'lyrebird_collector_success{collector="system"} 0' "$doc"
+    grep -qx 'lyrebird_collector_success{collector="mediamtx"} 1' "$doc"
+    grep -qx 'lyrebird_collector_success{collector="api"} 1' "$doc"
+    # what the failed collector did print is kept, and the others still ran
+    grep -qx 'lyrebird_partial_system 7' "$doc"
+    grep -q '^lyrebird_stream_manager_up ' "$doc"
+}
+
+@test "a collector that exits abruptly cannot take the other collectors or the document down [LB-18]" {
+    run env PROJECT_ROOT="$PROJECT_ROOT" FFMPEG_PID_DIR="$FFMPEG_PID_DIR" PID_FILE="$PID_FILE" HEARTBEAT_FILE="$HEARTBEAT_FILE" \
+        bash -c 'set -euo pipefail; source "$PROJECT_ROOT/lyrebird-metrics.sh"
+            collect_usb_audio_metrics() { emit_metric "before_crash" 1 "printed before the crash"; exit 7; }
+            rc=0; generate_all_metrics 2>/dev/null || rc=$?
+            echo "RC=$rc"'
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"RC=3"* ]]
+    [[ "$output" == *'lyrebird_collector_success{collector="usb_audio"} 0'* ]]
+    [[ "$output" == *'lyrebird_before_crash 1'* ]]
+    [[ "$output" == *'lyrebird_collector_success{collector="streams"} 1'* ]]
+    [[ "$output" == *'lyrebird_scrape_timestamp_seconds '* ]]
+}
+
+@test "a refused sample marks its collector failed even though the collector itself returned 0 [LB-18]" {
+    run env PROJECT_ROOT="$PROJECT_ROOT" FFMPEG_PID_DIR="$FFMPEG_PID_DIR" PID_FILE="$PID_FILE" HEARTBEAT_FILE="$HEARTBEAT_FILE" \
+        bash -c 'set -euo pipefail; source "$PROJECT_ROOT/lyrebird-metrics.sh"
+            collect_usb_audio_metrics() { emit_metric "bad_value" "N/A" "never printed"; return 0; }
+            rc=0; generate_all_metrics 2>/dev/null || rc=$?
+            echo "RC=$rc"'
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"RC=3"* ]]
+    [[ "$output" == *'lyrebird_collector_success{collector="usb_audio"} 0'* ]]
+    [[ "$output" != *'lyrebird_bad_value'* ]]
+    [[ "$output" == *'lyrebird_scrape_success 0'* ]]
+}
+
+@test "without pgrep the mediamtx collector fails visibly and no false lyrebird_mediamtx_up 0 is published [LB-18]" {
+    _toolbox_without "$TEST_SCRATCH/nopgrep" pgrep
+    _run_once PATH="$TEST_SCRATCH/nopgrep" FFMPEG_PID_DIR="$FFMPEG_PID_DIR" PID_FILE="$PID_FILE" HEARTBEAT_FILE="$HEARTBEAT_FILE"
+    [ "$RUN_RC" -eq 3 ]
+    run prom_validate "$TEST_SCRATCH/out"
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    grep -qx 'lyrebird_collector_success{collector="mediamtx"} 0' "$TEST_SCRATCH/out"
+    grep -qx 'lyrebird_collector_success{collector="system"} 1' "$TEST_SCRATCH/out"
+    grep -qx 'lyrebird_scrape_success 0' "$TEST_SCRATCH/out"
+    ! grep -q '^lyrebird_mediamtx_up' "$TEST_SCRATCH/out" || false
+    grep -q 'pgrep' "$TEST_SCRATCH/err"
+}
+
+@test "without curl the api collector fails visibly instead of publishing nothing silently [LB-18]" {
+    _toolbox_without "$TEST_SCRATCH/nocurl" curl
+    _run_once PATH="$TEST_SCRATCH/nocurl" FFMPEG_PID_DIR="$FFMPEG_PID_DIR" PID_FILE="$PID_FILE" HEARTBEAT_FILE="$HEARTBEAT_FILE"
+    [ "$RUN_RC" -eq 3 ]
+    grep -qx 'lyrebird_collector_success{collector="api"} 0' "$TEST_SCRATCH/out"
+    grep -qx 'lyrebird_collector_success{collector="mediamtx"} 1' "$TEST_SCRATCH/out"
+    ! grep -q '^lyrebird_api_up' "$TEST_SCRATCH/out" || false
+    grep -q 'curl' "$TEST_SCRATCH/err"
+}
+
+@test "an unreadable pid file leaves stream state unknown: metrics omitted, both stream collectors failed [LB-18]" {
+    local real_cat dir="$TEST_SCRATCH/pids"
+    mkdir -p "$dir" "$TEST_SCRATCH/bin"
+    echo $$ >"$dir/mic1.pid"
+    real_cat="$(command -v cat)"
+    # cat failing the way it does on a file the user may not read
+    cat >"$TEST_SCRATCH/bin/cat" <<EOF
+#!/bin/bash
+for a in "\$@"; do
+    if [[ "\$a" == *.pid ]]; then echo "cat: \$a: Permission denied" >&2; exit 1; fi
+done
+exec "$real_cat" "\$@"
+EOF
+    chmod +x "$TEST_SCRATCH/bin/cat"
+    echo $$ >"$TEST_SCRATCH/manager.pid"
+    _stub_curl "$TEST_SCRATCH/bin"
+    _run_once PATH="$TEST_SCRATCH/bin:$PATH" FFMPEG_PID_DIR="$dir" PID_FILE="$TEST_SCRATCH/manager.pid" HEARTBEAT_FILE="$HEARTBEAT_FILE"
+    [ "$RUN_RC" -eq 3 ]
+    run prom_validate "$TEST_SCRATCH/out"
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    grep -qx 'lyrebird_collector_success{collector="stream_manager"} 0' "$TEST_SCRATCH/out"
+    grep -qx 'lyrebird_collector_success{collector="streams"} 0' "$TEST_SCRATCH/out"
+    ! grep -q '^lyrebird_stream_manager_up\|^lyrebird_active_streams\|^lyrebird_stream_up' "$TEST_SCRATCH/out" || false
+    # what could be read is still there
+    grep -q '^lyrebird_configured_devices ' "$TEST_SCRATCH/out"
+    grep -q '^lyrebird_system_load_1m ' "$TEST_SCRATCH/out"
+}
+
+@test "a pid file that vanishes while it is read is a stopped stream, not a collector failure [LB-18]" {
+    local dir="$TEST_SCRATCH/pids" real_cat
+    mkdir -p "$dir" "$TEST_SCRATCH/bin"
+    echo $$ >"$dir/mic1.pid"
+    real_cat="$(command -v cat)"
+    # the manager removes the pid file between our existence check and the read
+    cat >"$TEST_SCRATCH/bin/cat" <<EOF
+#!/bin/bash
+for a in "\$@"; do
+    if [[ "\$a" == *.pid ]]; then rm -f "\$a"; exit 1; fi
+done
+exec "$real_cat" "\$@"
+EOF
+    chmod +x "$TEST_SCRATCH/bin/cat"
+    # each collector on its own: the first reader consumes the vanishing file, so
+    # a full scrape would only ever exercise one of them
+    local fn
+    for fn in collect_stream_manager_metrics collect_stream_metrics; do
+        echo $$ >"$dir/mic1.pid"
+        run env PROJECT_ROOT="$PROJECT_ROOT" PATH="$TEST_SCRATCH/bin:$PATH" FFMPEG_PID_DIR="$dir" \
+            PID_FILE="$PID_FILE" HEARTBEAT_FILE="$HEARTBEAT_FILE" FN="$fn" \
+            bash -c 'set -euo pipefail; source "$PROJECT_ROOT/lyrebird-metrics.sh"; "$FN" 2>&1'
+        [ "$status" -eq 0 ] || { echo "$fn returned $status: $output"; return 1; }
+        [[ "$output" != *"cannot read"* ]] || { echo "$fn reported: $output"; return 1; }
+    done
+    # and in a full scrape
+    echo $$ >"$dir/mic1.pid"
+    _stub_curl "$TEST_SCRATCH/bin"
+    _run_once PATH="$TEST_SCRATCH/bin:$PATH" FFMPEG_PID_DIR="$dir" PID_FILE="$PID_FILE" HEARTBEAT_FILE="$HEARTBEAT_FILE"
+    [ "$RUN_RC" -eq 0 ]
+    grep -qx 'lyrebird_scrape_success 1' "$TEST_SCRATCH/out"
+}
+
+@test "a failing df fails the system collector but the rest of the document is still published [LB-18]" {
+    mkdir -p "$TEST_SCRATCH/bin"
+    printf '#!/bin/bash\necho "df: cannot read table of mounted file systems" >&2\nexit 1\n' >"$TEST_SCRATCH/bin/df"
+    chmod +x "$TEST_SCRATCH/bin/df"
+    _stub_curl "$TEST_SCRATCH/bin"
+    _run_once PATH="$TEST_SCRATCH/bin:$PATH" FFMPEG_PID_DIR="$FFMPEG_PID_DIR" PID_FILE="$PID_FILE" HEARTBEAT_FILE="$HEARTBEAT_FILE"
+    [ "$RUN_RC" -eq 3 ]
+    run prom_validate "$TEST_SCRATCH/out"
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    grep -qx 'lyrebird_collector_success{collector="system"} 0' "$TEST_SCRATCH/out"
+    grep -q '^lyrebird_system_memory_total_bytes ' "$TEST_SCRATCH/out"
+    ! grep -q '^lyrebird_disk_usage_percent' "$TEST_SCRATCH/out" || false
+}
+
 @test "emit_metric refuses an empty or non-numeric value: no output, counted, status 0 [LB-18]" {
     local v expected=0
     for v in '' 'N/A' '1,5' 'abc' '1 2' '--1'; do
@@ -471,8 +658,10 @@ EOF
     run env PROJECT_ROOT="$PROJECT_ROOT" PATH="$TEST_SCRATCH/bin:$PATH" MEDIAMTX_CONFIG_DIR="$cfgdir" \
         PID_FILE="$PID_FILE" FFMPEG_PID_DIR="$FFMPEG_PID_DIR" HEARTBEAT_FILE="$HEARTBEAT_FILE" \
         bash -c 'set -euo pipefail; source "$PROJECT_ROOT/lyrebird-metrics.sh"; collect_stream_manager_metrics 2>/dev/null'
-    [ "$status" -eq 0 ]
+    # the collector reports the unreadable source (status 1) but still prints a valid document
+    [ "$status" -eq 1 ]
     printf '%s\n' "$output" >"$TEST_SCRATCH/mgr.prom"
     run prom_validate "$TEST_SCRATCH/mgr.prom"
     [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    ! grep -q '^lyrebird_configured_devices' "$TEST_SCRATCH/mgr.prom" || false
 }

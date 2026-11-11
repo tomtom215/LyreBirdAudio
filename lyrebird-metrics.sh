@@ -43,6 +43,9 @@ readonly DEVICE_CONFIG="${CONFIG_DIR}/audio-devices.conf"
 # Metric prefix
 readonly METRIC_PREFIX="lyrebird"
 
+# Exit statuses (also in --help). 1 is a command-line error.
+readonly EXIT_DEGRADED=3 # the output was delivered but a collector failed (lyrebird_scrape_success 0)
+
 # ============================================================================
 # Helper Functions
 # ============================================================================
@@ -140,6 +143,13 @@ collect_mediamtx_metrics() {
     local mediamtx_running=0
     local mediamtx_pid=0
 
+    # Without pgrep "not running" cannot be told from "cannot tell"; report the
+    # collector as failed instead of publishing a false lyrebird_mediamtx_up 0.
+    if ! has_command pgrep; then
+        log "ERROR: pgrep not found; cannot tell whether MediaMTX is running (install procps)"
+        return 1
+    fi
+
     # Check if MediaMTX is running
     if pgrep -f "mediamtx" >/dev/null 2>&1; then
         mediamtx_running=1
@@ -189,45 +199,69 @@ collect_mediamtx_metrics() {
             fi
         fi
     fi
+    return 0
 }
 
 # Collect stream manager metrics
+#
+# A source that exists but cannot be read makes the corresponding metric unknown:
+# it is left out and the collector is reported as failed, rather than publishing
+# a made-up 0 that would fire "stream manager down" alerts for a permission error.
 collect_stream_manager_metrics() {
     local stream_mgr_running=0
     local active_streams=0
     local configured_devices=0
+    local failed=0
 
     # Check if stream manager is running
     if [[ -f "$PID_FILE" ]]; then
         local pid
-        pid=$(cat "$PID_FILE" 2>/dev/null)
-        if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
-            stream_mgr_running=1
+        if pid=$(cat "$PID_FILE" 2>/dev/null); then
+            if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+                stream_mgr_running=1
+            fi
+        elif [[ -e "$PID_FILE" ]]; then
+            log "ERROR: cannot read ${PID_FILE}"
+            failed=1
+            stream_mgr_running=""
         fi
     fi
 
-    emit_metric "stream_manager_up" "$stream_mgr_running" "Stream manager running (1=up, 0=down)"
+    [[ -z "$stream_mgr_running" ]] || emit_metric "stream_manager_up" "$stream_mgr_running" "Stream manager running (1=up, 0=down)"
 
     # Count active FFmpeg streams
     if [[ -d "$FFMPEG_PID_DIR" ]]; then
         for pid_file in "${FFMPEG_PID_DIR}"/*.pid; do
             [[ -f "$pid_file" ]] || continue
             local pid
-            pid=$(cat "$pid_file" 2>/dev/null)
+            if ! pid=$(cat "$pid_file" 2>/dev/null); then
+                # a pid file removed while we looked is a stopped stream, not an error
+                [[ -e "$pid_file" ]] || continue
+                log "ERROR: cannot read ${pid_file}"
+                failed=1
+                active_streams=""
+                break
+            fi
             if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
                 ((++active_streams))
             fi
         done
     fi
 
-    emit_metric "active_streams" "$active_streams" "Number of active audio streams"
+    [[ -z "$active_streams" ]] || emit_metric "active_streams" "$active_streams" "Number of active audio streams"
 
-    # Count configured devices
+    # Count configured devices (grep -c: 0 = matches, 1 = none, 2 = cannot read)
     if [[ -f "$DEVICE_CONFIG" ]]; then
-        configured_devices=$(grep -c "^DEVICE_" "$DEVICE_CONFIG" 2>/dev/null || true)
+        local grep_rc=0
+        configured_devices=$(grep -c "^DEVICE_" "$DEVICE_CONFIG" 2>/dev/null) || grep_rc=$?
+        if ((grep_rc > 1)); then
+            log "ERROR: cannot read ${DEVICE_CONFIG}"
+            failed=1
+            configured_devices=""
+        fi
     fi
 
-    emit_metric "configured_devices" "$configured_devices" "Number of configured audio devices"
+    [[ -z "$configured_devices" ]] || emit_metric "configured_devices" "$configured_devices" "Number of configured audio devices"
 
     # Heartbeat freshness
     if [[ -f "$HEARTBEAT_FILE" ]]; then
@@ -248,28 +282,39 @@ collect_stream_manager_metrics() {
         emit_metric "heartbeat_age_seconds" "-1" "Seconds since last heartbeat"
         emit_metric "heartbeat_healthy" "0" "Heartbeat is recent (1=healthy, 0=stale)"
     fi
+    return "$failed"
 }
 
 # Collect USB audio device metrics
 collect_usb_audio_metrics() {
     local usb_audio_count=0
     local total_audio_cards=0
+    local failed=0
+    local cards=""
 
     # Count audio cards from ALSA
     if [[ -f "/proc/asound/cards" ]]; then
-        while IFS= read -r line; do
-            if [[ "$line" =~ ^[[:space:]]*([0-9]+)[[:space:]]*\[ ]]; then
-                ((++total_audio_cards))
-                local card_num="${BASH_REMATCH[1]}"
-                if [[ -f "/proc/asound/card${card_num}/usbid" ]]; then
-                    ((++usb_audio_count))
+        if cards=$(cat /proc/asound/cards 2>/dev/null); then
+            while IFS= read -r line; do
+                if [[ "$line" =~ ^[[:space:]]*([0-9]+)[[:space:]]*\[ ]]; then
+                    ((++total_audio_cards))
+                    local card_num="${BASH_REMATCH[1]}"
+                    if [[ -f "/proc/asound/card${card_num}/usbid" ]]; then
+                        ((++usb_audio_count))
+                    fi
                 fi
-            fi
-        done </proc/asound/cards
+            done <<<"$cards"
+        else
+            log "ERROR: cannot read /proc/asound/cards"
+            failed=1
+        fi
     fi
 
-    emit_metric "usb_audio_devices" "$usb_audio_count" "Number of USB audio devices detected"
-    emit_metric "total_audio_cards" "$total_audio_cards" "Total ALSA audio cards"
+    if ((failed == 0)); then
+        emit_metric "usb_audio_devices" "$usb_audio_count" "Number of USB audio devices detected"
+        emit_metric "total_audio_cards" "$total_audio_cards" "Total ALSA audio cards"
+    fi
+    return "$failed"
 }
 
 # Collect system resource metrics
@@ -279,10 +324,16 @@ collect_system_metrics() {
     # scrape. df -P forces single-line POSIX output; a wrapped long device name
     # (LVM/dm/ZFS) would otherwise shift columns and yield a non-numeric percent.
     local _disk_hdr=0
+    local failed=0
     for path in "/" "/var" "/tmp"; do
         if [[ -d "$path" ]] && has_command df; then
-            local usage
-            usage=$(df -P "$path" 2>/dev/null | awk 'NR==2 {gsub(/%/,"",$5); print $5}')
+            local usage df_out
+            if ! df_out=$(df -P "$path" 2>/dev/null); then
+                log "ERROR: df failed for ${path}"
+                failed=1
+                continue
+            fi
+            usage=$(awk 'NR==2 {gsub(/%/,"",$5); print $5}' <<<"$df_out")
             if [[ "$usage" =~ ^[0-9]+$ ]]; then
                 if [[ $_disk_hdr -eq 0 ]]; then
                     emit_help_type "disk_usage_percent" "Disk usage percentage" "gauge"
@@ -323,6 +374,7 @@ collect_system_metrics() {
         entropy=$(cat /proc/sys/kernel/random/entropy_avail)
         emit_metric "system_entropy_available" "$entropy" "Available entropy bytes"
     fi
+    return "$failed"
 }
 
 # Helper function for API calls with retry for transient network failures
@@ -347,8 +399,10 @@ api_call_with_retry() {
 # Collect MediaMTX API metrics (if available)
 # Enhanced in v1.1.0 with MediaMTX /v3 API coverage (validated v1.15.5 - v1.19.x)
 collect_api_metrics() {
+    # Without curl the API state is unknown (not "down"); fail the collector.
     if ! has_command curl; then
-        return
+        log "ERROR: curl not found; cannot query the MediaMTX API (install curl)"
+        return 1
     fi
 
     local api_url="http://${MEDIAMTX_API_HOST}:${MEDIAMTX_API_PORT}"
@@ -489,6 +543,7 @@ collect_api_metrics() {
         [[ "${srt_conn_count:-0}" =~ ^[0-9]+$ ]] && total_connections=$((total_connections + srt_conn_count))
         emit_metric "api_total_connections" "$total_connections" "Total active connections across all protocols"
     fi
+    return 0
 }
 
 # Collect per-stream metrics
@@ -499,15 +554,23 @@ collect_api_metrics() {
 # interleaves the families as soon as there are two streams.
 collect_stream_metrics() {
     if [[ ! -d "$FFMPEG_PID_DIR" ]]; then
-        return
+        return 0
     fi
 
     local -a stream_names=() stream_pids=() stream_alive=()
     local pid_file stream_name pid i n labels
+    local failed=0
     for pid_file in "${FFMPEG_PID_DIR}"/*.pid; do
         [[ -f "$pid_file" ]] || continue
         stream_name=$(basename "$pid_file" .pid)
-        pid=$(cat "$pid_file" 2>/dev/null) || true
+        if ! pid=$(cat "$pid_file" 2>/dev/null); then
+            # a pid file removed while we looked is a stopped stream, not an error;
+            # one that exists but cannot be read leaves that stream's state unknown
+            [[ -e "$pid_file" ]] || continue
+            log "ERROR: cannot read ${pid_file}"
+            failed=1
+            continue
+        fi
         stream_names+=("$stream_name")
         stream_pids+=("$pid")
         if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
@@ -519,7 +582,7 @@ collect_stream_metrics() {
 
     n=${#stream_names[@]}
     if ((n == 0)); then
-        return
+        return "$failed"
     fi
 
     emit_help_type "stream_up" "Stream running status" "gauge"
@@ -556,48 +619,99 @@ collect_stream_metrics() {
             emit_metric "stream_cpu_percent" "${cpu%.*}" "" "gauge" "$labels"
         done
     fi
+    return "$failed"
 }
 
 # ============================================================================
 # Output Functions
 # ============================================================================
 
+# The collectors, as a fixed list: the name is the stable, bounded value of the
+# `collector` label of lyrebird_collector_success, the function produces the
+# metrics.
+COLLECTOR_NAMES=(mediamtx stream_manager usb_audio system api streams)
+COLLECTOR_FUNCS=(
+    collect_mediamtx_metrics
+    collect_stream_manager_metrics
+    collect_usb_audio_metrics
+    collect_system_metrics
+    collect_api_metrics
+    collect_stream_metrics
+)
+
+# Run one collector isolated in a subshell, so that nothing it does (an `exit`, a
+# clobbered variable, a hung-up pipe) can take the document or its neighbours
+# down. Sets COLLECTOR_OUTPUT to whatever it printed and COLLECTOR_STATUS to 0
+# when it completed cleanly: it returned 0 and emit_metric refused no sample.
+# The status is read from the return value, not from `set -e`, which is switched
+# off for any function called from an `if`/`||` and so cannot be relied on.
+run_collector() {
+    local fn="$1"
+    local out=""
+    local status=0
+
+    out="$(
+        _EMIT_ERRORS=0
+        collector_rc=0
+        "$fn" || collector_rc=$?
+        if ((collector_rc == 0 && _EMIT_ERRORS > 0)); then
+            collector_rc=1
+        fi
+        exit "$collector_rc"
+    )" || status=$?
+
+    COLLECTOR_OUTPUT="$out"
+    COLLECTOR_STATUS="$status"
+}
+
+# Print the whole document. Returns 0 when every collector completed, EXIT_DEGRADED
+# when the document is complete and valid but at least one collector failed (the
+# failure is in lyrebird_scrape_success / lyrebird_collector_success), and 1 when
+# the document could not be written. Collector failures are logged, never fatal.
 generate_all_metrics() {
-    echo "# LyreBirdAudio Prometheus Metrics"
-    echo "# Generated at $(date -Iseconds)"
-    echo ""
+    local doc="" i name fn ok failed=0
+    local -a status_names=() status_values=()
 
-    # Build info
-    emit_metric "build_info" "1" "LyreBirdAudio metrics exporter version" "gauge" "version=\"${VERSION}\""
-    echo ""
+    doc+="# LyreBirdAudio Prometheus Metrics"$'\n'
+    doc+="# Generated at $(date -Iseconds)"$'\n\n'
+    doc+="$(emit_metric "build_info" "1" "LyreBirdAudio metrics exporter version" "gauge" "version=\"${VERSION}\"")"$'\n\n'
 
-    # Each collector is best-effort: a `|| true` ensures one collector failing
-    # (a probe error, an API blip) can never abort generate_all_metrics and
-    # leave a stale/empty scrape that hides a dead recorder. The per-line guards
-    # inside the collectors already prevent this; these are defense in depth.
-    collect_mediamtx_metrics || true
-    echo ""
+    for ((i = 0; i < ${#COLLECTOR_NAMES[@]}; i++)); do
+        name="${COLLECTOR_NAMES[i]}"
+        fn="${COLLECTOR_FUNCS[i]}"
+        run_collector "$fn"
+        if [[ -n "$COLLECTOR_OUTPUT" ]]; then
+            doc+="${COLLECTOR_OUTPUT}"$'\n\n'
+        fi
+        ok=1
+        if ((COLLECTOR_STATUS != 0)); then
+            ok=0
+            failed=$((failed + 1))
+            log "WARN: collector '${name}' failed (status ${COLLECTOR_STATUS}); its metrics may be missing or partial"
+        fi
+        status_names+=("$name")
+        status_values+=("$ok")
+    done
 
-    collect_stream_manager_metrics || true
-    echo ""
+    doc+="$(emit_help_type "collector_success" "1 if the collector completed without error, 0 if it failed and its metrics may be missing or partial" "gauge")"$'\n'
+    for ((i = 0; i < ${#status_names[@]}; i++)); do
+        doc+="$(emit_metric "collector_success" "${status_values[i]}" "" "gauge" "collector=\"${status_names[i]}\"")"$'\n'
+    done
+    doc+=$'\n'
 
-    collect_usb_audio_metrics || true
-    echo ""
-
-    collect_system_metrics || true
-    echo ""
-
-    collect_api_metrics || true
-    echo ""
-
-    collect_stream_metrics || true
-    echo ""
+    ok=1
+    ((failed == 0)) || ok=0
+    doc+="$(emit_metric "scrape_success" "$ok" "1 if every collector completed without error, 0 if any failed (see lyrebird_collector_success); alert on == 0")"$'\n\n'
 
     # In-band staleness marker. A textfile .prom left behind by a dead exporter
     # is otherwise indistinguishable from a live one -- the node "looks alive"
     # while recording nothing. Alert on:
     #   time() - lyrebird_scrape_timestamp_seconds > <2x scrape interval>
-    emit_metric "scrape_timestamp_seconds" "$(date +%s)" "Unix time this scrape was generated (alert when stale)"
+    doc+="$(emit_metric "scrape_timestamp_seconds" "$(date +%s)" "Unix time this scrape was generated (alert when stale)")"$'\n'
+
+    printf '%s' "$doc" || return 1
+    ((failed == 0)) || return "$EXIT_DEGRADED"
+    return 0
 }
 
 # Simple HTTP server using netcat (for basic metrics serving)
@@ -663,6 +777,13 @@ Options:
   --file PATH         Write metrics to file (for node_exporter textfile)
   --once              Output metrics once and exit (default)
 
+Exit status:
+  0  every collector completed
+  1  command-line error
+  3  the output was delivered, but at least one collector failed
+     (lyrebird_scrape_success is 0; the failing collector is named in
+     lyrebird_collector_success and on stderr)
+
 Examples:
   ${SCRIPT_NAME}                        # Output to stdout
   ${SCRIPT_NAME} --serve 9100           # Start HTTP server
@@ -683,6 +804,7 @@ main() {
     local mode="once"
     local port="9100"
     local output_file=""
+    local gen_rc=0
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -737,15 +859,22 @@ main() {
             # Only replace the published file on a successful, complete
             # generation; on failure keep the previous file and drop the partial
             # temp rather than orphaning a `.tmp` (and never crash the cron).
-            if generate_all_metrics >"${output_file}.tmp"; then
+            # A document with a failed collector is complete and valid: it is
+            # published (its lyrebird_scrape_success is 0) and the status says so.
+            gen_rc=0
+            generate_all_metrics >"${output_file}.tmp" || gen_rc=$?
+            if ((gen_rc == 0 || gen_rc == EXIT_DEGRADED)); then
                 mv "${output_file}.tmp" "$output_file"
+                return "$gen_rc"
             else
                 log "ERROR: metric generation failed; leaving previous ${output_file} in place"
                 rm -f "${output_file}.tmp" 2>/dev/null || true
             fi
             ;;
         once | *)
-            generate_all_metrics
+            gen_rc=0
+            generate_all_metrics || gen_rc=$?
+            return "$gen_rc"
             ;;
     esac
 }
