@@ -9,9 +9,8 @@
 #
 #   hardware   a "device tree" in $HW: $HW/<card> holds the device name,
 #              $HW/dev-snd/controlC<card> is its control node. detect_audio_devices,
-#              check_audio_device and check_alsa_device_available read it;
-#              start_all_ffmpeg_streams has its one literal /dev/snd redirected
-#              into the tree (the function text is the real one).
+#              check_audio_device, check_alsa_device_available and
+#              device_node_exists read it.
 #   MediaMTX   a copy of the bash binary at the configured MediaMTX path that
 #              waits (BASH_ENV, for that copy only), and a `curl` shim that answers
 #              the API from $API/<stream>.json (404 when the file is absent).
@@ -71,6 +70,7 @@ STUB_EOF
     printf '#!/bin/bash\nexit 0\n' >"$ST/shim/ss"
     cat >"$ST/shim/curl" <<'CURL_EOF'
 #!/bin/bash
+[[ ! -e "$ST/api-down" ]] || exit 7
 url="${!#}"
 want_code=false
 for arg in "$@"; do
@@ -169,7 +169,7 @@ detect_audio_devices() {
 }
 check_audio_device() { [[ -e "$HW/$1" ]]; }
 check_alsa_device_available() { [[ -e "$HW/$1" && ! -e "$HW/busy-$1" ]]; }
-eval "$(declare -f start_all_ffmpeg_streams | sed "s#/dev/snd/#$HW/dev-snd/#g")"
+device_node_exists() { [[ -e "$HW/dev-snd/controlC$1" ]]; }
 '
     export STAGE_STABILIZE='wait_for_usb_stabilization() { return 0; }'
 }
