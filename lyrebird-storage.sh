@@ -139,6 +139,14 @@ unset _max_log_size
 # Dry run mode (set to true to see what would be deleted)
 DRY_RUN="${DRY_RUN:-false}"
 
+# Exit status of a run that finished but could not delete at least one file
+# (permission, immutable bit, read-only filesystem, ...). 1 stays "usage error";
+# 2 is lyrebird-common's E_PERMISSION, which this is not specific to.
+readonly EXIT_DELETE_FAILED=3
+
+# Deletions that failed in this run; every delete goes through safe_delete.
+DELETE_FAILURES=0
+
 # ============================================================================
 # Safety Validation
 # ============================================================================
@@ -269,17 +277,78 @@ count_files() {
     find "$path" -maxdepth 1 -name "$pattern" -type f 2>/dev/null | wc -l
 }
 
-# Safe delete with dry run support
+# Safe delete with dry run support. Returns 0 when the file is gone (or, in a dry
+# run, would be) and 1 when rm refused; a refusal is logged with rm's reason and
+# counted in DELETE_FAILURES so the run's exit status reports it. Under
+# `set -e` an unhandled rm failure used to abort the whole run mid-cleanup, so
+# nothing after the first stuck file was cleaned and no summary was logged.
+# Files only: there is no -r, so a path swapped for a directory between the
+# listing and the removal fails instead of taking a tree with it.
 safe_delete() {
     local path="$1"
     local desc="${2:-file}"
+    local err
 
     if [[ "$DRY_RUN" == "true" ]]; then
         log_info "[DRY RUN] Would delete ${desc}: $path"
-    else
-        log_debug "Deleting ${desc}: $path"
-        rm -rf -- "$path"
+        return 0
     fi
+
+    log_debug "Deleting ${desc}: $path"
+    if err=$(rm -f -- "$path" 2>&1); then
+        return 0
+    fi
+    # Already gone (another run, or the recorder reusing the slot): done.
+    if [[ ! -e "$path" && ! -L "$path" ]]; then
+        return 0
+    fi
+    ((++DELETE_FAILURES))
+    log_error "Cannot delete ${desc} ${path}: ${err:-rm failed}"
+    return 1
+}
+
+# Totals of the current _sweep calls; _sweep_reset starts a new tally.
+SWEEP_DELETED=0
+SWEEP_FAILED=0
+SWEEP_FREED=0
+
+_sweep_reset() {
+    SWEEP_DELETED=0
+    SWEEP_FAILED=0
+    SWEEP_FREED=0
+}
+
+# Delete every NUL-separated path read from stdin through safe_delete, adding to
+# the SWEEP_* totals. A failure is counted and the sweep carries on.
+_sweep() {
+    local desc="$1" file size
+    while IFS= read -r -d '' file; do
+        size=$(stat -c%s -- "$file" 2>/dev/null || echo 0)
+        if safe_delete "$file" "$desc"; then
+            ((++SWEEP_DELETED))
+            SWEEP_FREED=$((SWEEP_FREED + size))
+        else
+            ((++SWEEP_FAILED))
+        fi
+    done
+    return 0
+}
+
+# "; N deletion(s) FAILED" when N > 0, nothing otherwise (for summary lines).
+_failed_suffix() {
+    if (($1 > 0)); then
+        printf '; %d deletion(s) FAILED' "$1"
+    fi
+}
+
+# End-of-command verdict: the run's exit status is EXIT_DELETE_FAILED when any
+# deletion failed, 0 otherwise.
+_report_delete_failures() {
+    if ((DELETE_FAILURES > 0)); then
+        log_error "Run finished with ${DELETE_FAILURES} failed deletion(s); the files named in the errors above are still on disk"
+        return "$EXIT_DELETE_FAILED"
+    fi
+    return 0
 }
 
 # ============================================================================
@@ -307,6 +376,7 @@ cleanup_recordings() {
     local count=0
     local freed_bytes=0
     local kept_broken_clock=0
+    local failed=0
 
     # Find and delete old recording files
     while IFS= read -r -d '' file; do
@@ -320,9 +390,12 @@ cleanup_recordings() {
         fi
         local size
         size=$(stat -c%s "$file" 2>/dev/null || echo 0)
-        safe_delete "$file" "recording"
-        ((++count))
-        freed_bytes=$((freed_bytes + size))
+        if safe_delete "$file" "recording"; then
+            ((++count))
+            freed_bytes=$((freed_bytes + size))
+        else
+            ((++failed))
+        fi
     done < <(find "$RECORDING_DIR" -type f "${RECORDING_NAME_TEST[@]}" -mtime "+${RECORDING_RETENTION_DAYS}" -print0 2>/dev/null)
 
     if [[ $kept_broken_clock -gt 0 ]]; then
@@ -336,69 +409,43 @@ cleanup_recordings() {
     # unattended box.
     find "$RECORDING_DIR" -mindepth 1 -type d -empty -delete 2>/dev/null || true
 
-    log_info "Cleaned $count recording file(s), freed $(format_bytes $freed_bytes)"
+    log_info "Cleaned $count recording file(s), freed $(format_bytes $freed_bytes)$(_failed_suffix "$failed")"
 }
 
 # Clean old log files
 cleanup_logs() {
     log_info "Cleaning logs older than ${LOG_RETENTION_DAYS} days"
 
-    local count=0
-    local freed_bytes=0
+    _sweep_reset
 
     # Clean LyreBird logs
     if [[ -d "$LOG_DIR" ]]; then
-        while IFS= read -r -d '' file; do
-            local size
-            size=$(stat -c%s "$file" 2>/dev/null || echo 0)
-            safe_delete "$file" "log"
-            ((++count))
-            freed_bytes=$((freed_bytes + size))
-        done < <(find "$LOG_DIR" -type f -name "*.log*" -mtime "+${LOG_RETENTION_DAYS}" -print0 2>/dev/null)
+        _sweep "log" < <(find "$LOG_DIR" -type f -name "*.log*" -mtime "+${LOG_RETENTION_DAYS}" -print0 2>/dev/null)
     fi
 
     # Clean rotated MediaMTX logs
     if [[ -d "$MEDIAMTX_LOG_DIR" ]]; then
-        while IFS= read -r -d '' file; do
-            local size
-            size=$(stat -c%s "$file" 2>/dev/null || echo 0)
-            safe_delete "$file" "mediamtx log"
-            ((++count))
-            freed_bytes=$((freed_bytes + size))
-        done < <(find "$MEDIAMTX_LOG_DIR" -type f -name "mediamtx*.out.*" -mtime "+${LOG_RETENTION_DAYS}" -print0 2>/dev/null)
+        _sweep "mediamtx log" < <(find "$MEDIAMTX_LOG_DIR" -type f -name "mediamtx*.out.*" -mtime "+${LOG_RETENTION_DAYS}" -print0 2>/dev/null)
     fi
 
-    log_info "Cleaned $count log file(s), freed $(format_bytes $freed_bytes)"
+    log_info "Cleaned $SWEEP_DELETED log file(s), freed $(format_bytes "$SWEEP_FREED")$(_failed_suffix "$SWEEP_FAILED")"
 }
 
 # Clean temporary files
 cleanup_temp() {
     log_info "Cleaning temp files older than ${TEMP_RETENTION_HOURS} hours"
 
-    local count=0
-    local freed_bytes=0
+    _sweep_reset
 
     # Clean LyreBird temp files in /tmp
-    while IFS= read -r -d '' file; do
-        local size
-        size=$(stat -c%s "$file" 2>/dev/null || echo 0)
-        safe_delete "$file" "temp"
-        ((++count))
-        freed_bytes=$((freed_bytes + size))
-    done < <(find "$TEMP_DIR" -maxdepth 1 -type f -name "lyrebird-*" -mmin "+$((TEMP_RETENTION_HOURS * 60))" -print0 2>/dev/null)
+    _sweep "temp" < <(find "$TEMP_DIR" -maxdepth 1 -type f -name "lyrebird-*" -mmin "+$((TEMP_RETENTION_HOURS * 60))" -print0 2>/dev/null)
 
     # Clean memory buffer directory if present
     if [[ -d "$BUFFER_DIR" ]]; then
-        while IFS= read -r -d '' file; do
-            local size
-            size=$(stat -c%s "$file" 2>/dev/null || echo 0)
-            safe_delete "$file" "buffer"
-            ((++count))
-            freed_bytes=$((freed_bytes + size))
-        done < <(find "$BUFFER_DIR" -type f -mmin "+$((TEMP_RETENTION_HOURS * 60))" -print0 2>/dev/null)
+        _sweep "buffer" < <(find "$BUFFER_DIR" -type f -mmin "+$((TEMP_RETENTION_HOURS * 60))" -print0 2>/dev/null)
     fi
 
-    log_info "Cleaned $count temp file(s), freed $(format_bytes $freed_bytes)"
+    log_info "Cleaned $SWEEP_DELETED temp file(s), freed $(format_bytes "$SWEEP_FREED")$(_failed_suffix "$SWEEP_FAILED")"
 }
 
 # Truncate oversized log files
@@ -464,15 +511,19 @@ emergency_cleanup() {
     if [[ -d "$RECORDING_DIR" ]]; then
         log_info "Emergency: Removing oldest recordings..."
         local deleted=0
+        local failed=0
         local max_delete=100
 
         while IFS= read -r file; do
-            safe_delete "$file" "emergency recording"
-            ((++deleted))
-            [[ $deleted -ge $max_delete ]] && break
+            if safe_delete "$file" "emergency recording"; then
+                ((++deleted))
+            else
+                ((++failed))
+            fi
+            [[ $((deleted + failed)) -ge $max_delete ]] && break
         done < <(find "$RECORDING_DIR" -type f "${RECORDING_NAME_TEST[@]}" -printf '%T+ %p\n' 2>/dev/null | sort | head -n "$max_delete" | cut -d' ' -f2-)
 
-        log_info "Emergency: Deleted $deleted oldest recording(s)"
+        log_info "Emergency: Deleted $deleted oldest recording(s)$(_failed_suffix "$failed")"
     fi
 
     # Delete rotated logs, temp files, and buffer contents.
@@ -483,17 +534,26 @@ emergency_cleanup() {
     if [[ "$DRY_RUN" == "true" ]]; then
         log_info "[DRY RUN] Would delete rotated LyreBird/MediaMTX logs, LyreBird temp files, and buffer contents"
     else
-        [[ -d "$LOG_DIR" ]] && find "$LOG_DIR" -maxdepth 1 -name "*.gz" -delete 2>/dev/null || true
-        find "$MEDIAMTX_LOG_DIR" -maxdepth 1 -name "mediamtx*.out*.gz" -delete 2>/dev/null || true
+        _sweep_reset
+        if [[ -d "$LOG_DIR" ]]; then
+            _sweep "rotated log" < <(find "$LOG_DIR" -maxdepth 1 -type f -name "*.gz" -print0 2>/dev/null)
+        fi
+        _sweep "rotated mediamtx log" < <(find "$MEDIAMTX_LOG_DIR" -maxdepth 1 -type f -name "mediamtx*.out*.gz" -print0 2>/dev/null)
 
         # Clear LyreBird temp files
-        find "$TEMP_DIR" -maxdepth 1 -name "lyrebird-*" -type f -delete 2>/dev/null || true
+        _sweep "temp" < <(find "$TEMP_DIR" -maxdepth 1 -name "lyrebird-*" -type f -print0 2>/dev/null)
+        log_info "Emergency: Deleted $SWEEP_DELETED rotated log/temp file(s)$(_failed_suffix "$SWEEP_FAILED")"
 
         # Clear buffer directory (with safety validation)
         if [[ -d "$BUFFER_DIR" ]] && validate_safe_path "$BUFFER_DIR"; then
-            rm -rf "${BUFFER_DIR:?}"/* 2>/dev/null || true
+            local err
+            if ! err=$(rm -rf -- "${BUFFER_DIR:?}"/* 2>&1); then
+                ((++DELETE_FAILURES))
+                log_error "Cannot clear buffer directory ${BUFFER_DIR}: ${err:-rm failed}"
+            fi
         fi
     fi
+    return 0
 }
 
 # ============================================================================
@@ -575,12 +635,13 @@ cmd_cleanup() {
     cleanup_temp
     truncate_large_logs
 
+    _report_delete_failures || return "$EXIT_DELETE_FAILED"
     log_info "Cleanup completed"
 }
 
 # Monitor and cleanup if needed
 cmd_monitor() {
-    local usage free_mb
+    local usage free_mb rc=0
     usage=$(get_disk_usage "/")
     free_mb=$(get_free_space_mb "/")
 
@@ -590,8 +651,8 @@ cmd_monitor() {
     # the safe, retention-based cleanup (which deletes solely by age).
     if [[ ! "$usage" =~ ^[0-9]+$ ]] || [[ ! "$free_mb" =~ ^[0-9]+$ ]]; then
         log_error "Could not determine disk usage for / (df unparseable: usage='${usage}', free='${free_mb}'MB); running standard cleanup only"
-        cmd_cleanup
-        return 0
+        cmd_cleanup || rc=$?
+        return "$rc"
     fi
 
     # Inode pressure counts as disk pressure: many small recordings exhaust
@@ -608,17 +669,19 @@ cmd_monitor() {
         || [[ $free_mb -lt $MIN_FREE_SPACE_MB ]]; then
         log_error "EMERGENCY: Disk ${usage}% full, inodes ${iusage}% used, ${free_mb}MB free"
         emergency_cleanup
-        cmd_cleanup
+        cmd_cleanup || rc=$?
     elif [[ $usage -ge $DISK_CRITICAL_PERCENT ]] || [[ $iusage -ge $DISK_CRITICAL_PERCENT ]]; then
         log_warn "CRITICAL: Disk ${usage}% full, inodes ${iusage}% used"
-        cmd_cleanup
+        cmd_cleanup || rc=$?
     elif [[ $usage -ge $DISK_WARNING_PERCENT ]] || [[ $iusage -ge $DISK_WARNING_PERCENT ]]; then
         log_warn "WARNING: Disk ${usage}% full, inodes ${iusage}% used"
         cleanup_temp
         truncate_large_logs
+        _report_delete_failures || rc=$?
     else
         log_debug "Disk usage OK: ${usage}%"
     fi
+    return "$rc"
 }
 
 # Run emergency cleanup
