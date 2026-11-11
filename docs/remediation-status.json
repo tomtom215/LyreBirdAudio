@@ -191,16 +191,44 @@
       "title": "CI path filter and non-required jobs",
       "severity": "P3",
       "phase": 6,
-      "status": "open",
-      "tests": []
+      "status": "documented-hw",
+      "tests": [
+        "bash-ci runs on pull requests and pushes to main/master, weekly, on demand and when called",
+        "bash-ci has no path filter on any trigger",
+        "bash-ci cancels superseded pull request runs only, never a run on main or a tag",
+        "bash-ci runs its steps with bash -eo pipefail and a read-only token",
+        "bash-ci ShellCheck report step survives a script with findings under pipefail",
+        "bash-ci summary needs every other job, so none can fail or be skipped unnoticed",
+        "bash-ci summary fails unless every needed job succeeded: failure, cancelled, skipped and an empty result all fail",
+        "bash-ci summary report lists every needed job with its result",
+        "bash-ci shfmt job fails when a script is not formatted, and passes when all are",
+        "bash-ci bashate job fails when a script has style findings, and passes when none has",
+        "bash-ci security report states what the scan found instead of a fixed OK table"
+      ],
+      "note": "software fixed and statically validated (actionlint 1.7.12, hashes and SHAs re-verified upstream); only a real GitHub Actions run can prove the end-to-end chain"
     },
     {
       "id": "LB-20",
       "title": "live MediaMTX matrix lags newest release",
       "severity": "P3",
       "phase": 6,
-      "status": "open",
-      "tests": []
+      "status": "documented-hw",
+      "tests": [
+        "fetch_mediamtx pins v1.21.2 and v1.21.3 with the sha256 from the release checksum files",
+        "fetch_mediamtx: latest resolves the newest stable tag and ignores pre-releases",
+        "fetch_mediamtx: latest refuses a tarball that does not match the release checksum file",
+        "fetch_mediamtx: latest refuses a release whose checksum file has no single linux amd64 entry",
+        "fetch_mediamtx: latest fails when upstream has no stable release tag",
+        "fetch_mediamtx: latest on a pinned version requires the checksum file to agree with the pin",
+        "fetch_mediamtx: a pinned version whose download does not match its pin is refused and removed",
+        "fetch_mediamtx: an unpinned version is refused with exit status 2",
+        "every version in the live matrix has a sha256 pin in fetch_mediamtx.sh, and every pin is in the matrix",
+        "the live matrix runs v1.21.2 and v1.21.3, each version as its own job that fails on its own",
+        "bash-ci live step fetches exactly the matrix version and fails when its tests fail",
+        "the canary is advisory: continue-on-error, labelled non-blocking, outside the summary, skipped for tags",
+        "the canary resolves and verifies the newest upstream release and runs the same live tests"
+      ],
+      "note": "software fixed and statically validated (actionlint 1.7.12, hashes and SHAs re-verified upstream); only a real GitHub Actions run can prove the end-to-end chain"
     },
     {
       "id": "LB-21",
@@ -343,8 +371,20 @@
       "title": "release workflow publish step not idempotent",
       "severity": "P3",
       "phase": 6,
-      "status": "open",
-      "tests": []
+      "status": "documented-hw",
+      "tests": [
+        "release validates the tagged commit with the full Bash CI before it publishes",
+        "release source archive is the tracked files of the tagged commit and SHA256SUMS verifies it",
+        "release source archive is reproducible: rebuilding the same commit gives the same bytes",
+        "release archive step fails, and writes no checksums, when git archive fails",
+        "release publish creates the release when none exists, with the CHANGELOG section and both assets",
+        "release publish updates an existing release instead of failing, and replaces its assets",
+        "release publish survives losing the race to create: the release appears during create, so it is updated",
+        "release publish still fails when the release cannot be created and does not exist",
+        "release publish marks a hyphenated tag as a pre-release, on create and on update",
+        "release publish without a CHANGELOG section generates notes on create and keeps the notes of an existing release"
+      ],
+      "note": "software fixed and statically validated (actionlint 1.7.12, hashes and SHAs re-verified upstream); only a real GitHub Actions run can prove the end-to-end chain"
     },
     {
       "id": "X-17",
@@ -391,8 +431,21 @@
       "title": "CI summary does not require all jobs; unpinned Actions and tools",
       "severity": "P3",
       "phase": 6,
-      "status": "open",
-      "tests": []
+      "status": "documented-hw",
+      "tests": [
+        "no workflow interpolates an expression into a run script, and every run script parses",
+        "every action is pinned to a full commit sha with a version comment",
+        "each action is pinned to one commit, under one version, in every workflow",
+        "dependabot proposes weekly updates for the pinned GitHub Actions",
+        "dependabot proposes weekly updates for the pinned Python tools, and their requirements file exists",
+        "bash-ci installs ShellCheck only from a download that matches the pinned sha256",
+        "bash-ci installs shfmt only from a download that matches the pinned sha256",
+        "bash-ci installs actionlint only from a download that matches the pinned sha256",
+        "bash-ci tool pins are exact versions with a 64-hex sha256",
+        "no workflow step downloads a file without verifying a sha256, or pip-installs without hashes",
+        "bashate is installed at an exact version from a requirements file where every pin has hashes"
+      ],
+      "note": "software fixed and statically validated (actionlint 1.7.12, hashes and SHAs re-verified upstream); only a real GitHub Actions run can prove the end-to-end chain"
     },
     {
       "id": "X-25",
