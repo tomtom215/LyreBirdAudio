@@ -44,6 +44,7 @@ readonly DEVICE_CONFIG="${CONFIG_DIR}/audio-devices.conf"
 readonly METRIC_PREFIX="lyrebird"
 
 # Exit statuses (also in --help). 1 is a command-line error.
+readonly EXIT_FAILED=2   # nothing could be delivered (the file was not published, the server cannot run)
 readonly EXIT_DEGRADED=3 # the output was delivered but a collector failed (lyrebird_scrape_success 0)
 
 # ============================================================================
@@ -714,6 +715,77 @@ generate_all_metrics() {
     return 0
 }
 
+# The hidden temp file of the publish in progress, for the signal handlers.
+_PUBLISH_TMP=""
+
+# Publish the document as FILE (the node_exporter textfile collector reads it).
+#
+# The document is written to a hidden, uniquely named temp file in the same
+# directory (so writers never collide and rename(2) is atomic) and renamed over
+# FILE only once it is complete: readers see the previous document or the new
+# one, never a partial one, and a failed run leaves the last good file in place.
+# The temp name starts with "." and does not end in ".prom", so the textfile
+# collector never reads it.
+#
+# There is deliberately no fsync of the file or the directory: the document is
+# regenerated every interval, and if a power cut loses the newest rename the
+# worst case is the previous document (or an empty file after a crash on a
+# delayed-allocation filesystem), which the in-band lyrebird_scrape_timestamp_seconds
+# alert already treats as stale. A SIGKILL can still leave one ".FILE.XXXXXX"
+# temp file behind; it is never read as FILE.
+#
+# Returns 0 when published, EXIT_DEGRADED when published with a failed collector,
+# EXIT_FAILED when nothing was published. Never fatal to the calling shell.
+publish_metrics_file() {
+    local output_file="$1"
+    local dir base tmp mode gen_rc=0
+
+    if [[ -d "$output_file" ]]; then
+        log "ERROR: ${output_file} is a directory; not publishing"
+        return "$EXIT_FAILED"
+    fi
+    dir="$(dirname -- "$output_file")"
+    base="$(basename -- "$output_file")"
+
+    if ! tmp="$(mktemp "${dir}/.${base}.XXXXXX" 2>/dev/null)"; then
+        log "ERROR: cannot create a temporary file in ${dir}; ${output_file} was not updated"
+        return "$EXIT_FAILED"
+    fi
+
+    # Drop the temp file if we are stopped mid-run (cron overrun, shutdown).
+    _PUBLISH_TMP="$tmp"
+    trap 'rm -f -- "$_PUBLISH_TMP"; exit 129' HUP
+    trap 'rm -f -- "$_PUBLISH_TMP"; exit 130' INT
+    trap 'rm -f -- "$_PUBLISH_TMP"; exit 143' TERM
+
+    # mktemp creates 0600; keep the mode a plain redirect would have given (a
+    # node_exporter running as another user must be able to read the file).
+    mode="$(printf '%04o' $((0666 & ~$(umask))))"
+
+    generate_all_metrics >"$tmp" || gen_rc=$?
+    if ((gen_rc != 0 && gen_rc != EXIT_DEGRADED)); then
+        log "ERROR: writing the metrics failed (status ${gen_rc}); keeping the previous ${output_file}"
+    elif [[ ! -s "$tmp" ]]; then
+        gen_rc=1
+        log "ERROR: the generated metrics are empty; keeping the previous ${output_file}"
+    elif ! chmod "$mode" -- "$tmp"; then
+        gen_rc=1
+        log "ERROR: cannot set the mode of ${tmp}; keeping the previous ${output_file}"
+    elif ! mv -f -- "$tmp" "$output_file"; then
+        gen_rc=1
+        log "ERROR: cannot replace ${output_file}; keeping the previous file"
+    fi
+
+    rm -f -- "$tmp"
+    _PUBLISH_TMP=""
+    trap - HUP INT TERM
+
+    if ((gen_rc != 0 && gen_rc != EXIT_DEGRADED)); then
+        return "$EXIT_FAILED"
+    fi
+    return "$gen_rc"
+}
+
 # Simple HTTP server using netcat (for basic metrics serving)
 serve_metrics() {
     local port="${1:-9100}"
@@ -774,12 +846,16 @@ Options:
   -h, --help          Show this help message
   -v, --version       Show version
   --serve PORT        Start HTTP server on PORT (default: 9100)
-  --file PATH         Write metrics to file (for node_exporter textfile)
+  --file PATH         Write metrics to file (for node_exporter textfile); the file
+                      is replaced atomically and the previous one is kept if
+                      anything fails
   --once              Output metrics once and exit (default)
 
 Exit status:
   0  every collector completed
   1  command-line error
+  2  nothing could be delivered (--file could not publish; the previous file
+     is kept)
   3  the output was delivered, but at least one collector failed
      (lyrebird_scrape_success is 0; the failing collector is named in
      lyrebird_collector_success and on stderr)
@@ -856,20 +932,9 @@ main() {
                 log "ERROR: Output file path required"
                 exit 1
             fi
-            # Only replace the published file on a successful, complete
-            # generation; on failure keep the previous file and drop the partial
-            # temp rather than orphaning a `.tmp` (and never crash the cron).
-            # A document with a failed collector is complete and valid: it is
-            # published (its lyrebird_scrape_success is 0) and the status says so.
             gen_rc=0
-            generate_all_metrics >"${output_file}.tmp" || gen_rc=$?
-            if ((gen_rc == 0 || gen_rc == EXIT_DEGRADED)); then
-                mv "${output_file}.tmp" "$output_file"
-                return "$gen_rc"
-            else
-                log "ERROR: metric generation failed; leaving previous ${output_file} in place"
-                rm -f "${output_file}.tmp" 2>/dev/null || true
-            fi
+            publish_metrics_file "$output_file" || gen_rc=$?
+            return "$gen_rc"
             ;;
         once | *)
             gen_rc=0

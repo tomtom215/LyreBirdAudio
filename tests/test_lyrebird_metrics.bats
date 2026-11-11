@@ -628,6 +628,216 @@ EOF
     ! grep -q '^lyrebird_disk_usage_percent' "$TEST_SCRATCH/out" || false
 }
 
+# --- atomic --file publishing (LB-18) ------------------------------------------
+
+# A tiny launcher that sources the real script (main-guard), applies SNIPPET (to
+# replace a dependency such as the generator) and runs the real main with the
+# launcher's arguments. Prints the launcher's path.
+_make_launcher() {
+    local path="$TEST_SCRATCH/$1.sh"
+    {
+        echo '#!/bin/bash'
+        echo 'source "$PROJECT_ROOT/lyrebird-metrics.sh"'
+        printf '%s\n' "$2"
+        echo 'main "$@"'
+    } >"$path"
+    printf '%s' "$path"
+}
+
+# Run `lyrebird-metrics.sh --file OUT` for real with the shared test environment.
+_publish() {
+    RUN_RC=0
+    env PROJECT_ROOT="$PROJECT_ROOT" PATH="$TEST_SCRATCH/bin:$PATH" FFMPEG_PID_DIR="$FFMPEG_PID_DIR" \
+        PID_FILE="$PID_FILE" HEARTBEAT_FILE="$HEARTBEAT_FILE" \
+        "$BASH" "${LAUNCHER:-$PROJECT_ROOT/lyrebird-metrics.sh}" --file "$1" \
+        >"$TEST_SCRATCH/out" 2>"$TEST_SCRATCH/err" || RUN_RC=$?
+}
+
+@test "--file: parallel writers never collide; every run exits 0 and every file read meanwhile validates [LB-18]" {
+    _stub_curl "$TEST_SCRATCH/bin"
+    local pub="$TEST_SCRATCH/pub" n=8 rounds=3 i r
+    local -a pids=()
+    mkdir -p "$pub"
+    local out="$pub/lyrebird.prom"
+
+    # a reader validating whatever is published, for as long as the writers run
+    (
+        while [[ ! -e "$TEST_SCRATCH/stop" ]]; do
+            if cp "$out" "$TEST_SCRATCH/snap.prom" 2>/dev/null; then
+                if prom_validate "$TEST_SCRATCH/snap.prom" >"$TEST_SCRATCH/reader.err" 2>&1; then
+                    echo ok >>"$TEST_SCRATCH/reader.log"
+                else
+                    cp "$TEST_SCRATCH/snap.prom" "$TEST_SCRATCH/invalid.prom"
+                    echo invalid >>"$TEST_SCRATCH/reader.log"
+                fi
+            fi
+            sleep 0.02
+        done
+    ) &
+    local reader=$!
+
+    for ((i = 1; i <= n; i++)); do
+        (
+            for ((r = 1; r <= rounds; r++)); do
+                rc=0
+                env PROJECT_ROOT="$PROJECT_ROOT" PATH="$TEST_SCRATCH/bin:$PATH" FFMPEG_PID_DIR="$FFMPEG_PID_DIR" \
+                    PID_FILE="$PID_FILE" HEARTBEAT_FILE="$HEARTBEAT_FILE" \
+                    "$BASH" "$PROJECT_ROOT/lyrebird-metrics.sh" --file "$out" 2>>"$TEST_SCRATCH/writer.err" >/dev/null || rc=$?
+                echo "$rc" >>"$TEST_SCRATCH/rc.$i"
+            done
+        ) &
+        pids+=($!)
+    done
+    for i in "${pids[@]}"; do wait "$i"; done
+    touch "$TEST_SCRATCH/stop"
+    wait "$reader"
+
+    [ "$(cat "$TEST_SCRATCH"/rc.* | wc -l)" -eq $((n * rounds)) ]
+    [ "$(cat "$TEST_SCRATCH"/rc.* | sort -u)" = "0" ] || { cat "$TEST_SCRATCH/writer.err"; return 1; }
+    [ "$(grep -c '^ok$' "$TEST_SCRATCH/reader.log")" -ge 1 ]
+    ! grep -q invalid "$TEST_SCRATCH/reader.log" || { cat "$TEST_SCRATCH/reader.err"; false; }
+    run prom_validate "$out"
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    # nothing but the published file is left in the directory
+    [ "$(ls -A "$pub")" = "lyrebird.prom" ]
+}
+
+@test "--file never uses the fixed FILE.tmp name: a pre-existing FILE.tmp is left alone [LB-18]" {
+    _stub_curl "$TEST_SCRATCH/bin"
+    mkdir -p "$TEST_SCRATCH/pub"
+    printf 'someone else owns this file\n' >"$TEST_SCRATCH/pub/lyrebird.prom.tmp"
+    _publish "$TEST_SCRATCH/pub/lyrebird.prom"
+    [ "$RUN_RC" -eq 0 ]
+    [ "$(cat "$TEST_SCRATCH/pub/lyrebird.prom.tmp")" = "someone else owns this file" ]
+    run prom_validate "$TEST_SCRATCH/pub/lyrebird.prom"
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+}
+
+@test "--file writes through a hidden temp that the textfile collector would not read, and removes it [LB-18]" {
+    mkdir -p "$TEST_SCRATCH/pub"
+    LAUNCHER="$(_make_launcher watch 'generate_all_metrics() { ls -A "$PUB_DIR" >"$PUB_DIR/../listing"; echo "lyrebird_x 1"; }')"
+    PUB_DIR="$TEST_SCRATCH/pub" _publish "$TEST_SCRATCH/pub/lyrebird.prom"
+    [ "$RUN_RC" -eq 0 ]
+    local temp
+    temp="$(cat "$TEST_SCRATCH/listing")"
+    [ "$(printf '%s\n' "$temp" | wc -l)" -eq 1 ]
+    [[ "$temp" =~ ^\.lyrebird\.prom\.[A-Za-z0-9]{6}$ ]] || { echo "temp name: $temp"; return 1; }
+    [[ "$temp" != *.prom ]]
+    [ "$(ls -A "$TEST_SCRATCH/pub")" = "lyrebird.prom" ]
+    [ "$(cat "$TEST_SCRATCH/pub/lyrebird.prom")" = "lyrebird_x 1" ]
+}
+
+@test "--file: a failing generator keeps the last good file byte for byte, leaves no temp and exits 2 [LB-18]" {
+    mkdir -p "$TEST_SCRATCH/pub"
+    printf '# last good\nlyrebird_scrape_success 1\n' >"$TEST_SCRATCH/pub/lyrebird.prom"
+    cp "$TEST_SCRATCH/pub/lyrebird.prom" "$TEST_SCRATCH/good.copy"
+    LAUNCHER="$(_make_launcher failgen 'generate_all_metrics() { echo "partial output"; return 1; }')"
+    _publish "$TEST_SCRATCH/pub/lyrebird.prom"
+    [ "$RUN_RC" -eq 2 ]
+    cmp "$TEST_SCRATCH/pub/lyrebird.prom" "$TEST_SCRATCH/good.copy"
+    [ "$(ls -A "$TEST_SCRATCH/pub")" = "lyrebird.prom" ]
+    grep -q 'keeping the previous' "$TEST_SCRATCH/err"
+}
+
+@test "--file: a directory that cannot be written to, or an output that is a directory, exits 2 and creates nothing [LB-18]" {
+    mkdir -p "$TEST_SCRATCH/pub/asdir"
+    : >"$TEST_SCRATCH/notadir"
+    local target
+    for target in "$TEST_SCRATCH/missing/dir/lyrebird.prom" "$TEST_SCRATCH/notadir/lyrebird.prom" "$TEST_SCRATCH/pub/asdir"; do
+        _publish "$target"
+        [ "$RUN_RC" -eq 2 ] || { echo "$target: status $RUN_RC"; return 1; }
+        [ -s "$TEST_SCRATCH/err" ]
+    done
+    [ ! -e "$TEST_SCRATCH/missing" ]
+    [ -z "$(ls -A "$TEST_SCRATCH/pub/asdir")" ]
+    # a read-only directory: root ignores permissions, so only where it can apply
+    if [ "$(id -u)" -ne 0 ]; then
+        mkdir -p "$TEST_SCRATCH/ro"
+        chmod 555 "$TEST_SCRATCH/ro"
+        _publish "$TEST_SCRATCH/ro/lyrebird.prom"
+        [ "$RUN_RC" -eq 2 ]
+        [ -z "$(ls -A "$TEST_SCRATCH/ro")" ]
+    fi
+}
+
+@test "--file: a write that fails part-way (file size limit) keeps the last good file, leaves no temp, exits 2 [LB-18]" {
+    _stub_curl "$TEST_SCRATCH/bin"
+    mkdir -p "$TEST_SCRATCH/pub"
+    printf '# last good\nlyrebird_scrape_success 1\n' >"$TEST_SCRATCH/pub/lyrebird.prom"
+    cp "$TEST_SCRATCH/pub/lyrebird.prom" "$TEST_SCRATCH/good.copy"
+    local rc=0
+    (
+        ulimit -f 1 # 1 KiB: the document is larger, so the write fails with EFBIG
+        trap '' XFSZ
+        env PROJECT_ROOT="$PROJECT_ROOT" PATH="$TEST_SCRATCH/bin:$PATH" FFMPEG_PID_DIR="$FFMPEG_PID_DIR" \
+            PID_FILE="$PID_FILE" HEARTBEAT_FILE="$HEARTBEAT_FILE" \
+            "$BASH" "$PROJECT_ROOT/lyrebird-metrics.sh" --file "$TEST_SCRATCH/pub/lyrebird.prom" \
+            >"$TEST_SCRATCH/out" 2>"$TEST_SCRATCH/err"
+    ) || rc=$?
+    [ "$rc" -eq 2 ] || { echo "status $rc"; cat "$TEST_SCRATCH/err"; return 1; }
+    cmp "$TEST_SCRATCH/pub/lyrebird.prom" "$TEST_SCRATCH/good.copy"
+    [ "$(ls -A "$TEST_SCRATCH/pub")" = "lyrebird.prom" ]
+}
+
+@test "--file publishes a document whose collector failed, with scrape_success 0, and exits 3 [LB-18]" {
+    _stub_curl "$TEST_SCRATCH/bin"
+    mkdir -p "$TEST_SCRATCH/pub"
+    LAUNCHER="$(_make_launcher degraded 'collect_system_metrics() { return 1; }')"
+    _publish "$TEST_SCRATCH/pub/lyrebird.prom"
+    [ "$RUN_RC" -eq 3 ]
+    run prom_validate "$TEST_SCRATCH/pub/lyrebird.prom"
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    grep -qx 'lyrebird_scrape_success 0' "$TEST_SCRATCH/pub/lyrebird.prom"
+    grep -qx 'lyrebird_collector_success{collector="system"} 0' "$TEST_SCRATCH/pub/lyrebird.prom"
+    [ "$(ls -A "$TEST_SCRATCH/pub")" = "lyrebird.prom" ]
+}
+
+@test "--file: SIGTERM during generation removes the temp file and keeps the last good file [LB-18]" {
+    mkdir -p "$TEST_SCRATCH/pub"
+    printf '# last good\n' >"$TEST_SCRATCH/pub/lyrebird.prom"
+    local launcher
+    launcher="$(_make_launcher slowgen 'generate_all_metrics() { local i; echo partial; for ((i = 0; i < 300; i++)); do sleep 0.1; done; }')"
+    env PROJECT_ROOT="$PROJECT_ROOT" "$BASH" "$launcher" --file "$TEST_SCRATCH/pub/lyrebird.prom" \
+        >"$TEST_SCRATCH/out" 2>"$TEST_SCRATCH/err" &
+    local pid=$! i
+    for ((i = 0; i < 100; i++)); do
+        [ "$(ls -A "$TEST_SCRATCH/pub" | wc -l)" -ge 2 ] && break
+        sleep 0.05
+    done
+    [ "$(ls -A "$TEST_SCRATCH/pub" | wc -l)" -eq 2 ] || { kill "$pid"; wait "$pid" || true; echo "temp never appeared"; return 1; }
+    kill -TERM "$pid"
+    local rc=0
+    wait "$pid" || rc=$?
+    [ "$rc" -eq 143 ]
+    [ "$(ls -A "$TEST_SCRATCH/pub")" = "lyrebird.prom" ]
+    [ "$(cat "$TEST_SCRATCH/pub/lyrebird.prom")" = "# last good" ]
+}
+
+@test "--file gives the published file the mode a plain redirect would (umask), not mktemp's 0600 [LB-18]" {
+    _stub_curl "$TEST_SCRATCH/bin"
+    mkdir -p "$TEST_SCRATCH/pub"
+    (umask 022; _publish "$TEST_SCRATCH/pub/a.prom")
+    (umask 077; _publish "$TEST_SCRATCH/pub/b.prom")
+    [ "$(stat -c %a "$TEST_SCRATCH/pub/a.prom")" = "644" ]
+    [ "$(stat -c %a "$TEST_SCRATCH/pub/b.prom")" = "600" ]
+}
+
+@test "--file accepts a bare relative file name in the current directory [LB-18]" {
+    _stub_curl "$TEST_SCRATCH/bin"
+    mkdir -p "$TEST_SCRATCH/pub"
+    local rc=0
+    (
+        cd "$TEST_SCRATCH/pub"
+        env PROJECT_ROOT="$PROJECT_ROOT" PATH="$TEST_SCRATCH/bin:$PATH" FFMPEG_PID_DIR="$FFMPEG_PID_DIR" \
+            PID_FILE="$PID_FILE" HEARTBEAT_FILE="$HEARTBEAT_FILE" \
+            "$BASH" "$PROJECT_ROOT/lyrebird-metrics.sh" --file lyrebird.prom
+    ) >/dev/null 2>&1 || rc=$?
+    [ "$rc" -eq 0 ]
+    run prom_validate "$TEST_SCRATCH/pub/lyrebird.prom"
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [ "$(ls -A "$TEST_SCRATCH/pub")" = "lyrebird.prom" ]
+}
+
 @test "emit_metric refuses an empty or non-numeric value: no output, counted, status 0 [LB-18]" {
     local v expected=0
     for v in '' 'N/A' '1,5' 'abc' '1 2' '--1'; do
