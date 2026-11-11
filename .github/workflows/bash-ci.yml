@@ -1,11 +1,17 @@
 # LyreBirdAudio - Bash CI Pipeline
-# Runs comprehensive shell script validation on PRs targeting main branch
+# Runs the full validation on every pull request to main/master and on every
+# push to main/master, with no path filter: scripts, tests, workflows,
+# configuration and documentation changes are all checked. It also runs weekly
+# and on demand, and release.yml calls it (workflow_call) so a release is
+# validated by exactly the checks a pull request passes.
 #
 # Tools included (all free, open source, no API/subscription required):
 #   - bash -n: Built-in syntax validation
 #   - shellcheck: Static analysis (industry standard)
 #   - shfmt: Format/style consistency checking
 #   - bashate: OpenStack's bash style linter
+#   - actionlint: lints these workflows (and ShellCheck-checks every run: script)
+#   - bats: the test suite, and live tests against real MediaMTX releases
 #
 # Author: Tom F (https://github.com/tomtom215)
 # License: Apache 2.0
@@ -17,24 +23,56 @@ on:
     branches:
       - main
       - master
-    paths:
-      # Only run when shell scripts change
-      - '**.sh'
-      - '.github/workflows/bash-ci.yml'
+
+  push:
+    branches:
+      - main
+      - master
+
+  # Weekly, so a changed runner image or a new upstream MediaMTX release is
+  # noticed even when nobody pushes. Scheduled runs use the default branch.
+  schedule:
+    - cron: '23 4 * * 1'
 
   # Allow manual trigger for testing
   workflow_dispatch:
 
-# Cancel in-progress runs for the same PR
+  # Reused by release.yml to validate a tagged commit
+  workflow_call:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+# Cancel superseded runs of the same pull request only. A run on main (or a
+# tag) always finishes, so every merged commit keeps its verdict.
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
-  # Shellcheck version (check https://github.com/koalaman/shellcheck/releases)
+  # Downloaded tools: the version and the sha256 of the exact file the install
+  # step downloads. A download that does not match is never installed. Bump a
+  # version and its hash together.
+  #
+  # ShellCheck v0.11.0 and shfmt v3.13.1 publish no checksum file, so those two
+  # hashes were computed from the downloaded release assets (two independent
+  # downloads agreed). actionlint's is from the checksums file of its release.
+  # https://github.com/koalaman/shellcheck/releases
   SHELLCHECK_VERSION: 'v0.11.0'
-  # shfmt version (check https://github.com/mvdan/sh/releases)
+  # shellcheck-v0.11.0.linux.x86_64.tar.xz
+  SHELLCHECK_SHA256: '8c3be12b05d5c177a04c29e3c78ce89ac86f1595681cab149b65b97c4e227198'
+  # https://github.com/mvdan/sh/releases
   SHFMT_VERSION: 'v3.13.1'
+  # shfmt_v3.13.1_linux_amd64
+  SHFMT_SHA256: 'fb096c5d1ac6beabbdbaa2874d025badb03ee07929f0c9ff67563ce8c75398b1'
+  # https://github.com/rhysd/actionlint/releases
+  ACTIONLINT_VERSION: 'v1.7.12'
+  # actionlint_1.7.12_linux_amd64.tar.gz
+  ACTIONLINT_SHA256: '8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8'
 
 jobs:
   # ===========================================================================
@@ -48,7 +86,7 @@ jobs:
       script_count: ${{ steps.find-scripts.outputs.count }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
       - name: Find shell scripts
         id: find-scripts
@@ -63,6 +101,42 @@ jobs:
           echo "Found ${count} shell scripts"
 
   # ===========================================================================
+  # Job 1b: Lint the workflows themselves (actionlint)
+  #
+  # actionlint also runs ShellCheck over every `run:` script, so the pinned
+  # ShellCheck is installed here as well.
+  # ===========================================================================
+  workflow-lint:
+    name: Workflow Lint (actionlint)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+
+      - name: Install ShellCheck (pinned, sha256-verified)
+        run: |
+          archive="shellcheck-${SHELLCHECK_VERSION}.linux.x86_64.tar.xz"
+          curl -sSfL --retry 3 -o "${RUNNER_TEMP}/${archive}" \
+            "https://github.com/koalaman/shellcheck/releases/download/${SHELLCHECK_VERSION}/${archive}"
+          echo "${SHELLCHECK_SHA256}  ${RUNNER_TEMP}/${archive}" | sha256sum -c -
+          tar -xJf "${RUNNER_TEMP}/${archive}" -C "${RUNNER_TEMP}"
+          sudo install -m 0755 "${RUNNER_TEMP}/shellcheck-${SHELLCHECK_VERSION}/shellcheck" /usr/local/bin/shellcheck
+          shellcheck --version
+
+      - name: Install actionlint (pinned, sha256-verified)
+        run: |
+          archive="actionlint_${ACTIONLINT_VERSION#v}_linux_amd64.tar.gz"
+          curl -sSfL --retry 3 -o "${RUNNER_TEMP}/${archive}" \
+            "https://github.com/rhysd/actionlint/releases/download/${ACTIONLINT_VERSION}/${archive}"
+          echo "${ACTIONLINT_SHA256}  ${RUNNER_TEMP}/${archive}" | sha256sum -c -
+          tar -xzf "${RUNNER_TEMP}/${archive}" -C "${RUNNER_TEMP}" actionlint
+          sudo install -m 0755 "${RUNNER_TEMP}/actionlint" /usr/local/bin/actionlint
+          actionlint -version
+
+      - name: Lint the workflows
+        run: actionlint -color
+
+  # ===========================================================================
   # Job 2: Bash Syntax Validation (bash -n)
   # ===========================================================================
   bash-syntax:
@@ -71,7 +145,7 @@ jobs:
     needs: discover-scripts
     steps:
       - name: Checkout code
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
       - name: Validate bash syntax (bash -n)
         run: |
@@ -112,18 +186,19 @@ jobs:
     needs: discover-scripts
     steps:
       - name: Checkout code
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
-      - name: Install ShellCheck
+      - name: Install ShellCheck (pinned, sha256-verified)
         run: |
-          # Use GitHub's pre-installed shellcheck or install specific version
-          if command -v shellcheck &>/dev/null; then
-            echo "Using pre-installed shellcheck: $(shellcheck --version | head -2)"
-          else
-            echo "Installing shellcheck ${SHELLCHECK_VERSION}..."
-            wget -qO- "https://github.com/koalaman/shellcheck/releases/download/${SHELLCHECK_VERSION}/shellcheck-${SHELLCHECK_VERSION}.linux.x86_64.tar.xz" | tar -xJf -
-            sudo mv "shellcheck-${SHELLCHECK_VERSION}/shellcheck" /usr/local/bin/
-          fi
+          # Always the pinned version: the runner image's own shellcheck can be
+          # any version, and the gate is defined against this one.
+          archive="shellcheck-${SHELLCHECK_VERSION}.linux.x86_64.tar.xz"
+          curl -sSfL --retry 3 -o "${RUNNER_TEMP}/${archive}" \
+            "https://github.com/koalaman/shellcheck/releases/download/${SHELLCHECK_VERSION}/${archive}"
+          echo "${SHELLCHECK_SHA256}  ${RUNNER_TEMP}/${archive}" | sha256sum -c -
+          tar -xJf "${RUNNER_TEMP}/${archive}" -C "${RUNNER_TEMP}"
+          sudo install -m 0755 "${RUNNER_TEMP}/shellcheck-${SHELLCHECK_VERSION}/shellcheck" /usr/local/bin/shellcheck
+          shellcheck --version
 
       - name: Run ShellCheck
         run: |
@@ -176,9 +251,11 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
           while IFS= read -r script; do
-            errors=$(shellcheck --severity=error --format=json "$script" 2>/dev/null | jq 'length' || echo 0)
-            warnings=$(shellcheck --severity=warning --format=json "$script" 2>/dev/null | jq '[.[] | select(.level == "warning")] | length' || echo 0)
-            notes=$(shellcheck --format=json "$script" 2>/dev/null | jq '[.[] | select(.level == "info" or .level == "style")] | length' || echo 0)
+            # The tool exits 1 when it finds anything, which is not an error here
+            report=$(shellcheck --format=json "$script" 2>/dev/null || true)
+            errors=$(jq '[.[] | select(.level == "error")] | length' <<<"${report:-[]}")
+            warnings=$(jq '[.[] | select(.level == "warning")] | length' <<<"${report:-[]}")
+            notes=$(jq '[.[] | select(.level == "info" or .level == "style")] | length' <<<"${report:-[]}")
 
             if [[ "$errors" == "0" && "$warnings" == "0" ]]; then
               status="PASS"
@@ -198,13 +275,14 @@ jobs:
     needs: discover-scripts
     steps:
       - name: Checkout code
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
-      - name: Install shfmt
+      - name: Install shfmt (pinned, sha256-verified)
         run: |
-          echo "Installing shfmt ${SHFMT_VERSION}..."
-          wget -qO /usr/local/bin/shfmt "https://github.com/mvdan/sh/releases/download/${SHFMT_VERSION}/shfmt_${SHFMT_VERSION}_linux_amd64"
-          chmod +x /usr/local/bin/shfmt
+          curl -sSfL --retry 3 -o "${RUNNER_TEMP}/shfmt" \
+            "https://github.com/mvdan/sh/releases/download/${SHFMT_VERSION}/shfmt_${SHFMT_VERSION}_linux_amd64"
+          echo "${SHFMT_SHA256}  ${RUNNER_TEMP}/shfmt" | sha256sum -c -
+          sudo install -m 0755 "${RUNNER_TEMP}/shfmt" /usr/local/bin/shfmt
           echo "Installed: $(shfmt --version)"
 
       - name: Check formatting with shfmt
@@ -238,15 +316,11 @@ jobs:
           echo "============================================"
 
           if [[ $errors -gt 0 ]]; then
-            echo "::warning::${errors} script(s) have formatting inconsistencies"
-            echo "Note: Format issues are warnings, not failures"
+            echo "::error::${errors} script(s) have formatting inconsistencies"
             echo "Run 'shfmt -w -i 4 -bn -ci <script>' to auto-fix"
-            # Don't fail the build for formatting - just warn
-            # Uncomment the next line to make formatting failures block PRs:
-            # exit 1
-          else
-            echo "All scripts are consistently formatted"
+            exit 1
           fi
+          echo "All scripts are consistently formatted"
 
   # ===========================================================================
   # Job 5: bashate Style Check
@@ -257,12 +331,20 @@ jobs:
     needs: discover-scripts
     steps:
       - name: Checkout code
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
-      - name: Install bashate
+      - name: Install bashate (pinned, hash-verified)
         run: |
-          pip install bashate
-          echo "Installed: $(bashate --version)"
+          # bashate==2.1.1 and its dependencies (pbr, setuptools), each pinned
+          # with the sha256 of its wheel and sdist in .github/ci/requirements.txt;
+          # pip refuses anything else. A venv keeps the system Python untouched.
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq python3-venv
+          python3 -m venv "${RUNNER_TEMP}/bashate-venv"
+          "${RUNNER_TEMP}/bashate-venv/bin/pip" install --quiet --disable-pip-version-check \
+            --require-hashes -r .github/ci/requirements.txt
+          echo "${RUNNER_TEMP}/bashate-venv/bin" >> "$GITHUB_PATH"
+          echo "Installed: $("${RUNNER_TEMP}/bashate-venv/bin/bashate" --version)"
 
       - name: Run bashate style check
         run: |
@@ -292,14 +374,10 @@ jobs:
           echo "============================================"
 
           if [[ $errors -gt 0 ]]; then
-            echo "::warning::bashate found style issues in ${errors} script(s)"
-            echo "Note: Style issues are warnings, not failures"
-            # Don't fail the build for style - just warn
-            # Uncomment the next line to make style failures block PRs:
-            # exit 1
-          else
-            echo "All scripts pass bashate style checks"
+            echo "::error::bashate found style issues in ${errors} script(s)"
+            exit 1
           fi
+          echo "All scripts pass bashate style checks"
 
   # ===========================================================================
   # Job 6: Security Scan (basic checks)
@@ -310,7 +388,7 @@ jobs:
     needs: discover-scripts
     steps:
       - name: Checkout code
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
       - name: Basic security checks
         id: security
@@ -389,6 +467,8 @@ jobs:
           echo "4. Checking for unquoted command substitutions in dangerous commands..."
 
           # Look for rm/mv with unquoted $(...) - a real injection risk
+          # (the single-quoted '"$(' below is the text being searched for)
+          # shellcheck disable=SC2016
           unquoted_cmd=$(grep -rn --include='*.sh' -E '(rm|mv|cp)\s+-[rf]*\s+\$\(' . 2>/dev/null \
             | grep -v '"$(' \
             | grep -v '#' \
@@ -466,18 +546,20 @@ jobs:
 
       - name: Security Summary Report
         if: always()
+        env:
+          WARNING_COUNT: ${{ steps.security.outputs.warning_count }}
+          WARNING_LIST: ${{ steps.security.outputs.warning_list }}
         run: |
           {
             echo "## Security Scan Report"
             echo ""
-            echo "| Check | Status |"
-            echo "|-------|--------|"
-            echo "| Dangerous eval patterns | OK |"
-            echo "| Insecure downloads (-k/--insecure) | OK |"
-            echo "| World-writable permissions (777/666) | OK |"
-            echo "| Unquoted command substitutions | OK |"
-            echo "| Hardcoded secrets | OK |"
-            echo "| Predictable temp files | OK |"
+            if [[ -z "${WARNING_COUNT}" ]]; then
+              echo "The scan did not finish; see the step log."
+            elif [[ "${WARNING_COUNT}" == "0" ]]; then
+              echo "No pattern matched (eval, insecure downloads, world-writable chmod, unquoted command substitution in rm/mv/cp, hardcoded secrets, predictable temp files)."
+            else
+              echo "${WARNING_COUNT} pattern(s) matched: ${WARNING_LIST}. The step log lists the lines."
+            fi
             echo ""
             echo "_Note: This scan uses pattern matching and may have false positives/negatives._"
             echo "_ShellCheck provides more comprehensive variable quoting analysis._"
@@ -492,12 +574,13 @@ jobs:
     needs: discover-scripts
     steps:
       - name: Checkout code
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
       - name: Install bats
         run: |
+          # jq and python3-yaml: tests/test_ci_config.bats reads the workflows
           sudo apt-get update -qq
-          sudo apt-get install -y -qq bats
+          sudo apt-get install -y -qq bats jq python3-yaml
 
       - name: Run bats test suite
         run: |
@@ -517,208 +600,160 @@ jobs:
 
   # ===========================================================================
   # Job 7b: Live tests against real MediaMTX releases (checksum-pinned)
+  #
+  # One job per version, in parallel, so a failure names its version in the
+  # job list ("Live MediaMTX v1.19.0") instead of hiding in one long run.
+  # Every version here needs a sha256 pin in tests/fetch_mediamtx.sh and vice
+  # versa (tests/test_ci_config.bats checks both).
   # ===========================================================================
   live-mediamtx:
-    name: Live MediaMTX Tests
+    name: Live MediaMTX ${{ matrix.version }}
     runs-on: ubuntu-latest
     needs: discover-scripts
+    strategy:
+      fail-fast: false
+      matrix:
+        version:
+          - v1.15.0
+          - v1.18.0
+          - v1.19.0
+          - v1.21.1
+          - v1.21.2
+          - v1.21.3
     steps:
       - name: Checkout code
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
       - name: Install dependencies
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq bats ffmpeg jq curl
 
-      - name: Run live tests (MediaMTX 1.15.0, 1.18.0, 1.19.0, 1.21.1)
+      - name: Run live tests for one MediaMTX version
+        env:
+          MEDIAMTX_VERSION: ${{ matrix.version }}
         run: |
           export TMPDIR="${RUNNER_TEMP:-/tmp}"
-          LYREBIRD_TEST_MEDIAMTX_BINS="$(tests/fetch_mediamtx.sh "$RUNNER_TEMP/mediamtx")"
+          LYREBIRD_TEST_MEDIAMTX_BINS="$(tests/fetch_mediamtx.sh "$RUNNER_TEMP/mediamtx" "$MEDIAMTX_VERSION")"
           export LYREBIRD_TEST_MEDIAMTX_BINS
           tests/check_tmp_leaks.sh --print-output-on-failure --timing \
             tests/test_mediamtx_live.bats tests/test_soak_live.bats tests/test_soak_observer.bats
 
   # ===========================================================================
+  # Job 7c: Canary against the newest upstream MediaMTX release
+  #
+  # ADVISORY, NON-BLOCKING: `continue-on-error`, and deliberately not in the
+  # summary job's needs. It resolves the newest stable upstream release at run
+  # time, verifies the tarball against the checksums.sha256 published with
+  # that release, and runs the same live tests, so a release that breaks the
+  # generated config shows up here before it is pinned above. It does not run
+  # for tag pushes (release validation).
+  # ===========================================================================
+  live-mediamtx-canary:
+    name: Live MediaMTX newest upstream (advisory, non-blocking)
+    runs-on: ubuntu-latest
+    needs: discover-scripts
+    continue-on-error: true
+    if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq bats ffmpeg jq curl
+
+      - name: Run live tests against the newest upstream release
+        run: |
+          export TMPDIR="${RUNNER_TEMP:-/tmp}"
+          LYREBIRD_TEST_MEDIAMTX_BINS="$(tests/fetch_mediamtx.sh "$RUNNER_TEMP/mediamtx" latest)"
+          export LYREBIRD_TEST_MEDIAMTX_BINS
+          version="$(basename "$(dirname "$LYREBIRD_TEST_MEDIAMTX_BINS")")"
+          echo "Canary (advisory): MediaMTX ${version}, newest upstream release" >> "$GITHUB_STEP_SUMMARY"
+          tests/check_tmp_leaks.sh --print-output-on-failure --timing \
+            tests/test_mediamtx_live.bats tests/test_soak_live.bats tests/test_soak_observer.bats
+
+  # ===========================================================================
   # Job 8: Final Summary
+  #
+  # The one check that says whether the pipeline passed. It needs EVERY job
+  # above (the advisory canary excepted: it is not a gate and is not listed)
+  # and fails unless each of them finished as "success": a failed, cancelled
+  # or skipped job all fail it. Make this job the required status check in
+  # branch protection.
   # ===========================================================================
   summary:
     name: CI Summary
     runs-on: ubuntu-latest
-    needs: [discover-scripts, bash-syntax, shellcheck, shfmt, bashate, security-scan, bats-tests, live-mediamtx]
+    needs:
+      - discover-scripts
+      - workflow-lint
+      - bash-syntax
+      - shellcheck
+      - shfmt
+      - bashate
+      - security-scan
+      - bats-tests
+      - live-mediamtx
     if: always()
+    env:
+      NEEDS_JSON: ${{ toJSON(needs) }}
+      SCRIPT_COUNT: ${{ needs.discover-scripts.outputs.script_count }}
     steps:
-      - name: Generate Comprehensive Summary
+      - name: Report job results
         run: |
           {
-            # Header
             echo "# Bash CI Pipeline Results"
             echo ""
-            echo "---"
+            echo "Every job below is required: the pipeline passes only if all of them succeed."
             echo ""
-
-            # Overall Status
-            echo "## Overall Status"
+            echo "| Job | Result |"
+            echo "|-----|--------|"
+            jq -r 'to_entries[] | "| \(.key) | \(.value.result) |"' <<<"$NEEDS_JSON"
             echo ""
-
-            # Determine overall result
-            if [[ "${{ needs.bash-syntax.result }}" == "success" && "${{ needs.shellcheck.result }}" == "success" && "${{ needs.bats-tests.result }}" == "success" && "${{ needs.live-mediamtx.result }}" == "success" ]]; then
-              echo "### All Required Checks Passed"
-            else
-              echo "### Required Checks Failed"
-            fi
+            echo "## Tools"
             echo ""
-
-            # Results Table
-            echo "## Check Results"
-            echo ""
-            echo "| Check | Type | Status | Description |"
-            echo "|-------|------|--------|-------------|"
-            echo "| **Bash Syntax** | Required | ${{ needs.bash-syntax.result == 'success' && 'Passed' || 'Failed' }} | Validates script syntax with \`bash -n\` |"
-            echo "| **ShellCheck** | Required | ${{ needs.shellcheck.result == 'success' && 'Passed' || 'Failed' }} | Static analysis for bugs and issues |"
-            echo "| **Bats Tests** | Required | ${{ needs.bats-tests.result == 'success' && 'Passed' || 'Failed' }} | Unit and regression test suite |"
-            echo "| **Live MediaMTX** | Required | ${{ needs.live-mediamtx.result == 'success' && 'Passed' || 'Failed' }} | Stream manager, soak harness and observer against real MediaMTX 1.15.0-1.21.1 |"
-            echo "| **shfmt** | Advisory | ${{ needs.shfmt.result == 'success' && 'Passed' || 'Warnings' }} | Code formatting consistency |"
-            echo "| **bashate** | Advisory | ${{ needs.bashate.result == 'success' && 'Passed' || 'Warnings' }} | OpenStack style guidelines |"
-            echo "| **Security** | Advisory | ${{ needs.security-scan.result == 'success' && 'Passed' || 'Warnings' }} | Security anti-pattern detection |"
-            echo ""
-
-            # Legend
-            echo "<details>"
-            echo "<summary>Check Type Legend</summary>"
-            echo ""
-            echo "| Type | Meaning |"
+            echo "| Tool | Version |"
             echo "|------|---------|"
-            echo "| Required | Must pass for PR to be merged |"
-            echo "| Advisory | Informational only, does not block merge |"
+            echo "| ShellCheck | ${SHELLCHECK_VERSION} |"
+            echo "| shfmt | ${SHFMT_VERSION} |"
+            echo "| actionlint | ${ACTIONLINT_VERSION} |"
+            echo "| bashate | pinned in .github/ci/requirements.txt |"
             echo ""
-            echo "</details>"
+            echo "## Reproduce locally"
             echo ""
-
-            echo "---"
+            echo '```bash'
+            echo "bash -n script.sh"
+            echo "shellcheck --format=gcc --severity=warning --external-sources --shell=bash script.sh"
+            echo "shfmt -d -i 4 -bn -ci script.sh        # fix with: shfmt -w -i 4 -bn -ci script.sh"
+            echo "bashate --ignore E001,E006,E040,E042,E043 script.sh"
+            echo "tests/check_tmp_leaks.sh               # the whole bats suite"
+            echo '```'
             echo ""
-
-            # Tool Information
-            echo "## Tools & Versions"
-            echo ""
-            echo "| Tool | Version | Purpose |"
-            echo "|------|---------|---------|"
-            echo "| \`bash -n\` | System | Syntax validation |"
-            echo "| [ShellCheck](https://github.com/koalaman/shellcheck) | ${{ env.SHELLCHECK_VERSION }} | Static analysis |"
-            echo "| [shfmt](https://github.com/mvdan/sh) | ${{ env.SHFMT_VERSION }} | Formatting |"
-            echo "| [bashate](https://github.com/openstack/bashate) | Latest | Style checking |"
-            echo ""
-
-            echo "---"
-            echo ""
-
-            # What Gets Checked
-            echo "## What's Being Checked"
-            echo ""
-            echo "### Required Checks (blocking)"
-            echo ""
-            echo "1. **Bash Syntax (\`bash -n\`)** - Ensures all scripts are syntactically valid"
-            echo "2. **ShellCheck** - Catches:"
-            echo "   - Unquoted variables that may cause word splitting"
-            echo "   - Deprecated syntax and bashisms"
-            echo "   - Common scripting bugs and pitfalls"
-            echo "   - Potential security issues"
-            echo ""
-            echo "### Advisory Checks (non-blocking)"
-            echo ""
-            echo "3. **shfmt** - Checks formatting consistency:"
-            echo "   - 4-space indentation"
-            echo "   - Binary operators at start of line"
-            echo "   - Case statement indentation"
-            echo ""
-            echo "4. **bashate** - OpenStack style guidelines"
-            echo ""
-            echo "5. **Security Scan** - Pattern-based detection of:"
-            echo "   - Dangerous \`eval\` usage"
-            echo "   - Insecure download flags (\`-k\`, \`--insecure\`)"
-            echo "   - World-writable permissions (777/666)"
-            echo "   - Unquoted command substitutions"
-            echo "   - Hardcoded secrets"
-            echo "   - Predictable temp file names"
-            echo ""
-
-            echo "---"
-            echo ""
-
-            # Quick Fix Guide
-            echo "## Quick Fix Guide"
-            echo ""
-            echo "<details>"
-            echo "<summary>How to fix common issues</summary>"
-            echo ""
-            echo "### Bash Syntax Errors"
-            echo "\`\`\`bash"
-            echo "# Check syntax locally:"
-            echo "bash -n your-script.sh"
-            echo "\`\`\`"
-            echo ""
-            echo "### ShellCheck Issues"
-            echo "\`\`\`bash"
-            echo "# Run shellcheck locally:"
-            echo "shellcheck your-script.sh"
-            echo ""
-            echo "# Or install via package manager:"
-            echo "# Ubuntu/Debian: apt install shellcheck"
-            echo "# macOS: brew install shellcheck"
-            echo "\`\`\`"
-            echo ""
-            echo "### Format Issues (shfmt)"
-            echo "\`\`\`bash"
-            echo "# Auto-fix formatting:"
-            echo "shfmt -w -i 4 -bn -ci your-script.sh"
-            echo ""
-            echo "# Check without modifying:"
-            echo "shfmt -d -i 4 -bn -ci your-script.sh"
-            echo "\`\`\`"
-            echo ""
-            echo "</details>"
-            echo ""
-
-            echo "---"
-            echo ""
-            echo "_Generated by Bash CI Pipeline • Scripts analyzed: ${{ needs.discover-scripts.outputs.script_count }}_"
-
+            echo "_Scripts analyzed: ${SCRIPT_COUNT}_"
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Check required jobs
+      - name: Require every job to succeed
         run: |
-          echo "Checking required job results..."
-          echo ""
-
           failed=0
+          count=0
+          while IFS=$'\t' read -r job result; do
+            count=$((count + 1))
+            if [[ "$result" == "success" ]]; then
+              echo "PASS  ${job}"
+            else
+              echo "::error::${job} finished as '${result}' (required: success)"
+              failed=1
+            fi
+          done < <(jq -r 'to_entries[] | [.key, .value.result] | @tsv' <<<"$NEEDS_JSON")
 
-          if [[ "${{ needs.bash-syntax.result }}" != "success" ]]; then
-            echo "::error::Bash syntax validation failed"
-            failed=1
-          else
-            echo "Bash syntax: passed"
-          fi
-
-          if [[ "${{ needs.shellcheck.result }}" != "success" ]]; then
-            echo "::error::ShellCheck found errors or warnings"
-            failed=1
-          else
-            echo "ShellCheck: passed"
-          fi
-
-          if [[ "${{ needs.bats-tests.result }}" != "success" ]]; then
-            echo "::error::Bats test suite failed"
-            failed=1
-          else
-            echo "Bats tests: passed"
-          fi
-
-          echo ""
-          if [[ $failed -eq 1 ]]; then
-            echo "::error::One or more required checks failed. Please fix the issues above."
+          if [[ $count -eq 0 ]]; then
+            echo "::error::no job results were available to check"
             exit 1
           fi
-
-          echo "============================================"
-          echo "🎉 All required checks passed!"
-          echo "============================================"
+          if [[ $failed -ne 0 ]]; then
+            echo "::error::One or more required jobs did not succeed."
+            exit 1
+          fi
+          echo "All ${count} required jobs succeeded."

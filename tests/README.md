@@ -53,14 +53,26 @@ tests/check_tmp_leaks.sh
 ```
 
 **Run the live tests against real MediaMTX releases** (downloads checksum-pinned
-1.15.0, 1.18.0, 1.19.0 and 1.21.1 for linux amd64 into `.cache/mediamtx`; needs
-ffmpeg, curl, jq and free ports 8554/9997; refuses to run while another
-MediaMTX or RTSP ffmpeg is running):
+1.15.0, 1.18.0, 1.19.0, 1.21.1, 1.21.2 and 1.21.3 for linux amd64 into
+`.cache/mediamtx`; needs ffmpeg, curl, jq and free ports 8554/9997; refuses to
+run while another MediaMTX or RTSP ffmpeg is running):
 ```bash
 LYREBIRD_TEST_MEDIAMTX_BINS="$(tests/fetch_mediamtx.sh)" \
     bats tests/test_mediamtx_live.bats tests/test_soak_live.bats tests/test_soak_observer.bats
 ```
-Without `LYREBIRD_TEST_MEDIAMTX_BINS` those live tests are skipped.
+Without `LYREBIRD_TEST_MEDIAMTX_BINS` those live tests are skipped. One version
+only: `tests/fetch_mediamtx.sh .cache/mediamtx v1.21.3` (CI runs each pinned
+version as its own job).
+
+**Try the newest upstream release** (what the advisory CI canary does): the
+newest stable `vX.Y.Z` tag is resolved with `git ls-remote`, and its tarball is
+verified against the `checksums.sha256` published with that release:
+```bash
+LYREBIRD_TEST_MEDIAMTX_BINS="$(tests/fetch_mediamtx.sh .cache/mediamtx latest)" \
+    bats tests/test_mediamtx_live.bats tests/test_soak_live.bats tests/test_soak_observer.bats
+```
+Only the pinned versions are blocking: a release the pins have not reviewed
+yet cannot fail a pull request.
 
 **Run specific test file:**
 ```bash
