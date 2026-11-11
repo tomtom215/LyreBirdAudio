@@ -84,6 +84,11 @@ INSTALL_DIR="${INSTALL_PREFIX}/bin"
 readonly SERVICE_DIR="/etc/systemd/system"
 readonly SERVICE_NAME="mediamtx.service"
 readonly CONFIG_NAME="mediamtx.yml"
+# Unit that runs the stream manager (and through it MediaMTX plus its FFmpeg
+# children). The name is shared with lyrebird-stream-manager.sh.
+readonly STREAM_MANAGER_UNIT="mediamtx-audio"
+# Seconds a stopping MediaMTX gets to exit after SIGTERM before SIGKILL.
+STOP_TIMEOUT="${MEDIAMTX_STOP_TIMEOUT:-10}"
 
 # Temporary directory and files
 TEMP_BASE="${TMPDIR:-/tmp}"
@@ -921,16 +926,165 @@ get_release_info() {
 # Detection Functions
 # ============================================================================
 
-detect_management_mode() {
-    if command -v systemctl &>/dev/null && systemctl is-active --quiet mediamtx 2>/dev/null; then
-        echo "systemd"
-    elif [[ -d "/var/lib/mediamtx-ffmpeg" ]] && pgrep -f "ffmpeg.*rtsp://localhost" &>/dev/null; then
-        echo "stream-manager"
-    elif pgrep -x "mediamtx" &>/dev/null; then
-        echo "manual"
+# --- Process identity ------------------------------------------------------
+#
+# The installer only ever signals a process it can PROVE is the MediaMTX it
+# manages: /proc/<pid>/exe resolves to the installed binary AND argv[1] is
+# exactly the installed config path. Process names, substrings and command-line
+# patterns never select a process; they also match unrelated programs (a
+# mediamtx-exporter, another installation's MediaMTX, any FFmpeg that talks to
+# any local RTSP server). Without /proc nothing can be proven, so nothing is
+# signalled.
+
+# Print the part of /proc/<pid>/stat that follows the command name ("state
+# ppid ..."). The command name is parenthesised and may itself contain spaces
+# or ')', so everything up to the LAST ") " is dropped.
+proc_stat_rest() {
+    local line=""
+    { line=$(<"/proc/$1/stat"); } 2>/dev/null || return 1
+    [[ "${line}" == *") "* ]] || return 1
+    printf '%s\n' "${line##*) }"
+}
+
+# Print a process's start time (field 22 of /proc/<pid>/stat). Together with
+# the PID it identifies one process even if the PID number is reused.
+proc_starttime() {
+    local rest=""
+    local -a fields=()
+    rest=$(proc_stat_rest "$1") || return 1
+    read -r -a fields <<<"${rest}"
+    [[ -n "${fields[19]:-}" ]] || return 1
+    printf '%s\n' "${fields[19]}"
+}
+
+# Succeeds while the process with this PID and start time exists and is not a
+# zombie. A reused PID has another start time and counts as "gone".
+proc_alive() {
+    local rest=""
+    local -a fields=()
+    rest=$(proc_stat_rest "$1") || return 1
+    read -r -a fields <<<"${rest}"
+    [[ "${fields[0]:-}" != "Z" && "${fields[0]:-}" != "X" ]] || return 1
+    [[ "${fields[19]:-}" == "$2" ]]
+}
+
+# Print argv[1] of a process (/proc/<pid>/cmdline is NUL-separated).
+proc_argv1() {
+    local argv1=""
+    {
+        IFS= read -r -d '' _ || true
+        IFS= read -r -d '' argv1 || true
+    } 2>/dev/null <"/proc/$1/cmdline" || return 1
+    printf '%s' "${argv1}"
+}
+
+# Print a path with symlinks resolved, or the path itself if that fails.
+canonical_path() {
+    local resolved=""
+    if resolved=$(readlink -f -- "$1" 2>/dev/null) && [[ -n "${resolved}" ]]; then
+        printf '%s\n' "${resolved}"
     else
-        echo "none"
+        printf '%s\n' "$1"
     fi
+}
+
+# Succeeds only if PID is provably the installed MediaMTX. The optional second
+# and third arguments (resolved binary path, config path) let a caller that
+# checks many PIDs resolve them once.
+is_managed_mediamtx_pid() {
+    local pid="$1"
+    local want_exe="${2:-}"
+    local want_cfg="${3:-}"
+    [[ "${pid}" =~ ^[1-9][0-9]*$ ]] || return 1
+    [[ -n "${want_exe}" ]] || want_exe=$(canonical_path "${INSTALL_DIR}/mediamtx")
+    [[ -n "${want_cfg}" ]] || want_cfg="${CONFIG_DIR}/${CONFIG_NAME}"
+
+    # argv[1] first: it is read without forking, and rules out almost everything
+    local argv1=""
+    argv1=$(proc_argv1 "${pid}") || return 1
+    [[ "${argv1}" == "${want_cfg}" ]] || return 1
+
+    local exe=""
+    exe=$(readlink "/proc/${pid}/exe" 2>/dev/null) || return 1
+    # The running image of a binary that an update has since replaced is
+    # reported as "<path> (deleted)"; it is still the installed MediaMTX.
+    local deleted_suffix=" (deleted)"
+    exe="${exe%"${deleted_suffix}"}"
+    [[ "${exe}" == "${want_exe}" ]]
+}
+
+# Print the PID of every process that is provably the installed MediaMTX.
+find_managed_mediamtx_pids() {
+    [[ -d /proc/self ]] || return 0
+    local want_exe want_cfg dir pid
+    want_exe=$(canonical_path "${INSTALL_DIR}/mediamtx")
+    want_cfg="${CONFIG_DIR}/${CONFIG_NAME}"
+    for dir in /proc/[0-9]*; do
+        pid="${dir#/proc/}"
+        if is_managed_mediamtx_pid "${pid}" "${want_exe}" "${want_cfg}"; then
+            printf '%s\n' "${pid}"
+        fi
+    done
+    return 0
+}
+
+# Print the MediaMTX PID the stream manager recorded in its PID file, if any.
+read_stream_manager_pid() {
+    local pid_file="${MEDIAMTX_PID_FILE:-/run/mediamtx-audio.pid}"
+    local pid=""
+    [[ -f "${pid_file}" ]] || return 0
+    read -r pid _ <"${pid_file}" 2>/dev/null || true
+    if [[ "${pid}" =~ ^[1-9][0-9]*$ ]]; then
+        printf '%s\n' "${pid}"
+    fi
+    return 0
+}
+
+# Succeeds when running as root. Reading /proc/<pid>/exe of another user's
+# process needs root, so a non-root run cannot identify every MediaMTX.
+is_root() {
+    [[ "${EUID}" -eq 0 ]]
+}
+
+# Print how the running MediaMTX is managed:
+#   systemd                 mediamtx.service is active
+#   stream-manager-service  mediamtx-audio.service (stream manager) is active
+#   stream-manager          a verified MediaMTX the stream manager recorded in its PID file
+#   manual                  any other verified MediaMTX
+#   none                    nothing that can be proven to be the installed MediaMTX
+detect_management_mode() {
+    if command -v systemctl &>/dev/null; then
+        if systemctl is-active --quiet mediamtx 2>/dev/null; then
+            echo "systemd"
+            return 0
+        fi
+        if systemctl is-active --quiet "${STREAM_MANAGER_UNIT}" 2>/dev/null; then
+            echo "stream-manager-service"
+            return 0
+        fi
+    fi
+
+    local found=""
+    found=$(find_managed_mediamtx_pids)
+    if [[ -z "${found}" ]]; then
+        echo "none"
+        return 0
+    fi
+
+    local recorded=""
+    recorded=$(read_stream_manager_pid)
+    if [[ -n "${recorded}" ]]; then
+        local -a pids=()
+        local pid
+        mapfile -t pids <<<"${found}"
+        for pid in "${pids[@]}"; do
+            if [[ "${pid}" == "${recorded}" ]]; then
+                echo "stream-manager"
+                return 0
+            fi
+        done
+    fi
+    echo "manual"
 }
 
 find_stream_manager() {
@@ -1320,8 +1474,9 @@ update_mediamtx() {
     WAS_RUNNING=false
     [[ "${MANAGEMENT_MODE}" != "none" ]] && WAS_RUNNING=true
 
-    # Stop MediaMTX
-    stop_mediamtx "${MANAGEMENT_MODE}"
+    # Stop MediaMTX. If it cannot be stopped, leave the installed binary alone.
+    stop_mediamtx "${MANAGEMENT_MODE}" \
+        || fatal "Could not stop MediaMTX (${MANAGEMENT_MODE}); the installed binary was not changed" 7
 
     # Create backup
     BINARY_BACKUP="${INSTALL_DIR}/mediamtx.backup.$(date +%Y%m%d-%H%M%S)"
@@ -1424,9 +1579,13 @@ verify_service_started() {
             systemd)
                 systemctl is-active --quiet mediamtx && return 0
                 ;;
+            stream-manager-service)
+                systemctl is-active --quiet "${STREAM_MANAGER_UNIT}" && return 0
+                ;;
             *)
-                # stream-manager / manual: a mediamtx process must exist
-                pgrep -x mediamtx >/dev/null 2>&1 && return 0
+                # stream-manager / manual: the installed MediaMTX must be running
+                # (proven by identity; a process that merely has the name does not count)
+                [[ -n "$(find_managed_mediamtx_pids)" ]] && return 0
                 ;;
         esac
         sleep 1
@@ -1434,6 +1593,110 @@ verify_service_started() {
     return 1
 }
 
+# Stop a systemd unit and confirm it is no longer active. If systemd cannot stop
+# it, nothing else is signalled: killing a unit's process behind systemd's back
+# only fights its Restart= policy.
+stop_systemd_unit() {
+    local unit="$1"
+
+    log_info "Stopping ${unit} service..."
+    if ! systemctl stop "${unit}"; then
+        if systemctl is-active --quiet "${unit}" 2>/dev/null; then
+            log_error "systemctl stop ${unit} failed and the unit is still active"
+            return 1
+        fi
+        log_warn "systemctl stop ${unit} reported a failure, but the unit is no longer active"
+    fi
+    return 0
+}
+
+# Wait up to $1 seconds for every "pid:starttime" argument to exit. Succeeds
+# when none is left running.
+wait_for_managed_exit() {
+    local timeout="$1"
+    shift
+
+    # Poll every 0.2 s where sleep takes fractions, otherwise every second.
+    local per_second=5 delay=0.2
+    if ! sleep 0.01 2>/dev/null; then
+        per_second=1
+        delay=1
+    fi
+
+    local ticks=$((timeout * per_second))
+    local tick entry running
+    for ((tick = 0; tick <= ticks; tick++)); do
+        running=false
+        for entry in "$@"; do
+            if proc_alive "${entry%%:*}" "${entry#*:}"; then
+                running=true
+            fi
+        done
+        [[ "${running}" == "true" ]] || return 0
+        if ((tick < ticks)); then
+            sleep "${delay}"
+        fi
+    done
+    return 1
+}
+
+# Send one signal to one PID, but only if that PID is still the same process
+# that was identified (start time) and is still provably the installed MediaMTX.
+signal_managed_pid() {
+    local sig="$1"
+    local pid="$2"
+    local start="$3"
+
+    proc_alive "${pid}" "${start}" || return 1
+    is_managed_mediamtx_pid "${pid}" || return 1
+    kill "-${sig}" "${pid}" 2>/dev/null
+}
+
+# Stop every process that is provably the installed MediaMTX: SIGTERM, a
+# bounded wait, then SIGKILL for the ones that are still running. Returns 1 if
+# one of them survives.
+terminate_managed_mediamtx() {
+    local timeout="${STOP_TIMEOUT}"
+    [[ "${timeout}" =~ ^[1-9][0-9]*$ ]] || timeout=10
+
+    local -a entries=()
+    local pid start entry
+    while IFS= read -r pid; do
+        [[ -n "${pid}" ]] || continue
+        start=$(proc_starttime "${pid}") || continue
+        entries+=("${pid}:${start}")
+    done < <(find_managed_mediamtx_pids)
+
+    [[ ${#entries[@]} -gt 0 ]] || return 0
+
+    for entry in "${entries[@]}"; do
+        log_info "Stopping MediaMTX (PID ${entry%%:*})..."
+        signal_managed_pid TERM "${entry%%:*}" "${entry#*:}" || true
+    done
+
+    if wait_for_managed_exit "${timeout}" "${entries[@]}"; then
+        return 0
+    fi
+
+    for entry in "${entries[@]}"; do
+        if signal_managed_pid KILL "${entry%%:*}" "${entry#*:}"; then
+            log_warn "MediaMTX (PID ${entry%%:*}) did not exit ${timeout}s after SIGTERM; sent SIGKILL"
+        fi
+    done
+
+    if wait_for_managed_exit 5 "${entries[@]}"; then
+        return 0
+    fi
+
+    log_error "MediaMTX is still running after SIGKILL"
+    return 1
+}
+
+# Stop MediaMTX. Everything goes through the owner of the process: systemd when
+# a unit runs it, the stream manager's own stop command otherwise. Whatever is
+# still running afterwards and is provably the installed MediaMTX is then
+# stopped by PID. FFmpeg processes are never signalled here.
+# Returns 1 if MediaMTX could not be stopped; the caller must not go on.
 stop_mediamtx() {
     local mode="$1"
 
@@ -1444,8 +1707,12 @@ stop_mediamtx() {
 
     case "${mode}" in
         systemd)
-            log_info "Stopping MediaMTX service..."
-            systemctl stop mediamtx || log_warn "Failed to stop service cleanly"
+            stop_systemd_unit mediamtx || return 1
+            ;;
+
+        stream-manager-service)
+            # Stopping the unit stops the stream manager's FFmpeg children too
+            stop_systemd_unit "${STREAM_MANAGER_UNIT}" || return 1
             ;;
 
         stream-manager)
@@ -1453,32 +1720,25 @@ stop_mediamtx() {
             if stream_manager=$(find_stream_manager); then
                 log_info "Stopping MediaMTX via stream manager..."
                 if ! "${stream_manager}" stop; then
-                    log_warn "Stream manager stop failed, using manual stop"
-                    pkill -f "ffmpeg.*rtsp://localhost" 2>/dev/null || true
-                    pkill mediamtx 2>/dev/null || true
+                    log_warn "Stream manager stop failed; stopping only the verified MediaMTX process."
+                    log_warn "FFmpeg streams it started were NOT touched; stop them with: sudo ${stream_manager} stop"
                 fi
             else
-                log_info "Stopping MediaMTX manually..."
-                pkill -f "ffmpeg.*rtsp://localhost" 2>/dev/null || true
-                pkill mediamtx 2>/dev/null || true
+                log_warn "Stream manager not found; stopping only the verified MediaMTX process."
+                log_warn "Any FFmpeg streams it started were NOT touched."
             fi
+            ;;
+
+        none)
+            log_debug "No running MediaMTX was detected"
             ;;
 
         manual | *)
             log_info "Stopping MediaMTX..."
-            pkill mediamtx 2>/dev/null || true
             ;;
     esac
 
-    # Wait for processes to stop
-    sleep 2
-
-    # Force kill if still running
-    if pgrep -x "mediamtx" &>/dev/null; then
-        log_warn "MediaMTX still running, forcing stop..."
-        pkill -9 mediamtx 2>/dev/null || true
-        sleep 1
-    fi
+    terminate_managed_mediamtx
 }
 
 start_mediamtx() {
@@ -1493,6 +1753,11 @@ start_mediamtx() {
         systemd)
             log_info "Starting MediaMTX service..."
             systemctl start mediamtx || log_error "Failed to start service"
+            ;;
+
+        stream-manager-service)
+            log_info "Starting ${STREAM_MANAGER_UNIT} service..."
+            systemctl start "${STREAM_MANAGER_UNIT}" || log_error "Failed to start ${STREAM_MANAGER_UNIT} service"
             ;;
 
         stream-manager)
@@ -1527,7 +1792,8 @@ uninstall_mediamtx() {
     mode=$(detect_management_mode)
     if [[ "${mode}" != "none" ]]; then
         log_info "Stopping MediaMTX (${mode})..."
-        stop_mediamtx "${mode}"
+        stop_mediamtx "${mode}" \
+            || fatal "Could not stop MediaMTX (${mode}); nothing was removed" 7
     fi
 
     # Remove systemd service if present
@@ -1640,6 +1906,9 @@ show_status() {
         systemd)
             echo -e "Status: ${GREEN}[OK] Running (systemd)${NC}"
             ;;
+        stream-manager-service)
+            echo -e "Status: ${GREEN}[OK] Running (stream manager service)${NC}"
+            ;;
         stream-manager)
             echo -e "Status: ${YELLOW}[!] Running (stream manager)${NC}"
             ;;
@@ -1647,7 +1916,11 @@ show_status() {
             echo -e "Status: ${YELLOW}[!] Running (manual)${NC}"
             ;;
         none)
-            echo -e "Status: ${RED}[--] Not running${NC}"
+            if is_root; then
+                echo -e "Status: ${RED}[--] Not running${NC}"
+            else
+                echo -e "Status: ${YELLOW}[?] Not detected (run as root to identify a MediaMTX started outside systemd)${NC}"
+            fi
             ;;
     esac
 
@@ -1684,7 +1957,7 @@ show_status() {
             elif [[ -n "${port_status}" ]]; then
                 echo -e "  ${label} (${port}): ${GREEN}[OK] In use${NC}"
             else
-                if [[ "${management_mode}" == "stream-manager" ]] || [[ "${management_mode}" == "systemd" ]]; then
+                if [[ "${management_mode}" == "stream-manager" ]] || [[ "${management_mode}" == "stream-manager-service" ]] || [[ "${management_mode}" == "systemd" ]]; then
                     echo -e "  ${label} (${port}): ${YELLOW}[?] Status unknown${NC}"
                 else
                     echo -e "  ${label} (${port}): ${YELLOW}[--] Not in use${NC}"
@@ -1797,6 +2070,12 @@ show_post_update_guidance() {
             echo "  • Status: sudo systemctl status mediamtx"
             echo "  • Logs:   sudo journalctl -u mediamtx -f"
             ;;
+        stream-manager-service)
+            echo ""
+            echo "Quick Commands:"
+            echo "  • Status: sudo systemctl status ${STREAM_MANAGER_UNIT}"
+            echo "  • Logs:   sudo journalctl -u ${STREAM_MANAGER_UNIT} -f"
+            ;;
         stream-manager)
             echo ""
             echo "Quick Commands:"
@@ -1863,6 +2142,8 @@ ${BOLD}ENVIRONMENT VARIABLES:${NC}
     MEDIAMTX_STATE_DIR    State directory
     MEDIAMTX_USER         Service user name
     MEDIAMTX_GROUP        Service group name
+    MEDIAMTX_STOP_TIMEOUT Seconds MediaMTX gets to exit after SIGTERM before SIGKILL (default 10)
+    MEDIAMTX_PID_FILE     PID file of the stream manager's MediaMTX (default /run/mediamtx-audio.pid)
 
 ${BOLD}UPDATE NOTES:${NC}
     The update command uses MediaMTX's built-in --upgrade functionality
