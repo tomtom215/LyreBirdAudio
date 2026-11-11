@@ -283,7 +283,7 @@ get_free_space_mb() {
 get_dir_size() {
     local path="$1"
     if [[ -d "$path" ]]; then
-        du -sb "$path" 2>/dev/null | cut -f1
+        du -sbD "$path" 2>/dev/null | cut -f1
     else
         echo "0"
     fi
@@ -382,7 +382,12 @@ _recently_modified() {
 }
 
 # Regular files under $1 that match the find arguments after it, oldest first,
-# as NUL-terminated "<mtime> <path>" records. Equal mtimes are ordered by path
+# as NUL-terminated "<mtime> <path>" records. A symlink given as $1 itself is
+# followed (-H): /var/lib/.../recordings -> /mnt/usb is a normal setup, and
+# without -H find sees only the link and reports nothing, so retention and
+# eviction silently did nothing. Symlinks found INSIDE the tree are never
+# followed (-type f excludes them), so nothing outside the configured directory
+# can be reached through one. Equal mtimes are ordered by path
 # in byte order (LC_ALL=C), so the same tree is always evicted in the same
 # order whatever the locale. NUL-terminated because a name may contain a
 # newline: the old newline-separated pipeline turned the tail of such a name
@@ -391,7 +396,7 @@ _recently_modified() {
 _list_oldest_first() {
     local root="$1"
     shift
-    find "$root" -type f "$@" -printf '%T@ %p\0' 2>/dev/null | LC_ALL=C sort -z -k1,1n -k2
+    find -H "$root" -type f "$@" -printf '%T@ %p\0' 2>/dev/null | LC_ALL=C sort -z -k1,1n -k2
 }
 
 # Delete the oldest files under $1, at most $2 attempts (0 = no limit), logging
@@ -474,7 +479,7 @@ cleanup_recordings() {
         else
             ((++failed))
         fi
-    done < <(find "$RECORDING_DIR" -type f "${RECORDING_NAME_TEST[@]}" -empty -print0 2>/dev/null)
+    done < <(find -H "$RECORDING_DIR" -type f "${RECORDING_NAME_TEST[@]}" -empty -print0 2>/dev/null)
 
     # Find and delete old recording files
     while IFS= read -r -d '' file; do
@@ -492,7 +497,7 @@ cleanup_recordings() {
         else
             ((++failed))
         fi
-    done < <(find "$RECORDING_DIR" -type f "${RECORDING_NAME_TEST[@]}" -mtime "+${RECORDING_RETENTION_DAYS}" -print0 2>/dev/null)
+    done < <(find -H "$RECORDING_DIR" -type f "${RECORDING_NAME_TEST[@]}" -mtime "+${RECORDING_RETENTION_DAYS}" -print0 2>/dev/null)
 
     if [[ $kept_broken_clock -gt 0 ]]; then
         log_warn "Kept $kept_broken_clock recording(s) with pre-${CLOCK_SANE_EPOCH} mtimes (written before NTP sync; real age unknown)"
@@ -503,7 +508,7 @@ cleanup_recordings() {
     # itself, and if the recorder does not recreate it on the next write, every
     # subsequent recording silently fails — permanent data loss on an
     # unattended box.
-    find "$RECORDING_DIR" -mindepth 1 -type d -empty -delete 2>/dev/null || true
+    find -H "$RECORDING_DIR" -mindepth 1 -type d -empty -delete 2>/dev/null || true
 
     if [[ $empty_removed -gt 0 ]]; then
         log_info "Removed $empty_removed empty recording segment(s) idle for over ${ACTIVE_SEGMENT_SECONDS}s"
@@ -541,7 +546,7 @@ cleanup_temp() {
 
     # Clean memory buffer directory if present
     if [[ -d "$BUFFER_DIR" ]]; then
-        _sweep "buffer" < <(find "$BUFFER_DIR" -type f -mmin "+$((TEMP_RETENTION_HOURS * 60))" -print0 2>/dev/null)
+        _sweep "buffer" < <(find -H "$BUFFER_DIR" -type f -mmin "+$((TEMP_RETENTION_HOURS * 60))" -print0 2>/dev/null)
     fi
 
     log_info "Cleaned $SWEEP_DELETED temp file(s), freed $(format_bytes "$SWEEP_FREED")$(_failed_suffix "$SWEEP_FAILED")"
@@ -700,8 +705,8 @@ cmd_status() {
         local rec_count empty_count
         # `|| true`: find exits 1 on an unreadable subdirectory, which under
         # pipefail would abort `status` before it printed anything.
-        rec_count=$({ find "$RECORDING_DIR" -type f "${RECORDING_NAME_TEST[@]}" ! -empty 2>/dev/null || true; } | wc -l)
-        empty_count=$({ find "$RECORDING_DIR" -type f "${RECORDING_NAME_TEST[@]}" -empty 2>/dev/null || true; } | wc -l)
+        rec_count=$({ find -H "$RECORDING_DIR" -type f "${RECORDING_NAME_TEST[@]}" ! -empty 2>/dev/null || true; } | wc -l)
+        empty_count=$({ find -H "$RECORDING_DIR" -type f "${RECORDING_NAME_TEST[@]}" -empty 2>/dev/null || true; } | wc -l)
         printf "  Path: %s\n" "$RECORDING_DIR"
         printf "  Size: %s\n" "$(format_bytes "$rec_size")"
         printf "  Files: %d\n" "$rec_count"
