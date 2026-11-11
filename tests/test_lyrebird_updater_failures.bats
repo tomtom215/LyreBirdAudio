@@ -410,8 +410,6 @@ _updater_vars() {
     updater_make_big_tag
     export SMALL="$NODE/small"
     mkdir -p "$SMALL"
-    updater_stdin 3 v1.4.0 y
-    export INPUT="$UPDATER_INPUT"
     run "${UNSHARE_CMD[@]}" bash -c '
         mount -t tmpfs -o size=3m tmpfs "$SMALL" || exit 99
         cp -a "$REPO" "$SMALL/repo"
@@ -421,8 +419,11 @@ _updater_vars() {
         echo "precious edit" >>config.txt
         free_kb="$(df -k --output=avail . | tail -1)"
         dd if=/dev/zero of="$SMALL/filler" bs=1k count=$((free_kb - 300)) 2>/dev/null
-        printf "%s" "$INPUT" | env PATH="$SHIMS:$PATH" bash ./lyrebird-updater.sh >"$SMALL/out.txt" 2>&1
-        echo "RC=$?"
+        # inside the namespace the user may be root (unshare -r): answer the root prompt and
+        # let the repository pass the updater'"'"'s "owned by root" check
+        { [ "$EUID" -eq 0 ] && echo y; printf "3\nv1.4.0\ny\n"; } \
+            | env UPDATER_FAKE_OWNER=fixture PATH="$SHIMS:$PATH" bash ./lyrebird-updater.sh >"$SMALL/out.txt" 2>&1
+        echo "RC=${PIPESTATUS[1]}"
         echo "HEAD=$(git describe --tags --exact-match 2>/dev/null)"
         echo "DIRTY=$(git -c core.fileMode=false status --porcelain | wc -l)"
         echo "EDIT=$(grep -c "precious edit" config.txt)"

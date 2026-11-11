@@ -15,7 +15,7 @@ Unit tests for LyreBirdAudio using the [Bats](https://github.com/bats-core/bats-
 | lyrebird-metrics.sh | test_lyrebird_metrics.bats | 39 | 55% |
 | lyrebird-storage.sh | test_lyrebird_storage.bats | 59 | 65% |
 | lyrebird-updater.sh | test_lyrebird_updater.bats | 58 | 75% |
-| lyrebird-updater.sh, real git repositories with injected failures | test_lyrebird_updater_failures.bats, test_lyrebird_updater_history.bats, test_lyrebird_updater_rollback.bats | 51 + 11 + 18 | not estimated (real script vs. local bare origin; see `tests/updater_helper.bash`) |
+| lyrebird-updater.sh, real git repositories with injected failures | test_lyrebird_updater_failures.bats, test_lyrebird_updater_history.bats, test_lyrebird_updater_rollback.bats | 55 + 12 + 19 | not estimated (real script vs. local bare origin; see `tests/updater_helper.bash`) |
 | install_mediamtx.sh | test_install_mediamtx.bats | 66 | 70% |
 | lyrebird-mic-check.sh | test_lyrebird_mic_check.bats | 45 | 70% |
 | lyrebird-stream-manager.sh vs. MediaMTX versions | test_mediamtx_config_versions.bats, test_mediamtx_live.bats | 4 + 1 live | not estimated |
