@@ -337,7 +337,7 @@ teardown() {
     [[ "$output" == *"USAGE:"* ]]
     # Every user-facing flag main() accepts is documented.
     local flag
-    for flag in --status --list --history --migrate --version --help; do
+    for flag in --status --list --history --rollback --migrate --version --help; do
         [[ "$output" == *"$flag"* ]]
     done
 }

@@ -7,9 +7,21 @@
 # Copyright: Tom F and LyreBirdAudio contributors
 # License: Apache 2.0
 #
-# Version: 1.6.1
+# Version: 1.7.0
 #
-# NEW in v1.6.0:
+# NEW in v1.7.0:
+#   - --rollback [VERSION]: back to the previous version (or a tag/commit already
+#     in the clone) with the update's own transaction, no network needed
+#   - --history: past updates, failures and rollbacks (local append-only log)
+#   - Crash-safe updates: a journal in the git directory; an update killed halfway
+#     is undone (or, after a self-update hand-over, completed) by the next run
+#   - The automatic rollback now returns to the original commit (it was a no-op
+#     for tag installs) and never discards uncommitted work
+#   - The lock moved out of the working tree; saved changes that conflict with the
+#     new version stay in the stash instead of leaving conflict markers
+#   - Bounded network access (no hang on a dead uplink); --list exits 4 offline
+#
+# v1.6.0:
 #   - Automatic post-update migrations for breaking changes
 #   - Handles script renames (mediamtx-stream-manager.sh -> lyrebird-stream-manager.sh)
 #   - Updates systemd services, cron jobs, and /usr/local/bin installations
@@ -77,7 +89,7 @@ SCRIPT_NAME="$(basename "${BASH_SOURCE[0]}")"
 readonly SCRIPT_NAME
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly SCRIPT_DIR
-readonly VERSION="1.6.1"
+readonly VERSION="1.7.0"
 
 # Updater state: the lock, the update history and the transaction journal live
 # in a directory INSIDE the git directory, never in the working tree. A lock in
@@ -3165,6 +3177,85 @@ set_script_permissions() {
 }
 
 ################################################################################
+# Rollback Command
+################################################################################
+
+# lyrebird-updater.sh --rollback [VERSION]
+# Goes back to a version that is already in this clone, as the same
+# transaction an update is (stash, service handling, migrations, journal,
+# history), and without any network access.
+#   no VERSION  the version the last completed update, rollback or reset left
+#   VERSION     a release tag, or a commit; a branch name is refused (a
+#               rollback is to an exact commit, not to "the latest of a branch")
+# Exit status: that of the switch (0, 1, 5, 8, 9, 10, 11), 6 when the version is
+# not in the clone.
+rollback_command() {
+    local requested="${1:-}"
+    local commit="" target="" label=""
+
+    if [[ -n "$requested" ]]; then
+        if [[ ! "$requested" =~ ^[a-zA-Z0-9._/-]+$ ]]; then
+            log_error "Invalid version: $requested"
+            return "$E_GENERAL"
+        fi
+        if git show-ref --verify --quiet "refs/tags/${requested}"; then
+            target="$requested"
+        elif git show-ref --verify --quiet "refs/heads/${requested}" \
+            || git show-ref --verify --quiet "refs/remotes/origin/${requested}"; then
+            log_error "'${requested}' is a branch. A rollback goes back to a release tag or to a commit."
+            log_info "To follow a branch, use option 3 of the menu."
+            return "$E_GENERAL"
+        fi
+        if ! commit="$(git rev-parse --verify --quiet "${requested}^{commit}" 2>/dev/null)"; then
+            log_error "Version '${requested}' is not available in this repository"
+            log_info "A rollback never uses the network. For a release that has not been fetched yet,"
+            log_info "run '${SCRIPT_NAME} --list' while online (or: git fetch --tags), then try again."
+            log_info "Releases in this clone: git tag -l 'v*'    What was installed: ${SCRIPT_NAME} --history"
+            return "$E_NOT_FOUND"
+        fi
+        [[ -n "$target" ]] || target="$commit"
+        label="$requested"
+    else
+        local line from_commit from_label to_commit
+        line="$(history_last_change)"
+        if [[ -z "$line" ]]; then
+            log_error "There is no previous version to go back to: no completed update is recorded."
+            log_info "Name the version instead: ${SCRIPT_NAME} --rollback v1.2.3"
+            log_info "What this node has had: ${SCRIPT_NAME} --history    Releases here: git tag -l 'v*'"
+            return "$E_NOT_FOUND"
+        fi
+        IFS=$'\t' read -r _ _ _ from_commit from_label to_commit _ <<<"$line"
+        if [[ "$from_commit" == "-" ]]; then
+            log_error "The last update did not record the version it came from (an older updater started it)."
+            log_info "Name the version instead: ${SCRIPT_NAME} --rollback v1.2.3"
+            return "$E_NOT_FOUND"
+        fi
+        if ! commit="$(git rev-parse --verify --quiet "${from_commit}^{commit}" 2>/dev/null)"; then
+            log_error "The previous version (${from_label}, ${from_commit:0:7}) is no longer in this clone."
+            log_info "Name another one: ${SCRIPT_NAME} --rollback VERSION    Releases here: git tag -l 'v*'"
+            return "$E_NOT_FOUND"
+        fi
+        if [[ "$(git rev-parse HEAD 2>/dev/null || true)" != "$to_commit" ]]; then
+            log_warn "This node is not at the version the last update recorded; going back to ${from_label} anyway."
+        fi
+        label="$from_label"
+        target="$commit"
+        # a release tag that still names that commit reads better in the output
+        if [[ "$from_label" != "-" ]] && [[ "$(git rev-parse --verify --quiet "refs/tags/${from_label}^{commit}" 2>/dev/null || true)" == "$commit" ]]; then
+            target="$from_label"
+        fi
+    fi
+
+    if [[ "$(git rev-parse HEAD 2>/dev/null || true)" == "$commit" ]]; then
+        log_info "Already on ${label} (${commit:0:7}); nothing to do."
+        return 0
+    fi
+
+    log_info "Rolling back to ${label} (${commit:0:7}); the network is not used."
+    switch_version_safe "$target" rollback
+}
+
+################################################################################
 # Version Listing and Selection
 ################################################################################
 
@@ -3549,6 +3640,9 @@ USAGE:
   ${SCRIPT_NAME} --status     Show current version, branch and sync status (-s)
   ${SCRIPT_NAME} --list       Fetch and list available versions (-l)
   ${SCRIPT_NAME} --history    Show past updates, failures and rollbacks (no network needed)
+  ${SCRIPT_NAME} --rollback [VERSION]
+                              Go back to the previous version, or to a release tag or
+                              commit already in this clone (no network needed)
   ${SCRIPT_NAME} --migrate    Run post-update migrations
   ${SCRIPT_NAME} --version    Print the updater version (-v)
   ${SCRIPT_NAME} --help       Show this help (-h)
@@ -3641,7 +3735,13 @@ Q: What happens to my systemd service?
 A: It's automatically stopped, updated, and restarted with your custom config
 
 Q: Can I undo an update?
-A: Yes, use option 3 to switch back to any previous version
+A: Yes. '${SCRIPT_NAME} --rollback' returns to the previous version, '--rollback v1.3.0'
+   to a release already in this clone; '--history' shows what was installed. Option 3
+   of the menu also switches to any version (it can fetch new ones first).
+
+Q: The updater was killed or the power failed in the middle of an update.
+A: Run '${SCRIPT_NAME}' again: it finds the unfinished update and undoes it (or, for a
+   self-update, completes it). Your uncommitted changes are never discarded.
 
 Q: What if something goes wrong?
 A: The script automatically tries to recover, including service restoration
@@ -4001,6 +4101,16 @@ main() {
                 echo
                 run_post_update_migrations
                 exit "$E_SUCCESS"
+                ;;
+
+            --rollback)
+                if [[ $# -gt 2 ]]; then
+                    log_error "Usage: ${SCRIPT_NAME} --rollback [VERSION]"
+                    exit "$E_GENERAL"
+                fi
+                local rollback_status=0
+                rollback_command "${2:-}" || rollback_status=$?
+                exit "$rollback_status"
                 ;;
 
             *)
