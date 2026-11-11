@@ -52,8 +52,23 @@
       "title": "multiplex stream name differs between publisher and MediaMTX config",
       "severity": "P1",
       "phase": 4,
-      "status": "open",
-      "tests": []
+      "status": "fixed",
+      "tests": [
+        "-n is canonicalised by the real command line: status finds the stream under the canonical name [LB-04]",
+        "a hostile name cannot add a YAML key to the generated config [LB-04]",
+        "a name with a newline and YAML syntax becomes one harmless line [LB-04]",
+        "a name with a newline and a runOnInit line starts MediaMTX without running the injected command [LB-04, live]",
+        "a stream name with a control character, a line break or a non-ASCII byte is refused, so it cannot inject YAML [LB-04]",
+        "any printable stream name comes back from a YAML parser as exactly that one path name [LB-04]",
+        "every canonical name from the register's matrix loads in real MediaMTX and is published to [LB-04, live]",
+        "monitor finds the multiplex stream under the canonical name, hyphen included, and does not restart it [LB-04]",
+        "multiplex configuration: the named path accepts a publisher and every other path is refused [LB-04]",
+        "multiplex mode renders one quoted path; a stream name that is not a plain scalar cannot inject YAML [LB-04, LB-22]",
+        "names within MediaMTX's path syntax work quoted; one outside it is refused by MediaMTX itself, never read as YAML [LB-04]",
+        "the generated MediaMTX config has the same path name as the publisher [LB-04]",
+        "the multiplex wrapper, its PID file and its stream path use the canonical name [LB-04]",
+        "the register's name matrix maps to canonical names [LB-04, D13]"
+      ]
     },
     {
       "id": "LB-05",
@@ -89,7 +104,29 @@
       "severity": "P1",
       "phase": 4,
       "status": "open",
-      "tests": []
+      "tests": [
+        "RTSP is open by default: an anonymous remote client can publish and read. Asserted so that a change is deliberate [LB-06]",
+        "RTSP_AUTH_MODE=local-only-publish: the manager's own readiness and stream probes keep working on every version, with no credentials [LB-06, LB-13]",
+        "RTSP_AUTH_MODE=local-only-publish: this machine needs no credentials, a remote client needs a listed user, who can read but not publish [LB-06]",
+        "a file that now carries password hashes loses world access and group write; other modes are kept; hash-free renderings keep any mode [LB-06]",
+        "a missing users file is a warning, and only this machine may use RTSP [LB-06]",
+        "a publisher without credentials can publish and a client without credentials can read, from this machine [LB-06]",
+        "a users file with a plaintext password stops the start and nothing is written [LB-06]",
+        "an API bound to every interface under local-only-publish still answers 401 to a remote caller, the local machine keeps its access [LB-06]",
+        "local-only-publish renders the hardened pattern with the users of RTSP_USERS_FILE, and the file loses world access [LB-06]",
+        "local-only-publish: a plaintext password, a bad hash and a malformed line are refused without echoing the line [LB-06]",
+        "local-only-publish: each users-file line becomes a read-only remote user with a hashed password [LB-06]",
+        "local-only-publish: the loopback 'any' user may do everything, and nothing else is granted without a users file [LB-06]",
+        "local-only-publish: the user name 'any' is reserved, a duplicate is refused, an unreadable file is refused [LB-06]",
+        "moq: no is written for MediaMTX 1.19.0 and later, left out before it and when the version is unknown [LB-06]",
+        "publishers that do not connect through a loopback name are warned about under local-only-publish [LB-06]",
+        "the API and metrics listen on the loopback address by default; MEDIAMTX_API_BIND and MEDIAMTX_METRICS_BIND change that [D9, LB-06]",
+        "the API and the metrics endpoint cannot be reached from a remote address; bound to every interface they answer 401 there, 200 here [LB-06, D9]",
+        "the default configuration starts on every MediaMTX version and opens exactly the sockets it names, no SRT, MoQ, RTMP, HLS or WebRTC [LB-06]",
+        "the default users file is rtsp-users.conf in the MediaMTX configuration directory [LB-06]",
+        "the warning says when the operator-owned file is the one an earlier release wrote, whose API is on every interface [LB-06]"
+      ],
+      "note": "manager side fixed and verified on six real MediaMTX versions (loopback API/metrics, quoted stream name, optional local-only-publish auth); installer config (SRT/MoQ, all-interface API/metrics) is installer pass 2"
     },
     {
       "id": "LB-07",
@@ -104,16 +141,48 @@
       "title": "device config is sourced as executable shell",
       "severity": "P1",
       "phase": 4,
-      "status": "open",
-      "tests": []
+      "status": "fixed",
+      "tests": [
+        "'exec' does not replace the manager [LB-08]",
+        "'exit 0' and 'exit 3' end nothing and are reported [LB-08]",
+        "'sleep' does not run (it used to run twice, in validation and in the loader) [LB-08]",
+        "a 1 MB line makes the file too large, and is refused in bounded time [LB-08]",
+        "a config file larger than 64 KiB is one error and contributes nothing [LB-08]",
+        "a directory or a FIFO where the config file should be is an error and is never read [LB-08]",
+        "a file of garbage lines stops being read after 100 problems, in bounded time [LB-08]",
+        "a trap line does not remove the manager's own trap [LB-08, X-09]",
+        "a very long line in a file of acceptable size is refused quickly, whatever it holds, and the lines around it are read [LB-08]",
+        "an unbound variable on a line cannot kill the manager under set -u [LB-08, X-09]",
+        "an unterminated quote costs that line only [LB-08]",
+        "backslashes and dollar signs inside double quotes are not interpreted [LB-08]",
+        "binary junk is reported, capped, and ends nothing [LB-08]",
+        "command substitution and backticks in a value are never run [LB-08]",
+        "control characters in a bad value are not written to the log raw [LB-08]",
+        "hostile values in the device config never reach a wrapper: it carries the defaults, in both modes [LB-09, LB-08]",
+        "restart's path to the config, generate_mediamtx_config, survives a config that used to end the manager [LB-08]",
+        "shell syntax after a value is an error and is not run [LB-08]",
+        "source, dot, eval, function definitions and compound commands are not run [LB-08]",
+        "start does not stop for a bad device config: the main start arm goes on to start (README: a bad config never stops streams) [LB-08]",
+        "the generator and the loader go on, and the good settings stay, when other lines are bad [LB-08]",
+        "the real validate command survives every hostile file and never runs it [LB-08]",
+        "the validate command exits 4 on an unusable line, names the line, and leaves no cleanup marker [LB-08]"
+      ]
     },
     {
       "id": "LB-09",
       "title": "generated wrappers interpolate unescaped config values",
       "severity": "P2",
       "phase": 4,
-      "status": "open",
-      "tests": []
+      "status": "fixed",
+      "tests": [
+        "a codec with no encoder arguments stops a multiplex start, whatever the validation layer let through [X-28, LB-09]",
+        "a wrapper generated from hostile values, run for real, runs none of them [LB-09, X-10]",
+        "every vector in every setting of a multiplex wrapper stays data, device names and encoder arguments included [LB-09, X-10]",
+        "every vector in every setting of an individual wrapper stays data: no code runs and each value round-trips [LB-09, X-10]",
+        "hostile values in the device config never reach a wrapper: it carries the defaults, in both modes [LB-09, LB-08]",
+        "ordinary settings from the config reach both wrappers unchanged [LB-09]",
+        "paths and names taken from the environment and the arguments stay data too [LB-09, X-10]"
+      ]
     },
     {
       "id": "LB-10",
@@ -186,8 +255,39 @@
       "title": "readiness accepts any HTTP response",
       "severity": "P2",
       "phase": 4,
-      "status": "open",
-      "tests": []
+      "status": "fixed",
+      "tests": [
+        "RTSP_AUTH_MODE=local-only-publish: the manager's own readiness and stream probes keep working on every version, with no credentials [LB-06, LB-13]",
+        "behind an authenticated API a healthy publishing stream is not struck and not restarted by the monitor, on every version [LB-13]",
+        "deep health: a 5xx, garbage or an unreachable API never strike either; a path that is not ready does, until it is restarted [LB-13]",
+        "deep health: a healthy stream behind an authenticated API is never struck, however often it is checked [LB-13]",
+        "on every MediaMTX version the real API is ready, detected as v3, and a stream goes from not ready to ready to not ready [LB-13]",
+        "probe: a 401 or 403, a 5xx, a plain-text 404, garbage and a path of the wrong shape are unknown (2), not 'not ready' [LB-13]",
+        "probe: a published path is ready (0); an unavailable one, and a path MediaMTX does not know, are not ready (1) [LB-13]",
+        "probe: no answer at all (refused, too slow) is unknown (2) [LB-13]",
+        "probe: the path name goes under the detected API prefix [LB-13]",
+        "probe: the same verdicts without jq [LB-13]",
+        "readiness: a 200 that is not a paths list is not ready, with and without jq [LB-13]",
+        "readiness: a 200 with a paths list is ready, at once [LB-13]",
+        "readiness: a 401 or 403 means MediaMTX is up behind an authenticated API: accepted with a warning, never 'not ready' [LB-13]",
+        "readiness: a 404 everywhere, a 5xx, a redirect and any other status are not ready [LB-13]",
+        "readiness: a 404 on /v3 falls back to /v2, then /v1, then the unversioned API, as documented [LB-13]",
+        "readiness: a MediaMTX that died during start-up ends the wait at once [LB-13]",
+        "readiness: a paths list with entries is ready too, with and without jq [LB-13]",
+        "readiness: a refused connection is not ready until the deadline, and the message says so [LB-13]",
+        "readiness: an answer cut off before its announced length, or a connection closed without one, is no answer [LB-13]",
+        "readiness: an answer that takes longer than the request limit is not ready [LB-13]",
+        "readiness: an explicit MEDIAMTX_API_VERSION asks only that version [LB-13]",
+        "readiness: it keeps asking until the API answers properly [LB-13]",
+        "readiness: v3 and v2 want an items array, so an items object there is not ready [LB-13]",
+        "start_mediamtx, a real MediaMTX and the real wrapper work together on non-default ports: the stream is published, readable and seen by the probes [X-19, LB-13, LB-22]",
+        "the API host follows MEDIAMTX_API_BIND, and MEDIAMTX_HOST when the API listens on every interface [D9, LB-13]",
+        "validate_stream trusts the API only for a 200 that says the path is ready [LB-13]",
+        "version detection: a 401, a 5xx, garbage or no answer default to v3 without trying older prefixes [LB-13]",
+        "version detection: a 404 on /v3 moves on to /v2 and /v1, which could never happen before [LB-13]",
+        "version detection: an explicit MEDIAMTX_API_VERSION is used without asking [LB-13]",
+        "version detection: v3 when /v3 answers with a paths list [LB-13]"
+      ]
     },
     {
       "id": "LB-14",
@@ -370,7 +470,32 @@
       "severity": "P1",
       "phase": 4,
       "status": "open",
-      "tests": []
+      "tests": [
+        "MEDIAMTX_CONFIG_BACKUPS sets the number of backups, and at least one is always kept [LB-22]",
+        "a backup that cannot be saved stops the replacement and the file stays as it was [LB-22]",
+        "a managed file whose rendering changes is replaced after a backup of the old content [LB-22]",
+        "a managed file whose rendering is unchanged is not touched at all: same inode, same mtime, no backup [LB-22]",
+        "a rendering MediaMTX rejects never replaces the managed file: no new content, no backup, no temp file [LB-22]",
+        "a rendering that fails leaves a managed file as it is, and creates none [LB-22]",
+        "an operator-owned file is used as it is: bytes, mode, inode and mtime survive every start, with no backup [LB-22]",
+        "an operator-owned file that cannot be a MediaMTX configuration stops the start and is left alone [LB-22]",
+        "backups are bounded: only the newest MEDIAMTX_CONFIG_BACKUPS (default 5) are kept, even when several fall in one second [LB-22]",
+        "every option of the renderer produces a configuration MediaMTX accepts and honours [LB-22]",
+        "individual mode renders the catch-all path, moq follows the binary's version [LB-22]",
+        "multiplex mode renders one quoted path; a stream name that is not a plain scalar cannot inject YAML [LB-04, LB-22]",
+        "start_mediamtx checks the ports before it renders anything: a taken port leaves the configuration as it was [LB-22]",
+        "start_mediamtx launches MediaMTX on an operator-owned file without touching it [LB-22]",
+        "start_mediamtx refuses to start on an operator-owned file MediaMTX rejects, and launches nothing [LB-22]",
+        "start_mediamtx writes the configuration, then launches MediaMTX on that file [LB-22]",
+        "start_mediamtx, a real MediaMTX and the real wrapper work together on non-default ports: the stream is published, readable and seen by the probes [X-19, LB-13, LB-22]",
+        "the group of a managed file is kept when it is replaced [LB-22]",
+        "the manager validates a configuration with MediaMTX's own check where the binary has one, and says what the structural check cannot see [LB-22]",
+        "the mode of a managed file the operator changed is kept when it is replaced, and the backup has it too [LB-22]",
+        "two replacements in the same second never overwrite each other's backup [LB-22]",
+        "where MediaMTX has --validate-conf, its verdict decides about an operator-owned file, and its message is logged [LB-22]",
+        "with the clock standing still the retention still removes the oldest backups, never the newest [LB-22]"
+      ],
+      "note": "manager side fixed (managed marker, backups, atomic durable write, order after port check); the installer still has its own generator until pass 2, and X-38 covers upgrade from files written by the old manager"
     },
     {
       "id": "LB-23",
@@ -378,23 +503,53 @@
       "severity": "P2",
       "phase": 4,
       "status": "open",
-      "tests": []
+      "tests": [
+        "an empty file, what a power cut during an old non-durable write leaves behind, is replaced rather than treated as the operator's [LB-23]",
+        "the replacement is flushed to disk: the temp file before the rename, the directory after it [LB-23, D14]"
+      ],
+      "note": "manager MediaMTX config write is durable-atomic (verified call order); save_device_config still uses mktemp+mv without fsync; real power-cut durability needs hardware"
     },
     {
       "id": "LB-24",
       "title": "capture assumed to be ALSA PCM 0",
       "severity": "P2",
       "phase": 4,
-      "status": "open",
-      "tests": []
+      "status": "documented-hw",
+      "tests": [
+        "DEVICE_<NAME>_PCM chooses among the capture PCMs, by stream name or by device name [LB-24]",
+        "DEVICE_<NAME>_PCM selects the capture PCM a stream records from, end to end [LB-24]",
+        "PCM is a setting the parser accepts from 0 to 255 and rejects otherwise [LB-24, D3]",
+        "a PCM setting that is not a capture PCM of the card is an error and the first capture PCM is used [LB-24]",
+        "a card with no capture PCM is left out with a log line [LB-24]",
+        "a multiplex stream gives each device its own capture PCM and leaves out a card that cannot capture [LB-24]",
+        "a multiplex stream with no card that can capture does not start [LB-24]",
+        "a playback-only card gets no stream: start refuses it with a log line and writes nothing [LB-24]",
+        "alsa_capture_pcms lists a card's capture PCMs only, ascending [LB-24]",
+        "an arecord -l that is still writing when the card's line has been read does not make the card look absent (pipefail) [LB-24, new defect]",
+        "an individual stream of a card that captures on device 1 starts and records from plughw:CARD,1 [LB-24]",
+        "check_alsa_device_available looks at the capture device node, not at device 0 [LB-24]",
+        "check_audio_device accepts a card whose capture is on device 1 and refuses a playback-only card [LB-24]",
+        "check_audio_device refuses a capture PCM whose device node has gone [LB-24]",
+        "check_audio_level records from the capture PCM, not from device 0 [LB-24]",
+        "no capture path in the script assumes PCM device 0 any more [LB-24]",
+        "resolve_capture_pcm takes the first capture PCM, whichever device number it has [LB-24]",
+        "the roots default to the real /proc/asound and /dev/snd [LB-24]",
+        "the wrapper checks the capture PCM's device node, so it runs when only device 0 is missing and stops when device 1 is [LB-24]",
+        "without PCM directories in /proc/asound the capture device nodes are used [LB-24]"
+      ],
+      "note": "fixed in software with fake /proc/asound and /dev/snd trees; real card PCM layouts, plughw behaviour and second-open of a busy device need hardware"
     },
     {
       "id": "X-01",
       "title": "monitor restarts revert per-device settings to defaults",
       "severity": "P1",
       "phase": 4,
-      "status": "open",
-      "tests": []
+      "status": "fixed",
+      "tests": [
+        "a monitor-triggered restart keeps the per-device settings from the config file [X-01]",
+        "a monitor-triggered restart of the multiplex stream keeps the settings of its first device [X-01]",
+        "get_device_config loads the file itself when nobody has, so no caller can see defaults only [X-01]"
+      ]
     },
     {
       "id": "X-02",
@@ -451,16 +606,32 @@
       "title": "restart path skips config validation",
       "severity": "P1",
       "phase": 4,
-      "status": "open",
-      "tests": []
+      "status": "fixed",
+      "tests": [
+        "a trap line does not remove the manager's own trap [LB-08, X-09]",
+        "an unbound variable on a line cannot kill the manager under set -u [LB-08, X-09]"
+      ]
     },
     {
       "id": "X-10",
       "title": "individual wrapper not syntax-checked; wrappers written in place",
       "severity": "P2",
       "phase": 4,
-      "status": "open",
-      "tests": []
+      "status": "fixed",
+      "tests": [
+        "a generated wrapper whose FFmpeg fails waits and keeps running instead of dying on an unbound variable [X-10, new defect]",
+        "a wrapper generated from hostile values, run for real, runs none of them [LB-09, X-10]",
+        "a wrapper that fails bash -n is refused in both modes: nothing is installed or started [X-10]",
+        "every vector in every setting of a multiplex wrapper stays data, device names and encoder arguments included [LB-09, X-10]",
+        "every vector in every setting of an individual wrapper stays data: no code runs and each value round-trips [LB-09, X-10]",
+        "install_wrapper_script installs a good wrapper with mode 755 and leaves no temporary file [X-10]",
+        "install_wrapper_script keeps the old wrapper when the new one is refused, and removes its temporary file [X-10]",
+        "paths and names taken from the environment and the arguments stay data too [LB-09, X-10]",
+        "regenerating a wrapper replaces the file by rename and leaves the one a running wrapper reads intact [X-10]",
+        "start leaves only the wrapper behind: no temporary file, mode 755, in both modes [X-10]",
+        "the back-off delays the manager runs with are the ones its wrappers use [X-10]",
+        "the wrapper header defines every variable the fixed program reads [X-10]"
+      ]
     },
     {
       "id": "X-11",
@@ -566,8 +737,14 @@
       "title": "LOG_FILE and MEDIAMTX_LOG_FILE alias",
       "severity": "P3",
       "phase": 4,
-      "status": "open",
-      "tests": []
+      "status": "fixed",
+      "tests": [
+        "MEDIAMTX_LOG_FILE alone no longer moves the manager's own log [X-15]",
+        "STREAM_MANAGER_LOG_FILE alone leaves MediaMTX's output file at its default [X-15]",
+        "both log file defaults are unchanged when no variable is set [X-15]",
+        "the help text names both log variables [X-15]",
+        "the manager's own log follows STREAM_MANAGER_LOG_FILE and leaves MEDIAMTX_LOG_FILE alone [X-15]"
+      ]
     },
     {
       "id": "X-16",
@@ -659,16 +836,55 @@
       "title": "documented MEDIAMTX_*_PORT variables ignored",
       "severity": "P2",
       "phase": 4,
-      "status": "open",
-      "tests": []
+      "status": "fixed",
+      "tests": [
+        "a client socket that merely has a configured port number as its source port is not a port in use [X-19]",
+        "a multiplex wrapper publishes to the configured RTSP port and carries it in its environment [X-19]",
+        "a per-stream wrapper publishes to the configured RTSP port and carries it in its environment [X-19]",
+        "a per-stream wrapper with local recording publishes to the configured RTSP port [X-19]",
+        "an empty port variable means the default [X-19]",
+        "create_config keeps the documented default ports when the variables are unset [X-19 installer]",
+        "create_config writes the RTSP, API and metrics ports named by the environment [X-19 installer]",
+        "probe_stream_ready and the API version detection use the configured API port [X-19]",
+        "publisher and reader URLs are built from the configured host and RTSP port [X-19]",
+        "show_help documents the port, stop-timeout and PID-file variables [X-19 installer]",
+        "show_status checks the ports named by MEDIAMTX_RTSP_PORT, MEDIAMTX_API_PORT and MEDIAMTX_METRICS_PORT [X-19 installer]",
+        "start_mediamtx prints the URL of a stream that failed validation with the configured RTSP port [X-19]",
+        "start_mediamtx prints the stream URLs with the configured RTSP port, for individual and multiplex mode [X-19]",
+        "start_mediamtx refuses to start when any of the three configured ports is taken [X-19]",
+        "start_mediamtx refuses to start when any of the three configured ports is taken, checked with ss when lsof is absent [X-19]",
+        "start_mediamtx starts when the configured ports are free [X-19]",
+        "start_mediamtx, a real MediaMTX and the real wrapper work together on non-default ports: the stream is published, readable and seen by the probes [X-19, LB-13, LB-22]",
+        "status shows the multiplex stream URL with the configured RTSP port [X-19]",
+        "status shows the stream URL with the configured RTSP port [X-19]",
+        "the defaults are MediaMTX's own: 8554, 9997, 9998 [X-19]",
+        "the generated MediaMTX configuration listens on the configured ports [X-19]",
+        "the usage text shows the configured RTSP port in its multiplex examples [X-19]",
+        "wait_for_mediamtx_ready asks the API on the configured port [X-19]"
+      ]
     },
     {
       "id": "X-20",
       "title": "amix normalize needs FFmpeg 4.4; amerge+opus channel limits; docs",
       "severity": "P1",
       "phase": 4,
-      "status": "open",
-      "tests": []
+      "status": "documented-hw",
+      "tests": [
+        "a check that cannot be made does not stop the stream: no lavfi, or a timeout [X-20]",
+        "a refused combination stops the multiplex start with an error that names inputs x channels and the way out, and writes nothing [X-20]",
+        "amerge with aac: 10 and 12 channels are refused, 4 and 6 accepted [X-20]",
+        "amerge with opus: FFmpeg 6.1.1 refuses 2 stereo (4.0), 5 stereo (10 ch), 3 and 4 mono; accepts 4 stereo, 2 and 5 mono [X-20]",
+        "amix never produces a channel count libopus, aac or libmp3lame cannot take [X-20]",
+        "an FFmpeg whose amix has no normalize option is detected, and the answer is cached [X-20]",
+        "an accepted combination starts: amerge of 2 mono inputs with opus, amix of 2 stereo inputs [X-20]",
+        "multiplex_encoder_args gives each supported codec its arguments and refuses any other [X-20, X-28]",
+        "multiplex_filter_complex builds the graph the wrapper used to build itself [X-20]",
+        "normalize=0 mixes two equal inputs about 6 dB louder than amix's default, which is what the README's wording hides [X-20]",
+        "the real FFmpeg's amix is detected as having normalize [X-20]",
+        "the wrapper runs exactly the graph and the encoder arguments the check used, for every codec [X-20]",
+        "without normalize support the multiplex graph is the amix default and says why; with it, normalize=0 as before [X-20]"
+      ],
+      "note": "normalize feature-detected and channel/codec combinations verified on FFmpeg 6.1.1; FFmpeg 4.2/4.3 runtime, real ALSA channel layouts and USB clock drift need hardware or older FFmpeg"
     },
     {
       "id": "X-21",
@@ -815,8 +1031,14 @@
       "title": "manager: CODEC outside opus|aac|mp3 silently yields no local recording (muxer refuses the extension; RTSP continues)",
       "severity": "P2",
       "phase": 4,
-      "status": "open",
-      "tests": []
+      "status": "fixed",
+      "tests": [
+        "CODEC accepts opus, aac and mp3 in any case and rejects every other name, pcm_s16le included [D3, X-28]",
+        "a codec with no encoder arguments stops a multiplex start, whatever the validation layer let through [X-28, LB-09]",
+        "multiplex_encoder_args gives each supported codec its arguments and refuses any other [X-20, X-28]",
+        "resolve_stream_settings falls back to the built-in default, with an error, for an unusable DEFAULT_ value [D3, X-28]",
+        "the codec error names the supported codecs [D3, X-28]"
+      ]
     },
     {
       "id": "X-29",
@@ -847,6 +1069,54 @@
       "title": "updater residuals: lock still mkdir+pid (not flock, D2); menu exit status on failed action/EOF; self-update path skips post-update migrations",
       "severity": "P3",
       "phase": 6,
+      "status": "open",
+      "tests": []
+    },
+    {
+      "id": "X-32",
+      "title": "generated cron line runs monitor without STREAM_MODE/MULTIPLEX_* (and non-default port) environment: a multiplex node's cron monitor starts per-device streams",
+      "severity": "P1",
+      "phase": 5,
+      "status": "open",
+      "tests": []
+    },
+    {
+      "id": "X-33",
+      "title": "individual wrapper with AUDIO_LOCAL_RECORDING puts AUDIO_RECORDING_PATH into the tee muxer argument unescaped (| [ ] : change what tee writes; root-controlled)",
+      "severity": "P3",
+      "phase": 5,
+      "status": "open",
+      "tests": []
+    },
+    {
+      "id": "X-34",
+      "title": "a card with no capture PCM (e.g. a USB speaker) makes start_ffmpeg_stream return 1, so the start summary counts it as a failed stream instead of skipped",
+      "severity": "P2",
+      "phase": 3,
+      "status": "open",
+      "tests": []
+    },
+    {
+      "id": "X-35",
+      "title": "test suite writes the host's real /var/log (lyrebird-diagnostics.log, lyrebird/alerts.log, residual stream-manager log) and relative alerts.log",
+      "severity": "P3",
+      "phase": 6,
+      "status": "open",
+      "tests": []
+    },
+    {
+      "id": "X-36",
+      "title": "non-root `status` prints stream wrappers as Not running (kill -0 gives EPERM in show_status)",
+      "severity": "P3",
+      "phase": 3,
+      "status": "open",
+      "tests": []
+    },
+    {
+      "id": "X-38",
+      "title": "a managed-by-old-release config (first line '# MediaMTX Configuration - Audio Streams') is treated as operator-owned after upgrade: API/metrics stay on every interface and the node warns on every start",
+      "severity": "P2",
+      "phase": 4,
       "status": "open",
       "tests": []
     }
