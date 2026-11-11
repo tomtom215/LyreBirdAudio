@@ -2400,8 +2400,9 @@ check_audio_level() {
         pcm="$(first_capture_pcm "$card_num")"
     fi
     if [[ -z "$pcm" ]]; then
-        log DEBUG "Card ${card_num} has no capture PCM; no audio level check for $stream_name"
-        return 2
+        # ALSA lists no capture PCM for the card (no /proc/asound here, say): keep the
+        # old assumption, device 0, and let FFmpeg say whether it can be opened
+        pcm=0
     fi
     local audio_device="plughw:${card_num},${pcm}"
     local sample_duration="${AUDIO_LEVEL_SAMPLE_DURATION}"

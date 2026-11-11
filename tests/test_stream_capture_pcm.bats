@@ -205,13 +205,16 @@ teardown() {
         check_audio_level 3 pcmtest_a; echo "default for card 3: $?"
         check_audio_level 4 pcmtest_b; echo "default for card 4: $?"
         check_audio_level 4 pcmtest_c 1; echo "explicit 1 on card 4: $?"
-        check_audio_level 1 pcmtest_d || echo "no capture PCM: $?"'
+        check_audio_level 1 pcmtest_d; echo "no capture PCM listed: $?"'
     [ "$status" -eq 0 ]
     [ "$(sed -n 1p "$SD/ffmpeg.calls")" = "-f alsa -i plughw:3,1 -t 3 -af volumedetect -f null /dev/null" ]
     [ "$(sed -n 2p "$SD/ffmpeg.calls")" = "-f alsa -i plughw:4,0 -t 3 -af volumedetect -f null /dev/null" ]
     [ "$(sed -n 3p "$SD/ffmpeg.calls")" = "-f alsa -i plughw:4,1 -t 3 -af volumedetect -f null /dev/null" ]
-    [ "$(wc -l <"$SD/ffmpeg.calls")" -eq 3 ]
-    [[ "$output" == *"no capture PCM: 2"* ]]
+    # a card with no capture PCM in /proc/asound keeps the old assumption (device 0), and
+    # FFmpeg is left to say whether it can be opened (a host without /proc/asound is in this case)
+    [ "$(sed -n 4p "$SD/ffmpeg.calls")" = "-f alsa -i plughw:1,0 -t 3 -af volumedetect -f null /dev/null" ]
+    [ "$(wc -l <"$SD/ffmpeg.calls")" -eq 4 ]
+    [[ "$output" == *"no capture PCM listed: 0"* ]]
 }
 
 # ---------------------------------------------------------------------------

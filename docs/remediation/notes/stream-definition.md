@@ -4,10 +4,7 @@ Findings LB-04, LB-08, LB-09, LB-24, X-01, X-09, X-10, X-11 (wrapper side), X-15
 X-20, X-28; decisions D3 and D13. Code: `lyrebird-stream-manager.sh` (sections
 "Canonical stream names", "Device configuration", the wrapper generator, the
 capture-PCM helpers, the multiplex graph) and, for the writer only,
-`lyrebird-mic-check.sh`. Tests: `tests/test_stream_log_variables.bats`,
-`tests/test_stream_names.bats`, `tests/test_stream_device_config.bats`,
-`tests/test_stream_wrappers.bats`, `tests/test_stream_capture_pcm.bats`,
-`tests/test_stream_multiplex_graph.bats`, helper `tests/stream_definition_helper.bash`.
+`lyrebird-mic-check.sh`. Tests: see "Tests" at the end.
 
 ## X-15: two log variables
 
@@ -89,7 +86,7 @@ capture-PCM helpers, the multiplex graph) and, for the writer only,
 - **Format.** One `DEVICE_<NAME>_<SETTING>=value` per line. `<NAME>` is the friendly stream
   name or the full device name, upper-cased with other characters as `_` (lookup order
   unchanged: friendly name first, then device name, then the default). `<SETTING>` is one of
-  `SAMPLE_RATE`, `CHANNELS`, `CODEC`, `BITRATE`, `THREAD_QUEUE`. Blank lines and `#` comments
+  `SAMPLE_RATE`, `CHANNELS`, `CODEC`, `BITRATE`, `THREAD_QUEUE`, `PCM` (LB-24, below). Blank lines and `#` comments
   are ignored (a comment may follow a value: `...=192k   # high`). A value is bare,
   `'single-quoted'` or `"double-quoted"`, taken literally; `$`, backticks and backslashes
   are not interpreted (inside double quotes they are an error). No spaces around `=`.
@@ -100,7 +97,8 @@ capture-PCM helpers, the multiplex graph) and, for the writer only,
   FFmpeg 6.1.1: the encoder negotiates its own rate; the ALSA device is the real limit and is
   not known here); `CHANNELS` 1 to 32; `CODEC` `opus`, `aac` or `mp3` (any case);
   `BITRATE` `1k` to `9999k` (`k` or `K`; a plain number such as `128000`, which FFmpeg would have
-  taken, is now an error: the README only documents the `NNNk` form); `THREAD_QUEUE` 1 to 1048576. Leading zeros are removed.
+  taken, is now an error: the README only documents the `NNNk` form); `THREAD_QUEUE` 1 to 1048576;
+  `PCM` 0 to 255. Leading zeros are removed.
 - **X-28.** A `CODEC` outside `opus|aac|mp3` (the old sample comment `pcm_s16le`, the README's
   `pcm`) is rejected when the file is read, with `expected: one of opus, aac, mp3`; the
   setting keeps its default, so the wrong-extension recording segment (`audio_000.pcm_s16le`)
@@ -241,7 +239,9 @@ capture-PCM helpers, the multiplex graph) and, for the writer only,
   directory, ascending; if there is none, the `pcmC<CARD>D<N>c` device nodes) and
   `resolve_capture_pcm CARD DEVICE_NAME [STREAM_PATH]` (sets `STREAM_PCM`).
   `check_audio_device`, `check_alsa_device_available` and `check_audio_level` take the PCM as an
-  optional last argument and default to the card's first capture PCM.
+  optional last argument and default to the card's first capture PCM (`check_audio_level` keeps
+  device 0 when ALSA lists no capture PCM for the card, as before, and leaves FFmpeg to say whether it
+  opens; the other two refuse such a card).
 - **New setting `DEVICE_<NAME>_PCM`** (0 to 255), same lookup order as the other settings
   (friendly stream name, then device name). It must name a capture PCM of the card; if it does
   not, an ERROR is logged (`PCM 0 set for three is not a capture PCM of card 3 (capture PCMs: 1);
@@ -291,10 +291,15 @@ capture-PCM helpers, the multiplex graph) and, for the writer only,
   the C4 fix); under the script's own `set -u` that is `name: unbound variable`, the `cat`
   failed and the whole header (quality tier, format description, the note that `DEFAULT_*`
   are not read from the file) was missing from every generated config. Reproduced with the
-  real `generate_config` over a fake card; the comment no longer expands anything. README
-  text that says the generated file "starts with a header describing ..." is true again.
+  real `generate_config` over a fake card; the comment no longer expands anything.
 
 ## New defects found while verifying (not fixed here)
+
+- The tee muxer argument of the individual wrapper with `AUDIO_LOCAL_RECORDING=true`
+  (`...|[f=segment:...]${AUDIO_RECORDING_PATH}/<stream>/audio_%03d.<codec>`) does not escape
+  the recording path: a path containing `|`, `[`, `]` or `:` changes what the tee muxer writes
+  (read, not reproduced; the path is root-controlled configuration). The value is now data in
+  the wrapper header, but FFmpeg's tee syntax still interprets it. Owner: storage.
 
 - The cron line written by `install` (`.../lyrebird-stream-manager.sh monitor`) does not
   carry `STREAM_MODE`, `MULTIPLEX_STREAM_NAME` or `MULTIPLEX_FILTER_TYPE`, so the cron
@@ -302,3 +307,37 @@ capture-PCM helpers, the multiplex graph) and, for the writer only,
   files and tries to start individual streams next to the multiplex stream (read from
   `create_systemd_service` and `monitor_streams`, not reproduced end to end). Owner: units
   and monitoring.
+
+## Tests
+
+New files (127 tests): `tests/test_stream_log_variables.bats` (5, X-15),
+`tests/test_stream_names.bats` (23, LB-04/D13; 4 of them live), `tests/test_stream_device_config.bats`
+(51, LB-08/X-09/X-01/X-28/D3 and the mic-check writer), `tests/test_stream_capture_pcm.bats`
+(20, LB-24), `tests/test_stream_wrappers.bats` (15, LB-09/X-10), `tests/test_stream_multiplex_graph.bats`
+(13, X-20), and the shared fixtures `tests/stream_definition_helper.bash` (a private tree
+for everything the script writes, a fake ALSA tree with `arecord -l` stand-in, the `sm`/`smq`
+runners that source the REAL script in a child bash, the spawn stand-ins, the network-namespace
+helpers). `tests/README.md` needs a row per file and the suite total (+127; this worktree
+counts 1017 tests, recount with `bats --count tests/`).
+
+The live tests (`test_stream_names.bats`: the name matrix, the `runOnInit` injection, quoted
+`null`/`yes`/`123` keys, `all_others` as a catch-all) run only when `LYREBIRD_TEST_MEDIAMTX_BINS`
+names MediaMTX binaries (the oldest and the newest of the list are used) and `unshare --net --pid
+--fork --mount-proc` is permitted, inside a private network namespace (loopback brought up with a
+small `python3 -I` ioctl), so the host's ports are never touched; otherwise they skip with a
+message. They were run here with the list 1.15.0, 1.18.0, 1.19.0, 1.21.1, so each live test ran
+against 1.15.0 and 1.21.1.
+
+Existing tests changed (no assertion weakened or removed; each reason is in the commit message):
+`test_stream_manager_locks.bats` (the manager's own log is now `STREAM_MANAGER_LOG_FILE`; the two
+wrapper-launch tests use a fake `/proc/asound` and `/dev/snd` instead of sed-replacing
+`pcmCnD0c` with `/dev/null`, and their stub `ffmpeg` answers the manager's quick questions at once),
+`test_deep_health_check.bats` (the log variable), `test_e2e_integration.bats` (the C4 contract test
+loads the config with the manager's loader instead of `source`ing it).
+
+## Validation that cannot be done in CI (from this area)
+
+Real USB capture PCM layouts and `plughw:CARD,PCM` behaviour, a second open of a busy capture
+device (LB-24); FFmpeg 4.2/4.3 at run time (the `normalize` fallback is tested with a stand-in
+help text only), real ALSA channel layouts, USB clock drift across independent microphones
+(X-20); whether a real `arecord -l` can trigger the pipefail false negative that is fixed.
