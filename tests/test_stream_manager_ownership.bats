@@ -678,3 +678,111 @@ WRAP_EOF
     run_mgr show_help
     [[ "$output" == *"force-stop --kill-all [--yes]"* ]]
 }
+
+# ---------------------------------------------------------------------------
+# X-25: FFmpeg logs are rotated, not deleted
+# ---------------------------------------------------------------------------
+
+@test "help documents FFMPEG_LOG_KEEP and that no command deletes the logs [X-25]" {
+    run_mgr show_help
+    [[ "$output" == *"FFMPEG_LOG_KEEP"* ]]
+    [[ "$output" == *"never delete them"* ]]
+}
+
+@test "rotate_ffmpeg_log keeps the logs of the last FFMPEG_LOG_KEEP runs and removes older ones [X-25]" {
+    FFMPEG_LOG_KEEP=3 run_mgr eval '
+        for run in 1 2 3 4 5 6; do
+            rotate_ffmpeg_log "$FFMPEG_PID_DIR/mic1.log"
+            echo "run $run" >"$FFMPEG_PID_DIR/mic1.log"
+        done'
+    [ "$status" -eq 0 ]
+    [ "$(<"$FF/mic1.log")" = "run 6" ]
+    [ "$(<"$FF/mic1.log.prev.1")" = "run 5" ]
+    [ "$(<"$FF/mic1.log.prev.2")" = "run 4" ]
+    [ "$(<"$FF/mic1.log.prev.3")" = "run 3" ]
+    [ ! -e "$FF/mic1.log.prev.4" ]
+    # the bound holds: the live log and 3 archives
+    [ "$(find "$FF" -name 'mic1.log*' | wc -l)" -eq 4 ]
+}
+
+@test "rotate_ffmpeg_log removes archives beyond a lowered limit, skips an empty log and discards the old run at limit 0 [X-25]" {
+    printf 'a\n' >"$FF/s.log.prev.1"
+    printf 'b\n' >"$FF/s.log.prev.2"
+    printf 'c\n' >"$FF/s.log.prev.5"
+    : >"$FF/s.log"
+    FFMPEG_LOG_KEEP=2 run_mgr rotate_ffmpeg_log "$FF/s.log"
+    [ "$status" -eq 0 ]
+    [ -e "$FF/s.log.prev.2" ]
+    [ ! -e "$FF/s.log.prev.5" ]
+    # an empty live log is not worth an archive slot
+    [ "$(<"$FF/s.log.prev.1")" = "a" ]
+    printf 'now\n' >"$FF/s.log"
+    FFMPEG_LOG_KEEP=0 run_mgr rotate_ffmpeg_log "$FF/s.log"
+    [ ! -e "$FF/s.log" ]
+    [ ! -e "$FF/s.log.prev.1" ]
+}
+
+@test "FFMPEG_LOG_KEEP falls back to 3 when it is not a number and is capped at 20 [X-25]" {
+    FFMPEG_LOG_KEEP=lots run_mgr eval 'echo "keep=$FFMPEG_LOG_KEEP"'
+    [[ "$output" == *"keep=3"* ]]
+    FFMPEG_LOG_KEEP=500 run_mgr eval 'echo "keep=$FFMPEG_LOG_KEEP"'
+    [[ "$output" == *"keep=20"* ]]
+    run_mgr eval 'echo "keep=$FFMPEG_LOG_KEEP"'
+    [[ "$output" == *"keep=3"* ]]
+}
+
+# The processes are stopped, the post-mortem stays
+assert_logs_survive() {
+    [ "$(<"$FF/mic1.log")" = "why mic1 died" ]
+    [ "$(<"$FF/mic1.log.prev.1")" = "older" ]
+    [ "$(<"$FF/mic1.log.old")" = "rotated by the wrapper" ]
+}
+
+make_logs() {
+    printf 'why mic1 died\n' >"$FF/mic1.log"
+    printf 'older\n' >"$FF/mic1.log.prev.1"
+    printf 'rotated by the wrapper\n' >"$FF/mic1.log.old"
+}
+
+@test "cleanup_stale_processes keeps the FFmpeg logs of the run it cleans up [X-25]" {
+    our_mediamtx_up
+    our_wrapper_up mic1
+    make_logs
+    run_mgr cleanup_stale_processes
+    [ "$status" -eq 0 ]
+    assert_dead mtx w_mic1
+    assert_logs_survive
+}
+
+@test "stop_mediamtx keeps the FFmpeg logs of the run it stops [X-25]" {
+    our_mediamtx_up
+    our_wrapper_up mic1
+    make_logs
+    run_mgr stop_mediamtx
+    [ "$status" -eq 0 ]
+    assert_dead mtx w_mic1
+    assert_logs_survive
+}
+
+@test "force_stop_mediamtx keeps the FFmpeg logs [X-25]" {
+    our_mediamtx_up
+    our_wrapper_up mic1
+    make_logs
+    run_mgr force_stop_mediamtx
+    [ "$status" -eq 0 ]
+    assert_dead mtx w_mic1
+    assert_logs_survive
+}
+
+@test "starting a stream rotates the log of its previous run instead of deleting it [X-25]" {
+    use_seams
+    use_wrapper_stand_ins
+    export STREAM_MODE=multiplex
+    printf 'previous run\n' >"$FF/all_mics.log"
+    run_mgr start_ffmpeg_multiplex_stream mic1:31
+    [ "$status" -eq 0 ]
+    EXTRA_PIDS+=("$(<"$FF/all_mics.pid")")
+    [ "$(<"$FF/all_mics.log.prev.1")" = "previous run" ]
+    # the new run writes a fresh log
+    ! grep -q 'previous run' "$FF/all_mics.log" || false
+}

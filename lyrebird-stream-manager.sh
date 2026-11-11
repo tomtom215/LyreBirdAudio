@@ -342,6 +342,10 @@ FFMPEG_LOG_MAX_SIZE=$(_uint_or "${FFMPEG_LOG_MAX_SIZE:-}" 10485760) # 10MB
 readonly FFMPEG_LOG_MAX_SIZE
 MEDIAMTX_LOG_MAX_SIZE=$(_uint_or "${MEDIAMTX_LOG_MAX_SIZE:-}" 52428800) # 50MB
 readonly MEDIAMTX_LOG_MAX_SIZE
+# Runs of each stream's FFmpeg log kept besides the live one (0-20)
+FFMPEG_LOG_KEEP=$(_uint_or "${FFMPEG_LOG_KEEP:-}" 3)
+((FFMPEG_LOG_KEEP <= 20)) || FFMPEG_LOG_KEEP=20
+readonly FFMPEG_LOG_KEEP
 
 # ============================================================================
 # Production Reliability Settings (v1.4.2 additions)
@@ -3549,8 +3553,7 @@ clear_restart_marker() {
 #    configured binary as its executable and the configuration file as argv[1]
 #    - Calls terminate_process_group with 5s timeout
 #    - Deletes the PID file and its record
-# 3. Generated wrapper scripts whose wrapper is gone, and the FFmpeg logs
-#    (*.log, *.log.old)
+# 3. Generated wrapper scripts whose wrapper is gone
 # 4. Marker files
 #    - Deletes: CLEANUP_MARKER, RESTART_MARKER
 #    - Never deletes a lock file (LOCK_FILE, CONFIG_LOCK_FILE): the inode is the
@@ -3558,7 +3561,9 @@ clear_restart_marker() {
 #
 # No process is chosen by name or command-line pattern, so another
 # installation's MediaMTX or FFmpeg, mediamtx.service's process or an operator's
-# FFmpeg that reads a stream are never touched.
+# FFmpeg that reads a stream are never touched. The FFmpeg logs are kept: they
+# are the post-mortem of the run that is being cleaned up (rotate_ffmpeg_log
+# bounds them).
 #
 # start_mediamtx calls this only when it cannot prove that the MediaMTX it finds
 # is its own and healthy, or on a restart; a healthy start changes nothing.
@@ -3601,9 +3606,6 @@ cleanup_stale_processes() {
     for script in "${FFMPEG_PID_DIR}"/*.sh; do
         [[ -e "${script%.sh}.pid" ]] || rm -f -- "$script"
     done
-
-    rm -f "${FFMPEG_PID_DIR}"/*.log
-    rm -f "${FFMPEG_PID_DIR}"/*.log.old
 
     # Clean up markers
     rm -f "${CLEANUP_MARKER}"
@@ -4175,6 +4177,7 @@ start_ffmpeg_multiplex_stream() {
     # Create wrapper script
     local wrapper_script="${FFMPEG_PID_DIR}/${stream_path}.sh"
     local ffmpeg_log="${FFMPEG_PID_DIR}/${stream_path}.log"
+    rotate_ffmpeg_log "$ffmpeg_log"
 
     # Create wrapper with all variables properly quoted
     cat >"$wrapper_script" <<'WRAPPER_START'
@@ -4636,6 +4639,7 @@ start_ffmpeg_stream() {
     # Create wrapper script
     local wrapper_script="${FFMPEG_PID_DIR}/${stream_path}.sh"
     local ffmpeg_log="${FFMPEG_PID_DIR}/${stream_path}.log"
+    rotate_ffmpeg_log "$ffmpeg_log"
 
     # Create wrapper with all variables properly quoted
     cat >"$wrapper_script" <<'WRAPPER_START'
@@ -5058,15 +5062,42 @@ stop_ffmpeg_stream() {
     fi
 
     # Only a wrapper that is provably this manager's is signalled, and only the
-    # stream's wrapper and its children: no other FFmpeg is touched.
+    # stream's wrapper and its children: no other FFmpeg is touched. The log
+    # stays (rotate_ffmpeg_log keeps it bounded): it is the post-mortem.
     local rc=0
     stop_recorded_process "$pid_file" wrapper 10 "$stream_path" || rc=$?
     if [[ $rc -eq 0 ]]; then
         rm -f "${FFMPEG_PID_DIR}/${stream_path}.sh"
-        rm -f "${FFMPEG_PID_DIR}/${stream_path}.log"
-        rm -f "${FFMPEG_PID_DIR}/${stream_path}.log.old"
     fi
     return "$rc"
+}
+
+# Keep the last FFMPEG_LOG_KEEP runs of a stream's FFmpeg log. Called before a
+# new wrapper is started: the log of the previous run becomes <log>.prev.1,
+# older ones move up, and the ones beyond the limit are removed (also after the
+# limit was lowered). Nothing is deleted just because a stream is started,
+# stopped or cleaned up: the log of a run that went wrong is the post-mortem.
+# The archives are not named *.log, so logrotate's glob does not truncate them.
+rotate_ffmpeg_log() {
+    local log_file="$1" keep="${FFMPEG_LOG_KEEP}" archive n i
+    for archive in "${log_file}.prev."*; do
+        [[ -e "$archive" ]] || continue
+        n="${archive##*.prev.}"
+        if [[ "$n" =~ ^[0-9]+$ ]] && ((10#$n > keep)); then
+            rm -f -- "$archive"
+        fi
+    done
+    [[ -s "$log_file" ]] || return 0
+    if ((keep == 0)); then
+        rm -f -- "$log_file"
+        return 0
+    fi
+    for ((i = keep - 1; i >= 1; i--)); do
+        if [[ -e "${log_file}.prev.${i}" ]]; then
+            mv -f -- "${log_file}.prev.${i}" "${log_file}.prev.$((i + 1))"
+        fi
+    done
+    mv -f -- "$log_file" "${log_file}.prev.1"
 }
 
 # Start all streams with stable device list
@@ -5551,7 +5582,8 @@ kill_all_instance_processes() {
 #                                 there) and why, and exits 1 without signalling
 #   force-stop --kill-all --yes   sends SIGKILL to exactly that list
 #
-# The lock files are never removed.
+# The FFmpeg logs are kept (they are the post-mortem), the lock files are never
+# removed.
 force_stop_mediamtx() {
     local kill_all=false confirmed=false arg
     for arg in "$@"; do
@@ -5923,7 +5955,7 @@ Commands:
     stop        Stop MediaMTX and FFmpeg streams. Only processes this manager
                 started are signalled (PID files + process start time).
     force-stop  SIGKILL, at once, the processes this manager started (emergency
-                use)
+                use; the FFmpeg logs are kept)
     force-stop --kill-all [--yes]
                 The only broad kill: every process whose executable is the
                 configured MediaMTX binary, whose command line names a file in
@@ -5991,6 +6023,11 @@ Exit Codes:
     6  - No USB devices found (logged only)
     7  - MediaMTX not running (logged only)
     10 - Stream monitoring degraded (logged only)
+
+FFmpeg logs:
+    The log of each stream's previous run is kept as <stream>.log.prev.1 ...
+    in ${FFMPEG_PID_DIR}: FFMPEG_LOG_KEEP runs (default 3, at most 20). start,
+    stop and force-stop never delete them.
 
 EOF
 }
