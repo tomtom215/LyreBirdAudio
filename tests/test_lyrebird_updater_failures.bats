@@ -313,6 +313,50 @@ _updater_vars() {
     updater_git_clean
 }
 
+@test "saved changes that conflict with the new version stay in the stash, the tree is left clean, exit 10" {
+    updater_checkout v1.0.0
+    echo "config LOCAL EDIT" >"$REPO/config.txt" # v1.1.0 changes the same line
+    echo "mine" >"$REPO/mynotes.txt"
+    updater_stdin 3 v1.1.0 y
+    updater_run
+    [ "$status" -eq 10 ]
+    [[ "$output" == *"were NOT re-applied"* ]]
+    [[ "$output" == *"git stash show -p stash@{0}"* ]]
+    [ "$(updater_head)" = "v1.1.0" ]
+    updater_git_clean
+    ! grep -q '<<<<<<<' "$REPO/config.txt" || false
+    grep -qx 'config v1.1.0' "$REPO/config.txt"
+    [ ! -e "$REPO/mynotes.txt" ]
+    # nothing was lost: both the tracked edit and the untracked file are in the stash
+    git -C "$REPO" stash show -p 'stash@{0}' | grep -q "config LOCAL EDIT"
+    [ "$(git -C "$REPO" show 'stash@{0}^3:mynotes.txt')" = "mine" ]
+}
+
+@test "a stash holding an untracked file the new version now tracks: the version's file stays, the operator's is kept" {
+    updater_checkout v1.1.0
+    echo "operator's own file" >"$REPO/added-in-1.2.0.txt" # untracked here, tracked from v1.2.0 on
+    updater_stdin 3 v1.2.0 y
+    updater_run
+    [ "$status" -eq 10 ]
+    [ "$(updater_head)" = "v1.2.0" ]
+    [ "$(cat "$REPO/added-in-1.2.0.txt")" = "added in v1.2.0" ]
+    updater_git_clean
+    [ "$(git -C "$REPO" show 'stash@{0}^3:added-in-1.2.0.txt')" = "operator's own file" ]
+}
+
+@test "a self-update whose saved changes conflict also keeps them and exits 10" {
+    updater_checkout v1.0.0
+    echo "config LOCAL EDIT" >"$REPO/config.txt"
+    updater_stdin 3 v1.3.0 y "" q
+    updater_run
+    [ "$status" -eq 10 ]
+    [[ "$output" == *"Restarting with updated version"* ]]
+    [ "$(updater_head)" = "v1.3.0" ]
+    updater_git_clean
+    ! grep -q '<<<<<<<' "$REPO/config.txt" || false
+    git -C "$REPO" stash show -p 'stash@{0}' | grep -q "config LOCAL EDIT"
+}
+
 @test "a checkout that reports success after a write error is caught and rolled back" {
     updater_checkout v1.1.0
     updater_make_big_tag

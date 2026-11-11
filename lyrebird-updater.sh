@@ -130,7 +130,8 @@ readonly E_NOT_FOUND=6 # requested/previous version is not available locally
 readonly E_LOCKED=7
 readonly E_BAD_STATE=8
 readonly E_USER_ABORT=9
-readonly E_ROLLBACK_FAILED=11 # the automatic rollback could not restore everything; see the messages
+readonly E_RESTORE_CONFLICT=10 # switch done, but your saved changes could not be re-applied (kept in the stash)
+readonly E_ROLLBACK_FAILED=11  # the automatic rollback could not restore everything; see the messages
 
 # Version requirements
 readonly MIN_GIT_MAJOR=2
@@ -238,6 +239,10 @@ declare -A TRANSACTION_STATE=(
     [target_head]=""
     [head_changed]=false
 )
+
+# Exit status of a run that otherwise ended normally (E_RESTORE_CONFLICT when a
+# self-update could not re-apply the operator's saved changes)
+EXIT_STATUS="$E_SUCCESS"
 
 # Available versions array
 declare -a AVAILABLE_VERSIONS=()
@@ -1889,6 +1894,70 @@ find_stash_ref() {
     git stash list --format="%gd %H" 2>/dev/null | awk -v h="$hash" '$2 == h {print $1; exit}' || true
 }
 
+# Tell the operator where their changes are and how to get them back
+report_kept_stash() {
+    local ref="$1"
+    log_warn "Your saved changes could not be re-applied to this version and were NOT lost:"
+    log_info "  They are kept in:   $ref"
+    log_info "  To look at them:    git stash show -p $ref"
+    log_info "  To re-apply:        git stash apply $ref   (resolve any conflicts, then: git stash drop $ref)"
+}
+
+# After a failed `git stash pop` the working tree holds conflict markers and
+# possibly part of the stash. Called only when the tree was clean before the
+# pop, so everything modified or untracked now came from the failed pop:
+# discard it and leave the clean version the operator switched to.
+abandon_failed_stash_apply() {
+    local ref="$1"
+    local path
+    git reset --hard HEAD >/dev/null 2>&1 || true
+    # Untracked files stored in the stash (its third parent) that the failed
+    # apply may already have restored. A path that is tracked in HEAD is the
+    # version's own file (the stash held an untracked file of the same name): keep it.
+    if git rev-parse --verify --quiet "${ref}^3" >/dev/null 2>&1; then
+        while IFS= read -r -d '' path; do
+            [[ -e "$path" || -L "$path" ]] || continue
+            if git ls-files --error-unmatch -- "$path" >/dev/null 2>&1; then
+                continue
+            fi
+            rm -f -- "$path" 2>/dev/null || true
+        done < <(git ls-tree -r -z --name-only "${ref}^3" 2>/dev/null || true)
+    fi
+}
+
+# Re-apply the transaction stash HASH onto the working tree.
+#   0                   restored; the stash entry is dropped
+#   1                   the stash entry is gone, nothing to restore
+#   E_RESTORE_CONFLICT  conflicts: the working tree is left clean (the version
+#                       that was switched to) and the changes stay in the stash
+# `git stash pop` on conflicts leaves markers in tracked files and exits
+# non-zero; the old code then reported success, so the markers could end up in
+# a script the service runs.
+restore_saved_changes() {
+    local hash="$1" ref clean_before=false
+    ref="$(find_stash_ref "$hash")"
+    if [[ -z "$ref" ]]; then
+        log_warn "Could not find your saved changes (stash $hash)"
+        return 1
+    fi
+
+    if [[ -z "$(git status --porcelain 2>/dev/null || echo unknown)" ]]; then
+        clean_before=true
+    fi
+
+    if git stash pop "$ref" >/dev/null 2>&1; then
+        return 0
+    fi
+
+    if [[ "$clean_before" == "true" ]]; then
+        abandon_failed_stash_apply "$ref"
+    else
+        log_warn "The working tree was not clean, so the partial result is left in place for you to inspect"
+    fi
+    report_kept_stash "$ref"
+    return "$E_RESTORE_CONFLICT"
+}
+
 # Delete files the failed switch added to the working tree: present in the
 # target version, absent from the original one, and untracked once HEAD is
 # back. (`git checkout` of the original version does not remove them.)
@@ -1987,12 +2056,8 @@ transaction_rollback() {
         elif [[ "$head_restored" != "true" ]]; then
             log_warn "Your changes are saved in: $stash_ref"
             log_info "Once the version is back: git stash pop $stash_ref"
-        elif git stash pop "$stash_ref" >/dev/null 2>&1; then
+        elif restore_saved_changes "${TRANSACTION_STATE[stash_hash]}"; then
             log_success "Your changes were restored"
-        else
-            log_warn "Could not restore your changes automatically"
-            log_info "Your changes are saved in: $stash_ref"
-            log_info "To restore: git stash pop $stash_ref"
         fi
     fi
 
@@ -2368,32 +2433,16 @@ switch_version_safe() {
     run_post_update_migrations
 
     # Restore stashed changes (if not self-updating)
+    local restore_status=0
     if [[ -n "${TRANSACTION_STATE[stash_hash]}" ]]; then
         echo
         log_step "Restoring your saved changes..."
-
-        local stash_ref
-        stash_ref=$(git stash list --format="%gd %H" | grep "${TRANSACTION_STATE[stash_hash]}" | cut -d' ' -f1 || echo "")
-
-        if [[ -z "$stash_ref" ]]; then
-            log_warn "Could not find your saved changes"
+        restore_saved_changes "${TRANSACTION_STATE[stash_hash]}" || restore_status=$?
+        if [[ $restore_status -eq 0 ]]; then
+            log_success "Changes restored successfully"
+        elif [[ $restore_status -ne $E_RESTORE_CONFLICT ]]; then
             log_info "Your changes may have been lost (stash hash: ${TRANSACTION_STATE[stash_hash]})"
-        else
-            # Try to pop the stash
-            if git stash pop "$stash_ref" >/dev/null 2>&1; then
-                log_success "Changes restored successfully"
-            else
-                # Pop failed, try apply
-                if git stash apply "$stash_ref" >/dev/null 2>&1; then
-                    log_success "Changes restored (with manual stash cleanup needed)"
-                    log_info "To remove the stash: git stash drop $stash_ref"
-                else
-                    log_warn "Could not restore changes automatically (conflicts detected)"
-                    log_info "Your changes are saved in: $stash_ref"
-                    log_info "To restore manually: git stash pop $stash_ref"
-                    log_info "You may need to resolve conflicts first"
-                fi
-            fi
+            restore_status=0
         fi
     fi
 
@@ -2405,6 +2454,10 @@ switch_version_safe() {
     check_local_changes
 
     echo
+    if [[ $restore_status -eq $E_RESTORE_CONFLICT ]]; then
+        log_warn "Version switch complete, but your saved changes were NOT re-applied (see above)"
+        return "$E_RESTORE_CONFLICT"
+    fi
     log_success "Version switch complete!"
 
     return 0
@@ -3226,20 +3279,12 @@ main() {
                 log_success "Updater has been updated!"
                 log_step "Restoring your saved changes..."
 
-                local stash_hash="$2"
-                local stash_ref
-                stash_ref=$(git stash list --format="%gd %H" | grep "$stash_hash" | cut -d' ' -f1 || echo "")
-
-                if [[ -n "$stash_ref" ]]; then
-                    if git stash pop "$stash_ref" >/dev/null 2>&1; then
-                        log_success "Changes restored successfully"
-                    else
-                        log_warn "Could not restore changes automatically"
-                        log_info "Your changes are in: $stash_ref"
-                        log_info "To restore: git stash pop $stash_ref"
-                    fi
-                else
-                    log_warn "Could not find your saved changes"
+                local restore_status=0
+                restore_saved_changes "$2" || restore_status=$?
+                if [[ $restore_status -eq 0 ]]; then
+                    log_success "Changes restored successfully"
+                elif [[ $restore_status -eq $E_RESTORE_CONFLICT ]]; then
+                    EXIT_STATUS="$E_RESTORE_CONFLICT"
                 fi
 
                 # Check for pending service update
@@ -3327,7 +3372,7 @@ main() {
     # Run interactive menu
     main_menu
 
-    exit "$E_SUCCESS"
+    exit "$EXIT_STATUS"
 }
 
 # Run main function
