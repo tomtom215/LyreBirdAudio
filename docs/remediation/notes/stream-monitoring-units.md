@@ -187,3 +187,56 @@ re-defined `update_heartbeat` in the test and tested the copy) is replaced by th
 
 Real hardware watchdog drivers (nothing opens a device any more; configuring
 `RuntimeWatchdogSec=` on a given board is the operator's and was not tested here).
+
+## Recording is RAM-only unless AUDIO_RECORDING_PATH says otherwise (LB-16, D8)
+
+### What was wrong (S, confirmed by reading every use)
+
+`AUDIO_DISK_PERSIST` (comment: "Move segments to disk (SD card wear!)") only made
+`setup_directories` run `mkdir -p` and `chmod 755` on `AUDIO_DISK_PATH` (default
+`/var/lib/mediamtx-ffmpeg/recordings`) when `AUDIO_LOCAL_RECORDING=true`. Neither
+variable reached a wrapper; the segments always went to `AUDIO_RECORDING_PATH`
+(default `/dev/shm/lyrebird-buffer`, tmpfs). Both defaulted to false/unused, so the
+only promise of persistence was the code comment.
+
+### What the code does now
+
+- `AUDIO_DISK_PERSIST` and `AUDIO_DISK_PATH` are not read by any code and the
+  directory creation is gone. If either name is present in the environment (even
+  empty) every run logs one `WARN Ignoring removed setting(s): ...` line saying
+  nothing is moved to disk, that recording is RAM-only by default and that durable
+  recording means pointing `AUDIO_RECORDING_PATH` at persistent storage (the same
+  function and the same once-per-run rule as the watchdog settings; the two groups
+  warn separately, so both set means two lines).
+- Unchanged: with `AUDIO_LOCAL_RECORDING=true` the wrapper's FFmpeg writes a ring of
+  `AUDIO_RECORDING_SEGMENTS` (default 12) segments of `AUDIO_RECORDING_SEGMENT_TIME`
+  seconds (default 300) per stream to `AUDIO_RECORDING_PATH/<stream>/audio_%03d.<codec>`.
+
+### Documentation consequences
+
+- Say plainly: the default recording is **RAM-only** (tmpfs): it is lost at reboot and
+  power loss, and it holds the last `AUDIO_RECORDING_SEGMENTS x AUDIO_RECORDING_SEGMENT_TIME`
+  seconds (one hour by default) per stream, nothing more (see
+  `docs/remediation/notes/storage.md`: the ring overwrites in place, retention days do
+  not govern it). To keep recordings across a reboot set `AUDIO_RECORDING_PATH` to a
+  directory on persistent storage (and, for the storage script's emergency clear and
+  retention, the matching `LYREBIRD_BUFFER_DIR` / `LYREBIRD_RECORDING_DIR`). Remove any
+  mention of `AUDIO_DISK_PERSIST` / `AUDIO_DISK_PATH`; neither was in the README's
+  configuration tables.
+- **Slot order is not chronological across restarts** (reproduced with the same FFmpeg
+  options the wrapper uses, `-f segment -segment_time 1 -segment_wrap 3`, scratchpad
+  `monunits/ring.*`): the ring restarts at slot 000 every time FFmpeg is (re)started, and
+  rewrites 000, 001, ... in place. After a 3.5 s run and a restart that ran 1.5 s the
+  mtimes were `000` newest-but-one, `001` newest, `002` oldest (still from the first
+  run). Anyone who plays the segments back must order them by modification time, not by
+  slot number; after a wrapper restart the newest audio is at the low slots and the
+  oldest is whatever the new run has not overwritten yet.
+
+### Tests
+
+`tests/test_stream_manager_removed_features.bats` (four more, 14 in all): no executable
+line names the removed settings; `setup_directories` with
+`AUDIO_LOCAL_RECORDING=true AUDIO_DISK_PERSIST=true` creates the recording directory
+and never `AUDIO_DISK_PATH`; the warning (once, both names, where durable recording
+goes; each group separately); the default path is tmpfs and the wrapper generators
+write the segments to `AUDIO_RECORDING_PATH` and name no other recording path.

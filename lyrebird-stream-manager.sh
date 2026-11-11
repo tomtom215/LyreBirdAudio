@@ -404,22 +404,25 @@ readonly NETWORK_CHECK_TIMEOUT
 NETWORK_FAIL_THRESHOLD=$(_uint_or "${NETWORK_FAIL_THRESHOLD:-}" 3) # Consecutive failures before alert
 readonly NETWORK_FAIL_THRESHOLD
 
-# Audio buffering (memory-based with optional disk persistence)
+# Audio buffering (memory only)
 # Memory buffering is done via FFmpeg's rtbufsize option (no SD card wear)
 readonly AUDIO_BUFFER_ENABLED="${AUDIO_BUFFER_ENABLED:-true}"   # Enable enhanced memory buffering
 AUDIO_BUFFER_SIZE_MB=$(_uint_or "${AUDIO_BUFFER_SIZE_MB:-}" 64) # Memory buffer size per stream (MB)
 readonly AUDIO_BUFFER_SIZE_MB
 AUDIO_RTBUFSIZE=$(_uint_or "${AUDIO_RTBUFSIZE:-}" 33554432) # Real-time buffer size in bytes (32MB default)
 readonly AUDIO_RTBUFSIZE
-# Local recording (ring buffer) - writes audio to tmpfs or disk alongside streaming
+# Local recording (ring buffer): FFmpeg writes the last AUDIO_RECORDING_SEGMENTS
+# segments of each stream to AUDIO_RECORDING_PATH alongside streaming. The default
+# is tmpfs (RAM): it does not survive a reboot or power loss. Recording that must
+# survive means pointing AUDIO_RECORDING_PATH at persistent storage; there is no
+# separate disk-persistence switch (AUDIO_DISK_PERSIST / AUDIO_DISK_PATH were
+# removed: they only created a directory nothing wrote to).
 readonly AUDIO_LOCAL_RECORDING="${AUDIO_LOCAL_RECORDING:-false}"                  # Enable local recording backup
 readonly AUDIO_RECORDING_PATH="${AUDIO_RECORDING_PATH:-/dev/shm/lyrebird-buffer}" # Default to tmpfs (RAM)
 AUDIO_RECORDING_SEGMENT_TIME=$(_uint_or "${AUDIO_RECORDING_SEGMENT_TIME:-}" 300)  # 5 min segments
 readonly AUDIO_RECORDING_SEGMENT_TIME
 AUDIO_RECORDING_SEGMENTS=$(_uint_or "${AUDIO_RECORDING_SEGMENTS:-}" 12) # Keep last 12 segments (1 hour)
 readonly AUDIO_RECORDING_SEGMENTS
-readonly AUDIO_DISK_PERSIST="${AUDIO_DISK_PERSIST:-false}" # Move segments to disk (SD card wear!)
-readonly AUDIO_DISK_PATH="${AUDIO_DISK_PATH:-/var/lib/mediamtx-ffmpeg/recordings}"
 
 # Audio level monitoring (detect dead/silent microphones). The monitor reads a
 # few seconds of each published stream back from MediaMTX over RTSP and measures
@@ -1799,16 +1802,6 @@ setup_directories() {
                 log WARN "Could not create audio buffer directory: ${AUDIO_RECORDING_PATH}"
             fi
         fi
-
-        # If disk persistence is enabled, create disk path
-        if [[ "${AUDIO_DISK_PERSIST}" == "true" ]] && [[ ! -d "${AUDIO_DISK_PATH}" ]]; then
-            if mkdir -p "${AUDIO_DISK_PATH}" 2>/dev/null; then
-                chmod 755 "${AUDIO_DISK_PATH}"
-                log INFO "Created disk recording directory: ${AUDIO_DISK_PATH}"
-            else
-                log WARN "Could not create disk recording directory: ${AUDIO_DISK_PATH}"
-            fi
-        fi
     fi
 
     # Setup MediaMTX log rotation if logrotate is available
@@ -3114,6 +3107,15 @@ warn_removed_settings() {
     done
     if [[ -n "$found" ]]; then
         log WARN "Ignoring removed setting(s): ${found}. The manager has no watchdog: it never opened a watchdog device. For a hardware watchdog use systemd's RuntimeWatchdogSec= (system.conf) or a watchdog daemon; the monitor only records the time of its last run in ${HEARTBEAT_FILE}"
+    fi
+    found=""
+    for name in AUDIO_DISK_PERSIST AUDIO_DISK_PATH; do
+        if [[ -v "$name" ]]; then
+            found+="${found:+, }${name}"
+        fi
+    done
+    if [[ -n "$found" ]]; then
+        log WARN "Ignoring removed setting(s): ${found}. Nothing is moved to disk: recording is RAM-only by default (AUDIO_RECORDING_PATH=/dev/shm/lyrebird-buffer, lost at reboot or power loss). For recording that survives, point AUDIO_RECORDING_PATH at persistent storage"
     fi
     return 0
 }

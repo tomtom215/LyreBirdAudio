@@ -222,3 +222,64 @@ SHIM
     run env "${metrics_env[@]}" bash "$PROJECT_ROOT/lyrebird-metrics.sh" --once
     [[ "$output" == *$'\nlyrebird_heartbeat_healthy 0\n'* ]]
 }
+
+# ---------------------------------------------------------------------------
+# D8: no disk-persistence switch (LB-16)
+# ---------------------------------------------------------------------------
+
+@test "AUDIO_DISK_PERSIST and AUDIO_DISK_PATH are no longer read or handled by any executable line [LB-16, D8]" {
+    run grep -c -E 'AUDIO_DISK_(PERSIST|PATH)' "$SCRIPT"
+    [ "$status" -eq 0 ] # the control: the names are in the script, in the warning and the comment that explain the removal
+    run static_hits 'AUDIO_DISK|disk recording directory|persistence'
+    [ "$status" -eq 1 ]
+    [ -z "$output" ]
+    run env -u AUDIO_DISK_PERSIST -u AUDIO_DISK_PATH bash -c '
+        source "$1" >/dev/null 2>&1
+        ! declare -p AUDIO_DISK_PERSIST >/dev/null 2>&1 && ! declare -p AUDIO_DISK_PATH >/dev/null 2>&1 && echo gone' _ "$SCRIPT"
+    [ "$output" = "gone" ]
+}
+
+@test "setup_directories creates the recording directory and never AUDIO_DISK_PATH, with AUDIO_DISK_PERSIST=true [LB-16, D8]" {
+    run env AUDIO_LOCAL_RECORDING=true AUDIO_RECORDING_PATH="$RF/recording" AUDIO_DISK_PERSIST=true AUDIO_DISK_PATH="$RF/disk-recordings" \
+        MEDIAMTX_LOG_FILE="$RF/logs/sm.log" bash -c '
+        source "$1" >/dev/null 2>&1
+        setup_mediamtx_logrotate() { :; }   # would write /etc/logrotate.d on a host that has logrotate
+        setup_directories
+        echo "rc=$?"' _ "$SCRIPT"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"rc=0" ]]
+    [ -d "$RF/recording" ]
+    [ ! -e "$RF/disk-recordings" ]
+}
+
+@test "the removed disk-persistence settings are named once per run, with where durable recording goes [LB-16, D8]" {
+    run env AUDIO_DISK_PERSIST=true AUDIO_DISK_PATH=/srv/recordings bash "$SCRIPT" help
+    [ "$status" -eq 0 ]
+    [ "$(grep -c "Ignoring removed setting" <<<"$output" || true)" -eq 1 ]
+    [[ "$output" == *"Ignoring removed setting(s): AUDIO_DISK_PERSIST, AUDIO_DISK_PATH."* ]]
+    [[ "$output" == *"RAM-only by default"* ]]
+    [[ "$output" == *"point AUDIO_RECORDING_PATH at persistent storage"* ]]
+    [ "$(count_log 'Ignoring removed setting')" -eq 1 ]
+
+    # either one alone is enough
+    run env AUDIO_DISK_PATH=/srv/recordings bash "$SCRIPT" help
+    [[ "$output" == *"Ignoring removed setting(s): AUDIO_DISK_PATH."* ]]
+
+    # the watchdog group and the disk group each warn once
+    run env AUDIO_DISK_PERSIST=true ENABLE_HARDWARE_WATCHDOG=yes bash "$SCRIPT" help
+    [ "$(grep -c "Ignoring removed setting" <<<"$output" || true)" -eq 2 ]
+
+    # unset: nothing
+    run env -u AUDIO_DISK_PERSIST -u AUDIO_DISK_PATH bash "$SCRIPT" help
+    [[ "$output" != *"AUDIO_DISK"* ]]
+}
+
+@test "recording stays RAM-only by default: the default path is tmpfs and no wrapper code names a disk path [LB-16, D8]" {
+    run env -u AUDIO_RECORDING_PATH bash -c 'source "$1" >/dev/null 2>&1; echo "$AUDIO_RECORDING_PATH"' _ "$SCRIPT"
+    [ "$output" = "/dev/shm/lyrebird-buffer" ]
+    # the wrapper generators write the segments to AUDIO_RECORDING_PATH, and know no other recording path
+    run bash -c 'source "$1" >/dev/null 2>&1; declare -f start_ffmpeg_stream start_ffmpeg_multiplex_stream' _ "$SCRIPT"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *'${AUDIO_RECORDING_PATH}/${STREAM_PATH}'* ]]
+    [[ "$output" != *DISK* ]]
+}
