@@ -342,3 +342,50 @@ SHIM
     # second: the directory, after the rename made the new content visible
     [[ "${calls[1]}" == "path=$d exists=y dest=new" ]]
 }
+
+# The owner reference (third argument), used when an operator-owned file is
+# replaced and must keep the ownership it was given
+
+# A group other than $1 that this user may give files to: any group for root,
+# else a supplementary group; fails if there is none
+_other_gid() {
+    local current="$1" g
+    if [ "$(id -u)" -eq 0 ]; then
+        echo 23456
+        return 0
+    fi
+    for g in $(id -G); do
+        [ "$g" != "$current" ] && { echo "$g"; return 0; }
+    done
+    return 1
+}
+
+@test "lyrebird_atomic_write gives the new file the owner and group of the reference file" {
+    local d="$BATS_TEST_TMPDIR/aw6" gid
+    mkdir -p "$d"
+    echo old >"$d/out"
+    gid="$(_other_gid "$(stat -c %g "$d/out")")" || skip "no second group to test with"
+    chgrp "$gid" "$d/out"
+    echo new | lyrebird_atomic_write "$d/out" 0640 "$d/out"
+    [ "$(cat "$d/out")" = "new" ]
+    [ "$(stat -c %g "$d/out")" = "$gid" ]
+    [ "$(stat -c %a "$d/out")" = "640" ]
+}
+
+@test "lyrebird_atomic_write without a reference file leaves the new file to the invoking user" {
+    local d="$BATS_TEST_TMPDIR/aw7" gid
+    mkdir -p "$d"
+    echo old >"$d/out"
+    gid="$(_other_gid "$(stat -c %g "$d/out")")" || skip "no second group to test with"
+    chgrp "$gid" "$d/out"
+    echo new | lyrebird_atomic_write "$d/out"
+    [ "$(stat -c %g "$d/out")" != "$gid" ]
+}
+
+@test "lyrebird_atomic_write ignores a reference file that does not exist" {
+    local d="$BATS_TEST_TMPDIR/aw8"
+    mkdir -p "$d"
+    echo new | lyrebird_atomic_write "$d/out" 0600 "$d/no-such-file"
+    [ "$(cat "$d/out")" = "new" ]
+    [ "$(stat -c %a "$d/out")" = "600" ]
+}

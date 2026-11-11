@@ -55,11 +55,16 @@ tests/check_tmp_leaks.sh
 
 **Run the live tests against real MediaMTX releases** (downloads checksum-pinned
 1.15.0, 1.18.0, 1.19.0, 1.21.1, 1.21.2 and 1.21.3 for linux amd64 into
-`.cache/mediamtx`; needs ffmpeg, curl, jq and free ports 8554/9997; refuses to
-run while another MediaMTX or RTSP ffmpeg is running):
+`.cache/mediamtx`; needs ffmpeg, curl, jq, openssl and python3; the soak live tests
+also need the free ports 8554/9997 and refuse to run while another MediaMTX or RTSP
+ffmpeg is running; the `test_mediamtx_*` live files bind no default port: each test
+takes free ports and moves MediaMTX's other listeners to spare ports, see
+`tests/mediamtx_live_helper.bash`, and `LYREBIRD_TEST_PORT_BASE=N` pins the block
+`N`..`N+12`):
 ```bash
 LYREBIRD_TEST_MEDIAMTX_BINS="$(tests/fetch_mediamtx.sh)" \
-    bats tests/test_mediamtx_live.bats tests/test_soak_live.bats tests/test_soak_observer.bats
+    bats tests/test_mediamtx_live.bats tests/test_soak_live.bats tests/test_soak_observer.bats \
+    tests/test_mediamtx_config_live.bats tests/test_mediamtx_api_live.bats tests/test_mediamtx_e2e_ports.bats
 ```
 Without `LYREBIRD_TEST_MEDIAMTX_BINS` those live tests are skipped. One version
 only: `tests/fetch_mediamtx.sh .cache/mediamtx v1.21.3` (CI runs each pinned

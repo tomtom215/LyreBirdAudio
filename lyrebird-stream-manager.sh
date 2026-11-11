@@ -248,6 +248,30 @@ readonly LOG_FILE="${STREAM_MANAGER_LOG_FILE:-/var/log/lyrebird-stream-manager.l
 readonly MEDIAMTX_LOG_FILE="${MEDIAMTX_LOG_FILE:-/var/log/mediamtx.out}"
 readonly MEDIAMTX_BIN="${MEDIAMTX_BINARY:-/usr/local/bin/mediamtx}"
 readonly MEDIAMTX_HOST="${MEDIAMTX_HOST:-localhost}"
+
+# MediaMTX listener ports (D15, X-19). An invalid value is an error and never a
+# silent fallback to the default: a manager that publishes to the wrong port
+# looks like a healthy node that records nothing.
+_mediamtx_port_env() {
+    local name="$1" default="$2" value
+    value="${!name:-}"
+    if [[ -z "$value" ]]; then
+        printf '%s' "$default"
+        return 0
+    fi
+    if [[ "$value" =~ ^[0-9]{1,5}$ ]] && ((10#$value >= 1 && 10#$value <= 65535)); then
+        printf '%s' "$((10#$value))"
+        return 0
+    fi
+    printf '[ERROR] %s must be an integer from 1 to 65535 (got: %q)\n' "$name" "$value" >&2
+    return 1
+}
+MEDIAMTX_RTSP_PORT="$(_mediamtx_port_env MEDIAMTX_RTSP_PORT 8554)" || exit "${E_CONFIG_ERROR}"
+readonly MEDIAMTX_RTSP_PORT
+MEDIAMTX_API_PORT="$(_mediamtx_port_env MEDIAMTX_API_PORT 9997)" || exit "${E_CONFIG_ERROR}"
+readonly MEDIAMTX_API_PORT
+MEDIAMTX_METRICS_PORT="$(_mediamtx_port_env MEDIAMTX_METRICS_PORT 9998)" || exit "${E_CONFIG_ERROR}"
+readonly MEDIAMTX_METRICS_PORT
 # Note: These are NOT readonly to allow command-line option overrides
 STREAM_MODE="${STREAM_MODE:-individual}"
 MULTIPLEX_STREAM_NAME="${MULTIPLEX_STREAM_NAME:-all_mics}"
@@ -322,6 +346,24 @@ readonly RESTART_STABILIZATION_DELAY
 # How long stop and force-stop wait for the lifecycle lock before refusing
 STOP_LOCK_TIMEOUT=$(_uint_or "${STOP_LOCK_TIMEOUT:-}" 5)
 readonly STOP_LOCK_TIMEOUT
+
+# MediaMTX configuration ownership and exposure (D9, D10; LB-06, LB-22)
+# - A file whose first line is "# Managed by LyreBirdAudio" is rewritten when
+#   its content changes, after a timestamped backup (the newest
+#   MEDIAMTX_CONFIG_BACKUPS are kept); any other file is the operator's.
+# - The control API and the metrics endpoint listen on the loopback address
+#   unless MEDIAMTX_API_BIND / MEDIAMTX_METRICS_BIND say otherwise (an address,
+#   or the empty string for every interface).
+# - RTSP_AUTH_MODE=local-only-publish renders internal authentication: this
+#   machine needs no password, everybody else needs a user from RTSP_USERS_FILE
+#   ("user:sha256:<base64>" lines).
+MEDIAMTX_CONFIG_BACKUPS=$(_uint_or "${MEDIAMTX_CONFIG_BACKUPS:-}" 5)
+((MEDIAMTX_CONFIG_BACKUPS >= 1)) || MEDIAMTX_CONFIG_BACKUPS=1
+readonly MEDIAMTX_CONFIG_BACKUPS
+readonly MEDIAMTX_API_BIND="${MEDIAMTX_API_BIND-127.0.0.1}"
+readonly MEDIAMTX_METRICS_BIND="${MEDIAMTX_METRICS_BIND-127.0.0.1}"
+readonly RTSP_AUTH_MODE="${RTSP_AUTH_MODE:-open}"
+readonly RTSP_USERS_FILE="${RTSP_USERS_FILE:-${CONFIG_DIR}/rtsp-users.conf}"
 
 # Resource monitoring thresholds
 MAX_FD_WARNING=$(_uint_or "${MAX_FD_WARNING:-}" 500)
@@ -476,6 +518,9 @@ declare -g LOCK_DEPRECATION_LOGGED=false
 
 # Skip cleanup flag
 declare -g SKIP_CLEANUP=false
+
+# Set by --regenerate-config: take over a MediaMTX configuration the operator owns
+declare -g REGENERATE_CONFIG=false
 
 # Command being executed (COMMAND used by cleanup trap, must be initialized early)
 declare -g COMMAND=""
@@ -2133,12 +2178,170 @@ check_network_connectivity() {
     return 0
 }
 
+# RTSP base URL every publisher and reader of this node uses:
+# rtsp://MEDIAMTX_HOST:MEDIAMTX_RTSP_PORT
+mediamtx_rtsp_base() {
+    printf 'rtsp://%s:%s' "${MEDIAMTX_HOST}" "${MEDIAMTX_RTSP_PORT}"
+}
+
+# URL a publisher or reader of stream path $1 connects to
+rtsp_publish_url() {
+    printf '%s/%s' "$(mediamtx_rtsp_base)" "$1"
+}
+
+# Host the manager asks the control API on: where MEDIAMTX_API_BIND says it
+# listens, or MEDIAMTX_HOST when that is every interface
+mediamtx_api_host() {
+    local host
+    case "${MEDIAMTX_API_BIND}" in
+        '' | 0.0.0.0 | ::) host="${MEDIAMTX_HOST}" ;;
+        *) host="${MEDIAMTX_API_BIND}" ;;
+    esac
+    [[ "$host" == *:* && "$host" != \[* ]] && host="[${host}]"
+    printf '%s' "$host"
+}
+
+# Root URL of the MediaMTX control API: http://HOST:MEDIAMTX_API_PORT
+mediamtx_api_root() {
+    printf 'http://%s:%s' "$(mediamtx_api_host)" "${MEDIAMTX_API_PORT}"
+}
+
+# GET $1 (a path below the API root, e.g. /v3/paths/list) with curl and keep
+# the answer apart from the transport:
+#   MEDIAMTX_API_STATUS  the HTTP status, 000 when there was no HTTP answer
+#   MEDIAMTX_API_BODY    the response body
+# Not -f: a 401 or 403 must stay distinguishable from a refused connection and
+# from a 5xx. A transfer that did not complete (refused, timed out, cut off) is
+# no answer, whatever it had received.
+# Usage: mediamtx_api_get PATH [MAX_SECONDS]
+# Returns: 0 = an HTTP answer arrived (any status), 1 = none, 2 = no curl
+mediamtx_api_get() {
+    local path="$1" max_time="${2:-3}" raw rc=0
+    MEDIAMTX_API_STATUS=000
+    MEDIAMTX_API_BODY=""
+    command_exists curl || return 2
+    raw="$(curl -sS --max-time "$max_time" -w $'\n%{http_code}' "$(mediamtx_api_root)${path}" 2>/dev/null)" || rc=$?
+    if [[ $rc -ne 0 || "$raw" != *$'\n'* ]]; then
+        return 1
+    fi
+    if ! [[ "${raw##*$'\n'}" =~ ^[0-9]{3}$ ]]; then
+        return 1
+    fi
+    MEDIAMTX_API_STATUS="${raw##*$'\n'}"
+    MEDIAMTX_API_BODY="${raw%$'\n'*}"
+    return 0
+}
+
+# Is $2 a JSON document of kind $1 that this MediaMTX API sends?
+#   list   a paths list: an object with "items" (an array, but for the API v1
+#          and the unversioned one, whose items were an object keyed by name)
+#   path   one path: an object with a string "name" and a boolean "available"
+#          or "ready"
+#   error  an error answer: an object with a string "error"
+# $3 is the API prefix (v3, v2, v1 or empty). Uses jq; without it a
+# conservative textual check of the same shapes.
+# Usage: mediamtx_api_body_is KIND BODY [PREFIX]
+mediamtx_api_body_is() {
+    local kind="$1" body="$2" prefix="${3-v3}"
+    [[ -n "$body" ]] || return 1
+    if command_exists jq; then
+        case "$kind" in
+            list)
+                if [[ "$prefix" == v3 || "$prefix" == v2 ]]; then
+                    jq -e 'type == "object" and (.items | type == "array")' <<<"$body" >/dev/null 2>&1
+                else
+                    jq -e 'type == "object" and has("items")' <<<"$body" >/dev/null 2>&1
+                fi
+                ;;
+            path)
+                jq -e 'type == "object" and (.name | type == "string") and (((.available | type) == "boolean") or ((.ready | type) == "boolean"))' <<<"$body" >/dev/null 2>&1
+                ;;
+            error)
+                jq -e 'type == "object" and (.error | type == "string")' <<<"$body" >/dev/null 2>&1
+                ;;
+            *) return 1 ;;
+        esac
+        return
+    fi
+    [[ "$body" =~ ^[[:space:]]*\{.*\}[[:space:]]*$ ]] || return 1
+    case "$kind" in
+        list)
+            if [[ "$prefix" == v3 || "$prefix" == v2 ]]; then
+                [[ "$body" =~ \"items\"[[:space:]]*:[[:space:]]*\[ ]]
+            else
+                [[ "$body" =~ \"items\"[[:space:]]*:[[:space:]]*[\[\{] ]]
+            fi
+            ;;
+        path)
+            [[ "$body" =~ \"name\"[[:space:]]*:[[:space:]]*\" ]] \
+                && [[ "$body" =~ \"(available|ready)\"[[:space:]]*:[[:space:]]*(true|false) ]]
+            ;;
+        error) [[ "$body" =~ \"error\"[[:space:]]*:[[:space:]]*\" ]] ;;
+        *) return 1 ;;
+    esac
+}
+
+# Ask the control API for its paths list and say what the answer means. The API
+# is ready when it answers 200 with a paths list of the shape that API version
+# sends; a 404 means this version prefix does not exist, so the next older one
+# (v3, v2, v1, then no prefix unless MEDIAMTX_API_FALLBACK=false) is tried; a
+# 401 or 403 proves MediaMTX is up but not what is behind the door; anything
+# else (no answer, 5xx, any other status, a 200 that is not a paths list) is not
+# ready. Sets
+#   MEDIAMTX_API_STATE   ready | unauthorized | notready | unreachable | nocurl
+#   MEDIAMTX_API_BASE    root URL plus the prefix that answered (v3 if none did)
+#   MEDIAMTX_API_STATUS  the last HTTP status (see mediamtx_api_get)
+# Usage: mediamtx_api_probe [MAX_SECONDS_PER_REQUEST]
+# Returns: 0 = ready, 1 = not ready or unreachable, 2 = unauthorized, 3 = no curl
+mediamtx_api_probe() {
+    local max_time="${1:-2}" root version rc=0
+    local -a versions
+    root="$(mediamtx_api_root)"
+    MEDIAMTX_API_STATE=notready
+    MEDIAMTX_API_BASE="${root}/v3"
+    if [[ "${MEDIAMTX_API_VERSION}" != "auto" ]]; then
+        versions=("${MEDIAMTX_API_VERSION}")
+        MEDIAMTX_API_BASE="${root}/${MEDIAMTX_API_VERSION}"
+    elif [[ "${MEDIAMTX_API_FALLBACK}" == "true" ]]; then
+        versions=(v3 v2 v1 "")
+    else
+        versions=(v3 v2 v1)
+    fi
+    for version in "${versions[@]}"; do
+        rc=0
+        mediamtx_api_get "${version:+/$version}/paths/list" "$max_time" || rc=$?
+        if [[ $rc -eq 2 ]]; then
+            MEDIAMTX_API_STATE=nocurl
+            return 3
+        elif [[ $rc -ne 0 ]]; then
+            MEDIAMTX_API_STATE=unreachable
+            return 1
+        fi
+        case "${MEDIAMTX_API_STATUS}" in
+            200)
+                if mediamtx_api_body_is list "${MEDIAMTX_API_BODY}" "$version"; then
+                    MEDIAMTX_API_STATE=ready
+                    MEDIAMTX_API_BASE="${root}${version:+/$version}"
+                    return 0
+                fi
+                return 1
+                ;;
+            401 | 403)
+                MEDIAMTX_API_STATE=unauthorized
+                return 2
+                ;;
+            404) ;;
+            *) return 1 ;;
+        esac
+    done
+    return 1
+}
+
 # Detect MediaMTX API version and return appropriate base URL
 # Tries v3, v2, v1 in order if auto-detection is enabled
 detect_mediamtx_api_version() {
-    local host="${MEDIAMTX_HOST:-localhost}"
-    local port="${MEDIAMTX_API_PORT:-9997}"
-    local base_url="http://${host}:${port}"
+    local base_url
+    base_url="$(mediamtx_api_root)"
 
     # If version is explicitly set, use it
     if [[ "${MEDIAMTX_API_VERSION}" != "auto" ]]; then
@@ -2146,29 +2349,31 @@ detect_mediamtx_api_version() {
         return 0
     fi
 
-    # Auto-detect: try versions in order
-    if command_exists curl; then
-        for version in v3 v2 v1; do
-            local test_url="${base_url}/${version}/paths/list"
-            if curl -s --max-time 2 "$test_url" >/dev/null 2>&1; then
-                log DEBUG "Detected MediaMTX API version: $version"
-                echo "${base_url}/${version}"
-                return 0
-            fi
-        done
+    command_exists curl || {
+        log WARN "curl is not available, assuming MediaMTX API v3"
+        echo "${base_url}/v3"
+        return 0
+    }
 
-        # Fallback: try without version prefix (very old MediaMTX)
-        if [[ "${MEDIAMTX_API_FALLBACK}" == "true" ]]; then
-            if curl -s --max-time 2 "${base_url}/paths/list" >/dev/null 2>&1; then
-                log DEBUG "Using legacy MediaMTX API (no version prefix)"
-                echo "${base_url}"
-                return 0
-            fi
-        fi
-    fi
+    local rc=0
+    mediamtx_api_probe || rc=$?
+    case "$rc" in
+        0)
+            log DEBUG "Detected MediaMTX API: ${MEDIAMTX_API_BASE}"
+            echo "${MEDIAMTX_API_BASE}"
+            return 0
+            ;;
+        2)
+            # The API wants credentials, so no prefix can be tried; every
+            # MediaMTX this script supports (1.15 and later) has /v3
+            log DEBUG "MediaMTX API answered ${MEDIAMTX_API_STATUS}: it needs credentials, assuming v3"
+            echo "${base_url}/v3"
+            return 0
+            ;;
+    esac
 
     # Default to v3 if detection fails
-    log WARN "Could not detect MediaMTX API version, defaulting to v3"
+    log WARN "Could not detect MediaMTX API version (${MEDIAMTX_API_STATE}, last HTTP status ${MEDIAMTX_API_STATUS}), defaulting to v3"
     echo "${base_url}/v3"
     return 0
 }
@@ -3195,20 +3400,32 @@ should_restart_stream() {
 
 # --- Deep health probe (H9) --------------------------------------------------
 # Ask the MediaMTX control API whether a path is actually publishing.
-# Returns: 0 = ready, 1 = not ready, 2 = unknown (curl absent/API unreachable).
+# Returns: 0 = ready, 1 = not ready (MediaMTX has the path and it is not
+#          available, or knows no such path), 2 = unknown: curl absent, no
+#          answer, a 401 or 403 (the API wants credentials: the stream cannot
+#          be judged), a 5xx or an answer that is not what MediaMTX sends.
+#          Unknown never counts against a stream.
 probe_stream_ready() {
     local stream_path="$1"
     command_exists curl || return 2
-    local api_base response
+    local api_base prefix
     api_base=$(detect_mediamtx_api_version)
-    if ! response=$(curl -s --max-time 3 "${api_base}/paths/get/${stream_path}" 2>/dev/null) \
-        || [[ -z "$response" ]]; then
-        return 2
-    fi
-    if mediamtx_json_path_ready "$response"; then
-        return 0
-    fi
-    return 1
+    prefix="${api_base#"$(mediamtx_api_root)"}"
+    mediamtx_api_get "${prefix}/paths/get/${stream_path}" 3 || return 2
+    case "${MEDIAMTX_API_STATUS}" in
+        200)
+            mediamtx_api_body_is path "${MEDIAMTX_API_BODY}" || return 2
+            mediamtx_json_path_ready "${MEDIAMTX_API_BODY}"
+            return
+            ;;
+        404)
+            # MediaMTX answers {"status":"error","error":"path not found"}; a
+            # plain-text 404 is a server that does not know the route at all
+            mediamtx_api_body_is error "${MEDIAMTX_API_BODY}" && return 1
+            return 2
+            ;;
+    esac
+    return 2
 }
 
 # Record a probe verdict for a stream. Not-ready increments a strike counter;
@@ -3544,10 +3761,7 @@ validate_stream() {
         # v1.4.2: Use API version detection for compatibility
         # v1.4.4: Restructured to preserve curl exit status for better error detection
         if command_exists curl; then
-            local api_base api_response
-            api_base=$(detect_mediamtx_api_version)
-            local api_url="${api_base}/paths/get/${stream_path}"
-            if api_response=$(curl -s --max-time 2 "${api_url}" 2>/dev/null) && mediamtx_json_path_ready "$api_response"; then
+            if probe_stream_ready "$stream_path"; then
                 log DEBUG "Stream $stream_path validated via API (attempt ${attempt})"
                 return 0
             fi
@@ -3835,14 +4049,18 @@ wait_for_mediamtx_ready() {
         fi
 
         if command_exists curl; then
-            # v1.4.2: Try multiple API versions for compatibility
-            for api_version in v3 v2 v1 ""; do
-                local test_url="http://${MEDIAMTX_HOST}:9997/${api_version:+$api_version/}paths/list"
-                if curl -s --max-time 2 "$test_url" >/dev/null 2>&1; then
-                    log INFO "MediaMTX API is ready after ${elapsed} seconds (API: ${api_version:-legacy})"
-                    return 0
-                fi
-            done
+            # Ready means a 200 with a paths list, not just any answer (LB-13)
+            local rc=0
+            mediamtx_api_probe 2 || rc=$?
+            if [[ $rc -eq 0 ]]; then
+                log INFO "MediaMTX API is ready after ${elapsed} seconds (${MEDIAMTX_API_BASE})"
+                return 0
+            elif [[ $rc -eq 2 ]]; then
+                # MediaMTX is up and serving HTTP, but its API wants credentials
+                # this script does not have: waiting longer cannot change that
+                log WARN "MediaMTX is up (HTTP ${MEDIAMTX_API_STATUS} from ${MEDIAMTX_API_BASE}) but its API requires credentials: stream health cannot be checked through it"
+                return 0
+            fi
         else
             # Fallback: just check if process is running
             if [[ $elapsed -ge 10 ]]; then
@@ -3859,7 +4077,7 @@ wait_for_mediamtx_ready() {
         fi
     done
 
-    log ERROR "MediaMTX API did not become ready within ${max_wait} seconds"
+    log ERROR "MediaMTX API did not become ready within ${max_wait} seconds (${MEDIAMTX_API_STATE:-unknown} at ${MEDIAMTX_API_BASE:-$(mediamtx_api_root)}, last HTTP status ${MEDIAMTX_API_STATUS:-000})"
     return 1
 }
 
@@ -5033,6 +5251,7 @@ WRAPPER_START
         WRAPPER_PID_FILE "$pid_file" \
         CLEANUP_MARKER "$CLEANUP_MARKER" \
         MEDIAMTX_HOST "$MEDIAMTX_HOST" \
+        MEDIAMTX_RTSP_PORT "$MEDIAMTX_RTSP_PORT" \
         DEV_SND_ROOT "$DEV_SND_ROOT" \
         RESTART_COUNT 0 \
         CONSECUTIVE_FAILURES 0 \
@@ -5190,7 +5409,7 @@ run_ffmpeg() {
     ffmpeg_cmd+=(
         -f rtsp
         -rtsp_transport tcp
-        "rtsp://${MEDIAMTX_HOST}:8554/${STREAM_PATH}"
+        "rtsp://${MEDIAMTX_HOST}:${MEDIAMTX_RTSP_PORT}/${STREAM_PATH}"
     )
     
     # Log the complete command for debugging
@@ -5477,6 +5696,7 @@ WRAPPER_START
         WRAPPER_PID_FILE "$pid_file" \
         CLEANUP_MARKER "$CLEANUP_MARKER" \
         MEDIAMTX_HOST "$MEDIAMTX_HOST" \
+        MEDIAMTX_RTSP_PORT "$MEDIAMTX_RTSP_PORT" \
         MAIN_SCRIPT_PID "$$" \
         RESTART_COUNT 0 \
         CONSECUTIVE_FAILURES 0 \
@@ -5617,7 +5837,7 @@ run_ffmpeg() {
         ffmpeg_cmd+=(
             -f tee
             -map 0:a
-            "[f=rtsp:rtsp_transport=tcp]rtsp://${MEDIAMTX_HOST}:8554/${STREAM_PATH}|[f=segment:segment_time=${AUDIO_RECORDING_SEGMENT_TIME}:segment_wrap=${AUDIO_RECORDING_SEGMENTS}:strftime=0]${AUDIO_RECORDING_PATH}/${STREAM_PATH}/audio_%03d.${CODEC}"
+            "[f=rtsp:rtsp_transport=tcp]rtsp://${MEDIAMTX_HOST}:${MEDIAMTX_RTSP_PORT}/${STREAM_PATH}|[f=segment:segment_time=${AUDIO_RECORDING_SEGMENT_TIME}:segment_wrap=${AUDIO_RECORDING_SEGMENTS}:strftime=0]${AUDIO_RECORDING_PATH}/${STREAM_PATH}/audio_%03d.${CODEC}"
         )
         log_message "Local recording enabled: ${AUDIO_RECORDING_PATH}/${STREAM_PATH} (${AUDIO_RECORDING_SEGMENTS} x ${AUDIO_RECORDING_SEGMENT_TIME}s segments)"
     else
@@ -5626,7 +5846,7 @@ run_ffmpeg() {
         ffmpeg_cmd+=(
             -f rtsp
             -rtsp_transport tcp
-            "rtsp://${MEDIAMTX_HOST}:8554/${STREAM_PATH}"
+            "rtsp://${MEDIAMTX_HOST}:${MEDIAMTX_RTSP_PORT}/${STREAM_PATH}"
         )
     fi
     
@@ -5982,9 +6202,9 @@ stop_all_ffmpeg_streams() {
     return 0
 }
 
-# Does the installed MediaMTX accept the top-level "moq" key (>= 1.19.0)?
-# Fails when the binary is missing or its version cannot be read.
-mediamtx_supports_moq_key() {
+# The version the installed MediaMTX reports (first line of --version, e.g.
+# v1.21.1). Fails when the binary is missing or prints nothing.
+mediamtx_binary_version() {
     local ver
     [[ -x "${MEDIAMTX_BIN}" ]] || return 1
     if command_exists timeout; then
@@ -5992,9 +6212,113 @@ mediamtx_supports_moq_key() {
     else
         ver=$("${MEDIAMTX_BIN}" --version 2>/dev/null | head -n 1) || return 1
     fi
-    [[ "$ver" =~ ^v?([0-9]+)\.([0-9]+)\.[0-9]+ ]] || return 1
-    local major=$((10#${BASH_REMATCH[1]})) minor=$((10#${BASH_REMATCH[2]}))
-    ((major > 1 || (major == 1 && minor >= 19)))
+    [[ -n "$ver" ]] || return 1
+    printf '%s' "$ver"
+}
+
+# Does the installed MediaMTX have --validate-conf (1.21 and later)?
+mediamtx_supports_validate_conf() {
+    local help
+    [[ -x "${MEDIAMTX_BIN}" ]] || return 1
+    if command_exists timeout; then
+        help=$(timeout 10 "${MEDIAMTX_BIN}" --help 2>&1) || true
+    else
+        help=$("${MEDIAMTX_BIN}" --help 2>&1) || true
+    fi
+    [[ "$help" == *--validate-conf* ]]
+}
+
+# Is configuration file $1 acceptable to MediaMTX? Uses MediaMTX's own
+# --validate-conf where the binary has it; older binaries get a structural
+# check (a readable, non-empty text file with at least one top-level key and no
+# tab indentation, which YAML forbids). Problems are logged as errors.
+# Returns: 0 = acceptable, 1 = not
+mediamtx_validate_config() {
+    local file="$1" out="" line="" rc=0
+    if mediamtx_supports_validate_conf; then
+        if command_exists timeout; then
+            out=$(timeout 20 "${MEDIAMTX_BIN}" "--validate-conf=${file}" 2>&1) || rc=$?
+        else
+            out=$("${MEDIAMTX_BIN}" "--validate-conf=${file}" 2>&1) || rc=$?
+        fi
+        if [[ $rc -ne 0 ]]; then
+            log ERROR "MediaMTX rejects the configuration ${file}:"
+            while IFS= read -r line; do
+                [[ -n "$line" ]] && log ERROR "  ${line}"
+            done <<<"$out"
+            return 1
+        fi
+        return 0
+    fi
+    if [[ ! -f "$file" || ! -r "$file" ]]; then
+        log ERROR "MediaMTX configuration ${file} is not a readable file"
+        return 1
+    fi
+    if [[ ! -s "$file" ]]; then
+        log ERROR "MediaMTX configuration ${file} is empty (MediaMTX would start without the control API this manager needs)"
+        return 1
+    fi
+    if [[ "$(LC_ALL=C tr -d '\0' <"$file" | wc -c)" -ne "$(wc -c <"$file")" ]]; then
+        log ERROR "MediaMTX configuration ${file} contains NUL bytes: it is not a text file"
+        return 1
+    fi
+    if grep -q $'^[ ]*\t' "$file"; then
+        log ERROR "MediaMTX configuration ${file} is indented with tabs, which YAML does not allow"
+        return 1
+    fi
+    if ! grep -qE '^[A-Za-z_][A-Za-z0-9_]*:' "$file"; then
+        log ERROR "MediaMTX configuration ${file} has no top-level key"
+        return 1
+    fi
+    return 0
+}
+
+# Is the first line of $1 the marker that says LyreBirdAudio manages the file?
+mediamtx_config_is_managed() {
+    local first=""
+    IFS= read -r first <"$1" || [[ -n "$first" ]] || return 1
+    # trailing blanks and the CR of a CRLF line ending do not count
+    first="${first%"${first##*[![:space:]]}"}"
+    [[ "$first" == "${LYREBIRD_MEDIAMTX_CONFIG_MARKER:-# Managed by LyreBirdAudio}" ]]
+}
+
+# Save a timestamped copy of ${CONFIG_FILE} next to it (same mode and owner)
+# and keep only the newest MEDIAMTX_CONFIG_BACKUPS of them. Prints the path.
+# Returns: 0 = saved, 1 = could not save (the caller must not replace the file)
+mediamtx_config_backup() {
+    local stamp last=-1 c bak mode
+    stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+    # Several backups in one second are numbered after the highest number
+    # there is, never into a gap an earlier retention pass left: the names must
+    # sort in the order the backups were made
+    for bak in "${CONFIG_FILE}.${stamp}".??.bak; do
+        [[ -e "$bak" ]] || continue
+        c="${bak%.bak}"
+        c=$((10#${c##*.}))
+        if ((c > last)); then
+            last=$c
+        fi
+    done
+    if ((last >= 99)); then
+        log ERROR "Too many MediaMTX configuration backups in one second"
+        return 1
+    fi
+    printf -v bak '%s.%s.%02d.bak' "${CONFIG_FILE}" "$stamp" "$((last + 1))"
+    mode="$(stat -c %a "${CONFIG_FILE}" 2>/dev/null)" || mode=644
+    # shellcheck disable=SC2094 # CONFIG_FILE is only read: it is also the owner reference of the copy
+    lyrebird_atomic_write "$bak" "$mode" "${CONFIG_FILE}" <"${CONFIG_FILE}" || return 1
+
+    # Retention: the names sort by time, the oldest are removed
+    local -a backups=()
+    local f excess i
+    while IFS= read -r f; do
+        [[ -n "$f" ]] && backups+=("$f")
+    done < <(printf '%s\n' "${CONFIG_FILE}".????????T??????Z.??.bak 2>/dev/null | LC_ALL=C sort)
+    excess=$((${#backups[@]} - MEDIAMTX_CONFIG_BACKUPS))
+    for ((i = 0; i < excess; i++)); do
+        rm -f -- "${backups[$i]}"
+    done
+    printf '%s' "$bak"
 }
 
 # Generate MediaMTX configuration without subshell locking
@@ -6020,84 +6344,145 @@ generate_mediamtx_config() {
         return 1
     fi
 
-    # Create temp file for atomic write
-    local tmp_config
-    tmp_config="$(mktemp -p "$(dirname "${CONFIG_FILE}")" "$(basename "${CONFIG_FILE}").XXXXXX")"
-
-    # Ensure temp file and lock are cleaned up on any failure
-    local _config_cleanup_needed=true
-    trap 'if [[ "${_config_cleanup_needed:-}" == "true" ]]; then rm -f "$tmp_config" 2>/dev/null; release_config_lock_unsafe; fi' RETURN
-
-    cat >"$tmp_config" <<'EOF'
-# MediaMTX Configuration - Audio Streams
-logLevel: info
-readTimeout: 30s
-writeTimeout: 30s
-
-api: yes
-apiAddress: :9997
-
-metrics: yes
-metricsAddress: :9998
-
-rtsp: yes
-rtspAddress: :8554
-rtspTransports: [tcp, udp]
-
-rtmp: no
-hls: no
-webrtc: no
-srt: no
-EOF
-
-    # MediaMTX >= 1.19.0 also starts a MoQ (Media over QUIC) server by default:
-    # :8892/tcp, :8892/udp and :8893/udp on every interface. Turn it off, but
-    # only where the key exists -- 1.15-1.18 reject an unknown "moq" key and
-    # refuse to start, so an unknown version leaves the key out.
-    if mediamtx_supports_moq_key; then
-        printf 'moq: no\n' >>"$tmp_config"
-    fi
-    printf '\npaths:\n' >>"$tmp_config"
-
-    # Add paths based on stream mode
-    if [[ "${STREAM_MODE}" == "multiplex" ]]; then
-        cat >>"$tmp_config" <<EOF
-  ${MULTIPLEX_STREAM_NAME}:
-    source: publisher
-    sourceProtocol: automatic
-    sourceOnDemand: no
-EOF
-    else
-        # Individual mode - accept any stream name
-        cat >>"$tmp_config" <<EOF
-  '~^[a-zA-Z0-9_-]+$':
-    source: publisher
-    sourceProtocol: automatic
-    sourceOnDemand: no
-EOF
-    fi
-
-    # Set permissions BEFORE atomic move (following write_pid_atomic pattern)
-    chmod 644 "$tmp_config" 2>/dev/null || {
-        rm -f "$tmp_config"
-        log ERROR "Failed to set permissions on temp config file"
-        release_config_lock_unsafe
-        return 1
-    }
-
-    # Atomically move into place
-    mv -f "$tmp_config" "${CONFIG_FILE}" || {
-        rm -f "$tmp_config"
-        log ERROR "Failed to move config file into place"
-        release_config_lock_unsafe
-        return 1
-    }
-
-    # Release config lock
+    local rc=0
+    mediamtx_config_apply || rc=$?
     release_config_lock_unsafe
+    return "$rc"
+}
 
-    _config_cleanup_needed=false
-    log INFO "Configuration generated successfully"
+# Bring ${CONFIG_FILE} to the rendered configuration, under the config lock.
+#
+# Ownership (D10): the file is rewritten only when it does not exist or its
+# first line is the "# Managed by LyreBirdAudio" marker. Any other file belongs
+# to the operator: it is validated and used as it is, never rewritten (one
+# warning says how to hand it over: --regenerate-config, which saves a
+# timestamped backup first). A rendered configuration identical to the file
+# leaves the file untouched (no new mtime); a different one is validated by
+# MediaMTX first, the old file is backed up, and the replacement is atomic and
+# durable (lyrebird_atomic_write, D14). The mode and owner of an existing file
+# are kept, except that a file that now carries password hashes loses world
+# access and group write.
+mediamtx_config_apply() {
+    local state=new
+    # A zero-length file is what a power cut during an old, non-durable write
+    # leaves behind; nobody keeps an empty configuration on purpose
+    if [[ -s "${CONFIG_FILE}" ]]; then
+        if mediamtx_config_is_managed "${CONFIG_FILE}"; then
+            state=managed
+        elif [[ "${REGENERATE_CONFIG}" == "true" ]]; then
+            state=takeover
+        else
+            state=operator
+        fi
+    elif [[ -e "${CONFIG_FILE}" ]]; then
+        state=managed
+    fi
+
+    if [[ "$state" == operator ]]; then
+        local origin=""
+        if [[ "$(head -n 1 "${CONFIG_FILE}" 2>/dev/null)" == "# MediaMTX Configuration - Audio Streams" ]]; then
+            origin=" (it looks like the file an earlier release of this script wrote: its API and metrics listen on every interface)"
+        fi
+        log WARN "MediaMTX configuration ${CONFIG_FILE} does not start with the line '${LYREBIRD_MEDIAMTX_CONFIG_MARKER:-# Managed by LyreBirdAudio}'${origin}: it is treated as yours and used as it is, never rewritten. To let ${SCRIPT_NAME} manage it, run '${SCRIPT_NAME} --regenerate-config start' (a timestamped backup is saved first)"
+        if [[ "${RTSP_AUTH_MODE}" != "open" ]]; then
+            log WARN "RTSP_AUTH_MODE=${RTSP_AUTH_MODE} has no effect on a configuration you manage yourself"
+        fi
+        mediamtx_validate_config "${CONFIG_FILE}"
+        return
+    fi
+
+    if ! declare -F lyrebird_render_mediamtx_config >/dev/null; then
+        log ERROR "lyrebird-common.sh with lyrebird_render_mediamtx_config is required next to ${SCRIPT_NAME}"
+        return 1
+    fi
+
+    # What to render
+    local -a args=(
+        --rtsp-port "${MEDIAMTX_RTSP_PORT}"
+        --api-port "${MEDIAMTX_API_PORT}"
+        --metrics-port "${MEDIAMTX_METRICS_PORT}"
+        --api-bind "${MEDIAMTX_API_BIND}"
+        --metrics-bind "${MEDIAMTX_METRICS_BIND}"
+        --auth-mode "${RTSP_AUTH_MODE}"
+    )
+    local version=""
+    if version="$(mediamtx_binary_version)"; then
+        args+=(--mediamtx-version "$version")
+    fi
+    if [[ "${STREAM_MODE}" == "multiplex" ]]; then
+        args+=(--stream-name "${MULTIPLEX_STREAM_NAME}")
+    fi
+    if [[ "${RTSP_AUTH_MODE}" == "local-only-publish" ]]; then
+        if [[ -f "${RTSP_USERS_FILE}" ]]; then
+            args+=(--users-file "${RTSP_USERS_FILE}")
+        else
+            log WARN "RTSP_AUTH_MODE=local-only-publish but ${RTSP_USERS_FILE} does not exist: only this machine can use RTSP"
+        fi
+        case "${MEDIAMTX_HOST}" in
+            localhost | 127.* | ::1) ;;
+            *) log WARN "RTSP_AUTH_MODE=local-only-publish: publishers connect to ${MEDIAMTX_HOST}, which is not a loopback name; MediaMTX will refuse them" ;;
+        esac
+    fi
+
+    local tmp err rc=0
+    tmp="$(mktemp)" || {
+        log ERROR "Cannot create a temporary file for the MediaMTX configuration"
+        return 1
+    }
+    if ! err="$(lyrebird_render_mediamtx_config "${args[@]}" 2>&1 >"$tmp")"; then
+        log ERROR "Cannot render the MediaMTX configuration: ${err}"
+        rm -f "$tmp"
+        return 1
+    fi
+
+    mediamtx_config_install "$state" "$tmp" || rc=$?
+    rm -f "$tmp"
+    return "$rc"
+}
+
+# Install the rendered configuration $2 over ${CONFIG_FILE} (state $1 is new,
+# managed or takeover); see mediamtx_config_apply
+mediamtx_config_install() {
+    local state="$1" tmp="$2" mode=644 existing
+
+    if [[ "$state" != new ]] && cmp -s "$tmp" "${CONFIG_FILE}"; then
+        log INFO "MediaMTX configuration is up to date: ${CONFIG_FILE} left untouched"
+        return 0
+    fi
+
+    # MediaMTX must accept it before it can replace a file that may be working
+    if ! mediamtx_validate_config "$tmp"; then
+        log ERROR "Not writing ${CONFIG_FILE}"
+        return 1
+    fi
+
+    if grep -q 'sha256:' "$tmp"; then
+        mode=640
+    fi
+    if [[ "$state" != new ]]; then
+        existing="$(stat -c %a "${CONFIG_FILE}" 2>/dev/null)" || existing=644
+        mode="$existing"
+        if grep -q 'sha256:' "$tmp"; then
+            mode="$(printf '%o' $((8#$existing & 8#750)))"
+        fi
+        if [[ -s "${CONFIG_FILE}" ]]; then
+            local bak
+            if ! bak="$(mediamtx_config_backup)"; then
+                log ERROR "Cannot save a backup of ${CONFIG_FILE}: leaving it as it is"
+                return 1
+            fi
+            log INFO "Saved the previous MediaMTX configuration as ${bak}"
+        fi
+        if is_mediamtx_running; then
+            log INFO "MediaMTX is running; it watches its configuration file and normally reloads a change by itself"
+        fi
+    fi
+
+    if ! lyrebird_atomic_write "${CONFIG_FILE}" "$mode" "${CONFIG_FILE}" <"$tmp"; then
+        log ERROR "Failed to write ${CONFIG_FILE}"
+        return 1
+    fi
+    log INFO "MediaMTX configuration written: ${CONFIG_FILE} (mode ${mode})"
     return 0
 }
 
@@ -6191,20 +6576,19 @@ start_mediamtx() {
         return "${E_USB_NO_DEVICES}"
     fi
 
-    if ! generate_mediamtx_config; then
-        error_exit "Failed to generate configuration" "${E_CONFIG_ERROR}"
-    fi
-
-    # Check ports if lsof is available
+    # Check ports if lsof is available. Only a listening TCP socket takes a
+    # port away from MediaMTX: `lsof -i :PORT` also reports a client socket that
+    # merely uses the number as its source port, and with the ports now
+    # configurable that is a real chance (the ephemeral range)
     if command_exists lsof; then
-        for port in 8554 9997 9998; do
-            if lsof -i ":$port" >/dev/null 2>&1; then
+        for port in "${MEDIAMTX_RTSP_PORT}" "${MEDIAMTX_API_PORT}" "${MEDIAMTX_METRICS_PORT}"; do
+            if lsof -nP -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1; then
                 log ERROR "Port $port is already in use"
                 return 1
             fi
         done
     elif command_exists ss; then
-        for port in 8554 9997 9998; do
+        for port in "${MEDIAMTX_RTSP_PORT}" "${MEDIAMTX_API_PORT}" "${MEDIAMTX_METRICS_PORT}"; do
             if ss -tuln | grep -q ":$port "; then
                 log ERROR "Port $port appears to be in use"
                 return 1
@@ -6212,6 +6596,11 @@ start_mediamtx() {
         done
     else
         log WARN "Cannot check if MediaMTX ports are in use"
+    fi
+
+    # Only now is the configuration rendered and, if it changed, written
+    if ! generate_mediamtx_config; then
+        error_exit "Failed to generate configuration" "${E_CONFIG_ERROR}"
     fi
 
     # Set limits
@@ -6292,9 +6681,9 @@ start_streams_and_report() {
         # In multiplex mode, validate the single multiplexed stream
         local stream_path="${MULTIPLEX_STREAM_NAME}"
         if validate_stream "$stream_path"; then
-            echo -e "${GREEN}[OK]${NC} rtsp://${MEDIAMTX_HOST}:8554/${stream_path} (multiplexed from ${#devices[@]} devices)"
+            echo -e "${GREEN}[OK]${NC} rtsp://${MEDIAMTX_HOST}:${MEDIAMTX_RTSP_PORT}/${stream_path} (multiplexed from ${#devices[@]} devices)"
         else
-            echo -e "${RED}[FAIL]${NC} rtsp://${MEDIAMTX_HOST}:8554/${stream_path} (failed)"
+            echo -e "${RED}[FAIL]${NC} rtsp://${MEDIAMTX_HOST}:${MEDIAMTX_RTSP_PORT}/${stream_path} (failed)"
         fi
     else
         # In individual mode, validate each device's stream
@@ -6304,9 +6693,9 @@ start_streams_and_report() {
             stream_path="$(generate_stream_path "$device_name" "$card_num")"
 
             if validate_stream "$stream_path"; then
-                echo -e "${GREEN}[OK]${NC} rtsp://${MEDIAMTX_HOST}:8554/${stream_path}"
+                echo -e "${GREEN}[OK]${NC} rtsp://${MEDIAMTX_HOST}:${MEDIAMTX_RTSP_PORT}/${stream_path}"
             else
-                echo -e "${RED}[FAIL]${NC} rtsp://${MEDIAMTX_HOST}:8554/${stream_path} (failed)"
+                echo -e "${RED}[FAIL]${NC} rtsp://${MEDIAMTX_HOST}:${MEDIAMTX_RTSP_PORT}/${stream_path} (failed)"
             fi
         done
     fi
@@ -6564,7 +6953,7 @@ show_status() {
     if [[ "$is_multiplex_mode" == "true" ]]; then
         # Multiplex mode is active
         echo "Multiplex stream (combining ${#devices[@]} devices):"
-        echo "  Stream: rtsp://${MEDIAMTX_HOST}:8554/${MULTIPLEX_STREAM_NAME}"
+        echo "  Stream: rtsp://${MEDIAMTX_HOST}:${MEDIAMTX_RTSP_PORT}/${MULTIPLEX_STREAM_NAME}"
         if [[ ${#devices[@]} -gt 0 ]]; then
             IFS=':' read -r device_name _ <<<"${devices[0]}"
             resolve_stream_settings "$device_name" "${MULTIPLEX_STREAM_NAME}"
@@ -6602,7 +6991,7 @@ show_status() {
                 stream_path="$(generate_stream_path "$device_name" "$card_num")"
 
                 echo "  - $device_name (card $card_num)"
-                echo "    Stream: rtsp://${MEDIAMTX_HOST}:8554/$stream_path"
+                echo "    Stream: rtsp://${MEDIAMTX_HOST}:${MEDIAMTX_RTSP_PORT}/$stream_path"
                 resolve_stream_settings "$device_name" "$stream_path"
                 echo "    Settings: ${STREAM_SAMPLE_RATE} Hz, ${STREAM_CHANNELS} ch, ${STREAM_CODEC} ${STREAM_BITRATE}"
 
@@ -6817,6 +7206,9 @@ Options:
                          Lower-case letters, digits, '_' and '-', at most 64
                          characters; anything else is replaced by '_' and the
                          result is logged
+        --regenerate-config  start/restart: replace a MediaMTX configuration that is
+                         not managed by this script (a timestamped backup is
+                         saved first)
     -d, --debug          Enable debug output
     -h, --help           Show this help message
 
@@ -6824,6 +7216,17 @@ Environment Variables:
     MULTIPLEX_FILTER_TYPE    Multiplex audio filter type [default: amix]
                              - amix: Mix all audio sources into one output
                              - amerge: Merge sources keeping channels separate
+    MEDIAMTX_RTSP_PORT       RTSP port [default: 8554]
+    MEDIAMTX_API_PORT        Control API port [default: 9997]
+    MEDIAMTX_METRICS_PORT    Metrics port [default: 9998]
+    MEDIAMTX_API_BIND        Address the API listens on [default: 127.0.0.1;
+    MEDIAMTX_METRICS_BIND    same for metrics; empty = every interface]
+    RTSP_AUTH_MODE           open (default) | local-only-publish: this machine
+                             needs no password, everybody else must be listed in
+                             RTSP_USERS_FILE [default: ${CONFIG_DIR}/rtsp-users.conf]
+                             as "user:sha256:<base64 of the SHA-256 of the password>"
+    MEDIAMTX_CONFIG_BACKUPS  Timestamped backups of the MediaMTX configuration
+                             kept when it changes [default: 5]
 
 Commands:
     start       Start MediaMTX and FFmpeg streams. Safe to repeat: when this
@@ -6869,7 +7272,7 @@ Multiplex Mode Usage:
         # Or use default filter (amix)
         sudo ./lyrebird-stream-manager.sh -m multiplex start
         Mixes all microphones into a single audio stream
-        Output: rtsp://localhost:8554/${MULTIPLEX_STREAM_NAME}
+        Output: rtsp://localhost:${MEDIAMTX_RTSP_PORT}/${MULTIPLEX_STREAM_NAME}
 
     Multiplex mode - Separate channels (amerge):
         sudo ./lyrebird-stream-manager.sh -m multiplex -f amerge start
@@ -6878,7 +7281,7 @@ Multiplex Mode Usage:
 
     Custom stream name:
         sudo ./lyrebird-stream-manager.sh -m multiplex -f amix -n studio start
-        Output: rtsp://localhost:8554/studio
+        Output: rtsp://localhost:${MEDIAMTX_RTSP_PORT}/studio
 
 
 Resource Monitoring:
@@ -6945,6 +7348,10 @@ parse_arguments() {
                 ;;
             -d | --debug)
                 export DEBUG=true
+                shift
+                ;;
+            --regenerate-config)
+                REGENERATE_CONFIG=true
                 shift
                 ;;
             -h | --help)
