@@ -4271,6 +4271,139 @@ install_wrapper_script() {
     return 0
 }
 
+# ============================================================================
+# Multiplex audio graph (X-20)
+# ============================================================================
+# What a multiplex stream feeds its encoder is decided here, once, when the wrapper is
+# generated: the filter graph string (multiplex_filter_complex), the encoder
+# arguments (multiplex_encoder_args), and whether this FFmpeg can really encode that
+# combination (check_multiplex_encoding). The wrapper receives the finished graph and
+# argument list in its header, so what was checked is exactly what runs.
+
+# Does this FFmpeg's amix have the `normalize` option? It was added in FFmpeg 4.4;
+# 4.2 and 4.3 (Ubuntu 20.04, Debian 11) reject an amix with it ("Option not found") and
+# the stream never starts. Asked once per process; the answer is cached.
+AMIX_NORMALIZE_SUPPORT=""
+amix_supports_normalize() {
+    if [[ -z "$AMIX_NORMALIZE_SUPPORT" ]]; then
+        local help=""
+        if command_exists ffmpeg; then
+            if command_exists timeout; then
+                help="$(timeout 10 ffmpeg -hide_banner -h filter=amix 2>&1 || true)"
+            else
+                help="$(ffmpeg -hide_banner -h filter=amix 2>&1 || true)"
+            fi
+        fi
+        if [[ "$help" =~ [[:space:]]normalize[[:space:]] ]]; then
+            AMIX_NORMALIZE_SUPPORT=yes
+        else
+            AMIX_NORMALIZE_SUPPORT=no
+        fi
+    fi
+    [[ "$AMIX_NORMALIZE_SUPPORT" == "yes" ]]
+}
+
+# The -filter_complex string of a multiplex stream.
+# Usage: multiplex_filter_complex FILTER_TYPE INPUTS [AMIX_NORMALIZE_OPTION]
+multiplex_filter_complex() {
+    local filter_type="$1" inputs="$2" normalize_option="${3-}" labels="" i
+    for ((i = 0; i < inputs; i++)); do
+        labels+="[${i}:a]"
+    done
+    case "$filter_type" in
+        amix)
+            printf '%samix=inputs=%s:duration=longest%s,aresample=async=1:first_pts=0' "$labels" "$inputs" "$normalize_option"
+            ;;
+        amerge)
+            printf '%samerge=inputs=%s,aresample=async=1:first_pts=0' "$labels" "$inputs"
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+# The encoder arguments for a codec, in the array MULTIPLEX_ENCODER_ARGS (one element
+# per word, so any bitrate text stays one word); the array is empty and the status 1
+# for a codec that has none.
+# Usage: multiplex_encoder_args CODEC BITRATE
+declare -ga MULTIPLEX_ENCODER_ARGS=()
+multiplex_encoder_args() {
+    MULTIPLEX_ENCODER_ARGS=()
+    case "$1" in
+        opus) MULTIPLEX_ENCODER_ARGS=(-c:a libopus -b:a "$2" -application audio) ;;
+        aac) MULTIPLEX_ENCODER_ARGS=(-c:a aac -b:a "$2") ;;
+        mp3) MULTIPLEX_ENCODER_ARGS=(-c:a libmp3lame -b:a "$2") ;;
+        *) return 1 ;;
+    esac
+}
+
+# The channel layout FFmpeg gives an input of N channels when nothing says otherwise
+# (what an ALSA input read with -ac N becomes).
+_default_channel_layout() {
+    case "$1" in
+        1) echo mono ;;
+        2) echo stereo ;;
+        3) echo 3.0 ;;
+        4) echo 4.0 ;;
+        5) echo 5.0 ;;
+        6) echo 5.1 ;;
+        7) echo 6.1 ;;
+        8) echo 7.1 ;;
+        *) echo "${1}c" ;;
+    esac
+}
+
+# Can this FFmpeg encode what the multiplex graph produces? Which channel counts an
+# encoder takes depends on the layout the graph ends with (libopus refuses 3 or 4
+# channels, 9 and more, and several merges of stereo inputs; libmp3lame takes 1 or 2;
+# measured with FFmpeg 6.1.1 -- older versions were not available to try), so the
+# question is put to FFmpeg itself: the exact filter graph and encoder arguments the
+# wrapper will use, run for a tenth of a second over silent lavfi inputs with the same
+# number of channels (the wrapper's inputs are ALSA devices with the same layouts),
+# written to the null muxer. Returns 0 when FFmpeg accepts it, and also when the
+# check cannot be made (no ffmpeg/timeout, no lavfi, a timeout): the wrapper then runs
+# as before. Returns 1, with an error that names inputs x channels and the way out,
+# when FFmpeg refuses it.
+# Usage: check_multiplex_encoding FILTER_TYPE INPUTS CHANNELS SAMPLE_RATE CODEC FILTER_COMPLEX ENCODER_ARG...
+check_multiplex_encoding() {
+    local filter_type="$1" inputs="$2" channels="$3" rate="$4" codec="$5" graph="$6" merged i out rc=0 reason
+    shift 6
+    if [[ ! "$inputs" =~ ^[0-9]+$ ]] || [[ ! "$channels" =~ ^[0-9]+$ ]] || [[ ! "$rate" =~ ^[0-9]+$ ]]; then
+        log ERROR "Multiplex stream not started: inputs, channels and sample rate must be numbers (got '$(visible_text "$inputs" 16)', '$(visible_text "$channels" 16)', '$(visible_text "$rate" 16)')"
+        return 1
+    fi
+    merged="$channels"
+    if [[ "$filter_type" == "amerge" ]]; then
+        merged=$((inputs * channels))
+    fi
+    if ! command_exists ffmpeg || ! command_exists timeout; then
+        log DEBUG "Cannot check the multiplex encoding (ffmpeg or timeout missing)"
+        return 0
+    fi
+    local -a cmd=(timeout 20 ffmpeg -nostdin -hide_banner -loglevel error)
+    for ((i = 0; i < inputs; i++)); do
+        cmd+=(-f lavfi -t 0.1 -i "anullsrc=channel_layout=$(_default_channel_layout "$channels"):sample_rate=${rate}")
+    done
+    cmd+=(-filter_complex "$graph" "$@" -f null -)
+    out="$("${cmd[@]}" 2>&1)" || rc=$?
+    if ((rc == 0)); then
+        return 0
+    fi
+    if ((rc == 124)) || [[ "$out" == *"Unknown input format"* ]] || [[ "$out" == *"No such filter"* ]] || [[ "$out" == *"Filter anullsrc not found"* ]]; then
+        log WARN "Could not check whether FFmpeg can encode the multiplex graph (rc=${rc}); starting it anyway"
+        return 0
+    fi
+    reason="$(printf '%s\n' "$out" | grep -v '^[[:space:]]*$' | head -n 1)"
+    log ERROR "Multiplex stream not started: FFmpeg cannot encode ${inputs} inputs x ${channels} channels as ${codec} with ${filter_type} (${merged} channels): $(visible_text "$reason" 160)"
+    if [[ "$filter_type" == "amerge" ]]; then
+        log ERROR "Use MULTIPLEX_FILTER_TYPE=amix (mixes the inputs down to ${channels} channels), or a codec or an input count that gives a channel count FFmpeg can encode as ${codec}"
+    else
+        log ERROR "Use CODEC=aac, or a CHANNELS value that ${codec} can encode"
+    fi
+    return 1
+}
+
 # Start FFmpeg multiplex stream (single stream from multiple devices)
 start_ffmpeg_multiplex_stream() {
     local -a devices=("$@")
@@ -4361,6 +4494,27 @@ start_ffmpeg_multiplex_stream() {
     bitrate="$STREAM_BITRATE"
     thread_queue="$STREAM_THREAD_QUEUE"
 
+    # The filter graph and the encoder arguments, built here so that the check below and
+    # the wrapper use the very same ones. amix gets `normalize=0` (no 1/N scaling of the
+    # inputs) where this FFmpeg has the option, and its plain default where it does not.
+    local amix_normalize_option=""
+    if [[ "${MULTIPLEX_FILTER_TYPE}" == "amix" ]]; then
+        if amix_supports_normalize; then
+            amix_normalize_option=":normalize=0"
+        else
+            log INFO "This FFmpeg's amix has no normalize option (it is older than 4.4): the inputs are mixed with amix's default, which scales each by 1/N, so the mix is quieter than with normalize=0"
+        fi
+    fi
+    local filter_complex
+    filter_complex="$(multiplex_filter_complex "${MULTIPLEX_FILTER_TYPE}" "${#valid_devices[@]}" "$amix_normalize_option")"
+    if ! multiplex_encoder_args "$codec" "$bitrate"; then
+        log ERROR "Multiplex stream not started: there are no encoder arguments for codec '$(visible_text "$codec" 32)' (supported: ${SUPPORTED_CODECS// /, })"
+        return 1
+    fi
+    if ! check_multiplex_encoding "${MULTIPLEX_FILTER_TYPE}" "${#valid_devices[@]}" "$channels" "$sample_rate" "$codec" "$filter_complex" "${MULTIPLEX_ENCODER_ARGS[@]}"; then
+        return 1
+    fi
+
     # Create wrapper script (built in a temporary file, installed by rename)
     local wrapper_script="${FFMPEG_PID_DIR}/${stream_path}.sh"
     local ffmpeg_log="${FFMPEG_PID_DIR}/${stream_path}.log"
@@ -4392,6 +4546,7 @@ WRAPPER_START
         PROBESIZE "$DEFAULT_PROBESIZE" \
         CODEC "$codec" \
         FILTER_TYPE "${MULTIPLEX_FILTER_TYPE}" \
+        FILTER_COMPLEX "$filter_complex" \
         FFMPEG_LOG "$ffmpeg_log" \
         LOG_FILE "$LOG_FILE" \
         WRAPPER_PID_FILE "$pid_file" \
@@ -4412,6 +4567,16 @@ WRAPPER_START
         rm -f "$wrapper_tmp"
         return 1
     }
+
+    # The encoder arguments, one array element per word
+    printf 'declare -a ENCODER_ARGS=()\n' >>"$wrapper_tmp"
+    local encoder_arg
+    for encoder_arg in "${MULTIPLEX_ENCODER_ARGS[@]}"; do
+        wrapper_array_item "$wrapper_tmp" ENCODER_ARGS "$encoder_arg" || {
+            rm -f "$wrapper_tmp"
+            return 1
+        }
+    done
 
     # Device arrays, one element per input device (names with spaces stay one word)
     printf 'declare -a CARD_NUMBERS=()\ndeclare -a PCM_NUMBERS=()\ndeclare -a DEVICE_NAMES=()\n' >>"$wrapper_tmp"
@@ -4521,53 +4686,25 @@ run_ffmpeg() {
         )
     done
     
-    # Build filter complex based on filter type
-    if [[ "${FILTER_TYPE}" == "amix" ]]; then
-        # Mix all audio inputs into a single output
-        # Create input labels [0:a][1:a][2:a]... and use amix filter
-        local filter_inputs=""
-        for i in "${!CARD_NUMBERS[@]}"; do
-            filter_inputs+="[${i}:a]"
-        done
-        
-        local filter_complex="${filter_inputs}amix=inputs=${NUM_DEVICES}:duration=longest:normalize=0,aresample=async=1:first_pts=0"
-        ffmpeg_cmd+=(-filter_complex "$filter_complex")
-        
-        log_message "Using amix filter to mix ${NUM_DEVICES} audio streams"
-        
-    elif [[ "${FILTER_TYPE}" == "amerge" ]]; then
-        # Merge all audio inputs keeping channels separate
-        # This creates a single stream with (NUM_DEVICES * CHANNELS) channels
-        local filter_inputs=""
-        for i in "${!CARD_NUMBERS[@]}"; do
-            filter_inputs+="[${i}:a]"
-        done
-        
-        local filter_complex="${filter_inputs}amerge=inputs=${NUM_DEVICES},aresample=async=1:first_pts=0"
-        ffmpeg_cmd+=(-filter_complex "$filter_complex")
-        
-        log_message "Using amerge filter to merge ${NUM_DEVICES} audio streams"
-    else
-        log_message "ERROR: Invalid filter type: ${FILTER_TYPE}"
-        return 1
-    fi
-    
-    # Add codec options based on codec type
-    case "${CODEC}" in
-        opus)
-            ffmpeg_cmd+=(-c:a libopus -b:a "${BITRATE}" -application audio)
+    # The filter graph and the encoder arguments were built, and checked against this
+    # FFmpeg, by the manager when it generated this wrapper (FILTER_COMPLEX and
+    # ENCODER_ARGS in the header above)
+    case "${FILTER_TYPE}" in
+        amix)
+            log_message "Using amix filter to mix ${NUM_DEVICES} audio streams"
             ;;
-        aac)
-            ffmpeg_cmd+=(-c:a aac -b:a "${BITRATE}")
-            ;;
-        mp3)
-            ffmpeg_cmd+=(-c:a libmp3lame -b:a "${BITRATE}")
+        amerge)
+            # A single stream with (NUM_DEVICES * CHANNELS) channels
+            log_message "Using amerge filter to merge ${NUM_DEVICES} audio streams"
             ;;
         *)
-            ffmpeg_cmd+=(-c:a libopus -b:a "${BITRATE}")
+            log_message "ERROR: Invalid filter type: ${FILTER_TYPE}"
+            return 1
             ;;
     esac
-    
+    ffmpeg_cmd+=(-filter_complex "${FILTER_COMPLEX}")
+    ffmpeg_cmd+=("${ENCODER_ARGS[@]}")
+
     # Add output options
     ffmpeg_cmd+=(
         -f rtsp

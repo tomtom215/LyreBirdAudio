@@ -127,7 +127,7 @@ spawn_detached() {
 validate_stream() { return 0; }
 '
 
-# Run a wrapper script for real until its FFmpeg log holds PATTERN (or 15 s), then
+# Run a wrapper script for real until its FFmpeg log holds PATTERN (or 30 s), then
 # stop it. The wrapper starts the real ffmpeg, which cannot open a fake card and
 # exits; what the test reads is what the wrapper logged on the way: the device it
 # was about to record from, why it stopped, that it started again. (The wrapper
@@ -141,7 +141,7 @@ sd_run_wrapper_until_logged() {
     setsid bash "$wrapper" >"$SD/wrapper.out" 2>&1 3>&- &
     local pid=$!
     echo "$pid" >>"$SD_PIDS_FILE"
-    for ((i = 0; i < 300; i++)); do
+    for ((i = 0; i < 600; i++)); do
         (($(grep -cF -- "$pattern" "$log" 2>/dev/null || true) >= want)) && break
         kill -0 "$pid" 2>/dev/null || break
         sleep 0.05

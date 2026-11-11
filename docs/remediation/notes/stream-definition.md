@@ -146,6 +146,53 @@ capture-PCM helpers, the multiplex graph) and, for the writer only,
   the manager no longer does that, so the test now calls `load_device_config`
   (`MEDIAMTX_DEVICE_CONFIG`). The assertion (96000 is honoured) is unchanged.
 
+## X-20: the multiplex audio graph
+
+- **amix `normalize`, feature-detected.** `amix_supports_normalize` asks `ffmpeg -h filter=amix`
+  once per process (cached). With the option (FFmpeg 4.4 and later) the graph is as before,
+  `amix=inputs=N:duration=longest:normalize=0,aresample=async=1:first_pts=0`. Without it (4.2 and 4.3,
+  which ship in Ubuntu 20.04 and Debian 11) the option is left out, so the stream starts
+  instead of failing with "Option not found", and one INFO line says why. Not verified on a real
+  FFmpeg 4.3: no such binary was available; the 4.3 side is tested with a stand-in `ffmpeg` whose
+  help text has no `normalize` (the option was added in FFmpeg 4.4, from the changelog/source, not
+  from a run).
+- **Loudness, for the README** (measured with FFmpeg 6.1.1, two equal 440 Hz sine inputs): with
+  `normalize=0` the mix is the plain sum, **6 dB louder** than amix's default (-15.1 dB against
+  -21.1 dB mean volume, i.e. +20*log10(2) for two inputs, 20*log10(N) for N), and it can clip when the
+  inputs are loud; amix's default scales every input by 1/N (and renormalises when an input ends).
+  The README says the output is "normalized"; with FFmpeg 4.4 and later it is the opposite
+  (`normalize=0`, unchanged behaviour, deliberately kept so loudness does not change on existing
+  nodes); with 4.2/4.3 it is normalized. State both.
+- **Channel counts against the codec, asked of FFmpeg.** `check_multiplex_encoding` runs the exact
+  `-filter_complex` string and encoder arguments the wrapper will use for 0.1 s over silent lavfi
+  inputs of the same channel count (`anullsrc`, default layout for that count) into the null
+  muxer, before the wrapper is written. No table of channel counts is hard-coded. A combination
+  FFmpeg refuses stops the multiplex start (status 1, nothing written) with
+  `Multiplex stream not started: FFmpeg cannot encode 2 inputs x 2 channels as opus with amerge (4 channels): <FFmpeg's first error line>`
+  and `Use MULTIPLEX_FILTER_TYPE=amix (mixes the inputs down to 2 channels), or a codec or an input count that gives a channel count FFmpeg can encode as opus`
+  (for amix: `Use CODEC=aac, or a CHANNELS value that opus can encode`). If the check cannot be made
+  (no ffmpeg or timeout, no lavfi, a timeout of 20 s) it logs a WARN and the wrapper starts as it
+  did before.
+- **Measured with FFmpeg 6.1.1** (stereo = 2 channel inputs, mono = 1 channel inputs):
+  `amerge` + `opus` refuses 2 stereo (4 channels, "Invalid channel layout 4.0"), 5 and 6 stereo
+  (10 and 12 channels), 3 and 4 mono; accepts 1, 3 and 4 stereo, 1, 2, 5 and 6 mono. `amerge` + `aac`
+  refuses 5 and 6 stereo (10 and 12 channels) and accepts up to 4 stereo. `amerge` + `mp3` accepted
+  every count tried (FFmpeg inserts a downmix to the 2 channels libmp3lame takes). `amix` was
+  accepted with all three codecs for 1 to 6 inputs of 1 or 2 channels. Real ALSA channel layouts, and
+  other FFmpeg versions, may differ; that is why the question is put to the installed FFmpeg.
+  The README's amerge description ("(num_devices * channels_per_device) total channels") needs
+  "if the codec can encode that many channels; the manager refuses the stream otherwise".
+- **What the wrapper runs.** The multiplex wrapper's header now carries `FILTER_COMPLEX` (the finished
+  graph) and `ENCODER_ARGS` (an array), built by `multiplex_filter_complex` and
+  `multiplex_encoder_args` in the manager, so the graph that was checked is the graph that runs. The
+  wrapper's own graph construction and its `case "${CODEC}"` (with the libopus fallback arm) are gone
+  from the multiplex wrapper; the individual wrapper keeps its `case` (a codec outside opus, aac and
+  mp3 can no longer reach it, see X-28 above).
+- **Not changed.** `aresample=async=1:first_pts=0` still follows the mix (resampling happens after
+  mixing); USB clock drift across independent microphones needs hardware to evaluate. The individual
+  mode `CHANNELS` against the codec (for example 4 channels with opus) is not checked before launch: the
+  stream still starts and its wrapper fails the same way (residual).
+
 ## LB-09 / X-10 / X-11 (wrapper side): generated wrappers
 
 - **Choice and why.** The wrapper stays a generated per-stream script (`<FFMPEG_PID_DIR>/<stream>.sh`,

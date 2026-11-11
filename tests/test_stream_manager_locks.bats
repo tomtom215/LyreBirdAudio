@@ -824,7 +824,12 @@ if [[ "${1:-}" == "$LB_DIR/ff/"*.sh ]]; then
 fi
 exec /bin/bash "$@"
 SHIM_EOF
-    printf '#!/bin/bash\nexec sleep 600\n' >"$LK/bin/ffmpeg"
+    # The stub ffmpeg waits when it is run as a stream; the manager's own quick questions to
+    # FFmpeg before it generates a multiplex wrapper (the amix help, the encoding check that
+    # ends in "-f null -") are answered at once
+    printf '%s\n' '#!/bin/bash' \
+        'case "$*" in *"-h filter=amix"* | *"-f null -") exit 0 ;; esac' \
+        'exec sleep 600' >"$LK/bin/ffmpeg"
     chmod +x "$LK/wrapbin/bash" "$LK/bin/ffmpeg"
     export PATH="$LK/wrapbin:$PATH"
 }

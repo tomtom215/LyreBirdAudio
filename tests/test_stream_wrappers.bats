@@ -101,7 +101,7 @@ _header_round_trip() {
     done
 }
 
-@test "every vector in every setting of a multiplex wrapper stays data, device names included [LB-09, X-10]" {
+@test "every vector in every setting of a multiplex wrapper stays data, device names and encoder arguments included [LB-09, X-10]" {
     _vectors
     local vec out
     for vec in "${VECTORS[@]}"; do
@@ -110,26 +110,51 @@ _header_round_trip() {
         # a device name cannot hold the ":" that separates it from the card number, nor a newline
         export DEVNAME="${vec//:/_}"
         DEVNAME="${DEVNAME//$'\n'/_}"
+        # Stood in for: the validation layer (resolve_stream_settings returns the hostile value
+        # for every setting but the codec, which must be one that has encoder arguments) and the
+        # check against FFmpeg (which would take the hostile channel count for a number)
         run smq "$SD_SPAWN_STUBS"'
             resolve_stream_settings() {
-                STREAM_SAMPLE_RATE="$HOSTILE"; STREAM_CHANNELS="$HOSTILE"; STREAM_CODEC="$HOSTILE"
+                STREAM_SAMPLE_RATE="$HOSTILE"; STREAM_CHANNELS="$HOSTILE"; STREAM_CODEC=opus
                 STREAM_BITRATE="$HOSTILE"; STREAM_THREAD_QUEUE="$HOSTILE"
             }
+            check_multiplex_encoding() { return 0; }
             resolve_multiplex_stream_name
             rc=0; start_ffmpeg_multiplex_stream "${DEVNAME}:98" "second:99" || rc=$?
             echo "start rc=$rc"'
         [ "$status" -eq 0 ]
         [[ "$output" == *"start rc=0"* ]] || { printf 'vector %q: %s\n' "$vec" "$output"; return 1; }
         bash -n "$SD/ff/all_mics.sh"
-        out="$(_header_round_trip "$SD/ff/all_mics.sh" SAMPLE_RATE CHANNELS CODEC BITRATE THREAD_QUEUE)"
-        [ "$out" = "$(printf 'SAMPLE_RATE:OK\nCHANNELS:OK\nCODEC:OK\nBITRATE:OK\nTHREAD_QUEUE:OK')" ] || { printf 'vector %q: %s\n' "$vec" "$out"; return 1; }
-        # the device name is the first array element (the device list is one device per
-        # line, so a name cannot hold a newline: it is the settings that carry it)
+        out="$(_header_round_trip "$SD/ff/all_mics.sh" SAMPLE_RATE CHANNELS BITRATE THREAD_QUEUE)"
+        [ "$out" = "$(printf 'SAMPLE_RATE:OK\nCHANNELS:OK\nBITRATE:OK\nTHREAD_QUEUE:OK')" ] || { printf 'vector %q: %s\n' "$vec" "$out"; return 1; }
+        # the encoder arguments (-c:a libopus -b:a <hostile> -application audio) and the device
+        # names are arrays in the header (the device list is one device per line, so a name
+        # cannot hold a newline: it is the settings that carry it)
         export EXPECTED="$DEVNAME"
-        out="$(sed -n '1,/^# Create log file if it doesn/p' "$SD/ff/all_mics.sh" | head -n -1 >"$SD/header.sh"; cd "$SD" && bash -c 'source "$1"; [[ "${DEVICE_NAMES[0]}" == "$EXPECTED" && "${#DEVICE_NAMES[@]}" -eq 2 ]] && echo OK || printf "BAD %q\n" "${DEVICE_NAMES[0]}"' _ "$SD/header.sh")"
-        [ "$out" = "OK" ] || { printf 'vector %q: device name %s\n' "$vec" "$out"; return 1; }
+        out="$(sed -n '1,/^# Create log file if it doesn/p' "$SD/ff/all_mics.sh" | head -n -1 >"$SD/header.sh"; cd "$SD" \
+            && HOSTILE="$vec" bash -c 'source "$1"
+                [[ "${DEVICE_NAMES[0]}" == "$EXPECTED" && "${#DEVICE_NAMES[@]}" -eq 2 ]] || { printf "BAD name %q\n" "${DEVICE_NAMES[0]}"; exit 0; }
+                [[ "${#ENCODER_ARGS[@]}" -eq 6 && "${ENCODER_ARGS[1]}" == libopus && "${ENCODER_ARGS[3]}" == "$HOSTILE" ]] || { printf "BAD encoder args %q\n" "${ENCODER_ARGS[*]}"; exit 0; }
+                echo OK' _ "$SD/header.sh")"
+        [ "$out" = "OK" ] || { printf 'vector %q: %s\n' "$vec" "$out"; return 1; }
         [ ! -e "$SD/MARK" ] || { printf 'vector %q ran code\n' "$vec"; return 1; }
     done
+}
+
+@test "a codec with no encoder arguments stops a multiplex start, whatever the validation layer let through [X-28, LB-09]" {
+    export HOSTILE='$(touch MARK)'
+    run smq "$SD_SPAWN_STUBS"'
+        resolve_stream_settings() {
+            STREAM_SAMPLE_RATE=48000; STREAM_CHANNELS=2; STREAM_CODEC="$HOSTILE"
+            STREAM_BITRATE=128k; STREAM_THREAD_QUEUE=8192
+        }
+        resolve_multiplex_stream_name
+        rc=0; start_ffmpeg_multiplex_stream "usb-audio-x:98" || rc=$?
+        echo "start rc=$rc"'
+    [[ "$output" == *"start rc=1"* ]]
+    grep -qF "there are no encoder arguments for codec '\$(touch MARK)' (supported: opus, aac, mp3)" "$STREAM_MANAGER_LOG_FILE"
+    [ -z "$(ls -A "$SD/ff")" ]
+    [ ! -e "$SD/MARK" ]
 }
 
 @test "paths and names taken from the environment and the arguments stay data too [LB-09, X-10]" {
@@ -176,7 +201,11 @@ _header_round_trip() {
             resolve_stream_settings() {
                 STREAM_SAMPLE_RATE="$HOSTILE"; STREAM_CHANNELS="$HOSTILE"; STREAM_CODEC="$HOSTILE"
                 STREAM_BITRATE="$HOSTILE"; STREAM_THREAD_QUEUE="$HOSTILE"
+                # a multiplex codec must be one that has encoder arguments
+                [[ "'"$mode"'" == multiplex ]] && STREAM_CODEC=opus
+                return 0
             }
+            check_multiplex_encoding() { return 0; }
             if [[ "'"$mode"'" == individual ]]; then
                 start_ffmpeg_stream "usb-audio-x" 98 "mic1"
             else
