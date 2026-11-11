@@ -2142,6 +2142,9 @@ ${BOLD}ENVIRONMENT VARIABLES:${NC}
     MEDIAMTX_STATE_DIR    State directory
     MEDIAMTX_USER         Service user name
     MEDIAMTX_GROUP        Service group name
+    MEDIAMTX_RTSP_PORT    RTSP port written to the config and checked by status (default 8554)
+    MEDIAMTX_API_PORT     API port written to the config and checked by status (default 9997)
+    MEDIAMTX_METRICS_PORT Metrics port written to the config and checked by status (default 9998)
     MEDIAMTX_STOP_TIMEOUT Seconds MediaMTX gets to exit after SIGTERM before SIGKILL (default 10)
     MEDIAMTX_PID_FILE     PID file of the stream manager's MediaMTX (default /run/mediamtx-audio.pid)
 

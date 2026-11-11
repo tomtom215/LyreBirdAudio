@@ -1025,3 +1025,81 @@ assert_decoys_alive() {
         return 1
     }
 }
+
+# ============================================================================
+# Ports are configuration [X-19 installer part, D15]
+#
+# The installer reads MEDIAMTX_RTSP_PORT / MEDIAMTX_API_PORT /
+# MEDIAMTX_METRICS_PORT once at start-up (defaults 8554 / 9997 / 9998). These
+# tests use ports from the private block 31000-31099 and never touch the
+# default ports.
+# ============================================================================
+
+@test "create_config writes the RTSP, API and metrics ports named by the environment [X-19 installer]" {
+    installer_env
+    export MEDIAMTX_RTSP_PORT=31021 MEDIAMTX_API_PORT=31022 MEDIAMTX_METRICS_PORT=31023
+    run_strict create_config
+    [ "$status" -eq 0 ]
+    grep -qxF 'rtspAddress: :31021' "$CONFIG_DIR/mediamtx.yml"
+    grep -qxF 'apiAddress: :31022' "$CONFIG_DIR/mediamtx.yml"
+    grep -qxF 'metricsAddress: :31023' "$CONFIG_DIR/mediamtx.yml"
+    run grep -E '^(rtsp|api|metrics)Address: :(8554|9997|9998)$' "$CONFIG_DIR/mediamtx.yml"
+    [ "$status" -eq 1 ]
+}
+
+@test "create_config keeps the documented default ports when the variables are unset [X-19 installer]" {
+    installer_env
+    unset MEDIAMTX_RTSP_PORT MEDIAMTX_API_PORT MEDIAMTX_METRICS_PORT
+    run_strict create_config
+    [ "$status" -eq 0 ]
+    grep -qxF 'rtspAddress: :8554' "$CONFIG_DIR/mediamtx.yml"
+    grep -qxF 'apiAddress: :9997' "$CONFIG_DIR/mediamtx.yml"
+    grep -qxF 'metricsAddress: :9998' "$CONFIG_DIR/mediamtx.yml"
+}
+
+@test "show_status checks the ports named by MEDIAMTX_RTSP_PORT, MEDIAMTX_API_PORT and MEDIAMTX_METRICS_PORT [X-19 installer]" {
+    command -v lsof >/dev/null 2>&1 || command -v ss >/dev/null 2>&1 || skip "neither lsof nor ss is installed"
+    installer_env
+    cat >"$DECOY_DIR/listen.py" <<'PY'
+import socket
+import sys
+import time
+
+socks = []
+for port in sys.argv[2:]:
+    s = socket.socket()
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s.bind(("127.0.0.1", int(port)))
+    s.listen(1)
+    socks.append(s)
+open(sys.argv[1], "w").close()
+time.sleep(60)
+PY
+    # Listeners on the RTSP and API ports of the private block; metrics left free
+    decoy_spawn L "$(command -v python3)" -I "$DECOY_DIR/listen.py" "$DECOY_DIR/listen.ready" 31021 31022
+    local i
+    for ((i = 0; i < 100; i++)); do
+        [[ -e "$DECOY_DIR/listen.ready" ]] && break
+        sleep 0.05
+    done
+    [ -e "$DECOY_DIR/listen.ready" ]
+    export MEDIAMTX_RTSP_PORT=31021 MEDIAMTX_API_PORT=31022 MEDIAMTX_METRICS_PORT=31023
+    run_strict show_status
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"RTSP (31021): "*"In use"* ]]
+    [[ "$output" == *"API (31022): "*"In use"* ]]
+    [[ "$output" == *"Metrics (31023): "*"Not in use"* ]]
+    [[ "$output" != *"(8554)"* && "$output" != *"(9997)"* && "$output" != *"(9998)"* ]]
+}
+
+@test "show_help documents the port, stop-timeout and PID-file variables [X-19 installer]" {
+    run show_help
+    [ "$status" -eq 0 ]
+    local var
+    for var in MEDIAMTX_RTSP_PORT MEDIAMTX_API_PORT MEDIAMTX_METRICS_PORT MEDIAMTX_STOP_TIMEOUT MEDIAMTX_PID_FILE; do
+        [[ "$output" == *"$var"* ]] || {
+            echo "help does not mention $var"
+            return 1
+        }
+    done
+}
