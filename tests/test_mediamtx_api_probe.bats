@@ -33,7 +33,7 @@ setup() {
     mtx_ports_setup
     echo '{}' >"$TEST_SCRATCH/stub-plan.json"
     export MEDIAMTX_HOST=127.0.0.1 MEDIAMTX_API_PORT="$P_API"
-    export MEDIAMTX_LOG_FILE="$D/sm.log" MEDIAMTX_FFMPEG_DIR="$D/ff" MEDIAMTX_CONFIG_DIR="$D/cfg"
+    export MEDIAMTX_LOG_FILE="$D/sm.log" STREAM_MANAGER_LOG_FILE="$D/sm.log" MEDIAMTX_FFMPEG_DIR="$D/ff" MEDIAMTX_CONFIG_DIR="$D/cfg"
     export DEEP_HEALTH_STATE_DIR="$D/strikes" DEEP_HEALTH_MAX_STRIKES=3
     unset MEDIAMTX_API_VERSION MEDIAMTX_API_FALLBACK
     sleep 300 3>&- &

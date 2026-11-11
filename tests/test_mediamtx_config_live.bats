@@ -275,12 +275,12 @@ make_users_file() {
         mtx_start "$bin" "$TEST_SCRATCH/mg/cfg/mediamtx.yml"
         mtx_publish "rtsp://127.0.0.1:${P_RTSP}/mic1"
         mtx_wait_path_ready mic1
-        run env MEDIAMTX_HOST=127.0.0.1 MEDIAMTX_API_PORT="$P_API" MEDIAMTX_LOG_FILE="$TEST_SCRATCH/sm.log" MEDIAMTX_API_TIMEOUT=5 \
+        run env MEDIAMTX_HOST=127.0.0.1 MEDIAMTX_API_PORT="$P_API" MEDIAMTX_LOG_FILE="$TEST_SCRATCH/sm.log" STREAM_MANAGER_LOG_FILE="$TEST_SCRATCH/sm.log" MEDIAMTX_API_TIMEOUT=5 \
             bash -c 'source "$1" >/dev/null 2>&1; set +e; wait_for_mediamtx_ready "$2"' _ "$PROJECT_ROOT/lyrebird-stream-manager.sh" "$MTX_PID"
         [ "$status" -eq 0 ]
         ! grep -q 'requires credentials' "$TEST_SCRATCH/sm.log"
         rc=0
-        env MEDIAMTX_HOST=127.0.0.1 MEDIAMTX_API_PORT="$P_API" MEDIAMTX_LOG_FILE="$TEST_SCRATCH/sm.log" \
+        env MEDIAMTX_HOST=127.0.0.1 MEDIAMTX_API_PORT="$P_API" MEDIAMTX_LOG_FILE="$TEST_SCRATCH/sm.log" STREAM_MANAGER_LOG_FILE="$TEST_SCRATCH/sm.log" \
             bash -c 'source "$1" >/dev/null 2>&1; set +e; probe_stream_ready mic1' _ "$PROJECT_ROOT/lyrebird-stream-manager.sh" || rc=$?
         [ "$rc" -eq 0 ]
         mtx_unpublish
@@ -321,7 +321,7 @@ manager_generate() {
     shift 2
     mkdir -p "$dir/cfg" "$dir/ff"
     env "$@" MEDIAMTX_BINARY="$bin" MEDIAMTX_CONFIG_DIR="$dir/cfg" MEDIAMTX_FFMPEG_DIR="$dir/ff" \
-        MEDIAMTX_PID_FILE="$dir/p" MEDIAMTX_LOCK_FILE="$dir/l" MEDIAMTX_LOG_FILE="$dir/log" \
+        MEDIAMTX_PID_FILE="$dir/p" MEDIAMTX_LOCK_FILE="$dir/l" MEDIAMTX_LOG_FILE="$dir/log" STREAM_MANAGER_LOG_FILE="$dir/log" \
         MEDIAMTX_RTSP_PORT="$P_RTSP" MEDIAMTX_API_PORT="$P_API" MEDIAMTX_METRICS_PORT="$P_METRICS" \
         bash -c 'source "$1" >/dev/null 2>&1; set +e; generate_mediamtx_config' _ "$PROJECT_ROOT/lyrebird-stream-manager.sh" 2>&1
 }

@@ -44,7 +44,7 @@ each_binary_begin() {
     echo "# MediaMTX $(mtx_version "$1")" >&3
     mtx_ports_setup
     export MEDIAMTX_HOST=127.0.0.1 MEDIAMTX_API_PORT="$P_API" MEDIAMTX_RTSP_PORT="$P_RTSP" MEDIAMTX_METRICS_PORT="$P_METRICS"
-    export MEDIAMTX_LOG_FILE="$D/sm.log" MEDIAMTX_FFMPEG_DIR="$D/pids" MEDIAMTX_PID_FILE="$D/mtx.pid"
+    export MEDIAMTX_LOG_FILE="$D/sm.log" STREAM_MANAGER_LOG_FILE="$D/sm.log" MEDIAMTX_FFMPEG_DIR="$D/pids" MEDIAMTX_PID_FILE="$D/mtx.pid"
     export DEEP_HEALTH_STATE_DIR="$D/strikes" DEEP_HEALTH_MAX_STRIKES=3 CRON_RESTART_STATE_DIR="$D/cron"
     rm -f "$D"/strikes/* "$D"/pids/* "$D"/cron/* "$D/sm.log"
 }

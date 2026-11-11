@@ -24,7 +24,7 @@ setup() {
     export MEDIAMTX_CONFIG_DIR="$D/cfg"
     export MEDIAMTX_PID_FILE="$D/mtx.pid"
     export MEDIAMTX_FFMPEG_DIR="$D/ff"
-    export MEDIAMTX_LOG_FILE="$D/sm.log"
+    export MEDIAMTX_LOG_FILE="$D/sm.log" STREAM_MANAGER_LOG_FILE="$D/sm.log"
     export MEDIAMTX_LOCK_FILE="$D/run.lock"
     export MEDIAMTX_RESTART_MARKER="$D/restart.marker"
     export MEDIAMTX_CLEANUP_MARKER="$D/cleanup.marker"
@@ -369,6 +369,17 @@ SHIM
     chmod +x "$D/wrapbin/bash" "$D/bin/ffmpeg"
     export STAND_IN_BIN="$D/bin" FFMPEG_ARGS="$D/ffmpeg.args"
     export PATH="$D/wrapbin:$PATH"
+    # a capture PCM for the stand-in cards: the manager reads a card's capture
+    # PCMs from ASOUND_PROC_ROOT and checks their nodes under DEV_SND_ROOT
+    local card
+    export ASOUND_PROC_ROOT="$D/asound" DEV_SND_ROOT="$D/dev-snd"
+    mkdir -p "$ASOUND_PROC_ROOT" "$DEV_SND_ROOT"
+    for card in 1 2; do
+        mkdir -p "$ASOUND_PROC_ROOT/card${card}/pcm0c"
+        echo "0d8c:0014" >"$ASOUND_PROC_ROOT/card${card}/usbid"
+        : >"$DEV_SND_ROOT/controlC${card}"
+        : >"$DEV_SND_ROOT/pcmC${card}D0c"
+    done
 }
 
 # Wait for the stub ffmpeg of a wrapper to have run; remember what to kill
@@ -397,7 +408,7 @@ _wait_for_ffmpeg_args() {
     [ "$status" -eq 0 ]
     _wait_for_ffmpeg_args
     grep -qx "rtsp://localhost:${P_RTSP}/testmic" "$FFMPEG_ARGS"
-    grep -q "^MEDIAMTX_RTSP_PORT=\"${P_RTSP}\"" "$D/ff/testmic.sh"
+    grep -Eq "^MEDIAMTX_RTSP_PORT=\"?${P_RTSP}\"?$" "$D/ff/testmic.sh"
 }
 
 @test "a per-stream wrapper with local recording publishes to the configured RTSP port [X-19]" {
@@ -423,7 +434,7 @@ _wait_for_ffmpeg_args() {
     [ "$status" -eq 0 ]
     _wait_for_ffmpeg_args
     grep -qx "rtsp://localhost:${P_RTSP}/studio" "$FFMPEG_ARGS"
-    grep -q "^MEDIAMTX_RTSP_PORT=\"${P_RTSP}\"" "$D/ff/studio.sh"
+    grep -Eq "^MEDIAMTX_RTSP_PORT=\"?${P_RTSP}\"?$" "$D/ff/studio.sh"
 }
 
 # ---------------------------------------------------------------------------

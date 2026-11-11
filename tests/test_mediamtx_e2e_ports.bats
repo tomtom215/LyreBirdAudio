@@ -49,7 +49,7 @@ teardown() {
 # and MediaMTX's other listeners moved off their defaults
 manager_env() {
     export MEDIAMTX_CONFIG_DIR="$D/cfg" MEDIAMTX_PID_FILE="$D/mtx.pid" MEDIAMTX_FFMPEG_DIR="$D/ff"
-    export MEDIAMTX_LOG_FILE="$D/sm.log" MEDIAMTX_LOCK_FILE="$D/run.lock"
+    export MEDIAMTX_LOG_FILE="$D/sm.log" STREAM_MANAGER_LOG_FILE="$D/sm.log" MEDIAMTX_LOCK_FILE="$D/run.lock"
     export MEDIAMTX_RESTART_MARKER="$D/restart.marker" MEDIAMTX_CLEANUP_MARKER="$D/cleanup.marker"
     export MEDIAMTX_HOST=127.0.0.1 MEDIAMTX_BINARY="$1"
     export MEDIAMTX_RTSP_PORT="$P_RTSP" MEDIAMTX_API_PORT="$P_API" MEDIAMTX_METRICS_PORT="$P_METRICS"

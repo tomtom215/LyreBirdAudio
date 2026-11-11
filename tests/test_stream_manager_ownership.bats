@@ -58,11 +58,16 @@ setup() {
     # its "configuration file" it waits, which makes it a live look-alike
     decoy_bash_copy "$MEDIAMTX_BINARY"
     decoy_hold_script "$CFG"
+    # It stands for the configuration the manager wrote on an earlier start, so it
+    # carries the managed marker (a comment line for the decoy's bash as well);
+    # a file without it would be the operator's and is never rewritten
+    { printf '# Managed by LyreBirdAudio\n'; cat "$CFG"; } >"$CFG.new" && mv "$CFG.new" "$CFG"
 
     # Port probes and the readiness probe see an idle, healthy host
     printf '#!/bin/bash\nexit 1\n' >"$OW/shim/lsof"
     printf '#!/bin/bash\nexit 0\n' >"$OW/shim/ss"
-    printf '#!/bin/bash\nexit 0\n' >"$OW/shim/curl"
+    # a MediaMTX API that answers like a healthy one (200 and a paths list)
+    install -m 755 "$BATS_TEST_DIRNAME/helpers/mediamtx/curl_shim" "$OW/shim/curl"
     chmod +x "$OW/shim/"*
     PATH="$OW/shim:$PATH"
     export SEAM_LOG="$OW/seam.log"
@@ -946,7 +951,8 @@ if [[ -f "$MEDIAMTX_PID_FILE" && -f "$MEDIAMTX_PID_FILE.id" ]]; then
 else
     echo "not recorded" >>"$OW/probe.log"
 fi
-exit 0
+# ...and then answer like a healthy API
+exec "$PROJECT_ROOT/tests/helpers/mediamtx/curl_shim" "$@"
 CURL_EOF
     run_mgr eval 'COMMAND=start; trap cleanup EXIT; start_mediamtx'
     [ "$status" -eq 0 ]

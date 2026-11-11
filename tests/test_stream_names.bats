@@ -234,7 +234,7 @@ teardown() {
     [ ! -e "$SD/ff/Studio Mix.pid" ]
     grep -E '^STREAM_PATH=' "$SD/ff/studio_mix.sh" | grep -q 'studio_mix'
     # the published URL is built from the wrapper's STREAM_PATH
-    grep -qF 'rtsp://${MEDIAMTX_HOST}:8554/${STREAM_PATH}' "$SD/ff/studio_mix.sh"
+    grep -qF 'rtsp://${MEDIAMTX_HOST}:${MEDIAMTX_RTSP_PORT}/${STREAM_PATH}' "$SD/ff/studio_mix.sh"
 }
 
 @test "the generated MediaMTX config has the same path name as the publisher [LB-04]" {

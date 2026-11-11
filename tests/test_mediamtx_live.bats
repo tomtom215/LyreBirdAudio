@@ -42,7 +42,7 @@ teardown() {
 sm() {
     env MEDIAMTX_BINARY="$1" MEDIAMTX_CONFIG_DIR="$TEST_SCRATCH/etc-${1//\//_}" \
         MEDIAMTX_HOST=127.0.0.1 MEDIAMTX_RTSP_PORT="$P_RTSP" MEDIAMTX_API_PORT="$P_API" MEDIAMTX_METRICS_PORT="$P_METRICS" \
-        MEDIAMTX_LOG_FILE="$TEST_SCRATCH/sm.log" MEDIAMTX_FFMPEG_DIR="$TEST_SCRATCH/ff" MEDIAMTX_LOCK_FILE="$TEST_SCRATCH/sm.lock" \
+        MEDIAMTX_LOG_FILE="$TEST_SCRATCH/sm.log" STREAM_MANAGER_LOG_FILE="$TEST_SCRATCH/sm.log" MEDIAMTX_FFMPEG_DIR="$TEST_SCRATCH/ff" MEDIAMTX_LOCK_FILE="$TEST_SCRATCH/sm.lock" \
         MEDIAMTX_PID_FILE="$TEST_SCRATCH/sm.pid" \
         bash -c 'source "$1" >/dev/null 2>&1; log() { :; }; eval "$2"' _ \
         "$PROJECT_ROOT/lyrebird-stream-manager.sh" "$2"

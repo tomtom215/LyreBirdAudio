@@ -23,7 +23,7 @@ setup() {
     export MEDIAMTX_CONFIG_DIR="$CFG"
     export MEDIAMTX_PID_FILE="$D/mtx.pid"
     export MEDIAMTX_FFMPEG_DIR="$D/ff"
-    export MEDIAMTX_LOG_FILE="$D/sm.log"
+    export MEDIAMTX_LOG_FILE="$D/sm.log" STREAM_MANAGER_LOG_FILE="$D/sm.log"
     export MEDIAMTX_LOCK_FILE="$D/run.lock"
     export MEDIAMTX_RESTART_MARKER="$D/restart.marker"
     export MEDIAMTX_CLEANUP_MARKER="$D/cleanup.marker"
