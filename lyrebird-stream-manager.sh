@@ -5273,10 +5273,13 @@ start_mediamtx() {
         return "${E_USB_NO_DEVICES}"
     fi
 
-    # Check ports if lsof is available
+    # Check ports if lsof is available. Only a listening TCP socket takes a
+    # port away from MediaMTX: `lsof -i :PORT` also reports a client socket that
+    # merely uses the number as its source port, and with the ports now
+    # configurable that is a real chance (the ephemeral range)
     if command_exists lsof; then
         for port in "${MEDIAMTX_RTSP_PORT}" "${MEDIAMTX_API_PORT}" "${MEDIAMTX_METRICS_PORT}"; do
-            if lsof -i ":$port" >/dev/null 2>&1; then
+            if lsof -nP -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1; then
                 log ERROR "Port $port is already in use"
                 return 1
             fi

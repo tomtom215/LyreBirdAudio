@@ -236,6 +236,45 @@ SHIM
     [ -s "$D/mediamtx.started" ]
 }
 
+@test "a client socket that merely has a configured port number as its source port is not a port in use [X-19]" {
+    command -v lsof >/dev/null || skip "lsof is not installed"
+    local var port
+    for var in P_RTSP P_API P_METRICS; do
+        port="${!var}"
+        rm -f "$D/connected" "$D/sm.log" "$D/mediamtx.started"
+        # a listener elsewhere, and a connected client whose local port is the configured one:
+        # `lsof -i :PORT` lists it, nothing listens on PORT
+        python3 -I -c '
+import socket, sys, time
+srv = socket.socket(); srv.bind(("127.0.0.1", 0)); srv.listen()
+cli = socket.socket(); cli.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+cli.bind(("127.0.0.1", int(sys.argv[1]))); cli.connect(srv.getsockname())
+open(sys.argv[2], "w").close()
+time.sleep(120)' "$port" "$D/connected" 3>&- &
+        LISTENER_PID=$!
+        HELD_PIDS+=("$LISTENER_PID")
+        local i
+        for ((i = 0; i < 50; i++)); do
+            [[ -e "$D/connected" ]] && break
+            sleep 0.1
+        done
+        [ -e "$D/connected" ]
+        # the premise: lsof does name this port
+        lsof -i ":${port}" >/dev/null 2>&1
+        _start_with_stub_mediamtx
+        [ "$status" -eq 0 ] || {
+            echo "$var=$port: a client socket was taken for a listener"
+            cat "$D/sm.log"
+            false
+        }
+        [ -s "$D/mediamtx.started" ]
+        kill -9 "$(head -n 1 "$D/mediamtx.started")" 2>/dev/null || true
+        rm -f "$MEDIAMTX_PID_FILE"
+        kill -9 "$LISTENER_PID" 2>/dev/null || true
+        wait "$LISTENER_PID" 2>/dev/null || true
+    done
+}
+
 @test "start_mediamtx refuses to start when any of the three configured ports is taken [X-19]" {
     command -v lsof >/dev/null || command -v ss >/dev/null || skip "neither lsof nor ss is installed"
     local var port
