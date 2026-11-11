@@ -468,6 +468,13 @@ declare -g LOCK_DEPRECATION_LOGGED=false
 # Skip cleanup flag
 declare -g SKIP_CLEANUP=false
 
+# What this run has started and not yet accounted for: set when it launches
+# MediaMTX or a stream wrapper, cleared when the start succeeds or has taken
+# them down again. cleanup() acts on it (see there).
+declare -g RUN_DIRTY=false
+declare -g RUN_STARTED_MEDIAMTX=""
+declare -ga RUN_STARTED_STREAMS=()
+
 # Command being executed (COMMAND used by cleanup trap, must be initialized early)
 declare -g COMMAND=""
 
@@ -525,7 +532,18 @@ compute_hash() {
     fi
 }
 
-# Enhanced atomic cleanup with better marker creation
+# Exit handler (EXIT trap).
+#
+# The cleanup marker (CLEANUP_MARKER) stops every stream wrapper at its next
+# loop iteration and makes the next start clean up, so it must only exist when
+# this run has left something behind that needs that. An ordinary failed command
+# (a refused start, a missing dependency, a start whose policy was not met, a
+# usage error) changes nothing that is running: it leaves no marker and the
+# wrappers of a healthy stack keep running. What this run launched and has not
+# accounted for (RUN_DIRTY: it was interrupted, or an error aborted it under
+# errexit) is taken down again here; the marker is written first, so that a run
+# that is killed while it does so is still recorded, and removed once that
+# succeeded.
 cleanup() {
     local exit_code=$?
 
@@ -536,14 +554,15 @@ cleanup() {
         exit "${exit_code}"
     fi
 
-    # Only perform cleanup on unexpected exit (non-zero exit code)
-    # Skip marker creation for read-only commands to prevent race conditions
-    if [[ $exit_code -ne 0 ]] && [[ "${COMMAND}" != "monitor" ]] && [[ "${COMMAND}" != "status" ]] && [[ "${COMMAND}" != "config" ]]; then
+    if [[ $exit_code -ne 0 ]] && [[ "${RUN_DIRTY}" == "true" ]]; then
         # Use atomic marker creation
         local marker_tmp
         marker_tmp="$(mktemp "${CLEANUP_MARKER}.XXXXXX" 2>/dev/null)" \
             && mv -f "$marker_tmp" "${CLEANUP_MARKER}" 2>/dev/null \
             || touch "${CLEANUP_MARKER}" 2>/dev/null || true
+        if rollback_failed_start; then
+            rm -f "${CLEANUP_MARKER}"
+        fi
     fi
 
     # Always release locks on exit
@@ -553,10 +572,25 @@ cleanup() {
     exit "${exit_code}"
 }
 
+# INT, TERM and QUIT end the run with the conventional 128+signal status. (A
+# trap that only ran cleanup() exited with the status of whatever command had
+# run last, usually 0.) cleanup() then runs as the EXIT trap.
+on_terminate_signal() {
+    log WARN "Received SIG$1, shutting down"
+    exit $((128 + $2))
+}
+
+install_lifecycle_traps() {
+    trap cleanup EXIT
+    trap 'on_terminate_signal INT 2' INT
+    trap 'on_terminate_signal TERM 15' TERM
+    trap 'on_terminate_signal QUIT 3' QUIT
+}
+
 # Set trap for cleanup only in main script
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]] && [[ $$ -eq $BASHPID ]]; then
     # Comprehensive signal handling for production reliability
-    trap cleanup EXIT INT TERM QUIT
+    install_lifecycle_traps
 
     # Ignore SIGPIPE to prevent crashes on broken pipe (common in API calls)
     trap '' PIPE
@@ -5183,8 +5217,15 @@ start_all_ffmpeg_streams() {
         # Progress feedback for manual starts
         echo "Starting stream ${device_idx}/${#devices[@]}: ${stream_path}..."
 
+        local was_running=false
+        if stream_wrapper_alive "$stream_path"; then
+            was_running=true
+        fi
         if start_ffmpeg_stream "$device_name" "$card_num" "$stream_path"; then
             ((success_count++)) || true
+            if [[ "$was_running" != "true" ]]; then
+                run_track_stream "$stream_path"
+            fi
         else
             failed_streams+=("$stream_path")
             log ERROR "Failed to start stream for $device_name (card $card_num)"
@@ -5362,6 +5403,60 @@ is_mediamtx_running() {
     [[ $rc -ne 1 ]]
 }
 
+# ============================================================================
+# What a run has started, and taking it down again
+# ============================================================================
+
+# The path a multiplex stream is published on: the configured name, sanitized
+# the way start_ffmpeg_multiplex_stream and monitor_streams do
+multiplex_stream_path() {
+    local stream_path
+    stream_path="$(sanitize_path_name "${MULTIPLEX_STREAM_NAME}")"
+    if [[ "$stream_path" =~ ^[0-9] ]]; then
+        stream_path="stream_${stream_path}"
+    fi
+    printf '%s' "$stream_path"
+}
+
+# Succeeds when stream $1 has a running wrapper that is provably this
+# manager's (an unidentifiable process counts as running: it is left alone)
+stream_wrapper_alive() {
+    local pid
+    pid="$(read_pid_safe "${FFMPEG_PID_DIR}/${1}.pid")"
+    [[ -n "$pid" ]] || return 1
+    ! pid_is_foreign_wrapper "$pid" "$1"
+}
+
+# Record a stream wrapper that THIS run launched (not one that was already
+# running): it goes down again with a start that fails
+run_track_stream() {
+    RUN_STARTED_STREAMS+=("$1")
+    RUN_DIRTY=true
+}
+
+# Take down what THIS run started and nothing else: the stream wrappers it
+# launched and the MediaMTX it launched, each by identity. A healthy stack that
+# was running before this run is never touched. Returns 1 when something could
+# not be stopped (RUN_DIRTY then stays set).
+rollback_failed_start() {
+    local stream_path rc=0
+    if ((${#RUN_STARTED_STREAMS[@]} > 0)) || [[ -n "${RUN_STARTED_MEDIAMTX}" ]]; then
+        log WARN "Taking down what this run started (anything that was already running is left alone)"
+    fi
+    for stream_path in ${RUN_STARTED_STREAMS[@]+"${RUN_STARTED_STREAMS[@]}"}; do
+        stop_ffmpeg_stream "$stream_path" || rc=1
+    done
+    if [[ -n "${RUN_STARTED_MEDIAMTX}" ]]; then
+        stop_recorded_process "${PID_FILE}" mediamtx 30 || rc=1
+    fi
+    if [[ $rc -eq 0 ]]; then
+        RUN_STARTED_STREAMS=()
+        RUN_STARTED_MEDIAMTX=""
+        RUN_DIRTY=false
+    fi
+    return "$rc"
+}
+
 # Start MediaMTX with single device detection
 #
 # One owner (D1): the MediaMTX this manager runs is the one it started and
@@ -5475,11 +5570,15 @@ start_mediamtx() {
         spawn_detached nohup "${MEDIAMTX_BIN}" "${CONFIG_FILE}" >>"${MEDIAMTX_LOG_FILE}" 2>&1 &
     fi
     local pid=$!
+    RUN_STARTED_MEDIAMTX="$pid"
+    RUN_DIRTY=true
 
     sleep "$QUICK_SLEEP"
 
     if ! kill -0 "$pid" 2>/dev/null; then
         log ERROR "MediaMTX process died immediately"
+        RUN_STARTED_MEDIAMTX=""
+        RUN_DIRTY=false
         return 1
     fi
 
@@ -5489,12 +5588,18 @@ start_mediamtx() {
     # signals what it can prove it started) could not take over again
     if ! write_pid_atomic "$pid" "${PID_FILE}"; then
         log ERROR "Failed to write PID file"
-        terminate_process_group "$pid" 5
+        if terminate_process_group "$pid" 5; then
+            RUN_STARTED_MEDIAMTX=""
+            RUN_DIRTY=false
+        fi
         return 1
     fi
 
     if ! wait_for_mediamtx_ready "$pid"; then
-        terminate_process_group "$pid" 5
+        if terminate_process_group "$pid" 5; then
+            RUN_STARTED_MEDIAMTX=""
+            RUN_DIRTY=false
+        fi
         pid_file_remove "${PID_FILE}"
         log ERROR "MediaMTX failed to become ready"
         return 1
@@ -5523,7 +5628,16 @@ start_streams_and_report() {
         log INFO "Multiplex mode - starting single multiplexed stream to ${MULTIPLEX_STREAM_NAME}"
         echo "Starting multiplexed stream (${#devices[@]} devices): ${MULTIPLEX_STREAM_NAME}..."
         # Start single multiplex stream with all devices
-        if ! start_ffmpeg_multiplex_stream "${devices[@]}"; then
+        local multiplex_path was_running=false
+        multiplex_path="$(multiplex_stream_path)"
+        if stream_wrapper_alive "$multiplex_path"; then
+            was_running=true
+        fi
+        if start_ffmpeg_multiplex_stream "${devices[@]}"; then
+            if [[ "$was_running" != "true" ]]; then
+                run_track_stream "$multiplex_path"
+            fi
+        else
             log ERROR "Failed to start multiplex stream"
             stop_mediamtx
             return 1
@@ -5562,6 +5676,10 @@ start_streams_and_report() {
     fi
 
     echo
+    # Everything this run launched is accounted for
+    RUN_STARTED_STREAMS=()
+    RUN_STARTED_MEDIAMTX=""
+    RUN_DIRTY=false
     return 0
 }
 
