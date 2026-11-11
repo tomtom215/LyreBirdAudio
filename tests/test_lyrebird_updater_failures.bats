@@ -497,6 +497,53 @@ _scripts_executable() {
 }
 
 # ============================================================================
+# Small things a field run hits
+# ============================================================================
+
+@test "the menu does not die when the terminal cannot be cleared (TERM=dumb)" {
+    updater_checkout v1.1.0
+    updater_stdin q
+    TERM=dumb updater_run
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"Thank you for using"* ]]
+}
+
+@test "an unset USER does not turn the root-owned-repository message into a crash" {
+    updater_checkout v1.1.0
+    updater_stdin
+    UPDATER_FAKE_OWNER=root run env -u USER PATH="$SHIMS:$PATH" bash "$REPO/lyrebird-updater.sh" --status \
+        <<<"$([[ $EUID -eq 0 ]] && echo y)"
+    [ "$status" -eq 5 ]
+    [[ "$output" == *"owned by root"* ]]
+    [[ "$output" != *"unbound variable"* ]]
+}
+
+@test "declining the root/sudo prompt exits 9 (user aborted), not the prerequisites code" {
+    updater_checkout v1.1.0
+    SUDO_USER=someone run env PATH="$SHIMS:$PATH" bash "$REPO/lyrebird-updater.sh" --status </dev/null
+    [ "$status" -eq 9 ]
+    [[ "$output" == *"Cancelled by user"* ]]
+}
+
+@test "on a full disk the lock cannot be written: the updater says so and exits 5 instead of spinning" {
+    updater_unshare_cmd || skip "mount namespaces are not permitted here"
+    updater_checkout v1.1.0
+    export SMALL="$NODE/small"
+    mkdir -p "$SMALL"
+    run timeout 40 "${UNSHARE_CMD[@]}" bash -c '
+        mount -t tmpfs -o size=1m tmpfs "$SMALL" || exit 99
+        cp -a "$REPO" "$SMALL/repo"
+        cd "$SMALL/repo" || exit 98
+        # fill every free block
+        dd if=/dev/zero of="$SMALL/filler" bs=1k 2>/dev/null
+        printf "%s\n" "$([[ $EUID -eq 0 ]] && echo y)" | env PATH="$SHIMS:$PATH" bash ./lyrebird-updater.sh --status
+        echo "RC=$?"
+    '
+    [[ "$output" == *"RC=5"* ]]
+    [[ "$output" == *"Cannot write the lock file"* ]]
+}
+
+# ============================================================================
 # The network goes away
 # ============================================================================
 

@@ -78,6 +78,10 @@ set -o pipefail # Catch errors in pipes
 set -o nounset  # Exit if uninitialized variable is used
 set -o errtrace # Inherit ERR trap in functions
 
+# USER is only used in "to fix: sudo chown" hints, but unset (cron, systemd,
+# some containers) it crashed the updater under nounset instead of printing them
+: "${USER:=$(id -un 2>/dev/null || echo user)}"
+
 # Source shared library if available (backward compatible)
 # Provides: colors, logging, command_exists, compute_hash, exit codes
 # Falls back gracefully if library not present - all functions defined locally below
@@ -511,7 +515,7 @@ legacy_lock_held() {
 }
 
 acquire_lock() {
-    local waited=0
+    local waited=0 pid_write_failures=0
 
     # The lock lives in the updater state directory (inside the git directory)
     if ! mkdir -p "$UPDATER_STATE_DIR" 2>/dev/null || [[ ! -w "$UPDATER_STATE_DIR" ]]; then
@@ -543,8 +547,14 @@ acquire_lock() {
                 log_debug "Lock acquired (PID: $$)"
                 return 0
             else
-                # Failed to write PID - clean up and retry
+                # Failed to write PID - clean up and retry a few times. On a full or
+                # read-only disk it fails every time: say so instead of spinning.
                 rm -rf "$LOCKFILE" 2>/dev/null
+                pid_write_failures=$((pid_write_failures + 1))
+                if [[ $pid_write_failures -ge 5 ]]; then
+                    log_error "Cannot write the lock file in $UPDATER_STATE_DIR (disk full or read-only?)"
+                    return "$E_PERMISSION"
+                fi
                 sleep 0.1
                 continue
             fi
@@ -3797,7 +3807,7 @@ main_menu() {
         get_current_version
         check_local_changes
 
-        clear
+        clear 2>/dev/null || true # exits 1 on TERM=dumb or without terminfo: not a reason to end the menu
         echo
         echo "${BOLD}+---------------------------------------------------------+${NC}"
         echo "${BOLD}|     LyreBirdAudio - Version Manager v${VERSION}      |${NC}"
@@ -3995,19 +4005,26 @@ main() {
         --post-update-complete | --post-update-restore) RESUMED_POST_UPDATE=true ;;
     esac
 
-    # Check prerequisites
-    if ! check_prerequisites; then
-        exit "$E_PREREQUISITES"
+    # Check prerequisites. The checks return the documented code themselves (2
+    # missing tool, 9 operator declined the root prompt); main() used to
+    # replace every one of them with a single code, so 5, 9 and 3-vs-5 never
+    # reached the caller.
+    local startup_status=0
+    check_prerequisites || startup_status=$?
+    if [[ $startup_status -ne 0 ]]; then
+        exit "$startup_status"
     fi
 
-    # Acquire lock
-    if ! acquire_lock; then
-        exit "$E_LOCKED"
+    # Acquire lock (7 held by another updater, 5 cannot be written)
+    acquire_lock || startup_status=$?
+    if [[ $startup_status -ne 0 ]]; then
+        exit "$startup_status"
     fi
 
-    # Validate git repository
-    if ! check_git_repository; then
-        exit "$E_NOT_GIT_REPO"
+    # Validate git repository (3 not a repository, 5 not writable or owned by root)
+    check_git_repository || startup_status=$?
+    if [[ $startup_status -ne 0 ]]; then
+        exit "$startup_status"
     fi
 
     # Save and configure git settings
