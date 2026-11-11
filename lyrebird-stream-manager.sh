@@ -372,15 +372,12 @@ DEEP_HEALTH_MAX_STRIKES=$(_uint_or "${DEEP_HEALTH_MAX_STRIKES:-}" 3)
 readonly DEEP_HEALTH_MAX_STRIKES
 readonly DEEP_HEALTH_STATE_DIR="${DEEP_HEALTH_STATE_DIR:-/run/lyrebird/deep-health}"
 
-# Watchdog/Heartbeat settings
-# Heartbeat runs more frequently than cron for faster failure detection
-HEARTBEAT_INTERVAL=$(_uint_or "${HEARTBEAT_INTERVAL:-}" 30) # Seconds between heartbeats
-readonly HEARTBEAT_INTERVAL
+# Heartbeat: the Unix time of the last monitor run (update_heartbeat, written
+# once per run of the cron `monitor`). It proves that the monitor ran, nothing
+# else: it is written while MediaMTX is down too. There is no software watchdog in
+# this script; a hardware watchdog is systemd's RuntimeWatchdogSec= or a watchdog
+# daemon (the settings of the removed implementation: warn_removed_settings).
 readonly HEARTBEAT_FILE="${HEARTBEAT_FILE:-/run/mediamtx-audio.heartbeat}"
-readonly ENABLE_HARDWARE_WATCHDOG="${ENABLE_HARDWARE_WATCHDOG:-auto}" # auto, yes, no
-readonly HARDWARE_WATCHDOG_DEVICE="${HARDWARE_WATCHDOG_DEVICE:-/dev/watchdog}"
-HARDWARE_WATCHDOG_TIMEOUT=$(_uint_or "${HARDWARE_WATCHDOG_TIMEOUT:-}" 60) # Seconds
-readonly HARDWARE_WATCHDOG_TIMEOUT
 
 # Disk space monitoring thresholds
 DISK_SPACE_WARNING_PERCENT=$(_uint_or "${DISK_SPACE_WARNING_PERCENT:-}" 80)
@@ -581,8 +578,6 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]] && [[ $$ -eq $BASHPID ]]; then
         trap 'log INFO "Received SIGHUP, reloading configuration"; restart_mediamtx' HUP
         # SIGUSR1: Dump status for debugging
         trap 'log INFO "Received SIGUSR1, dumping status"; show_status >/dev/null 2>&1 || log INFO "Status dump completed"' USR1
-        # SIGUSR2: Force heartbeat update
-        trap 'log DEBUG "Received SIGUSR2, updating heartbeat"; update_heartbeat' USR2
     fi
     # Note: When running under systemd (INVOCATION_ID is set), default signal handlers are used
 fi
@@ -3082,8 +3077,10 @@ validate_config() {
     return 0
 }
 
-# Watchdog heartbeat - writes timestamp to heartbeat file
-# Can be used by external watchdog or systemd WatchdogSec
+# Heartbeat: write the Unix time of this monitor run to HEARTBEAT_FILE
+# (lyrebird-metrics.sh reads it as lyrebird_heartbeat_*). Called once per monitor
+# run, by check_all_resources, whatever the state of MediaMTX or the streams: the
+# file says "the monitor ran at this time" and nothing more.
 update_heartbeat() {
     local timestamp
     timestamp=$(date +%s)
@@ -3094,67 +3091,31 @@ update_heartbeat() {
     [[ -d "$heartbeat_dir" ]] || mkdir -p "$heartbeat_dir" 2>/dev/null || true
 
     # Write timestamp atomically
-    echo "$timestamp" >"${HEARTBEAT_FILE}.tmp" 2>/dev/null \
-        && mv "${HEARTBEAT_FILE}.tmp" "${HEARTBEAT_FILE}" 2>/dev/null \
-        || true
-
-    # Notify systemd watchdog if running under systemd
-    if [[ -n "${NOTIFY_SOCKET:-}" ]] && command_exists systemd-notify; then
-        systemd-notify WATCHDOG=1 2>/dev/null || true
+    if ! { echo "$timestamp" >"${HEARTBEAT_FILE}.tmp" && mv "${HEARTBEAT_FILE}.tmp" "${HEARTBEAT_FILE}"; } 2>/dev/null; then
+        log WARN "Cannot write the monitor heartbeat ${HEARTBEAT_FILE}"
     fi
-
-    # Kick hardware watchdog if enabled
-    kick_hardware_watchdog
-}
-
-# Initialize hardware watchdog (graceful - never blocks if unavailable)
-init_hardware_watchdog() {
-    # Check if hardware watchdog should be enabled
-    case "${ENABLE_HARDWARE_WATCHDOG}" in
-        no | false | 0)
-            log DEBUG "Hardware watchdog disabled by configuration"
-            return 0
-            ;;
-        yes | true | 1)
-            # Explicitly enabled - warn if not available
-            if [[ ! -c "${HARDWARE_WATCHDOG_DEVICE}" ]]; then
-                log WARN "Hardware watchdog enabled but device ${HARDWARE_WATCHDOG_DEVICE} not found"
-                return 0
-            fi
-            ;;
-        auto | *)
-            # Auto-detect - silently skip if not available
-            if [[ ! -c "${HARDWARE_WATCHDOG_DEVICE}" ]]; then
-                log DEBUG "Hardware watchdog not available (auto-detect)"
-                return 0
-            fi
-            ;;
-    esac
-
-    # Try to set watchdog timeout (requires root)
-    if [[ -w "${HARDWARE_WATCHDOG_DEVICE}" ]]; then
-        # Note: This uses the magic close feature - we just write to keep it alive
-        # The timeout is typically set in kernel/firmware
-        log INFO "Hardware watchdog initialized at ${HARDWARE_WATCHDOG_DEVICE}"
-        export HARDWARE_WATCHDOG_ACTIVE=true
-    else
-        log DEBUG "Hardware watchdog device not writable (may require root)"
-        export HARDWARE_WATCHDOG_ACTIVE=false
-    fi
-
     return 0
 }
 
-# Kick hardware watchdog to prevent system reset
-kick_hardware_watchdog() {
-    if [[ "${HARDWARE_WATCHDOG_ACTIVE:-false}" != "true" ]]; then
+# Settings of features that were removed because they did nothing (LB-15, LB-16;
+# decisions D7, D8). They are still read from the environment only to say, once
+# per run, that they are ignored and what replaces them.
+REMOVED_SETTINGS_WARNED=false
+warn_removed_settings() {
+    if [[ "${REMOVED_SETTINGS_WARNED}" == "true" ]]; then
         return 0
     fi
-
-    # Write any character to the watchdog device to kick it
-    if [[ -w "${HARDWARE_WATCHDOG_DEVICE}" ]]; then
-        echo "1" >"${HARDWARE_WATCHDOG_DEVICE}" 2>/dev/null || true
+    REMOVED_SETTINGS_WARNED=true
+    local name found=""
+    for name in HEARTBEAT_INTERVAL HARDWARE_WATCHDOG_TIMEOUT ENABLE_HARDWARE_WATCHDOG HARDWARE_WATCHDOG_DEVICE LYREBIRD_WATCHDOG_ENABLED LYREBIRD_WATCHDOG_INTERVAL; do
+        if [[ -v "$name" ]]; then
+            found+="${found:+, }${name}"
+        fi
+    done
+    if [[ -n "$found" ]]; then
+        log WARN "Ignoring removed setting(s): ${found}. The manager has no watchdog: it never opened a watchdog device. For a hardware watchdog use systemd's RuntimeWatchdogSec= (system.conf) or a watchdog daemon; the monitor only records the time of its last run in ${HEARTBEAT_FILE}"
     fi
+    return 0
 }
 
 # Version compatibility check
@@ -3222,7 +3183,8 @@ check_all_resources() {
         ((issues++)) || true
     fi
 
-    # Update heartbeat to show we're alive
+    # Record the time of this monitor run (it says the monitor ran, not that
+    # anything is healthy)
     update_heartbeat
 
     if [[ "$critical" == "true" ]]; then
@@ -6431,6 +6393,7 @@ main() {
     # Note: COMMAND is global so cleanup() can check it
     COMMAND=""
     parse_arguments "$@"
+    warn_removed_settings
 
     # Log stream mode if set
     if [[ -n "${STREAM_MODE}" ]] && [[ "${STREAM_MODE}" != "individual" ]]; then
@@ -6445,7 +6408,6 @@ main() {
             # v1.4.2: Pre-start validation and initialization
             check_version_compatibility || log WARN "Version compatibility check failed (continuing anyway)"
             validate_config || error_exit "Configuration validation failed" ${E_CONFIG_ERROR}
-            init_hardware_watchdog
             start_mediamtx
             exit_code=$?
             ;;

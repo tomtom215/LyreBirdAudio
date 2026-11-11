@@ -48,22 +48,15 @@ Restart=always
 RestartSec=10
 RestartPreventExitStatus=SIGTERM SIGINT
 
-# NOTE: no WatchdogSec. The stream manager can feed systemd's watchdog only via
-# the `systemd-notify` HELPER (a child process), which systemd rejects under the
-# default NotifyAccess=main -- so a WatchdogSec would receive no keep-alive and
-# kill the service every interval. LyreBird's own heartbeat, the optional
-# hardware watchdog, and the cron health monitor provide recovery instead. To use
-# the systemd watchdog anyway, add `NotifyAccess=all`, set WatchdogSec well above
-# LYREBIRD_WATCHDOG_INTERVAL, and validate on your hardware first.
+# NOTE: no WatchdogSec. The stream manager sends no sd_notify watchdog
+# keep-alives (it has no code for them), so a WatchdogSec would receive none and
+# systemd would kill the service every interval. Recovery is Restart= below and
+# the cron health monitor. For a hardware watchdog use systemd's own
+# RuntimeWatchdogSec= in /etc/systemd/system.conf (the machine is reset if PID 1
+# stops, whatever this service does) or a watchdog daemon.
 
 # Give time for graceful shutdown
 TimeoutStopSec=30
-
-# Environment. LYREBIRD_WATCHDOG_* drives LyreBird's OWN heartbeat / hardware
-# watchdog (independent of systemd's WatchdogSec, which is intentionally unset
-# above).
-Environment=LYREBIRD_WATCHDOG_ENABLED=true
-Environment=LYREBIRD_WATCHDOG_INTERVAL=30
 
 # Optional: increase file descriptor limit for many streams
 LimitNOFILE=65535

@@ -108,3 +108,82 @@ device would have reported every microphone silent.
   device, so the second-open EBUSY question of the old design is moot. Capture
   behaviour under load (a probe every 5 minutes next to the capture FFmpeg) is
   unchanged by it.
+
+## No watchdog claims, a heartbeat that says what it is (LB-15, X-13 manager side, D7)
+
+### What was wrong (R, scratchpad monitoring/)
+
+`HEARTBEAT_INTERVAL` and `HARDWARE_WATCHDOG_TIMEOUT` were never used.
+`init_hardware_watchdog` (only reachable from `start`) tested `-c`/`-w` on the device,
+logged "Hardware watchdog initialized" without ever opening it (strace: no `open`
+of the device) and exported `HARDWARE_WATCHDOG_ACTIVE` in the short-lived launcher
+process only, so `kick_hardware_watchdog`, called from `update_heartbeat` in the
+cron `monitor` process, was unreachable; had it run it would have opened, written one
+byte to and closed the device without the magic close character, which on a real driver
+arms a reset. The `systemd-notify WATCHDOG=1` branch could never run (`NOTIFY_SOCKET` is
+not set for the cron monitor, and the unit has no `WatchdogSec=` by design). The sample
+unit's `LYREBIRD_WATCHDOG_ENABLED`/`LYREBIRD_WATCHDOG_INTERVAL` were read by nothing.
+`update_heartbeat` is called only from `check_all_resources` (the monitor, every 5
+minutes from cron), and it wrote the heartbeat while MediaMTX was down.
+
+### What the code does now
+
+- Removed: `HEARTBEAT_INTERVAL`, `HARDWARE_WATCHDOG_TIMEOUT`, `ENABLE_HARDWARE_WATCHDOG`,
+  `HARDWARE_WATCHDOG_DEVICE`, `init_hardware_watchdog`, `kick_hardware_watchdog`, the
+  `systemd-notify` branch, the call in `start`, the SIGUSR2 trap (it wrote the heartbeat
+  outside a monitor run, so the file could not mean "last monitor run"), and the
+  `LYREBIRD_WATCHDOG_*` lines of `config/mediamtx-audio.service`.
+- If any of the six names (those four and `LYREBIRD_WATCHDOG_ENABLED`,
+  `LYREBIRD_WATCHDOG_INTERVAL`, which units copied from the old sample still set) is
+  present in the environment, even empty, every run of the script logs exactly one
+  `WARN Ignoring removed setting(s): A, B. The manager has no watchdog: it never opened
+  a watchdog device. For a hardware watchdog use systemd's RuntimeWatchdogSec= ...`
+  line (`warn_removed_settings`, called once from `main`).
+- The heartbeat stays and is exactly "the last monitor run": `update_heartbeat` writes
+  one line, the Unix time, atomically (`HEARTBEAT_FILE.tmp` then `mv`) to
+  `HEARTBEAT_FILE` (default `/run/mediamtx-audio.heartbeat`), once per `monitor` run
+  (`check_all_resources`), whatever state MediaMTX is in. A write that fails logs
+  `WARN Cannot write the monitor heartbeat <file>` (it used to be silent) and does not
+  fail the run. `lyrebird-metrics.sh` (threshold `LYREBIRD_HEARTBEAT_MAX_AGE`, 900 s) sees
+  the file the real manager writes as healthy and one older than that as unhealthy
+  (tested end to end).
+
+### Documentation consequences
+
+- `README.md` L1481 ("systemd service for stream manager (with watchdog)"),
+  `docs/configuration.html` L139, `docs/index.html` L57, `docs/usage.html` L216
+  ("Enables systemd watchdog integration"), `CHANGELOG.md` L310/L335 (history, keep):
+  say what exists. The unit has **no** `WatchdogSec=` (the manager sends no sd_notify
+  keep-alives: a `WatchdogSec=` would kill the service every interval). Recovery is
+  `Restart=`, the cron monitor (exit 2 restarts the service) and, for a hardware watchdog,
+  systemd's own `RuntimeWatchdogSec=` in `/etc/systemd/system.conf` (resets the machine
+  if PID 1 stops responding; Raspberry Pi: needs the `bcm2835_wdt` driver and
+  `RuntimeWatchdogSec=` set) or a watchdog daemon. None of that is implemented or
+  validated by this project.
+- The heartbeat file: Unix time of the last monitor run, nothing else. It proves the
+  cron monitor ran; it does not prove MediaMTX or any stream is up (`lyrebird_stream_up`,
+  `lyrebird_api_up` do).
+- Settings removed from the configuration reference, if listed: `HEARTBEAT_INTERVAL`,
+  `HARDWARE_WATCHDOG_TIMEOUT`, `ENABLE_HARDWARE_WATCHDOG`, `HARDWARE_WATCHDOG_DEVICE`.
+  `tests/README.md`: the heartbeat/watchdog line under "Unit Tests (Current)" should say
+  heartbeat only.
+
+### Tests
+
+`tests/test_stream_manager_removed_features.bats` (10): the settings and functions are
+gone; no executable line mentions a watchdog device, the notify socket or SIGUSR2; one
+warning per run naming every set variable and `RuntimeWatchdogSec=`, none when unset;
+with the old settings set and a FIFO as the "device" nothing opens it (the old
+`kick_hardware_watchdog` writes to it); `update_heartbeat` content and mtime semantics;
+one heartbeat write per `monitor` run, also with MediaMTX down; metrics reads it as
+healthy. `tests/test_config_files.bats` "no shipped unit sets or mentions the
+LYREBIRD_WATCHDOG_* variables". Two tests in `tests/test_stream_manager.bats` changed:
+"default values are set for timeouts" lost its `HEARTBEAT_INTERVAL` assertion (the
+setting is gone) and the inline-copy "heartbeat file update writes timestamp" (it
+re-defined `update_heartbeat` in the test and tested the copy) is replaced by the real
+`update_heartbeat` tests above.
+
+### Not validated (HW)
+
+Real hardware watchdog drivers (nothing opens a device any more; configuring
+`RuntimeWatchdogSec=` on a given board is the operator's and was not tested here).
