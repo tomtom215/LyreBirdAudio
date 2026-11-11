@@ -433,6 +433,70 @@ _updater_vars() {
 }
 
 # ============================================================================
+# File modes: executable bits and the operator's umask
+# ============================================================================
+
+# every tracked *.sh in the node is executable
+_scripts_executable() {
+    local f
+    while IFS= read -r f; do
+        [ -x "$REPO/$f" ] || { echo "not executable: $f"; return 1; }
+    done < <(git -C "$REPO" ls-files '*.sh')
+}
+
+@test "an update leaves every tracked shell script executable, including the ones git rewrote" {
+    umask 022
+    updater_checkout v1.1.0
+    chmod +x "$REPO"/*.sh # as the README tells an operator to
+    updater_stdin 3 v1.2.0 "" q
+    updater_run
+    [ "$status" -eq 0 ]
+    [ "$(updater_head)" = "v1.2.0" ]
+    _scripts_executable
+    [ "$(updater_mode lyrebird-diagnostics.sh)" = "755" ] # rewritten by v1.2.0, not one of the five the updater used to know
+}
+
+@test "a rolled-back update leaves every tracked shell script executable and the other files at 0644" {
+    umask 022
+    updater_checkout v1.0.0
+    chmod +x "$REPO"/*.sh
+    updater_inject checkout after FAIL
+    updater_stdin 3 v1.2.0 # rewrites config.txt, the stream manager and the diagnostics script, then "fails"
+    updater_run
+    [ "$status" -eq 1 ]
+    [ "$(updater_head)" = "v1.0.0" ]
+    _scripts_executable
+    [ "$(updater_mode config.txt)" = "644" ] # restored by the rollback's own checkout
+}
+
+@test "the files an update rewrites get the modes of the operator's umask, not 0600/0700" {
+    umask 022
+    updater_checkout v1.0.0
+    updater_stdin 3 v1.1.0 "" q
+    updater_run
+    [ "$status" -eq 0 ]
+    [ "$(updater_mode config.txt)" = "644" ] # rewritten by v1.1.0; it is not a script
+    updater_checkout v1.1.0
+    updater_stdin 3 v1.2.0 "" q
+    updater_run
+    [ "$(updater_mode added-in-1.2.0.txt)" = "644" ] # a file the switch created
+}
+
+@test "a rollback keeps those modes too" {
+    umask 022
+    updater_checkout v1.1.0
+    updater_stdin 3 v1.2.0 "" q
+    updater_run
+    [ "$status" -eq 0 ]
+    updater_checkout v1.2.0
+    updater_stdin 3 v1.0.0 "" q
+    updater_run
+    [ "$status" -eq 0 ]
+    [ "$(updater_mode config.txt)" = "644" ]
+    _scripts_executable
+}
+
+# ============================================================================
 # The network goes away
 # ============================================================================
 

@@ -65,7 +65,13 @@ fi
 
 # Strict error handling and security
 export LC_ALL=C # Ensure consistent sorting and string handling
-umask 077       # Secure file creation (owner-only by default)
+# The updater's own files (lock, journal, history, backups) are owner-only, but
+# the files git writes into the working tree must get the modes the operator's
+# umask gives every other file in the repository. Under umask 077 an update used
+# to leave the files it rewrote 0600/0700 and the rest 0644: ORIGINAL_UMASK is
+# applied to those operations (git_worktree, set_script_permissions).
+ORIGINAL_UMASK="$(umask)"
+umask 077 # Secure file creation (owner-only by default)
 
 set -o errexit  # Exit on any command failure
 set -o pipefail # Catch errors in pipes
@@ -1473,6 +1479,14 @@ install_signal_traps() {
 }
 install_signal_traps
 
+# Run a git command that writes working-tree files with the operator's umask
+git_worktree() {
+    (
+        umask "$ORIGINAL_UMASK"
+        git "$@"
+    )
+}
+
 ################################################################################
 # Git Configuration Management
 ################################################################################
@@ -2253,7 +2267,7 @@ report_kept_stash() {
 abandon_failed_stash_apply() {
     local ref="$1"
     local path
-    git reset --hard HEAD >/dev/null 2>&1 || true
+    git_worktree reset --hard HEAD >/dev/null 2>&1 || true
     # Untracked files stored in the stash (its third parent) that the failed
     # apply may already have restored. A path that is tracked in HEAD is the
     # version's own file (the stash held an untracked file of the same name): keep it.
@@ -2288,7 +2302,7 @@ restore_saved_changes() {
         clean_before=true
     fi
 
-    if git stash pop "$ref" >/dev/null 2>&1; then
+    if git_worktree stash pop "$ref" >/dev/null 2>&1; then
         return 0
     fi
 
@@ -2369,14 +2383,14 @@ restore_original_head() {
     if [[ "$orig_ref" != "HEAD" ]]; then
         # Started on a branch: back on it, and back to where its tip was
         # (fast_forward_branch_to_origin may have advanced the branch)
-        git checkout --force "$orig_ref" >/dev/null 2>&1 || return 1
+        git_worktree checkout --force "$orig_ref" >/dev/null 2>&1 || return 1
         if [[ "$(git rev-parse HEAD 2>/dev/null || true)" != "$orig_head" ]]; then
-            git reset --hard "$orig_head" >/dev/null 2>&1 || return 1
+            git_worktree reset --hard "$orig_head" >/dev/null 2>&1 || return 1
         fi
     else
         # Started on a tag or commit (detached HEAD): `git checkout HEAD` would
         # re-check-out the version we are trying to leave
-        git checkout --force --detach "$orig_head" >/dev/null 2>&1 || return 1
+        git_worktree checkout --force --detach "$orig_head" >/dev/null 2>&1 || return 1
     fi
 
     [[ "$(git rev-parse HEAD 2>/dev/null || true)" == "$orig_head" ]]
@@ -2785,7 +2799,7 @@ fast_forward_branch_to_origin() {
     git show-ref --verify --quiet "refs/heads/${target}" || return 0
     # No remote-tracking counterpart -> local-only branch, leave as-is.
     git show-ref --verify --quiet "refs/remotes/origin/${target}" || return 0
-    git merge --ff-only "origin/${target}" >/dev/null 2>&1
+    git_worktree merge --ff-only "origin/${target}" >/dev/null 2>&1
 }
 
 # True when the updater script at COMMIT can resume after a self-update re-exec
@@ -2929,7 +2943,7 @@ switch_version_safe() {
     fi
 
     local checkout_output
-    if ! checkout_output=$(git checkout "$target_version" 2>&1); then
+    if ! checkout_output=$(git_worktree checkout "$target_version" 2>&1); then
         log_error "Failed to switch to version: $target_version"
         echo "$checkout_output" >&2
         transaction_abort "checkout failed" "$E_GENERAL" || return $?
@@ -3131,7 +3145,7 @@ reset_to_clean_state() {
     log_step "Resetting to clean state: $target"
 
     # Perform reset
-    if ! git reset --hard "$target" >/dev/null 2>&1; then
+    if ! git_worktree reset --hard "$target" >/dev/null 2>&1; then
         log_error "Failed to reset to $target"
         return "$E_GENERAL"
     fi
@@ -3156,17 +3170,30 @@ reset_to_clean_state() {
 set_script_permissions() {
     log_debug "Setting executable permissions on scripts..."
 
-    local scripts=(
+    # The known scripts plus every shell script the repository tracks. git
+    # writes a changed file with the mode recorded in the repository (644 for
+    # most of the scripts) and core.fileMode is off while the updater runs, so
+    # after a switch or a rollback whatever is not marked here is no longer
+    # executable -- the diagnostics and mic-check scripts were not on the old
+    # list of five.
+    local -a scripts=(
         "install_mediamtx.sh"
         "lyrebird-orchestrator.sh"
         "lyrebird-updater.sh"
         "lyrebird-stream-manager.sh"
         "usb-audio-mapper.sh"
     )
+    local tracked script
+    while IFS= read -r -d '' tracked; do
+        scripts+=("$tracked")
+    done < <(git ls-files -z -- '*.sh' 2>/dev/null || true)
 
     for script in "${scripts[@]}"; do
         if [[ -f "$script" ]]; then
-            if ! chmod +x "$script" 2>/dev/null; then
+            if ! (
+                umask "$ORIGINAL_UMASK"
+                chmod +x "$script"
+            ) 2>/dev/null; then
                 log_warn "Could not set executable permission on $script (permission denied)"
                 log_debug "This may cause issues when running $script"
             fi
