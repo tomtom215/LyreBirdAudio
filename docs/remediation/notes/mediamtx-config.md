@@ -44,6 +44,9 @@ needed) and `test_mediamtx_config_live.bats`, `test_mediamtx_api_live.bats`,
   `stop_all_ffmpeg_streams` and `force_stop_mediamtx`.
 - The installer already honoured the three variables (see `installer.md`); it does not
   validate them. Pass 2 should use `lyrebird_is_valid_port`.
+- The port-in-use check (`lsof`) now looks only at listening TCP sockets: `lsof -i :PORT` also
+  names a client socket that merely uses the number as its source port (reproduced), which
+  with configurable ports in the ephemeral range could refuse a start at random.
 
 ### Who owns `/etc/mediamtx/mediamtx.yml` (LB-22, D10)
 
@@ -232,14 +235,14 @@ so the README sentence "needs ports 8554/9997 free" no longer applies to it
 
 ## Test counts for tests/README.md
 
-`bats --count tests/` is 1015 on this branch (other workers' tests not included). New files:
-`test_mediamtx_ports.bats` 19, `test_mediamtx_config_render.bats` 25,
+`bats --count tests/` is 1016 on this branch (other workers' tests not included). New files:
+`test_mediamtx_ports.bats` 20, `test_mediamtx_config_render.bats` 25,
 `test_mediamtx_config_ownership.bats` 38, `test_mediamtx_api_probe.bats` 26 (these four need
 no MediaMTX), `test_mediamtx_config_live.bats` 11, `test_mediamtx_api_live.bats` 2,
 `test_mediamtx_e2e_ports.bats` 1 (live: skipped without `LYREBIRD_TEST_MEDIAMTX_BINS`);
 `test_lyrebird_common.bats` +3 (46 to 49 with the owner reference tests);
 `test_mediamtx_live.bats` is still 1 live test. The full suite run through
-`tests/check_tmp_leaks.sh` passed 1015 of 1015 with 28 skipped (18 live tests: 15 above and
+`tests/check_tmp_leaks.sh` passed 1016 of 1016 with 28 skipped (18 live tests: 15 above and
 3 in the soak files; the 9 placeholder integration tests that were already skipped; one
 `udevadm` test) and no temp file left behind.
 
@@ -274,6 +277,7 @@ Tests per tag, as they appear in the files:
 - start_mediamtx prints the stream URLs with the configured RTSP port, for individual and multiplex mode [X-19]
 - start_mediamtx prints the URL of a stream that failed validation with the configured RTSP port [X-19]
 - start_mediamtx refuses to start when any of the three configured ports is taken, checked with ss when lsof is absent [X-19]
+- a client socket that merely has a configured port number as its source port is not a port in use [X-19]
 - start_mediamtx refuses to start when any of the three configured ports is taken [X-19]
 - wait_for_mediamtx_ready asks the API on the configured port [X-19]
 - probe_stream_ready and the API version detection use the configured API port [X-19]
@@ -363,6 +367,29 @@ Tests per tag, as they appear in the files:
 - RTSP_AUTH_MODE=local-only-publish: this machine needs no credentials, a remote client needs a listed user, who can read but not publish [LB-06]
 - RTSP_AUTH_MODE=local-only-publish: the manager's own readiness and stream probes keep working on every version, with no credentials [LB-06, LB-13]
 - an API bound to every interface under local-only-publish still answers 401 to a remote caller, the local machine keeps its access [LB-06]
+#### D15
+- a port outside 1-65535 or not a plain integer is refused with an error naming the variable [D15]
+- the bounds 1 and 65535 and leading zeros are accepted, and leading zeros are not read as octal [D15]
+- invalid values are refused, nothing is printed and the message names the option [D15]
+#### D10
+- the first line is the managed marker, with nothing before it [D10]
+- no file yet: the rendered configuration is written with the marker first, mode 0644, and no backup [D10]
+- only a first line that is the marker (a line ending or trailing blanks aside) makes a file managed [D10]
+- an operator-owned file gets one warning per start that names --regenerate-config [D10]
+- RTSP_AUTH_MODE has no effect on an operator-owned file, and the log says so [D10]
+- --regenerate-config replaces an operator-owned file after saving it, keeping its mode; the next start leaves the new file alone [D10]
+#### D9
+- RTMP, HLS, WebRTC and SRT are switched off, and so is every key that has no switch-on option [D9]
+- the API and metrics listen on the loopback address by default; MEDIAMTX_API_BIND and MEDIAMTX_METRICS_BIND change that [D9, LB-06]
+- an invalid MEDIAMTX_API_BIND stops the start with a message, and the file stays [D9]
+- the API host follows MEDIAMTX_API_BIND, and MEDIAMTX_HOST when the API listens on every interface [D9, LB-13]
+- the API and the metrics endpoint cannot be reached from a remote address; bound to every interface they answer 401 there, 200 here [LB-06, D9]
+#### LB-04
+- any printable stream name comes back from a YAML parser as exactly that one path name [LB-04]
+- a stream name with a control character, a line break or a non-ASCII byte is refused, so it cannot inject YAML [LB-04]
+- multiplex mode renders one quoted path; a stream name that is not a plain scalar cannot inject YAML [LB-04, LB-22]
+- multiplex configuration: the named path accepts a publisher and every other path is refused [LB-04]
+- names within MediaMTX's path syntax work quoted; one outside it is refused by MediaMTX itself, never read as YAML [LB-04]
 
 ## README / docs corrections (summary)
 
