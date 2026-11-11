@@ -8,8 +8,9 @@ so a test can change the answer while the server runs:
     {"routes": {"/v3/paths/list": REPLY}, "default": REPLY}
 
 REPLY is {"status": 200, "body": "text", "delay": 0.0, "drop": false,
-"headers": {"Name": "value"}}. A reply with "drop" closes the connection
-without answering. A request for a path with no route gets "default"
+"truncate": false, "headers": {"Name": "value"}}. A reply with "drop" closes the
+connection without answering; one with "truncate" announces 50 bytes more than
+it sends and closes. A request for a path with no route gets "default"
 (404, "404 page not found" if the plan has none). Every request is appended to
 LOG_FILE as "METHOD PATH". READY_FILE is created once the port is bound.
 """
@@ -49,9 +50,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.send_response(int(reply.get("status", 200)))
         for name, value in reply.get("headers", {}).items():
             self.send_header(name, value)
-        self.send_header("Content-Length", str(len(body)))
+        # "truncate": announce more than is sent, then close (a cut-off answer)
+        self.send_header("Content-Length", str(len(body) + (50 if reply.get("truncate") else 0)))
         self.end_headers()
         self.wfile.write(body)
+        if reply.get("truncate"):
+            self.wfile.flush()
+            self.close_connection = True
 
     do_GET = _reply
     do_POST = _reply

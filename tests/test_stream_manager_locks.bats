@@ -52,7 +52,9 @@ setup() {
     for tool in pkill pgrep lsof ss; do
         printf '#!/bin/bash\nprintf "%%s\\n" "$*" >>"%s/%s.calls"\nexit 1\n' "$LK" "$tool" >"$LK/bin/$tool"
     done
-    printf '#!/bin/bash\nexit 0\n' >"$LK/bin/curl"
+    # curl answers like a MediaMTX API with no paths (the manager checks the
+    # status and the shape of the answer, LB-13)
+    install -m 755 "$PROJECT_ROOT/tests/helpers/mediamtx/curl_shim" "$LK/bin/curl"
     chmod +x "$LK/bin/"*
     export PATH="$LK/bin:$PATH"
 

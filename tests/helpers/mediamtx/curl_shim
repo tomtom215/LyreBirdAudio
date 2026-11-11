@@ -1,0 +1,35 @@
+#!/bin/bash
+# A `curl` for tests that run the stream manager's own code against a pretend
+# MediaMTX API, with the arguments the manager really passes (-sS, --max-time,
+# -w with %{http_code}, the URL last). Install it first on PATH as "curl":
+#
+#   install -m 755 tests/helpers/mediamtx/curl_shim "$dir/curl"
+#
+# Environment:
+#   CURL_SHIM_STATUS     HTTP status to report (default 200)
+#   CURL_SHIM_LIST_BODY  body for every URL except .../paths/get/... (default a
+#                        valid, empty v3 paths list)
+#   CURL_SHIM_GET_BODY   body for .../paths/get/... (default a ready path)
+#   CURL_SHIM_EXIT       exit status of curl without any answer, e.g. 7 for a
+#                        refused connection (default 0: answer)
+#   CURL_SHIM_LOG        file to append every requested URL to
+# The body is printed first and the -w format after it, as curl does.
+
+args=("$@")
+url="${args[${#args[@]} - 1]}"
+fmt=""
+for ((i = 0; i < ${#args[@]} - 1; i++)); do
+    [[ "${args[i]}" == -w ]] && fmt="${args[i + 1]}"
+done
+[[ -n "${CURL_SHIM_LOG:-}" ]] && printf '%s\n' "$url" >>"$CURL_SHIM_LOG"
+if [[ "${CURL_SHIM_EXIT:-0}" != 0 ]]; then
+    exit "$CURL_SHIM_EXIT"
+fi
+default_list='{"itemCount":0,"pageCount":0,"items":[]}'
+default_get='{"name":"x","ready":true,"available":true}'
+case "$url" in
+    */paths/get/*) printf '%s' "${CURL_SHIM_GET_BODY-$default_get}" ;;
+    *) printf '%s' "${CURL_SHIM_LIST_BODY-$default_list}" ;;
+esac
+[[ -n "$fmt" ]] && printf '%s' "${fmt//'%{http_code}'/${CURL_SHIM_STATUS:-200}}"
+exit 0

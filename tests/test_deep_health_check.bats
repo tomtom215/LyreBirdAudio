@@ -30,24 +30,19 @@ teardown() {
 }
 
 # Stub API: paths/get/<name> answers with $1; everything else is a valid list.
+# The manager reads the HTTP status from curl's -w output (LB-13), so the stand-in
+# is the shared curl shim, which reports one the way curl does, and not a script
+# that prints only a body.
 _write_api() {
-    local get_body="$1"
-    cat > "$DH_TMP/bin/curl" <<CURLEOF
-#!/bin/bash
-url="\${!#}"
-case "\$url" in
-    */paths/get/*) printf '%s' '${get_body}' ;;
-    *)             printf '%s' '{"itemCount":0,"items":[]}' ;;
-esac
-exit 0
-CURLEOF
-    chmod +x "$DH_TMP/bin/curl"
+    install -m 755 "$PROJECT_ROOT/tests/helpers/mediamtx/curl_shim" "$DH_TMP/bin/curl"
+    export CURL_SHIM_GET_BODY="$1" CURL_SHIM_STATUS=200
+    unset CURL_SHIM_EXIT
 }
 
-# An API that is down: curl always fails.
+# An API that is down: curl fails like a refused connection.
 _write_dead_api() {
-    printf '#!/bin/bash\nexit 7\n' > "$DH_TMP/bin/curl"
-    chmod +x "$DH_TMP/bin/curl"
+    install -m 755 "$PROJECT_ROOT/tests/helpers/mediamtx/curl_shim" "$DH_TMP/bin/curl"
+    export CURL_SHIM_EXIT=7
 }
 
 # Start a live fake wrapper whose cmdline matches pgrep -f "<dir>/<stream>.sh"

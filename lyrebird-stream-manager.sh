@@ -1796,6 +1796,137 @@ mediamtx_api_root() {
     printf 'http://%s:%s' "$(mediamtx_api_host)" "${MEDIAMTX_API_PORT}"
 }
 
+# GET $1 (a path below the API root, e.g. /v3/paths/list) with curl and keep
+# the answer apart from the transport:
+#   MEDIAMTX_API_STATUS  the HTTP status, 000 when there was no HTTP answer
+#   MEDIAMTX_API_BODY    the response body
+# Not -f: a 401 or 403 must stay distinguishable from a refused connection and
+# from a 5xx. A transfer that did not complete (refused, timed out, cut off) is
+# no answer, whatever it had received.
+# Usage: mediamtx_api_get PATH [MAX_SECONDS]
+# Returns: 0 = an HTTP answer arrived (any status), 1 = none, 2 = no curl
+mediamtx_api_get() {
+    local path="$1" max_time="${2:-3}" raw rc=0
+    MEDIAMTX_API_STATUS=000
+    MEDIAMTX_API_BODY=""
+    command_exists curl || return 2
+    raw="$(curl -sS --max-time "$max_time" -w $'\n%{http_code}' "$(mediamtx_api_root)${path}" 2>/dev/null)" || rc=$?
+    if [[ $rc -ne 0 || "$raw" != *$'\n'* ]]; then
+        return 1
+    fi
+    if ! [[ "${raw##*$'\n'}" =~ ^[0-9]{3}$ ]]; then
+        return 1
+    fi
+    MEDIAMTX_API_STATUS="${raw##*$'\n'}"
+    MEDIAMTX_API_BODY="${raw%$'\n'*}"
+    return 0
+}
+
+# Is $2 a JSON document of kind $1 that this MediaMTX API sends?
+#   list   a paths list: an object with "items" (an array, but for the API v1
+#          and the unversioned one, whose items were an object keyed by name)
+#   path   one path: an object with a string "name" and a boolean "available"
+#          or "ready"
+#   error  an error answer: an object with a string "error"
+# $3 is the API prefix (v3, v2, v1 or empty). Uses jq; without it a
+# conservative textual check of the same shapes.
+# Usage: mediamtx_api_body_is KIND BODY [PREFIX]
+mediamtx_api_body_is() {
+    local kind="$1" body="$2" prefix="${3-v3}"
+    [[ -n "$body" ]] || return 1
+    if command_exists jq; then
+        case "$kind" in
+            list)
+                if [[ "$prefix" == v3 || "$prefix" == v2 ]]; then
+                    jq -e 'type == "object" and (.items | type == "array")' <<<"$body" >/dev/null 2>&1
+                else
+                    jq -e 'type == "object" and has("items")' <<<"$body" >/dev/null 2>&1
+                fi
+                ;;
+            path)
+                jq -e 'type == "object" and (.name | type == "string") and (((.available | type) == "boolean") or ((.ready | type) == "boolean"))' <<<"$body" >/dev/null 2>&1
+                ;;
+            error)
+                jq -e 'type == "object" and (.error | type == "string")' <<<"$body" >/dev/null 2>&1
+                ;;
+            *) return 1 ;;
+        esac
+        return
+    fi
+    [[ "$body" =~ ^[[:space:]]*\{.*\}[[:space:]]*$ ]] || return 1
+    case "$kind" in
+        list)
+            if [[ "$prefix" == v3 || "$prefix" == v2 ]]; then
+                [[ "$body" =~ \"items\"[[:space:]]*:[[:space:]]*\[ ]]
+            else
+                [[ "$body" =~ \"items\"[[:space:]]*:[[:space:]]*[\[\{] ]]
+            fi
+            ;;
+        path)
+            [[ "$body" =~ \"name\"[[:space:]]*:[[:space:]]*\" ]] \
+                && [[ "$body" =~ \"(available|ready)\"[[:space:]]*:[[:space:]]*(true|false) ]]
+            ;;
+        error) [[ "$body" =~ \"error\"[[:space:]]*:[[:space:]]*\" ]] ;;
+        *) return 1 ;;
+    esac
+}
+
+# Ask the control API for its paths list and say what the answer means. The API
+# is ready when it answers 200 with a paths list of the shape that API version
+# sends; a 404 means this version prefix does not exist, so the next older one
+# (v3, v2, v1, then no prefix unless MEDIAMTX_API_FALLBACK=false) is tried; a
+# 401 or 403 proves MediaMTX is up but not what is behind the door; anything
+# else (no answer, 5xx, any other status, a 200 that is not a paths list) is not
+# ready. Sets
+#   MEDIAMTX_API_STATE   ready | unauthorized | notready | unreachable | nocurl
+#   MEDIAMTX_API_BASE    root URL plus the prefix that answered (v3 if none did)
+#   MEDIAMTX_API_STATUS  the last HTTP status (see mediamtx_api_get)
+# Usage: mediamtx_api_probe [MAX_SECONDS_PER_REQUEST]
+# Returns: 0 = ready, 1 = not ready or unreachable, 2 = unauthorized, 3 = no curl
+mediamtx_api_probe() {
+    local max_time="${1:-2}" root version rc=0
+    local -a versions
+    root="$(mediamtx_api_root)"
+    MEDIAMTX_API_STATE=notready
+    MEDIAMTX_API_BASE="${root}/v3"
+    if [[ "${MEDIAMTX_API_VERSION}" != "auto" ]]; then
+        versions=("${MEDIAMTX_API_VERSION}")
+        MEDIAMTX_API_BASE="${root}/${MEDIAMTX_API_VERSION}"
+    elif [[ "${MEDIAMTX_API_FALLBACK}" == "true" ]]; then
+        versions=(v3 v2 v1 "")
+    else
+        versions=(v3 v2 v1)
+    fi
+    for version in "${versions[@]}"; do
+        rc=0
+        mediamtx_api_get "${version:+/$version}/paths/list" "$max_time" || rc=$?
+        if [[ $rc -eq 2 ]]; then
+            MEDIAMTX_API_STATE=nocurl
+            return 3
+        elif [[ $rc -ne 0 ]]; then
+            MEDIAMTX_API_STATE=unreachable
+            return 1
+        fi
+        case "${MEDIAMTX_API_STATUS}" in
+            200)
+                if mediamtx_api_body_is list "${MEDIAMTX_API_BODY}" "$version"; then
+                    MEDIAMTX_API_STATE=ready
+                    MEDIAMTX_API_BASE="${root}${version:+/$version}"
+                    return 0
+                fi
+                return 1
+                ;;
+            401 | 403)
+                MEDIAMTX_API_STATE=unauthorized
+                return 2
+                ;;
+            404) ;;
+            *) return 1 ;;
+        esac
+    done
+    return 1
+}
+
 # Detect MediaMTX API version and return appropriate base URL
 # Tries v3, v2, v1 in order if auto-detection is enabled
 detect_mediamtx_api_version() {
@@ -1808,29 +1939,31 @@ detect_mediamtx_api_version() {
         return 0
     fi
 
-    # Auto-detect: try versions in order
-    if command_exists curl; then
-        for version in v3 v2 v1; do
-            local test_url="${base_url}/${version}/paths/list"
-            if curl -s --max-time 2 "$test_url" >/dev/null 2>&1; then
-                log DEBUG "Detected MediaMTX API version: $version"
-                echo "${base_url}/${version}"
-                return 0
-            fi
-        done
+    command_exists curl || {
+        log WARN "curl is not available, assuming MediaMTX API v3"
+        echo "${base_url}/v3"
+        return 0
+    }
 
-        # Fallback: try without version prefix (very old MediaMTX)
-        if [[ "${MEDIAMTX_API_FALLBACK}" == "true" ]]; then
-            if curl -s --max-time 2 "${base_url}/paths/list" >/dev/null 2>&1; then
-                log DEBUG "Using legacy MediaMTX API (no version prefix)"
-                echo "${base_url}"
-                return 0
-            fi
-        fi
-    fi
+    local rc=0
+    mediamtx_api_probe || rc=$?
+    case "$rc" in
+        0)
+            log DEBUG "Detected MediaMTX API: ${MEDIAMTX_API_BASE}"
+            echo "${MEDIAMTX_API_BASE}"
+            return 0
+            ;;
+        2)
+            # The API wants credentials, so no prefix can be tried; every
+            # MediaMTX this script supports (1.15 and later) has /v3
+            log DEBUG "MediaMTX API answered ${MEDIAMTX_API_STATUS}: it needs credentials, assuming v3"
+            echo "${base_url}/v3"
+            return 0
+            ;;
+    esac
 
     # Default to v3 if detection fails
-    log WARN "Could not detect MediaMTX API version, defaulting to v3"
+    log WARN "Could not detect MediaMTX API version (${MEDIAMTX_API_STATE}, last HTTP status ${MEDIAMTX_API_STATUS}), defaulting to v3"
     echo "${base_url}/v3"
     return 0
 }
@@ -2840,20 +2973,32 @@ should_restart_stream() {
 
 # --- Deep health probe (H9) --------------------------------------------------
 # Ask the MediaMTX control API whether a path is actually publishing.
-# Returns: 0 = ready, 1 = not ready, 2 = unknown (curl absent/API unreachable).
+# Returns: 0 = ready, 1 = not ready (MediaMTX has the path and it is not
+#          available, or knows no such path), 2 = unknown: curl absent, no
+#          answer, a 401 or 403 (the API wants credentials: the stream cannot
+#          be judged), a 5xx or an answer that is not what MediaMTX sends.
+#          Unknown never counts against a stream.
 probe_stream_ready() {
     local stream_path="$1"
     command_exists curl || return 2
-    local api_base response
+    local api_base prefix
     api_base=$(detect_mediamtx_api_version)
-    if ! response=$(curl -s --max-time 3 "${api_base}/paths/get/${stream_path}" 2>/dev/null) \
-        || [[ -z "$response" ]]; then
-        return 2
-    fi
-    if mediamtx_json_path_ready "$response"; then
-        return 0
-    fi
-    return 1
+    prefix="${api_base#"$(mediamtx_api_root)"}"
+    mediamtx_api_get "${prefix}/paths/get/${stream_path}" 3 || return 2
+    case "${MEDIAMTX_API_STATUS}" in
+        200)
+            mediamtx_api_body_is path "${MEDIAMTX_API_BODY}" || return 2
+            mediamtx_json_path_ready "${MEDIAMTX_API_BODY}"
+            return
+            ;;
+        404)
+            # MediaMTX answers {"status":"error","error":"path not found"}; a
+            # plain-text 404 is a server that does not know the route at all
+            mediamtx_api_body_is error "${MEDIAMTX_API_BODY}" && return 1
+            return 2
+            ;;
+    esac
+    return 2
 }
 
 # Record a probe verdict for a stream. Not-ready increments a strike counter;
@@ -3193,10 +3338,7 @@ validate_stream() {
         # v1.4.2: Use API version detection for compatibility
         # v1.4.4: Restructured to preserve curl exit status for better error detection
         if command_exists curl; then
-            local api_base api_response
-            api_base=$(detect_mediamtx_api_version)
-            local api_url="${api_base}/paths/get/${stream_path}"
-            if api_response=$(curl -s --max-time 2 "${api_url}" 2>/dev/null) && mediamtx_json_path_ready "$api_response"; then
+            if probe_stream_ready "$stream_path"; then
                 log DEBUG "Stream $stream_path validated via API (attempt ${attempt})"
                 return 0
             fi
@@ -3406,15 +3548,18 @@ wait_for_mediamtx_ready() {
         fi
 
         if command_exists curl; then
-            # v1.4.2: Try multiple API versions for compatibility
-            for api_version in v3 v2 v1 ""; do
-                local test_url
-                test_url="$(mediamtx_api_root)/${api_version:+$api_version/}paths/list"
-                if curl -s --max-time 2 "$test_url" >/dev/null 2>&1; then
-                    log INFO "MediaMTX API is ready after ${elapsed} seconds (API: ${api_version:-legacy})"
-                    return 0
-                fi
-            done
+            # Ready means a 200 with a paths list, not just any answer (LB-13)
+            local rc=0
+            mediamtx_api_probe 2 || rc=$?
+            if [[ $rc -eq 0 ]]; then
+                log INFO "MediaMTX API is ready after ${elapsed} seconds (${MEDIAMTX_API_BASE})"
+                return 0
+            elif [[ $rc -eq 2 ]]; then
+                # MediaMTX is up and serving HTTP, but its API wants credentials
+                # this script does not have: waiting longer cannot change that
+                log WARN "MediaMTX is up (HTTP ${MEDIAMTX_API_STATUS} from ${MEDIAMTX_API_BASE}) but its API requires credentials: stream health cannot be checked through it"
+                return 0
+            fi
         else
             # Fallback: just check if process is running
             if [[ $elapsed -ge 10 ]]; then
@@ -3431,7 +3576,7 @@ wait_for_mediamtx_ready() {
         fi
     done
 
-    log ERROR "MediaMTX API did not become ready within ${max_wait} seconds"
+    log ERROR "MediaMTX API did not become ready within ${max_wait} seconds (${MEDIAMTX_API_STATE:-unknown} at ${MEDIAMTX_API_BASE:-$(mediamtx_api_root)}, last HTTP status ${MEDIAMTX_API_STATUS:-000})"
     return 1
 }
 
@@ -4889,6 +5034,7 @@ mediamtx_config_backup() {
     fi
     printf -v bak '%s.%s.%02d.bak' "${CONFIG_FILE}" "$stamp" "$((last + 1))"
     mode="$(stat -c %a "${CONFIG_FILE}" 2>/dev/null)" || mode=644
+    # shellcheck disable=SC2094 # CONFIG_FILE is only read: it is also the owner reference of the copy
     lyrebird_atomic_write "$bak" "$mode" "${CONFIG_FILE}" <"${CONFIG_FILE}" || return 1
 
     # Retention: the names sort by time, the oldest are removed
@@ -5057,7 +5203,7 @@ mediamtx_config_install() {
             log INFO "Saved the previous MediaMTX configuration as ${bak}"
         fi
         if is_mediamtx_running; then
-            log INFO "MediaMTX is running; it reloads the changed configuration itself"
+            log INFO "MediaMTX is running; it watches its configuration file and normally reloads a change by itself"
         fi
     fi
 
