@@ -798,22 +798,27 @@ validate_stream() { return 0; }
 check_audio_device() { return 0; }
 '
 
-# The generated wrapper checks /dev/snd/pcmC<N>D0c, which a machine without
-# sound hardware (CI) does not have, and drives a real ffmpeg. For the tests of
-# the wrapper launch sites only, `bash` on PATH is a shim that runs the wrapper
-# the manager generated with those two hardware dependencies pointed at stand-
-# ins (an existing path, and a stub ffmpeg that just waits). The launch itself,
+# The generated wrapper looks for the card's capture device node, which a machine
+# without sound hardware (CI) does not have (a fake /proc/asound and /dev/snd with
+# a capture PCM 0 for cards 1 and 2 stand in for it: ASOUND_PROC_ROOT and
+# DEV_SND_ROOT), and drives a real ffmpeg. For the tests of the wrapper launch
+# sites only, `bash` on PATH is a shim that runs the wrapper the manager generated
+# with a stub ffmpeg that just waits in front of the real one. The launch itself,
 # the wrapper text and the lock are the real ones.
 _use_wrapper_hardware_stand_ins() {
+    local card
+    for card in 1 2; do
+        mkdir -p "$LK/asound/card${card}/pcm0c" "$LK/dev-snd"
+        : >"$LK/dev-snd/pcmC${card}D0c"
+    done
+    export ASOUND_PROC_ROOT="$LK/asound" DEV_SND_ROOT="$LK/dev-snd"
     mkdir -p "$LK/wrapbin"
     cat >"$LK/wrapbin/bash" <<'SHIM_EOF'
 #!/bin/bash
 if [[ "${1:-}" == "$LB_DIR/ff/"*.sh ]]; then
     script="$1"
     shift
-    sed -e 's#/dev/snd/pcmC${card_num}D0c#/dev/null#' \
-        -e 's#/dev/snd/pcmC${CARD_NUM}D0c#/dev/null#' \
-        -e 's#export PATH="/usr/local/sbin#export PATH="'"$LB_DIR"'/bin:/usr/local/sbin#' \
+    sed -e 's#export PATH="/usr/local/sbin#export PATH="'"$LB_DIR"'/bin:/usr/local/sbin#' \
         "$script" >"${script%.sh}.standin"
     exec /bin/bash "${script%.sh}.standin" "$@"
 fi

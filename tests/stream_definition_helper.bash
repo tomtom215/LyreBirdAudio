@@ -127,6 +127,29 @@ spawn_detached() {
 validate_stream() { return 0; }
 '
 
+# Run a wrapper script for real until its FFmpeg log holds PATTERN (or 15 s), then
+# stop it. The wrapper starts the real ffmpeg, which cannot open a fake card and
+# exits; what the test reads is what the wrapper logged on the way: the device it
+# was about to record from, why it stopped, that it started again. (The wrapper
+# puts the system directories first in its PATH, so a stand-in ffmpeg cannot
+# shadow the real one.)
+# COUNT (default 1): how many lines must match.
+# Usage: sd_run_wrapper_until_logged WRAPPER_SCRIPT PATTERN [COUNT]
+sd_run_wrapper_until_logged() {
+    local wrapper="$1" pattern="$2" want="${3:-1}" log i
+    log="${wrapper%.sh}.log"
+    setsid bash "$wrapper" >"$SD/wrapper.out" 2>&1 3>&- &
+    local pid=$!
+    echo "$pid" >>"$SD_PIDS_FILE"
+    for ((i = 0; i < 300; i++)); do
+        (($(grep -cF -- "$pattern" "$log" 2>/dev/null || true) >= want)) && break
+        kill -0 "$pid" 2>/dev/null || break
+        sleep 0.05
+    done
+    kill -TERM "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+}
+
 # A line count of FILE matching PATTERN (fixed string), 0 when there is none
 sd_count() {
     local n

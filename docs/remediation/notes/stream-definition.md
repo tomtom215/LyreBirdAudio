@@ -146,6 +146,45 @@ capture-PCM helpers, the multiplex graph) and, for the writer only,
   the manager no longer does that, so the test now calls `load_device_config`
   (`MEDIAMTX_DEVICE_CONFIG`). The assertion (96000 is honoured) is unchanged.
 
+## LB-09 / X-10 / X-11 (wrapper side): generated wrappers
+
+- **Choice and why.** The wrapper stays a generated per-stream script (`<FFMPEG_PID_DIR>/<stream>.sh`,
+  still started as `bash <dir>/<stream>.sh`, so the `pgrep -f "<dir>/<stream>.sh"` identity checks
+  and `tests/test_e2e_stream_wrapper.bats`, which reads the program text, keep working). Its text is
+  fixed; only the header of `NAME=value` lines differs, and **every value reaches the file through
+  `printf %q`** (`wrapper_assign`, `wrapper_array_item`), so it is a bash-quoted word and never code,
+  whatever it holds (`"`, `$(...)`, backticks, `$VAR`, a trailing backslash, a newline, spaces). A
+  fixed wrapper program taking its values as arguments would avoid generating code altogether but
+  needs another installed/updated file (installer, updater, units) and changes the process command
+  line the monitor matches on; that is the alternative if the lead prefers it later.
+  Before this change the values were pasted between double quotes (`SAMPLE_RATE="$sample_rate"`):
+  `"`, `$(...)`, backticks, `$VAR` and a trailing backslash executed or broke the wrapper
+  (reproduced with the real generator before the fix; a newline alone was inert).
+- **Defence in depth.** The config parser and `resolve_stream_settings` already refuse hostile
+  settings (a bad value never reaches the generator); the generator's quoting does not rely on that
+  (tests call it with the validation layer stood in for) and also covers the values that are not
+  settings: stream path (file names), device names, host, log and marker paths, recording path.
+- **Checked and installed atomically.** The wrapper is written to `<dir>/.<stream>.sh.XXXXXX`,
+  checked with `bash -n` (now in **both** modes; individual mode had no check),
+  `chmod 755`, and renamed over `<stream>.sh` (`install_wrapper_script`). A running wrapper (bash reads
+  its script as it goes) is no longer rewritten under its feet when the monitor regenerates the
+  file: it keeps the old, complete inode. A wrapper that fails `bash -n` is not installed or started
+  (`Generated wrapper for <name> has syntax errors and is not used: ...`, the start returns 1).
+  A SIGKILL between creating the temporary file and the rename can leave a hidden
+  `.<stream>.sh.XXXXXX`; nothing reads it and the cleanup globs (`*.sh`) do not match dotfiles.
+- **New defect fixed here: the back-off aborted the wrapper.** The wrapper's program uses
+  `INITIAL_RESTART_DELAY` and `MAX_RESTART_DELAY`, which the generated header never defined (the manager
+  holds them `readonly`; they only reach the wrapper if the operator exported them). Under the
+  wrapper's `set -euo pipefail` the first back-off after an FFmpeg failure ended the wrapper with
+  `MAX_RESTART_DELAY: unbound variable` instead of waiting and retrying (reproduced by running a
+  wrapper generated for a fake card, whose real FFmpeg cannot open it: it logged `Failed to start
+  FFmpeg` and exited). The header now carries both. The existing e2e test did not catch it because
+  it defines these variables itself before running the loop text. README claims about automatic
+  restart with back-off were therefore not true for a default install until this change.
+- **X-11 (wrapper side).** With the canonical stream name (above) the `Environment=` value that `install`
+  writes for `MULTIPLEX_STREAM_NAME` can only hold `[a-z0-9_-]`; quoting that line in the unit
+  template is the units worker's change.
+
 ## LB-24: the capture PCM is not always 0
 
 - **What changed.** `check_audio_device`, `check_alsa_device_available`, `check_audio_level`, the
@@ -201,12 +240,6 @@ capture-PCM helpers, the multiplex graph) and, for the writer only,
 
 ## New defects found while verifying (not fixed here)
 
-- The generated wrappers refer to `MAX_RESTART_DELAY` and `INITIAL_RESTART_DELAY` but never
-  define them (the manager's copies are `readonly`, not exported): under the wrapper's own
-  `set -euo pipefail` the first back-off computation after an FFmpeg failure aborts the
-  wrapper with `MAX_RESTART_DELAY: unbound variable`. Reproduced by running a generated
-  wrapper for real: it logged `Failed to start FFmpeg` and ended with exit code 1 instead of
-  waiting and retrying (fixed in the wrapper commit, see below).
 - The cron line written by `install` (`.../lyrebird-stream-manager.sh monitor`) does not
   carry `STREAM_MODE`, `MULTIPLEX_STREAM_NAME` or `MULTIPLEX_FILTER_TYPE`, so the cron
   `monitor` always runs in individual mode: on a multiplex node it finds no per-device PID

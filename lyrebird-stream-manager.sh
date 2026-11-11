@@ -4189,6 +4189,72 @@ generate_stream_path() {
     echo "$base_path"
 }
 
+# ============================================================================
+# Generated wrapper scripts
+# ============================================================================
+# Each stream runs under a small generated Bash program (the "wrapper") that
+# restarts FFmpeg with a back-off. The program text is fixed; what differs between
+# streams is a header of NAME=value assignments. Every value in that header reaches
+# the file through printf %q, so it is a bash-quoted word and never code: a quote,
+# $(...), a backtick, $VAR, a trailing backslash or a newline in a setting, a path or
+# a device name stays data (it used to be pasted between double quotes, where each
+# of them ran or broke the wrapper). The settings have already been checked by the
+# device config parser and resolve_stream_settings; this layer does not rely on that.
+# The wrapper is built in a temporary file in its own directory, checked with
+# `bash -n`, and renamed over the old one, so a wrapper that is running (bash reads
+# its script as it goes) never sees a half-written or rewritten file.
+# A fixed wrapper program that receives its values as arguments would avoid
+# generating code at all, but it needs one more installed file, and the process
+# identity checks (pgrep on "<dir>/<stream>.sh") and e2e tests rely on the per-stream
+# script, so the values are quoted instead.
+
+# Append NAME=<value quoted for bash> lines to the wrapper being built.
+# Usage: wrapper_assign FILE NAME VALUE [NAME VALUE]...
+# NAME is always one of this script's own variable names (upper-case letters,
+# digits, underscore); anything else is refused.
+wrapper_assign() {
+    local file="$1" name
+    shift
+    while (($# >= 2)); do
+        name="$1"
+        if [[ ! "$name" =~ ^[A-Z][A-Z0-9_]*$ ]]; then
+            log ERROR "Refusing to write wrapper variable with name '$(visible_text "$name" 32)'"
+            return 1
+        fi
+        printf '%s=%q\n' "$name" "$2" >>"$file" || return 1
+        shift 2
+    done
+}
+
+# Append ARRAY+=(<value quoted for bash>) to the wrapper being built.
+# Usage: wrapper_array_item FILE ARRAY VALUE
+wrapper_array_item() {
+    if [[ ! "$2" =~ ^[A-Z][A-Z0-9_]*$ ]]; then
+        log ERROR "Refusing to write wrapper array with name '$(visible_text "$2" 32)'"
+        return 1
+    fi
+    printf '%s+=(%q)\n' "$2" "$3" >>"$1" || return 1
+}
+
+# Check a generated wrapper and put it in place: `bash -n` on the temporary file,
+# then mode 755 and a rename over DEST (same directory, so atomic). On any failure
+# the temporary file is removed and DEST is left as it was.
+# Usage: install_wrapper_script TMPFILE DEST
+install_wrapper_script() {
+    local tmp="$1" dest="$2" problems
+    if ! problems="$(bash -n "$tmp" 2>&1)"; then
+        log ERROR "Generated wrapper for $(basename "$dest" .sh) has syntax errors and is not used: $(visible_text "$problems" 200)"
+        rm -f "$tmp"
+        return 1
+    fi
+    if ! chmod 755 "$tmp" || ! mv -f "$tmp" "$dest"; then
+        log ERROR "Failed to put the wrapper script in place: $dest"
+        rm -f "$tmp"
+        return 1
+    fi
+    return 0
+}
+
 # Start FFmpeg multiplex stream (single stream from multiple devices)
 start_ffmpeg_multiplex_stream() {
     local -a devices=("$@")
@@ -4279,12 +4345,17 @@ start_ffmpeg_multiplex_stream() {
     bitrate="$STREAM_BITRATE"
     thread_queue="$STREAM_THREAD_QUEUE"
 
-    # Create wrapper script
+    # Create wrapper script (built in a temporary file, installed by rename)
     local wrapper_script="${FFMPEG_PID_DIR}/${stream_path}.sh"
     local ffmpeg_log="${FFMPEG_PID_DIR}/${stream_path}.log"
+    local wrapper_tmp
+    if ! wrapper_tmp="$(mktemp "${FFMPEG_PID_DIR}/.${stream_path}.sh.XXXXXX")"; then
+        log ERROR "Failed to create a temporary wrapper script in ${FFMPEG_PID_DIR}"
+        return 1
+    fi
 
-    # Create wrapper with all variables properly quoted
-    cat >"$wrapper_script" <<'WRAPPER_START'
+    # Create wrapper with every value quoted for bash (see "Generated wrapper scripts")
+    cat >"$wrapper_tmp" <<'WRAPPER_START'
 #!/bin/bash
 set -euo pipefail
 
@@ -4294,62 +4365,58 @@ export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
 WRAPPER_START
 
     # Write configuration variables
-    cat >>"$wrapper_script" <<EOF
-# Stream Configuration
-STREAM_PATH="$stream_path"
-SAMPLE_RATE="$sample_rate"
-CHANNELS="$channels"
-BITRATE="$bitrate"
-THREAD_QUEUE="$thread_queue"
-ANALYZEDURATION="$DEFAULT_ANALYZEDURATION"
-PROBESIZE="$DEFAULT_PROBESIZE"
-CODEC="$codec"
-FILTER_TYPE="${MULTIPLEX_FILTER_TYPE}"
+    printf '# Stream Configuration\n' >>"$wrapper_tmp"
+    wrapper_assign "$wrapper_tmp" \
+        STREAM_PATH "$stream_path" \
+        SAMPLE_RATE "$sample_rate" \
+        CHANNELS "$channels" \
+        BITRATE "$bitrate" \
+        THREAD_QUEUE "$thread_queue" \
+        ANALYZEDURATION "$DEFAULT_ANALYZEDURATION" \
+        PROBESIZE "$DEFAULT_PROBESIZE" \
+        CODEC "$codec" \
+        FILTER_TYPE "${MULTIPLEX_FILTER_TYPE}" \
+        FFMPEG_LOG "$ffmpeg_log" \
+        LOG_FILE "$LOG_FILE" \
+        WRAPPER_PID_FILE "$pid_file" \
+        CLEANUP_MARKER "$CLEANUP_MARKER" \
+        MEDIAMTX_HOST "$MEDIAMTX_HOST" \
+        DEV_SND_ROOT "$DEV_SND_ROOT" \
+        RESTART_COUNT 0 \
+        CONSECUTIVE_FAILURES 0 \
+        MAX_CONSECUTIVE_FAILURES "$MAX_CONSECUTIVE_FAILURES" \
+        MAX_WRAPPER_RESTARTS "$MAX_WRAPPER_RESTARTS" \
+        WRAPPER_SUCCESS_DURATION "$WRAPPER_SUCCESS_DURATION" \
+        INITIAL_RESTART_DELAY "$INITIAL_RESTART_DELAY" \
+        MAX_RESTART_DELAY "$MAX_RESTART_DELAY" \
+        RESTART_DELAY "$INITIAL_RESTART_DELAY" \
+        FFMPEG_LOG_MAX_SIZE "$FFMPEG_LOG_MAX_SIZE" \
+        FFMPEG_PID "" \
+        MAIN_SCRIPT_PID "$$" || {
+        rm -f "$wrapper_tmp"
+        return 1
+    }
 
-# File paths
-FFMPEG_LOG="$ffmpeg_log"
-LOG_FILE="$LOG_FILE"
-WRAPPER_PID_FILE="$pid_file"
-CLEANUP_MARKER="$CLEANUP_MARKER"
-MEDIAMTX_HOST="$MEDIAMTX_HOST"
-
-# Restart configuration
-RESTART_COUNT=0
-CONSECUTIVE_FAILURES=0
-MAX_CONSECUTIVE_FAILURES=$MAX_CONSECUTIVE_FAILURES
-MAX_WRAPPER_RESTARTS=$MAX_WRAPPER_RESTARTS
-WRAPPER_SUCCESS_DURATION=$WRAPPER_SUCCESS_DURATION
-RESTART_DELAY=$INITIAL_RESTART_DELAY
-FFMPEG_LOG_MAX_SIZE=$FFMPEG_LOG_MAX_SIZE
-
-# Device arrays (initialized empty, populated below)
-declare -a CARD_NUMBERS=()
-declare -a PCM_NUMBERS=()
-declare -a DEVICE_NAMES=()
-DEV_SND_ROOT="$DEV_SND_ROOT"
-
-FFMPEG_PID=""
-MAIN_SCRIPT_PID="$$"
-EOF
-
-    # Populate arrays with proper quoting to handle spaces in device names
+    # Device arrays, one element per input device (names with spaces stay one word)
+    printf 'declare -a CARD_NUMBERS=()\ndeclare -a PCM_NUMBERS=()\ndeclare -a DEVICE_NAMES=()\n' >>"$wrapper_tmp"
     for i in "${!card_numbers[@]}"; do
-        cat >>"$wrapper_script" <<EOF
-CARD_NUMBERS+=("${card_numbers[$i]}")
-PCM_NUMBERS+=("${pcm_numbers[$i]}")
-DEVICE_NAMES+=("${device_names[$i]}")
-EOF
+        wrapper_array_item "$wrapper_tmp" CARD_NUMBERS "${card_numbers[$i]}" \
+            && wrapper_array_item "$wrapper_tmp" PCM_NUMBERS "${pcm_numbers[$i]}" \
+            && wrapper_array_item "$wrapper_tmp" DEVICE_NAMES "${device_names[$i]}" || {
+            rm -f "$wrapper_tmp"
+            return 1
+        }
     done
 
     # Add device count after arrays are populated
-    cat >>"$wrapper_script" <<EOF
-
-# Number of devices
-NUM_DEVICES=${#valid_devices[@]}
-EOF
+    printf '\n# Number of devices\n' >>"$wrapper_tmp"
+    wrapper_assign "$wrapper_tmp" NUM_DEVICES "${#valid_devices[@]}" || {
+        rm -f "$wrapper_tmp"
+        return 1
+    }
 
     # Add the wrapper logic
-    cat >>"$wrapper_script" <<'WRAPPER_LOGIC'
+    cat >>"$wrapper_tmp" <<'WRAPPER_LOGIC'
 
 # Create log file if it doesn't exist
 touch "${FFMPEG_LOG}" 2>/dev/null || true
@@ -4660,19 +4727,8 @@ done
 log_message "Wrapper exiting for ${STREAM_PATH}"
 WRAPPER_LOGIC
 
-    chmod +x "$wrapper_script"
-
-    # Check wrapper script was created properly
-    if [[ ! -x "$wrapper_script" ]]; then
-        log ERROR "Failed to create executable wrapper script"
-        return 1
-    fi
-
-    # Validate wrapper script syntax
-    if ! bash -n "$wrapper_script" 2>/dev/null; then
-        log ERROR "Wrapper script has syntax errors"
-        return 1
-    fi
+    # Check the generated script (bash -n) and install it atomically
+    install_wrapper_script "$wrapper_tmp" "$wrapper_script" || return 1
 
     # Start wrapper with process group using setsid if available
     log DEBUG "Starting multiplex wrapper script: $wrapper_script"
@@ -4748,12 +4804,17 @@ start_ffmpeg_stream() {
 
     log INFO "Starting FFmpeg for $stream_path (device: $device_name, card: $card_num)"
 
-    # Create wrapper script
+    # Create wrapper script (built in a temporary file, installed by rename)
     local wrapper_script="${FFMPEG_PID_DIR}/${stream_path}.sh"
     local ffmpeg_log="${FFMPEG_PID_DIR}/${stream_path}.log"
+    local wrapper_tmp
+    if ! wrapper_tmp="$(mktemp "${FFMPEG_PID_DIR}/.${stream_path}.sh.XXXXXX")"; then
+        log ERROR "Failed to create a temporary wrapper script in ${FFMPEG_PID_DIR}"
+        return 1
+    fi
 
-    # Create wrapper with all variables properly quoted
-    cat >"$wrapper_script" <<'WRAPPER_START'
+    # Create wrapper with every value quoted for bash (see "Generated wrapper scripts")
+    cat >"$wrapper_tmp" <<'WRAPPER_START'
 #!/bin/bash
 set -euo pipefail
 
@@ -4763,52 +4824,47 @@ export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
 WRAPPER_START
 
     # Write configuration variables
-    cat >>"$wrapper_script" <<EOF
-# Stream Configuration
-STREAM_PATH="$stream_path"
-CARD_NUM="$card_num"
-PCM_NUM="$pcm_num"
-DEV_SND_ROOT="$DEV_SND_ROOT"
-SAMPLE_RATE="$sample_rate"
-CHANNELS="$channels"
-BITRATE="$bitrate"
-THREAD_QUEUE="$thread_queue"
-ANALYZEDURATION="$DEFAULT_ANALYZEDURATION"
-PROBESIZE="$DEFAULT_PROBESIZE"
-CODEC="$codec"
-
-# File paths
-FFMPEG_LOG="$ffmpeg_log"
-LOG_FILE="$LOG_FILE"
-WRAPPER_PID_FILE="$pid_file"
-CLEANUP_MARKER="$CLEANUP_MARKER"
-MEDIAMTX_HOST="$MEDIAMTX_HOST"
-
-# Parent process tracking - use main script PID, not immediate parent
-MAIN_SCRIPT_PID="$$"
-
-# Restart configuration
-RESTART_COUNT=0
-CONSECUTIVE_FAILURES=0
-MAX_CONSECUTIVE_FAILURES=$MAX_CONSECUTIVE_FAILURES
-MAX_WRAPPER_RESTARTS=$MAX_WRAPPER_RESTARTS
-WRAPPER_SUCCESS_DURATION=$WRAPPER_SUCCESS_DURATION
-RESTART_DELAY=$INITIAL_RESTART_DELAY
-FFMPEG_LOG_MAX_SIZE=$FFMPEG_LOG_MAX_SIZE
-
-# Audio buffering configuration
-AUDIO_BUFFER_ENABLED="${AUDIO_BUFFER_ENABLED}"
-AUDIO_RTBUFSIZE="${AUDIO_RTBUFSIZE}"
-AUDIO_LOCAL_RECORDING="${AUDIO_LOCAL_RECORDING}"
-AUDIO_RECORDING_PATH="${AUDIO_RECORDING_PATH}"
-AUDIO_RECORDING_SEGMENT_TIME="${AUDIO_RECORDING_SEGMENT_TIME}"
-AUDIO_RECORDING_SEGMENTS="${AUDIO_RECORDING_SEGMENTS}"
-
-FFMPEG_PID=""
-EOF
+    printf '# Stream Configuration\n' >>"$wrapper_tmp"
+    wrapper_assign "$wrapper_tmp" \
+        STREAM_PATH "$stream_path" \
+        CARD_NUM "$card_num" \
+        PCM_NUM "$pcm_num" \
+        DEV_SND_ROOT "$DEV_SND_ROOT" \
+        SAMPLE_RATE "$sample_rate" \
+        CHANNELS "$channels" \
+        BITRATE "$bitrate" \
+        THREAD_QUEUE "$thread_queue" \
+        ANALYZEDURATION "$DEFAULT_ANALYZEDURATION" \
+        PROBESIZE "$DEFAULT_PROBESIZE" \
+        CODEC "$codec" \
+        FFMPEG_LOG "$ffmpeg_log" \
+        LOG_FILE "$LOG_FILE" \
+        WRAPPER_PID_FILE "$pid_file" \
+        CLEANUP_MARKER "$CLEANUP_MARKER" \
+        MEDIAMTX_HOST "$MEDIAMTX_HOST" \
+        MAIN_SCRIPT_PID "$$" \
+        RESTART_COUNT 0 \
+        CONSECUTIVE_FAILURES 0 \
+        MAX_CONSECUTIVE_FAILURES "$MAX_CONSECUTIVE_FAILURES" \
+        MAX_WRAPPER_RESTARTS "$MAX_WRAPPER_RESTARTS" \
+        WRAPPER_SUCCESS_DURATION "$WRAPPER_SUCCESS_DURATION" \
+        INITIAL_RESTART_DELAY "$INITIAL_RESTART_DELAY" \
+        MAX_RESTART_DELAY "$MAX_RESTART_DELAY" \
+        RESTART_DELAY "$INITIAL_RESTART_DELAY" \
+        FFMPEG_LOG_MAX_SIZE "$FFMPEG_LOG_MAX_SIZE" \
+        AUDIO_BUFFER_ENABLED "${AUDIO_BUFFER_ENABLED}" \
+        AUDIO_RTBUFSIZE "${AUDIO_RTBUFSIZE}" \
+        AUDIO_LOCAL_RECORDING "${AUDIO_LOCAL_RECORDING}" \
+        AUDIO_RECORDING_PATH "${AUDIO_RECORDING_PATH}" \
+        AUDIO_RECORDING_SEGMENT_TIME "${AUDIO_RECORDING_SEGMENT_TIME}" \
+        AUDIO_RECORDING_SEGMENTS "${AUDIO_RECORDING_SEGMENTS}" \
+        FFMPEG_PID "" || {
+        rm -f "$wrapper_tmp"
+        return 1
+    }
 
     # Add the wrapper logic
-    cat >>"$wrapper_script" <<'WRAPPER_LOGIC'
+    cat >>"$wrapper_tmp" <<'WRAPPER_LOGIC'
 
 # Create log file if it doesn't exist
 touch "${FFMPEG_LOG}" 2>/dev/null || true
@@ -5097,13 +5153,8 @@ done
 log_message "Wrapper exiting for ${STREAM_PATH}"
 WRAPPER_LOGIC
 
-    chmod +x "$wrapper_script"
-
-    # Check wrapper script was created properly
-    if [[ ! -x "$wrapper_script" ]]; then
-        log ERROR "Failed to create executable wrapper script"
-        return 1
-    fi
+    # Check the generated script (bash -n) and install it atomically
+    install_wrapper_script "$wrapper_tmp" "$wrapper_script" || return 1
 
     # Start wrapper with process group using setsid if available
     log DEBUG "Starting wrapper script: $wrapper_script"

@@ -27,26 +27,6 @@ teardown() {
     sd_teardown
 }
 
-# Run a wrapper script for real until its FFmpeg log holds PATTERN (or 10 s), then
-# stop it. The wrapper starts the real ffmpeg, which cannot open a fake card and
-# exits; what the test reads is what the wrapper logged on the way: the device it
-# was about to record from, or why it stopped. (The wrapper puts the system
-# directories first in its PATH, so a stand-in ffmpeg cannot shadow the real one.)
-_run_wrapper_until_logged() {
-    local wrapper="$1" pattern="$2" log i
-    log="${wrapper%.sh}.log"
-    setsid bash "$wrapper" >"$SD/wrapper.out" 2>&1 3>&- &
-    local pid=$!
-    echo "$pid" >>"$SD_PIDS_FILE"
-    for ((i = 0; i < 200; i++)); do
-        grep -qF -- "$pattern" "$log" 2>/dev/null && break
-        kill -0 "$pid" 2>/dev/null || break
-        sleep 0.05
-    done
-    kill -TERM "$pid" 2>/dev/null || true
-    wait "$pid" 2>/dev/null || true
-}
-
 # ---------------------------------------------------------------------------
 # Enumeration
 # ---------------------------------------------------------------------------
@@ -227,7 +207,7 @@ _run_wrapper_until_logged() {
     [[ "$output" == *"start rc=0"* ]]
     [ -f "$SD/ff/usbmic.sh" ]
     grep -qE '^PCM_NUM="?1"?$' "$SD/ff/usbmic.sh"
-    _run_wrapper_until_logged "$SD/ff/usbmic.sh" "Starting FFmpeg with device"
+    sd_run_wrapper_until_logged "$SD/ff/usbmic.sh" "Starting FFmpeg with device"
     grep -qF 'Starting FFmpeg with device: plughw:3,1' "$SD/ff/usbmic.log"
 }
 
@@ -237,7 +217,7 @@ _run_wrapper_until_logged() {
     run smq "$SD_SPAWN_STUBS"'
         start_ffmpeg_stream "usb-audio-mic1" 98 "mic1"; echo "rc=$?"'
     [[ "$output" == *"rc=0"* ]]
-    _run_wrapper_until_logged "$SD/ff/mic1.sh" "Starting FFmpeg with device"
+    sd_run_wrapper_until_logged "$SD/ff/mic1.sh" "Starting FFmpeg with device"
     grep -qF 'Starting FFmpeg with device: plughw:98,2' "$SD/ff/mic1.log"
 
     # the same card without the setting records from its first capture PCM
@@ -245,7 +225,7 @@ _run_wrapper_until_logged() {
     run smq "$SD_SPAWN_STUBS"'
         start_ffmpeg_stream "usb-audio-mic1" 98 "mic1"; echo "rc=$?"'
     [[ "$output" == *"rc=0"* ]]
-    _run_wrapper_until_logged "$SD/ff/mic1.sh" "Starting FFmpeg with device"
+    sd_run_wrapper_until_logged "$SD/ff/mic1.sh" "Starting FFmpeg with device"
     grep -qF 'Starting FFmpeg with device: plughw:98,0' "$SD/ff/mic1.log"
 }
 
@@ -267,7 +247,7 @@ _run_wrapper_until_logged() {
     [[ "$output" == *"rc=0"* ]]
     # There is no pcmC3D0c at all and the wrapper runs: it looks for pcmC3D1c
     [ ! -e "$DEV_SND_ROOT/pcmC3D0c" ]
-    _run_wrapper_until_logged "$SD/ff/usbmic.sh" "Starting FFmpeg with device"
+    sd_run_wrapper_until_logged "$SD/ff/usbmic.sh" "Starting FFmpeg with device"
     grep -qF 'Starting FFmpeg with device: plughw:3,1' "$SD/ff/usbmic.log"
 
     # The capture node goes away (a USB unplug): the wrapper stops instead of starting FFmpeg
@@ -289,7 +269,7 @@ _run_wrapper_until_logged() {
     [[ "$output" == *"start rc=0"* ]]
     grep -qF 'Card 5 (usb-audio-speaker) has no capture PCM' "$STREAM_MANAGER_LOG_FILE"
     grep -qE '^NUM_DEVICES=2$' "$SD/ff/all_mics.sh"
-    _run_wrapper_until_logged "$SD/ff/all_mics.sh" "FFmpeg command:"
+    sd_run_wrapper_until_logged "$SD/ff/all_mics.sh" "FFmpeg command:"
     local call
     call="$(grep -F 'FFmpeg command:' "$SD/ff/all_mics.log")"
     [[ "$call" == *"-i plughw:3,1 "* ]]
