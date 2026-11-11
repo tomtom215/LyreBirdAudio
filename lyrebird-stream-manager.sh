@@ -2481,30 +2481,32 @@ check_all_audio_levels() {
     return 0
 }
 
-# Validate configuration file syntax
+# Validate the device configuration file with the same allowlist parser that
+# load_device_config uses (the file is never sourced or run). Logs one structured
+# line per problem ("file:line: KEY: what is wrong (expected: ...)").
+# Returns: 0 = no problem (a missing file is fine: defaults), 1 = at least one
+# line that cannot be used. A problem line costs only that line: start, restart
+# and monitor go on with the defaults for the settings concerned.
 # shellcheck disable=SC2120 # Function accepts optional config_file parameter, defaults to DEVICE_CONFIG_FILE
 validate_config() {
     local config_file="${1:-${DEVICE_CONFIG_FILE}}"
 
-    if [[ ! -f "$config_file" ]]; then
+    parse_device_config "$config_file"
+    if [[ "$config_file" == "${DEVICE_CONFIG_FILE}" ]]; then
+        DEVICE_CONFIG_LOADED=true
+    else
+        DEVICE_CONFIG_LOADED=false
+    fi
+    log_device_config_problems
+
+    if [[ ! -e "$config_file" ]]; then
         log DEBUG "Config file $config_file does not exist (using defaults)"
         return 0
     fi
-
-    # Check for basic shell syntax errors
-    if ! bash -n "$config_file" 2>/dev/null; then
-        log ERROR "Configuration file $config_file has syntax errors"
+    if ((DEVICE_CONFIG_ERROR_COUNT > 0)); then
         return 1
     fi
-
-    # Source in subshell to check for errors
-    # shellcheck disable=SC1090 # Config file path is validated above, dynamic sourcing is intentional
-    if ! (source "$config_file" 2>/dev/null); then
-        log ERROR "Configuration file $config_file failed to source"
-        return 1
-    fi
-
-    log DEBUG "Configuration file $config_file validated successfully"
+    log DEBUG "Configuration file $config_file validated successfully (${#DEVICE_SETTINGS[@]} setting(s))"
     return 0
 }
 
@@ -3363,34 +3365,353 @@ wait_for_mediamtx_ready() {
     return 1
 }
 
-# Device configuration
-load_device_config() {
-    [[ -f "${DEVICE_CONFIG_FILE}" ]] || return 0
+# ============================================================================
+# Device configuration (decision D3: the file is data, never code)
+# ============================================================================
+# audio-devices.conf holds per-device audio settings, one assignment per line:
+#
+#     DEVICE_<NAME>_<SETTING>=value
+#
+# <NAME> is the stream path or the device name made upper-case with every run of
+# other characters turned into "_" (see get_device_config); <SETTING> is one of
+# SAMPLE_RATE, CHANNELS, CODEC, BITRATE, THREAD_QUEUE. Blank lines and lines that
+# start with "#" are ignored; a value may be bare, 'single-quoted' or
+# "double-quoted" and is taken literally: nothing in the file is expanded, run or
+# sourced. The file used to be `source`d, so a line such as `exit 0` ended the
+# manager with nothing running, an unbound variable killed it under `set -u`, a
+# `trap` line removed its cleanup trap and a command substitution ran twice.
+#
+# parse_device_config reads the file with an allowlist: only the assignments above
+# are accepted, each value is checked against what the wrapper can use, and
+# anything else is a structured problem ("file:line: KEY: what is wrong
+# (expected: ...)"). It never exits, aborts or touches the caller's shell state:
+# a bad line is skipped and logged, and the setting keeps its default.
+readonly DEVICE_CONFIG_MAX_BYTES=65536
+readonly DEVICE_CONFIG_MAX_LINE=4096
+readonly DEVICE_CONFIG_MAX_REPORTED=50
+# A file with this many problems is garbage: the parse stops there (each problem
+# costs a few processes, 100000 of them would take minutes)
+readonly DEVICE_CONFIG_MAX_PROBLEMS=100
+readonly DEVICE_SETTING_NAMES="SAMPLE_RATE, CHANNELS, CODEC, BITRATE, THREAD_QUEUE"
+readonly SUPPORTED_CODECS="opus aac mp3"
+readonly SUPPORTED_SAMPLE_RATES="8000 11025 12000 16000 22050 24000 32000 44100 48000 88200 96000 176400 192000 352800 384000 705600 768000"
+# What a setting falls back to when its value (in the file or in the DEFAULT_*
+# environment variable) is not valid
+builtin_setting() {
+    case "$1" in
+        SAMPLE_RATE) echo 48000 ;;
+        CHANNELS) echo 2 ;;
+        CODEC) echo opus ;;
+        BITRATE) echo 128k ;;
+        THREAD_QUEUE) echo 8192 ;;
+    esac
+}
 
-    # A device config truncated by a power loss mid-write, corrupted by SD-card
-    # bit-rot, or fat-fingered by an operator would otherwise be `source`d
-    # directly: a syntax error then aborts the WHOLE run under errexit, so
-    # `start` fails and NO streams come up on the next unattended boot -- a
-    # total outage triggered by one bad line. Validate syntax first and, on
-    # failure, fall back to built-in defaults (degrade, don't die).
-    if ! bash -n "${DEVICE_CONFIG_FILE}" 2>/dev/null; then
-        log ERROR "Device config ${DEVICE_CONFIG_FILE} is corrupt (syntax error); ignoring it and using defaults"
+# Parsed settings, keyed by DEVICE_<NAME>_<SETTING> (upper-case), and the line each
+# came from
+declare -gA DEVICE_SETTINGS=()
+declare -gA DEVICE_SETTING_LINES=()
+# Problems found by the last parse: "file:line: KEY: problem (expected: ...)"
+# (the arrays hold at most DEVICE_CONFIG_MAX_REPORTED entries, the counter is exact)
+declare -ga DEVICE_CONFIG_ERRORS=()
+declare -ga DEVICE_CONFIG_WARNINGS=()
+declare -gi DEVICE_CONFIG_ERROR_COUNT=0
+# The line at which the last parse gave up (DEVICE_CONFIG_MAX_PROBLEMS reached), 0 if it did not
+declare -gi DEVICE_CONFIG_STOPPED_AT=0
+declare -g DEVICE_CONFIG_LOADED=false
+# What was last logged, so the same findings are not logged again in one process
+declare -g DEVICE_CONFIG_LOGGED=""
+# Result of device_setting_check
+declare -g DS_VALUE=""
+declare -g DS_EXPECTED=""
+
+# Is VALUE acceptable for the setting KEY? On success DS_VALUE holds the normal
+# form (leading zeros removed, codec lower-case, bitrate with a lower-case k); on
+# failure DS_EXPECTED says what would be accepted. No output, no subshell.
+# Usage: device_setting_check KEY VALUE
+device_setting_check() {
+    local key="$1" value="$2" n
+    DS_VALUE=""
+    DS_EXPECTED=""
+    case "$key" in
+        SAMPLE_RATE)
+            DS_EXPECTED="one of ${SUPPORTED_SAMPLE_RATES// /, }"
+            [[ "$value" =~ ^[0-9]{4,6}$ ]] || return 1
+            n=$((10#$value))
+            [[ " ${SUPPORTED_SAMPLE_RATES} " == *" ${n} "* ]] || return 1
+            DS_VALUE="$n"
+            ;;
+        CHANNELS)
+            DS_EXPECTED="a whole number from 1 to 32"
+            [[ "$value" =~ ^[0-9]{1,2}$ ]] || return 1
+            n=$((10#$value))
+            ((n >= 1 && n <= 32)) || return 1
+            DS_VALUE="$n"
+            ;;
+        CODEC)
+            DS_EXPECTED="one of ${SUPPORTED_CODECS// /, }"
+            [[ "$value" =~ ^[A-Za-z0-9]{1,16}$ ]] || return 1
+            n="${value,,}"
+            [[ " ${SUPPORTED_CODECS} " == *" ${n} "* ]] || return 1
+            DS_VALUE="$n"
+            ;;
+        BITRATE)
+            DS_EXPECTED="a whole number of kilobits per second followed by k, from 1k to 9999k (for example 128k)"
+            [[ "$value" =~ ^[0-9]{1,4}[kK]$ ]] || return 1
+            n=$((10#${value%[kK]}))
+            ((n >= 1)) || return 1
+            DS_VALUE="${n}k"
+            ;;
+        THREAD_QUEUE)
+            DS_EXPECTED="a whole number from 1 to 1048576"
+            [[ "$value" =~ ^[0-9]{1,7}$ ]] || return 1
+            n=$((10#$value))
+            ((n >= 1 && n <= 1048576)) || return 1
+            DS_VALUE="$n"
+            ;;
+        *)
+            DS_EXPECTED="one of ${DEVICE_SETTING_NAMES}"
+            return 1
+            ;;
+    esac
+    return 0
+}
+
+# Record one problem of the last parse (kind: error or warning)
+# Usage: _dc_problem KIND FILE LINE KEY PROBLEM [EXPECTED]
+_dc_problem() {
+    local kind="$1" file="$2" lineno="$3" key="$4" problem="$5" expected="${6-}" text
+    if ((lineno > 0)); then
+        text="${file}:${lineno}: "
+    else
+        text="${file}: "
+    fi
+    text+="${key:+${key}: }${problem}${expected:+ (expected: ${expected})}"
+    if [[ "$kind" == "error" ]]; then
+        DEVICE_CONFIG_ERROR_COUNT=$((DEVICE_CONFIG_ERROR_COUNT + 1))
+        if ((${#DEVICE_CONFIG_ERRORS[@]} < DEVICE_CONFIG_MAX_REPORTED)); then
+            DEVICE_CONFIG_ERRORS+=("$text")
+        fi
+    elif ((${#DEVICE_CONFIG_WARNINGS[@]} < DEVICE_CONFIG_MAX_REPORTED)); then
+        DEVICE_CONFIG_WARNINGS+=("$text")
+    fi
+}
+
+# Parse FILE (default: the device config) into DEVICE_SETTINGS, replacing what an
+# earlier parse found. Always returns 0; the findings are in DEVICE_CONFIG_ERRORS,
+# DEVICE_CONFIG_WARNINGS and DEVICE_CONFIG_ERROR_COUNT. A missing file is not a
+# problem (every setting then has its default); a file that is not a regular
+# readable file, or is larger than DEVICE_CONFIG_MAX_BYTES, is one problem and
+# contributes nothing. A UTF-8 byte order mark and CRLF line endings are accepted.
+# Usage: parse_device_config [FILE]
+parse_device_config() {
+    local file="${1:-${DEVICE_CONFIG_FILE}}"
+    # Character classes and ranges below mean ASCII, whatever the locale
+    local LC_ALL=C
+    DEVICE_SETTINGS=()
+    DEVICE_SETTING_LINES=()
+    DEVICE_CONFIG_ERRORS=()
+    DEVICE_CONFIG_WARNINGS=()
+    DEVICE_CONFIG_ERROR_COUNT=0
+    DEVICE_CONFIG_STOPPED_AT=0
+
+    [[ -e "$file" ]] || return 0
+    if [[ ! -f "$file" ]]; then
+        _dc_problem error "$file" 0 "" "is not a regular file" "a regular file with DEVICE_<NAME>_<SETTING>=value lines"
+        return 0
+    fi
+    if [[ ! -r "$file" ]]; then
+        _dc_problem error "$file" 0 "" "cannot be read" "a readable file"
+        return 0
+    fi
+    local size
+    size="$(stat -c %s -- "$file" 2>/dev/null)" || size=0
+    [[ "$size" =~ ^[0-9]+$ ]] || size=0
+    if ((size > DEVICE_CONFIG_MAX_BYTES)); then
+        _dc_problem error "$file" 0 "" "is ${size} bytes long, more than the ${DEVICE_CONFIG_MAX_BYTES} byte limit" "a short list of DEVICE_<NAME>_<SETTING>=value lines"
         return 0
     fi
 
-    # Even syntactically valid config is sourced defensively: a `set -e`/command
-    # inside it must not abort or hang the manager. Source in the current shell
-    # (values must persist) but neutralise errexit for the duration.
-    local _had_errexit=0
-    [[ $- == *e* ]] && _had_errexit=1
-    set +e
-    # shellcheck source=/dev/null
-    source "${DEVICE_CONFIG_FILE}"
-    local _src_rc=$?
-    [[ $_had_errexit -eq 1 ]] && set -e
-    if [[ $_src_rc -ne 0 ]]; then
-        log WARN "Device config ${DEVICE_CONFIG_FILE} raised errors while loading (rc=${_src_rc}); continuing with whatever loaded plus defaults"
+    local line lineno=0 rest key ukey name setting value tail body cfgkey
+    local re_expansion='[$`\\]'
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        lineno=$((lineno + 1))
+        if ((DEVICE_CONFIG_ERROR_COUNT >= DEVICE_CONFIG_MAX_PROBLEMS)); then
+            DEVICE_CONFIG_STOPPED_AT="$lineno"
+            break
+        fi
+        # The length is checked before anything else touches the line: bash string
+        # operations on a megabyte line (trimming, replacing) take minutes
+        if ((${#line} > DEVICE_CONFIG_MAX_LINE)); then
+            if [[ "$line" != "#"* ]]; then
+                _dc_problem error "$file" "$lineno" "" "line is ${#line} characters long, more than the ${DEVICE_CONFIG_MAX_LINE} character limit" "a short DEVICE_<NAME>_<SETTING>=value line"
+            fi
+            continue
+        fi
+        if ((lineno == 1)); then
+            line="${line#$'\xef\xbb\xbf'}"
+        fi
+        line="${line%$'\r'}"
+        line="${line//$'\t'/ }"
+        line="${line#"${line%%[![:space:]]*}"}"
+        if [[ -z "$line" || "$line" == "#"* ]]; then
+            continue
+        fi
+        if [[ ! "$line" =~ ^([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]]; then
+            if [[ "$line" =~ ^[A-Za-z_][A-Za-z0-9_]*[[:space:]]+= ]]; then
+                _dc_problem error "$file" "$lineno" "" "no spaces are allowed before the '=': '$(visible_text "$line" 40)'" "DEVICE_<NAME>_<SETTING>=value"
+            else
+                _dc_problem error "$file" "$lineno" "" "not a DEVICE_<NAME>_<SETTING>=value assignment: '$(visible_text "$line" 40)'; shell commands are not run" "DEVICE_<NAME>_<SETTING>=value"
+            fi
+            continue
+        fi
+        key="${BASH_REMATCH[1]}"
+        rest="${BASH_REMATCH[2]}"
+
+        ukey="${key^^}"
+        if [[ ! "$ukey" =~ ^DEVICE_([A-Z0-9_]+)_(SAMPLE_RATE|CHANNELS|CODEC|BITRATE|THREAD_QUEUE)$ ]]; then
+            if [[ "$ukey" == DEFAULT_* ]]; then
+                _dc_problem error "$file" "$lineno" "$key" "defaults are read from the environment (the ${ukey} variable), not from this file" "a DEVICE_<NAME>_<SETTING> key"
+            elif [[ "$ukey" == DEVICE_* ]]; then
+                _dc_problem error "$file" "$lineno" "$key" "unknown setting" "DEVICE_<NAME>_<SETTING> with SETTING one of ${DEVICE_SETTING_NAMES}"
+            else
+                _dc_problem error "$file" "$lineno" "$key" "unknown key" "DEVICE_<NAME>_<SETTING> with SETTING one of ${DEVICE_SETTING_NAMES}"
+            fi
+            continue
+        fi
+        name="${BASH_REMATCH[1]}"
+        setting="${BASH_REMATCH[2]}"
+        cfgkey="DEVICE_${name}_${setting}"
+        if [[ "$key" != "$ukey" ]]; then
+            _dc_problem warning "$file" "$lineno" "$key" "key read as ${ukey} (keys are upper-case)"
+        fi
+
+        # The value: bare, 'single-quoted' or "double-quoted", then at most a comment
+        case "$rest" in
+            "'"*)
+                body="${rest:1}"
+                if [[ "$body" != *"'"* ]]; then
+                    _dc_problem error "$file" "$lineno" "$key" "unterminated single quote" "a value in matching quotes"
+                    continue
+                fi
+                value="${body%%"'"*}"
+                tail="${body#*"'"}"
+                ;;
+            '"'*)
+                body="${rest:1}"
+                if [[ "$body" != *'"'* ]]; then
+                    _dc_problem error "$file" "$lineno" "$key" "unterminated double quote" "a value in matching quotes"
+                    continue
+                fi
+                value="${body%%'"'*}"
+                tail="${body#*'"'}"
+                if [[ "$value" =~ $re_expansion ]]; then
+                    _dc_problem error "$file" "$lineno" "$key" "\$, backticks and backslashes are not interpreted in a value" "a plain value without \$, backtick or backslash"
+                    continue
+                fi
+                ;;
+            *)
+                value="${rest%%[[:space:]]*}"
+                tail="${rest#"$value"}"
+                if [[ ! "$value" =~ ^[A-Za-z0-9._+:/@%,=-]*$ ]]; then
+                    _dc_problem error "$file" "$lineno" "$key" "shell syntax is not accepted in a value: '$(visible_text "$value" 40)'" "a plain value, or one in quotes"
+                    continue
+                fi
+                ;;
+        esac
+        tail="${tail#"${tail%%[![:space:]]*}"}"
+        if [[ -n "$tail" && "$tail" != "#"* ]]; then
+            _dc_problem error "$file" "$lineno" "$key" "unexpected text after the value: '$(visible_text "$tail" 40)'" "one value, optionally followed by a # comment"
+            continue
+        fi
+
+        if ! device_setting_check "$setting" "$value"; then
+            _dc_problem error "$file" "$lineno" "$key" "unsupported value '$(visible_text "$value" 40)'" "$DS_EXPECTED"
+            continue
+        fi
+        if [[ -n "${DEVICE_SETTINGS[$cfgkey]+x}" ]]; then
+            _dc_problem warning "$file" "$lineno" "$key" "overrides the value on line ${DEVICE_SETTING_LINES[$cfgkey]}"
+        fi
+        DEVICE_SETTINGS["$cfgkey"]="$DS_VALUE"
+        DEVICE_SETTING_LINES["$cfgkey"]="$lineno"
+    done <"$file"
+    return 0
+}
+
+# Log what the last parse found. The same findings are logged once per process
+# (start parses the file for the validation, again for the loader, ...).
+log_device_config_problems() {
+    local i sig=""
+    for ((i = 0; i < ${#DEVICE_CONFIG_ERRORS[@]}; i++)); do
+        sig+="E${DEVICE_CONFIG_ERRORS[$i]}"$'\n'
+    done
+    for ((i = 0; i < ${#DEVICE_CONFIG_WARNINGS[@]}; i++)); do
+        sig+="W${DEVICE_CONFIG_WARNINGS[$i]}"$'\n'
+    done
+    sig+="N${DEVICE_CONFIG_ERROR_COUNT}S${DEVICE_CONFIG_STOPPED_AT}"
+    if [[ "$sig" == "$DEVICE_CONFIG_LOGGED" ]]; then
+        return 0
     fi
+    DEVICE_CONFIG_LOGGED="$sig"
+    for ((i = 0; i < ${#DEVICE_CONFIG_ERRORS[@]}; i++)); do
+        log ERROR "Device config ${DEVICE_CONFIG_ERRORS[$i]}"
+    done
+    if ((DEVICE_CONFIG_ERROR_COUNT > ${#DEVICE_CONFIG_ERRORS[@]})); then
+        log ERROR "Device config ${DEVICE_CONFIG_FILE}: $((DEVICE_CONFIG_ERROR_COUNT - ${#DEVICE_CONFIG_ERRORS[@]})) more problems not shown"
+    fi
+    if ((DEVICE_CONFIG_STOPPED_AT > 0)); then
+        log ERROR "Device config ${DEVICE_CONFIG_FILE}:${DEVICE_CONFIG_STOPPED_AT}: stopped reading after ${DEVICE_CONFIG_MAX_PROBLEMS} problems; this line and the rest of the file were not read"
+    fi
+    for ((i = 0; i < ${#DEVICE_CONFIG_WARNINGS[@]}; i++)); do
+        log WARN "Device config ${DEVICE_CONFIG_WARNINGS[$i]}"
+    done
+    if ((DEVICE_CONFIG_ERROR_COUNT > 0)); then
+        log WARN "Device config ${DEVICE_CONFIG_FILE}: ${DEVICE_CONFIG_ERROR_COUNT} problem(s); the settings concerned use their defaults, streams are not affected otherwise"
+    fi
+    return 0
+}
+
+# Read the device config. The single loader: it never exits or aborts, whatever the
+# file holds, and a problem line only costs that line (see parse_device_config).
+load_device_config() {
+    parse_device_config "${DEVICE_CONFIG_FILE}"
+    DEVICE_CONFIG_LOADED=true
+    log_device_config_problems
+    return 0
+}
+
+# Load the device config once per process, if nothing has yet. Every reader of
+# the settings (get_device_config, resolve_stream_settings) calls this first, so a
+# command that starts a stream without going through generate_mediamtx_config --
+# a monitor restart, a status display -- has the file's settings and not the
+# defaults (X-01: after the first monitor restart every per-device setting used to
+# revert to the default).
+ensure_device_config_loaded() {
+    if [[ "$DEVICE_CONFIG_LOADED" != "true" ]]; then
+        load_device_config
+    fi
+    return 0
+}
+
+# The settings of one stream, each checked: file value (friendly name first, then
+# device name, see get_device_config), else the DEFAULT_* value; a value that is not
+# valid falls back to the built-in default with an error in the log.
+# Sets STREAM_SAMPLE_RATE, STREAM_CHANNELS, STREAM_CODEC, STREAM_BITRATE and
+# STREAM_THREAD_QUEUE (not a subshell, so the caller sees them).
+# Usage: resolve_stream_settings DEVICE_NAME [STREAM_PATH]
+resolve_stream_settings() {
+    local device_name="$1" stream_path="${2:-}" key default builtin value
+    ensure_device_config_loaded
+    for key in SAMPLE_RATE CHANNELS CODEC BITRATE THREAD_QUEUE; do
+        default="DEFAULT_${key}"
+        builtin="$(builtin_setting "$key")"
+        value="$(get_device_config "$device_name" "$key" "${!default}" "$stream_path")"
+        if ! device_setting_check "$key" "$value"; then
+            log ERROR "${key} for ${stream_path:-$device_name} is '$(visible_text "$value" 40)', which cannot be used (expected: ${DS_EXPECTED}); using ${builtin}"
+            device_setting_check "$key" "$builtin"
+        fi
+        printf -v "STREAM_${key}" '%s' "$DS_VALUE"
+    done
     return 0
 }
 
@@ -3400,15 +3721,29 @@ save_device_config() {
 
     cat >"$tmp_config" <<'EOF'
 # Audio device configuration
-# Format: DEVICE_<name>_<parameter>=value
+# Format: DEVICE_<name>_<setting>=value, one per line
+#
+# The file is read as data: nothing in it is run or expanded. A value may be
+# written bare (opus), 'single-quoted' or "double-quoted". A line that is not
+# one of these assignments, an unknown setting or an unsupported value is
+# logged with its line number and skipped; the setting keeps its default.
+# Check the file with: lyrebird-stream-manager.sh validate
 #
 # You can use either:
 #   1. Friendly stream names (e.g., DEVICE_BLUE_YETI_SAMPLE_RATE=44100)
 #   2. Full device names (e.g., DEVICE_USB_AUDIO_BLUE_YETI_SAMPLE_RATE=44100)
 #
 # Friendly names are recommended and match the RTSP stream paths.
-
-# Universal defaults:
+#
+# Settings:
+#   SAMPLE_RATE   8000 11025 12000 16000 22050 24000 32000 44100 48000 88200
+#                 96000 176400 192000 352800 384000 705600 768000
+#   CHANNELS      1 to 32
+#   CODEC         opus, aac or mp3
+#   BITRATE       1k to 9999k, for example 128k
+#   THREAD_QUEUE  1 to 1048576
+#
+# Universal defaults (the DEFAULT_* environment variables, not this file):
 # - Sample Rate: 48000 Hz
 # - Channels: 2 (stereo)
 # - Format: s16le (16-bit little-endian)
@@ -3418,7 +3753,7 @@ save_device_config() {
 # Example overrides using friendly names:
 # DEVICE_BLUE_YETI_SAMPLE_RATE=44100
 # DEVICE_BLUE_YETI_CHANNELS=1
-# DEVICE_BLUE_YETI_CODEC=pcm_s16le
+# DEVICE_BLUE_YETI_CODEC=aac
 # DEVICE_BLUE_YETI_BITRATE=256k
 EOF
 
@@ -3606,14 +3941,18 @@ get_device_config() {
 
     local config_value=""
 
+    # The settings come from the parsed file (see "Device configuration"); load it
+    # now if no earlier step has, so no caller can see defaults only
+    ensure_device_config_loaded
+
     # Strategy 1: Try friendly stream name first (if provided)
     if [[ -n "$stream_path" ]]; then
         local friendly_name
         friendly_name="$(sanitize_device_name "$stream_path")"
         local friendly_key="DEVICE_${friendly_name^^}_${param^^}"
 
-        if [[ -n "${!friendly_key+x}" ]]; then
-            config_value="${!friendly_key}"
+        if [[ -n "${DEVICE_SETTINGS[$friendly_key]+x}" ]]; then
+            config_value="${DEVICE_SETTINGS[$friendly_key]}"
         fi
     fi
 
@@ -3623,8 +3962,8 @@ get_device_config() {
         safe_name="$(sanitize_device_name "$device_name")"
         local device_key="DEVICE_${safe_name^^}_${param^^}"
 
-        if [[ -n "${!device_key+x}" ]]; then
-            config_value="${!device_key}"
+        if [[ -n "${DEVICE_SETTINGS[$device_key]+x}" ]]; then
+            config_value="${DEVICE_SETTINGS[$device_key]}"
         fi
     fi
 
@@ -3833,11 +4172,12 @@ start_ffmpeg_multiplex_stream() {
     # Get audio configuration from first device (all devices should match)
     local first_device="${device_names[0]}"
     local sample_rate channels codec bitrate thread_queue
-    sample_rate="$(get_device_config "$first_device" "SAMPLE_RATE" "$DEFAULT_SAMPLE_RATE" "$stream_path")"
-    channels="$(get_device_config "$first_device" "CHANNELS" "$DEFAULT_CHANNELS" "$stream_path")"
-    codec="$(get_device_config "$first_device" "CODEC" "$DEFAULT_CODEC" "$stream_path")"
-    bitrate="$(get_device_config "$first_device" "BITRATE" "$DEFAULT_BITRATE" "$stream_path")"
-    thread_queue="$(get_device_config "$first_device" "THREAD_QUEUE" "$DEFAULT_THREAD_QUEUE" "$stream_path")"
+    resolve_stream_settings "$first_device" "$stream_path"
+    sample_rate="$STREAM_SAMPLE_RATE"
+    channels="$STREAM_CHANNELS"
+    codec="$STREAM_CODEC"
+    bitrate="$STREAM_BITRATE"
+    thread_queue="$STREAM_THREAD_QUEUE"
 
     # Create wrapper script
     local wrapper_script="${FFMPEG_PID_DIR}/${stream_path}.sh"
@@ -4292,11 +4632,12 @@ start_ffmpeg_stream() {
 
     # Get device configuration
     local sample_rate channels codec bitrate thread_queue
-    sample_rate="$(get_device_config "$device_name" "SAMPLE_RATE" "$DEFAULT_SAMPLE_RATE" "$stream_path")"
-    channels="$(get_device_config "$device_name" "CHANNELS" "$DEFAULT_CHANNELS" "$stream_path")"
-    codec="$(get_device_config "$device_name" "CODEC" "$DEFAULT_CODEC" "$stream_path")"
-    bitrate="$(get_device_config "$device_name" "BITRATE" "$DEFAULT_BITRATE" "$stream_path")"
-    thread_queue="$(get_device_config "$device_name" "THREAD_QUEUE" "$DEFAULT_THREAD_QUEUE" "$stream_path")"
+    resolve_stream_settings "$device_name" "$stream_path"
+    sample_rate="$STREAM_SAMPLE_RATE"
+    channels="$STREAM_CHANNELS"
+    codec="$STREAM_CODEC"
+    bitrate="$STREAM_BITRATE"
+    thread_queue="$STREAM_THREAD_QUEUE"
 
     log INFO "Starting FFmpeg for $stream_path (device: $device_name, card: $card_num)"
 
@@ -5232,6 +5573,11 @@ show_status() {
         # Multiplex mode is active
         echo "Multiplex stream (combining ${#devices[@]} devices):"
         echo "  Stream: rtsp://${MEDIAMTX_HOST}:8554/${MULTIPLEX_STREAM_NAME}"
+        if [[ ${#devices[@]} -gt 0 ]]; then
+            IFS=':' read -r device_name _ <<<"${devices[0]}"
+            resolve_stream_settings "$device_name" "${MULTIPLEX_STREAM_NAME}"
+            echo "  Settings: ${STREAM_SAMPLE_RATE} Hz, ${STREAM_CHANNELS} ch, ${STREAM_CODEC} ${STREAM_BITRATE}"
+        fi
 
         local multiplex_pid
         multiplex_pid="$(read_pid_safe "$multiplex_pid_file")"
@@ -5265,6 +5611,8 @@ show_status() {
 
                 echo "  - $device_name (card $card_num)"
                 echo "    Stream: rtsp://${MEDIAMTX_HOST}:8554/$stream_path"
+                resolve_stream_settings "$device_name" "$stream_path"
+                echo "    Settings: ${STREAM_SAMPLE_RATE} Hz, ${STREAM_CHANNELS} ch, ${STREAM_CODEC} ${STREAM_BITRATE}"
 
                 local pid_file="${FFMPEG_PID_DIR}/${stream_path}.pid"
                 if [[ -f "$pid_file" ]]; then
@@ -5492,6 +5840,8 @@ Commands:
     restart     Restart everything
     status      Show current status
     config      Show device configuration
+    validate    Check the device configuration file (exit 4 if a line cannot
+                be used; start, restart and monitor still run, with defaults)
     monitor     Check resource usage and stream health
                 Exit codes: 0=healthy, 2=critical resources, 3=MediaMTX down,
                             7=no devices, 10=streams degraded
@@ -5671,7 +6021,7 @@ main() {
             setup_directories
             # v1.4.2: Pre-start validation and initialization
             check_version_compatibility || log WARN "Version compatibility check failed (continuing anyway)"
-            validate_config || error_exit "Configuration validation failed" ${E_CONFIG_ERROR}
+            validate_config || log WARN "Device configuration has problems (listed above); the settings concerned use their defaults and the streams start"
             init_hardware_watchdog
             start_mediamtx
             exit_code=$?
@@ -5703,6 +6053,17 @@ main() {
         config)
             show_config
             exit_code=$?
+            ;;
+        validate)
+            # Read-only: a failing exit status must not leave the cleanup marker
+            SKIP_CLEANUP=true
+            if validate_config; then
+                echo "Device configuration ${DEVICE_CONFIG_FILE}: OK (${#DEVICE_SETTINGS[@]} setting(s))"
+                exit_code=0
+            else
+                echo "Device configuration ${DEVICE_CONFIG_FILE}: ${DEVICE_CONFIG_ERROR_COUNT} problem(s), see above"
+                exit_code=${E_CONFIG_ERROR}
+            fi
             ;;
         monitor)
             check_root

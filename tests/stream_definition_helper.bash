@@ -74,6 +74,12 @@ sm() {
     bash -c 'source "$LB_REAL_SCRIPT" || exit 99; eval "$1"' sm "$1"
 }
 
+# The same with stderr (the manager's log lines) kept out of the output, in
+# $SD/sm.stderr, so that `lines` holds only what the code printed
+smq() {
+    bash -c 'source "$LB_REAL_SCRIPT" || exit 99; eval "$1"' sm "$1" 2>>"$SD/sm.stderr"
+}
+
 # Code to put in front of a test's snippet when it runs start_ffmpeg_stream or
 # start_ffmpeg_multiplex_stream. Stands in for: the wrapper process (spawn_detached
 # only records the command and idles; the wrapper is written but never run), the

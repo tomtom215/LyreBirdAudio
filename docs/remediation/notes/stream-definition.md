@@ -78,6 +78,74 @@ capture-PCM helpers, the multiplex graph) and, for the writer only,
   capitals or dots; `-n NAME` help: "lower-case letters, digits, `_` and `-`, at most 64
   characters; anything else is replaced by `_` and the result is logged".
 
+## LB-08 / X-09 / X-01 / X-28, D3: the device config is data
+
+- **No `source`, no `eval`.** `parse_device_config` reads `audio-devices.conf` line by line
+  with an allowlist. One loader, `load_device_config`, serves `start`, `restart`
+  (through `generate_mediamtx_config`), `monitor` restarts, `status` and `validate`.
+  `get_device_config` and the new `resolve_stream_settings` load it themselves when no earlier
+  step has (`ensure_device_config_loaded`), so no caller can see defaults only (X-01:
+  after the first monitor restart every per-device setting used to revert to the default).
+- **Format.** One `DEVICE_<NAME>_<SETTING>=value` per line. `<NAME>` is the friendly stream
+  name or the full device name, upper-cased with other characters as `_` (lookup order
+  unchanged: friendly name first, then device name, then the default). `<SETTING>` is one of
+  `SAMPLE_RATE`, `CHANNELS`, `CODEC`, `BITRATE`, `THREAD_QUEUE`. Blank lines and `#` comments
+  are ignored (a comment may follow a value: `...=192k   # high`). A value is bare,
+  `'single-quoted'` or `"double-quoted"`, taken literally; `$`, backticks and backslashes
+  are not interpreted (inside double quotes they are an error). No spaces around `=`.
+  CRLF line endings and a UTF-8 byte order mark are accepted.
+- **Values** (anything else is an error naming the file, line, key and what is expected):
+  `SAMPLE_RATE` one of 8000 11025 12000 16000 22050 24000 32000 44100 48000 88200 96000 176400
+  192000 352800 384000 705600 768000 (all of them go through libopus, aac and libmp3lame in
+  FFmpeg 6.1.1: the encoder negotiates its own rate; the ALSA device is the real limit and is
+  not known here); `CHANNELS` 1 to 32; `CODEC` `opus`, `aac` or `mp3` (any case);
+  `BITRATE` `1k` to `9999k` (`k` or `K`; a plain number such as `128000`, which FFmpeg would have
+  taken, is now an error: the README only documents the `NNNk` form); `THREAD_QUEUE` 1 to 1048576. Leading zeros are removed.
+- **X-28.** A `CODEC` outside `opus|aac|mp3` (the old sample comment `pcm_s16le`, the README's
+  `pcm`) is rejected when the file is read, with `expected: one of opus, aac, mp3`; the
+  setting keeps its default, so the wrong-extension recording segment (`audio_000.pcm_s16le`)
+  can no longer happen. A `DEFAULT_CODEC` (and the other `DEFAULT_*` environment variables)
+  that is not valid falls back to the built-in default (`opus`, 48000, 2, 128k, 8192) with an
+  error in the log. The template `save_device_config` writes no longer uses `pcm_s16le`.
+- **A bad file never stops streams.** An invalid line is skipped, logged
+  (`Device config <file>:<line>: <KEY>: <problem> (expected: ...)`, at most 50 lines, the
+  rest counted, parsing stops after 100 problems) and the setting keeps its default. Nothing
+  exits, aborts or touches the manager's traps. `start` used to stop with exit 4
+  (`Configuration validation failed`) for a config with a syntax error; it now logs
+  `Device configuration has problems (listed above); ...` and starts. A file larger than
+  64 KiB, a line longer than 4096 characters, a directory or FIFO in place of the file are
+  one problem each. The same findings are logged once per process.
+- **New command `validate`**: `lyrebird-stream-manager.sh validate` parses the file (no root
+  needed, read-only, leaves no cleanup marker) and exits `0` ("OK (N setting(s))", also for a
+  missing file) or `4` (`E_CONFIG_ERROR`, "N problem(s), see above"). Document it next to
+  `config` in the command table and in the exit-code description. `status` now prints a
+  `Settings: 48000 Hz, 2 ch, opus 128k` line per device (and for the multiplex stream), so it
+  reads the file too.
+- **Behaviour changes to mention.** (1) Mixed-case keys such as `DEVICE_Blue_Yeti_SAMPLE_RATE`,
+  which the pre-C4 `lyrebird-mic-check.sh` wrote and which were silently ignored because the
+  lookup is upper-case, are now read as upper-case with one WARN, so those settings
+  start to apply. (2) The per-device variables are no longer taken from the environment
+  (`DEVICE_X_CODEC=aac lyrebird-stream-manager.sh start` used to work by accident); the file is the
+  only source. (3) `DEFAULT_*=...` lines in the file (the README suggests
+  `echo 'DEFAULT_THREAD_QUEUE=16384' >> audio-devices.conf`) were always ignored (readonly) and
+  are now an error line with a hint: set the environment variable instead. (4) Duplicate keys:
+  last line wins (as with `source`), with a WARN naming the earlier line. (5) No mode or
+  ownership check on the file was added (not required): it is still chmod 644 root-owned in
+  practice; because nothing in it runs, a writable config can no longer run code as root but a
+  bad one still degrades the streams it names.
+- **README to correct**: `Text (bash environment variables)` (file formats table, ~L542) ->
+  "Text, one `DEVICE_<NAME>_<SETTING>=value` per line; read as data, never executed"; the
+  settings list (~L525-530): drop `pcm` from the codecs, add the allowed values above, the
+  `validate` command; ~L1377 `DEFAULT_THREAD_QUEUE=16384 >> audio-devices.conf` -> set it in
+  the environment; ~L654-657 "a corrupted file never stops streams" is now true (say so for
+  invalid lines too, not only for corruption); the "Sample Rate Selection" list is fine.
+  `lyrebird-mic-check.sh` header comments ("This file is sourced by ...") are corrected
+  with the writer change.
+- Tests changed: `tests/test_e2e_integration.bats` "a per-device config (mic-check key format)
+  is honored by stream-manager" `source`d the config itself before calling `get_device_config`;
+  the manager no longer does that, so the test now calls `load_device_config`
+  (`MEDIAMTX_DEVICE_CONFIG`). The assertion (96000 is honoured) is unchanged.
+
 ## New defects found while verifying (not fixed here)
 
 - The cron line written by `install` (`.../lyrebird-stream-manager.sh monitor`) does not

@@ -131,10 +131,12 @@ EOF
     local cfg="$E2E_TMP/audio-devices.conf"
     printf '%s=96000\n' "$key" > "$cfg"
 
-    run env PROJECT_ROOT="$PROJECT_ROOT" CFG="$cfg" bash -c '
+    # The manager no longer `source`s the config (D3): it loads it with its own
+    # parser, so the test does the same.
+    run env PROJECT_ROOT="$PROJECT_ROOT" MEDIAMTX_DEVICE_CONFIG="$cfg" bash -c '
         source "$PROJECT_ROOT/lyrebird-stream-manager.sh" >/dev/null 2>&1
         set +e
-        source "$CFG"
+        load_device_config
         get_device_config "Blue Yeti" "SAMPLE_RATE" "48000"
     '
     [ "$status" -eq 0 ]
