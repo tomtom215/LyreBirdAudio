@@ -430,3 +430,192 @@ _updater_vars() {
     # the operator's edit is safe in the stash, not lost
     git -C "$REPO" stash list | grep -q lyrebird-tx
 }
+
+# ============================================================================
+# kill -9 (SIGKILL, OOM, power cut) mid-update, then run again
+# ============================================================================
+
+_state() { echo "$REPO/.git/lyrebird-updater"; }
+
+@test "kill -9 after the stash: the next read-only run reports it precisely and changes nothing" {
+    updater_checkout v1.1.0
+    echo "precious edit" >>"$REPO/config.txt"
+    updater_inject stash-push after KILL
+    updater_stdin 3 v1.2.0 y
+    updater_run
+    [ "$status" -eq 137 ]
+    updater_inject_clear
+    # the operator's edit is only in the stash right now, and the journal says so
+    [ "$(git -C "$REPO" stash list | wc -l)" -eq 1 ]
+    ! grep -q "precious edit" "$REPO/config.txt" || false
+    [ -f "$(_state)/transaction" ]
+    updater_run --status
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"An earlier update to v1.2.0"* ]]
+    [[ "$output" == *"interrupted at phase"* ]]
+    [[ "$output" == *"Run lyrebird-updater.sh without arguments to recover"* ]]
+    # read-only: nothing was touched
+    [ "$(git -C "$REPO" stash list | wc -l)" -eq 1 ]
+    [ -f "$(_state)/transaction" ]
+}
+
+@test "kill -9 after the stash: the next run puts the edit back and clears the journal" {
+    updater_checkout v1.1.0
+    echo "precious edit" >>"$REPO/config.txt"
+    updater_inject stash-push after KILL
+    updater_stdin 3 v1.2.0 y
+    updater_run
+    [ "$status" -eq 137 ]
+    updater_inject_clear
+    updater_stdin q
+    updater_run
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"was rolled back"* ]]
+    grep -qx "precious edit" "$REPO/config.txt"
+    [ -z "$(git -C "$REPO" stash list)" ]
+    [ ! -e "$(_state)/transaction" ]
+    [ "$(updater_head)" = "v1.1.0" ]
+}
+
+@test "kill -9 after the checkout: the next run returns to the original version with the edit restored" {
+    updater_checkout v1.1.0
+    echo "precious edit" >>"$REPO/config.txt"
+    updater_inject checkout after KILL
+    updater_stdin 3 v1.2.0 y
+    updater_run
+    [ "$status" -eq 137 ]
+    updater_inject_clear
+    [ "$(updater_head)" = "v1.2.0" ] # the node was left on the new version, half way
+    updater_stdin q
+    updater_run
+    [ "$status" -eq 0 ]
+    [ "$(updater_head)" = "v1.1.0" ]
+    grep -qx "precious edit" "$REPO/config.txt"
+    [ ! -e "$REPO/added-in-1.2.0.txt" ]
+    [ -z "$(git -C "$REPO" stash list)" ]
+    [ ! -e "$(_state)/transaction" ]
+    grep -q $'\tupdate\tinterrupted\t' "$(_state)/history.log"
+}
+
+@test "kill -9 just before the stash is restored: the next run goes back and restores it" {
+    updater_checkout v1.1.0
+    echo "precious edit" >>"$REPO/config.txt"
+    updater_inject stash-pop before KILL
+    updater_stdin 3 v1.2.0 y
+    updater_run
+    [ "$status" -eq 137 ]
+    updater_inject_clear
+    [ "$(updater_head)" = "v1.2.0" ]
+    [ "$(git -C "$REPO" stash list | wc -l)" -eq 1 ]
+    updater_stdin q
+    updater_run
+    [ "$status" -eq 0 ]
+    [ "$(updater_head)" = "v1.1.0" ]
+    grep -qx "precious edit" "$REPO/config.txt"
+    [ -z "$(git -C "$REPO" stash list)" ]
+}
+
+@test "kill -9 of the re-exec'd updater while it restores the stash: the next run completes the self-update" {
+    updater_checkout v1.1.0
+    echo "precious edit" >>"$REPO/config.txt"
+    updater_inject stash-pop before KILL
+    updater_stdin 3 v1.3.0 y
+    updater_run
+    [ "$status" -eq 137 ]
+    updater_inject_clear
+    [ "$(updater_head)" = "v1.3.0" ]
+    [ "$(git -C "$REPO" stash list | wc -l)" -eq 1 ]
+    grep -q '^phase=handoff$' "$(_state)/transaction"
+    updater_stdin q
+    updater_run
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"self-update was completed"* ]]
+    [ "$(updater_head)" = "v1.3.0" ] # rolled forward, not back
+    grep -qx "precious edit" "$REPO/config.txt"
+    [ -z "$(git -C "$REPO" stash list)" ]
+    [ ! -e "$(_state)/transaction" ]
+    grep -q $'\tupdate\tok\t' "$(_state)/history.log"
+}
+
+@test "edits made after a crash are saved in a recovery stash, not discarded by the recovery" {
+    updater_checkout v1.1.0
+    updater_inject checkout after KILL
+    updater_stdin 3 v1.2.0
+    updater_run
+    [ "$status" -eq 137 ]
+    updater_inject_clear
+    echo "hot fix after the crash" >>"$REPO/lyrebird-stream-manager.sh"
+    updater_stdin q
+    updater_run
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"saved first, in the stash entry named: lyrebird-recovery"* ]]
+    [ "$(updater_head)" = "v1.1.0" ]
+    git -C "$REPO" stash list | grep -q lyrebird-recovery
+    git -C "$REPO" stash show -p 'stash@{0}' | grep -q "hot fix after the crash"
+}
+
+@test "switching to a release whose updater cannot resume a self-update finishes in this process" {
+    updater_checkout v1.1.0
+    updater_make_old_updater_tag
+    echo "precious edit" >>"$REPO/lyrebird-orchestrator.sh" # no conflict with v0.9.0's changes
+    updater_stdin 3 v0.9.0 y "" q
+    updater_run
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    [[ "$output" == *"older and cannot resume an update"* ]]
+    [[ "$output" != *"Restarting with updated version"* ]]
+    [ "$(updater_head)" = "v0.9.0" ]
+    grep -qx "precious edit" "$REPO/lyrebird-orchestrator.sh" # restored here, not stranded in a stash
+    [ -z "$(git -C "$REPO" stash list)" ]
+    [ ! -e "$REPO/.git/lyrebird-updater/transaction" ]
+    grep -q $'\tupdate\tok\t' "$REPO/.git/lyrebird-updater/history.log"
+}
+
+@test "an unreadable transaction journal stops a changing run with exit 8 and touches nothing" {
+    updater_checkout v1.1.0
+    mkdir -p "$(_state)"
+    printf 'this is not a journal\n' >"$(_state)/transaction"
+    updater_stdin q
+    updater_run
+    [ "$status" -eq 8 ]
+    [[ "$output" == *"cannot be read"* ]]
+    [ "$(updater_head)" = "v1.1.0" ]
+}
+
+@test "kill -9 does not leave the temporary core.fileMode=false behind: the next run restores it" {
+    updater_checkout v1.1.0
+    [ "$(git -C "$REPO" config --local core.fileMode)" = "true" ]
+    updater_inject checkout after KILL
+    updater_stdin 3 v1.2.0
+    updater_run
+    [ "$status" -eq 137 ]
+    updater_inject_clear
+    [ "$(git -C "$REPO" config --local core.fileMode)" = "false" ] # the temporary value, as it was killed
+    updater_run --status
+    [ "$status" -eq 0 ]
+    [ "$(git -C "$REPO" config --local core.fileMode)" = "true" ]
+}
+
+@test "a self-update gives core.fileMode its original value back" {
+    updater_checkout v1.1.0
+    updater_stdin 3 v1.3.0 "" q
+    updater_run
+    [ "$status" -eq 0 ]
+    [ "$(updater_head)" = "v1.3.0" ]
+    [ "$(git -C "$REPO" config --local core.fileMode)" = "true" ]
+    # a normal self-update is not mistaken for a crashed run
+    [[ "$output" != *"ended before restoring core.fileMode"* ]]
+}
+
+@test "a run that stops early does not delete the operator's own core.fileMode setting" {
+    updater_checkout v1.1.0
+    git -C "$REPO" config --local core.fileMode false
+    mkdir -p "$(_state)/lock"
+    ( exec -a "lyrebird-updater.sh" sleep 30 ) &
+    local holder=$!
+    echo "$holder" >"$(_state)/lock/pid"
+    LYREBIRD_UPDATER_LOCK_WAIT=1 updater_run --status
+    kill "$holder" 2>/dev/null || true
+    wait "$holder" 2>/dev/null || true
+    [ "$status" -eq 7 ]
+    [ "$(git -C "$REPO" config --local core.fileMode)" = "false" ]
+}

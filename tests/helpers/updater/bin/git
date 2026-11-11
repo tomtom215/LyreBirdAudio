@@ -74,7 +74,11 @@ inject() {
     esac
 }
 
-((hit)) && [[ "${FAULT_WHEN:-after}" == before ]] && inject
+if ((hit)) && [[ "${FAULT_WHEN:-after}" == before ]]; then
+    inject
+    # a signal sent "before" means git never ran
+    [[ "$FAULT_ACT" == PROBE ]] || exit 128
+fi
 "$real" "$@"
 rc=$?
 ((hit)) && [[ "${FAULT_WHEN:-after}" == after ]] && inject

@@ -96,7 +96,10 @@ updater_node_setup() {
     SYSROOT="$NODE/sysroot"
     SHIMS="$NODE/shims"
     FAULT_LOG="$NODE/fault.log"
-    mkdir -p "$SYSROOT" "$SHIMS"
+    # the directories a real system has; there is no service unit, cron job or
+    # old script in them unless a test puts one there
+    mkdir -p "$SYSROOT/usr/local/bin" "$SYSROOT/var/log" "$SYSROOT/var/lib" "$SYSROOT/run" \
+        "$SYSROOT/etc/systemd/system" "$SYSROOT/etc/cron.d" "$SHIMS"
     git -C "$REPO" remote set-url origin "$ORIGIN"
     git -C "$WORK" remote set-url origin "$ORIGIN"
     cp "$UPDATER_HELPER_DIR/helpers/updater/bin/git" "$UPDATER_HELPER_DIR/helpers/updater/bin/stat" "$SHIMS/"
@@ -149,9 +152,17 @@ updater_stdin() {
 # Sets bats' $status and $output (stdout and stderr).
 updater_run() {
     [[ -n "${UPDATER_INPUT+set}" ]] || updater_stdin
-    run env PATH="$SHIMS:$PATH" bash "$REPO/lyrebird-updater.sh" "$@" <<<"${UPDATER_INPUT%$'\n'}"
+    run env "${UPDATER_SIGNAL_ARGS[@]}" PATH="$SHIMS:$PATH" bash "$REPO/lyrebird-updater.sh" "$@" <<<"${UPDATER_INPUT%$'\n'}"
     unset UPDATER_INPUT
 }
+
+# A script started from a background job inherits an ignored SIGINT, which it
+# can no longer trap. The signal tests need the default disposition, so the
+# updater is started through `env --default-signal` where coreutils has it.
+UPDATER_SIGNAL_ARGS=()
+if env --default-signal=INT,TERM true 2>/dev/null; then
+    UPDATER_SIGNAL_ARGS=(--default-signal=INT,TERM)
+fi
 
 # updater_head: abbreviated HEAD of the node (tag name when on one).
 updater_head() {
@@ -179,6 +190,19 @@ updater_make_diverged_dev() {
     git -C "$WORK" commit -qam "dev 2"
     git -C "$WORK" push -q origin dev 2>/dev/null
     git -C "$REPO" fetch -q origin
+}
+
+# updater_make_old_updater_tag: origin gets v0.9.0, whose lyrebird-updater.sh
+# predates the self-update hand-over: it knows no --post-update-* option.
+updater_make_old_updater_tag() {
+    git -C "$WORK" checkout -q v1.0.0
+    printf '#!/bin/bash\n# an old updater: no hand-over options\necho "old updater: unknown option: $1" >&2\nexit 1\n' >"$WORK/lyrebird-updater.sh"
+    echo "config v0.9.0" >"$WORK/config.txt"
+    git -C "$WORK" commit -qam "v0.9.0 (old updater)"
+    git -C "$WORK" tag v0.9.0
+    git -C "$WORK" push -q origin v0.9.0 2>/dev/null
+    git -C "$WORK" checkout -q main
+    git -C "$REPO" fetch -q origin --tags
 }
 
 # updater_make_big_tag: origin gets v1.4.0, whose checkout writes a small file
