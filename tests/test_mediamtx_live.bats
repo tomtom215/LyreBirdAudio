@@ -150,3 +150,25 @@ require_netns() {
         rm -rf "$TEST_SCRATCH/e2e"
     done
 }
+
+@test "audio level signals against a real MediaMTX and real publishers: a tone is ok, silence is silent, one DEAD MIC per episode that ends with the tone, an unpublished stream is unreachable and a failing probe tool is never silence [LB-14, X-05, D6]" {
+    require_live
+    require_netns
+    local bin out rc
+    for bin in $LYREBIRD_TEST_MEDIAMTX_BINS; do
+        echo "# $("$bin" --version 2>/dev/null | head -n 1)" >&3
+        mkdir -p "$TEST_SCRATCH/sig"
+        rc=0
+        out="$("${NETNS_CMD[@]}" env PATH="$PATH" PROJECT_ROOT="$PROJECT_ROOT" BIN="$bin" \
+            WORK="$TEST_SCRATCH/sig" OWNER="$(id -u):$(id -g)" \
+            bash "$PROJECT_ROOT/tests/signals_e2e.bash" 2>&1 3>&-)" || rc=$?
+        if [[ $rc -ne 0 ]]; then
+            echo "$out"
+            false
+        fi
+        sed 's/^/# /' <<<"$out" >&3
+        [[ "$out" == *"E2E: DONE"* ]]
+        chmod -R u+rwx "$TEST_SCRATCH/sig"
+        rm -rf "$TEST_SCRATCH/sig"
+    done
+}

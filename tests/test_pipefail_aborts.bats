@@ -71,25 +71,6 @@ EOF
     [ "$output" = "unknown" ]
 }
 
-@test "stream-manager: check_audio_level survives ffmpeg exiting 0 with NO volumedetect output" {
-    # An ffmpeg that succeeds but prints nothing parseable (e.g. muted loglevel,
-    # driver quirk). Must return 2 (check failed), never abort the monitor run.
-    printf '#!/bin/bash\nexit 0\n' > "$PA_TMP/bin/ffmpeg"
-    chmod +x "$PA_TMP/bin/ffmpeg"
-
-    run env PROJECT_ROOT="$PROJECT_ROOT" PATH="$PA_TMP/bin:$PATH" \
-        AUDIO_LEVEL_CHECK_ENABLED=true bash -c '
-        set -euo pipefail
-        source "$PROJECT_ROOT/lyrebird-stream-manager.sh" >/dev/null 2>&1
-        log() { :; }
-        rc=0
-        check_audio_level 0 pipefailtest || rc=$?
-        echo "rc=$rc"
-    '
-    [ "$status" -eq 0 ]
-    [[ "$output" == *"rc=2"* ]]
-}
-
 @test "stream-manager: get_status_summary survives an /v3/info body without a version field" {
     cat > "$PA_TMP/bin/curl" <<'EOF'
 #!/bin/bash

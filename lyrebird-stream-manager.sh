@@ -424,14 +424,26 @@ readonly AUDIO_RECORDING_SEGMENTS
 readonly AUDIO_DISK_PERSIST="${AUDIO_DISK_PERSIST:-false}" # Move segments to disk (SD card wear!)
 readonly AUDIO_DISK_PATH="${AUDIO_DISK_PATH:-/var/lib/mediamtx-ffmpeg/recordings}"
 
-# Audio level monitoring (detect dead/silent microphones)
+# Audio level monitoring (detect dead/silent microphones). The monitor reads a
+# few seconds of each published stream back from MediaMTX over RTSP and measures
+# its level (probe_stream_level, monitor_signals); it never opens an ALSA device.
 readonly AUDIO_LEVEL_CHECK_ENABLED="${AUDIO_LEVEL_CHECK_ENABLED:-true}"      # Enable silence detection
-AUDIO_LEVEL_SAMPLE_DURATION=$(_uint_or "${AUDIO_LEVEL_SAMPLE_DURATION:-}" 3) # Seconds to sample for level check
+AUDIO_LEVEL_SAMPLE_DURATION=$(_uint_or "${AUDIO_LEVEL_SAMPLE_DURATION:-}" 3) # Seconds of the stream to measure
 readonly AUDIO_LEVEL_SAMPLE_DURATION
-AUDIO_SILENCE_THRESHOLD_DB=$(_int_or "${AUDIO_SILENCE_THRESHOLD_DB:-}" -60) # dB below which is "silence"
+# Seconds the probe may spend connecting and finishing beyond the sample itself
+# before it is killed (the whole probe is bounded by sample + this)
+AUDIO_LEVEL_PROBE_GRACE=$(_uint_or "${AUDIO_LEVEL_PROBE_GRACE:-}" 10)
+readonly AUDIO_LEVEL_PROBE_GRACE
+# Least seconds between two probes of one stream: a monitor run that comes
+# sooner (a manual run, cron every minute) leaves the stream alone
+AUDIO_LEVEL_CHECK_INTERVAL=$(_uint_or "${AUDIO_LEVEL_CHECK_INTERVAL:-}" 240)
+readonly AUDIO_LEVEL_CHECK_INTERVAL
+AUDIO_SILENCE_THRESHOLD_DB=$(_int_or "${AUDIO_SILENCE_THRESHOLD_DB:-}" -60) # dB (max_volume) at or below which is "silence"
 readonly AUDIO_SILENCE_THRESHOLD_DB
-AUDIO_SILENCE_WARN_DURATION=$(_uint_or "${AUDIO_SILENCE_WARN_DURATION:-}" 60) # Seconds of silence before warning
+AUDIO_SILENCE_WARN_DURATION=$(_uint_or "${AUDIO_SILENCE_WARN_DURATION:-}" 60) # Seconds of silence before the DEAD MIC error
 readonly AUDIO_SILENCE_WARN_DURATION
+# Silence episodes and probe times per stream (under /run: cleared at boot)
+readonly SILENCE_STATE_DIR="${SILENCE_STATE_DIR:-/run/lyrebird/silence}"
 
 # MediaMTX API version compatibility
 readonly MEDIAMTX_API_VERSION="${MEDIAMTX_API_VERSION:-auto}"   # auto, v3, v2, v1
@@ -2764,116 +2776,282 @@ check_alsa_device_available() {
     return 0
 }
 
-# Check audio level for a device to detect dead/silent microphones
-# Uses FFmpeg's volumedetect filter to sample audio levels
-# Returns: 0 = audio detected, 1 = silence/dead mic, 2 = check failed
-check_audio_level() {
-    local card_num="$1"
-    local stream_name="${2:-unknown}"
+# ============================================================================
+# Audio level signals (LB-14, X-05; decision D6)
+# ============================================================================
+# A dead microphone is a stream that is published and silent. The PID file and
+# the API's ready flag cannot show it, and it must not be looked for by opening
+# the ALSA device a second time: that contends with the capture FFmpeg. The
+# level is measured where every listener gets it, from the stream MediaMTX
+# publishes, with a short RTSP read. Four signals stay apart: the path is ready
+# (probe_stream_ready), bytes move (the deep health probe), the level
+# (probe_stream_level) and prolonged silence (track_silence).
 
-    if [[ "${AUDIO_LEVEL_CHECK_ENABLED}" != "true" ]]; then
-        return 0
+# dB with at most one decimal as tenths of a dB, so the threshold comparison
+# needs no floating point: "-12.5" -> -125, "-inf" -> -99999. Fails (printing
+# nothing) for a value that is not a number. A decimal comma is accepted.
+_db_to_tenths() {
+    local v="${1//,/.}"
+    case "$v" in
+        -inf | -Inf | -INF)
+            printf '%s' -99999
+            return 0
+            ;;
+        inf | +inf | Inf | INF)
+            printf '%s' 99999
+            return 0
+            ;;
+    esac
+    local re='^(-?)([0-9]+)(\.([0-9]))?[0-9]*$'
+    [[ "$v" =~ $re ]] || return 1
+    local tenths=$((10#${BASH_REMATCH[2]} * 10 + 10#${BASH_REMATCH[4]:-0}))
+    if [[ -n "${BASH_REMATCH[1]}" ]]; then
+        tenths=$((-tenths))
     fi
-
-    # Verify FFmpeg is available
-    if ! command_exists ffmpeg; then
-        log DEBUG "FFmpeg not available for audio level check"
-        return 0
-    fi
-
-    local audio_device="plughw:${card_num},0"
-    local sample_duration="${AUDIO_LEVEL_SAMPLE_DURATION}"
-    local silence_threshold="${AUDIO_SILENCE_THRESHOLD_DB}"
-
-    log DEBUG "Checking audio level for $stream_name (device: $audio_device)"
-
-    # Use FFmpeg to sample audio and detect volume
-    # -t limits duration, volumedetect filter outputs max/mean volume
-    local ffmpeg_output
-    ffmpeg_output=$(ffmpeg -f alsa -i "$audio_device" -t "$sample_duration" \
-        -af volumedetect -f null /dev/null 2>&1) || {
-        log DEBUG "FFmpeg audio level check failed for $stream_name"
-        return 2
-    }
-
-    # Parse max volume from output (format: "max_volume: -XX.X dB")
-    local max_volume
-    max_volume=$(echo "$ffmpeg_output" | grep -o "max_volume: [0-9.-]*" | grep -o "[0-9.-]*" | head -1) || true
-
-    if [[ -z "$max_volume" ]]; then
-        log DEBUG "Could not parse audio level for $stream_name"
-        return 2
-    fi
-
-    # Compare with threshold (both are negative dB values)
-    # Note: -30 dB is louder than -60 dB, so we check if max > threshold
-    local max_int="${max_volume%.*}" # Remove decimal for integer comparison
-    local threshold_int="${silence_threshold%.*}"
-
-    if [[ $max_int -lt $threshold_int ]]; then
-        log WARN "Silence detected on $stream_name: max volume ${max_volume} dB (threshold: ${silence_threshold} dB)"
-
-        # Track silence duration
-        local silence_file="/run/mediamtx-silence-${stream_name}"
-        local silence_start
-        if [[ -f "$silence_file" ]]; then
-            silence_start=$(cat "$silence_file" 2>/dev/null || echo "0")
-        else
-            silence_start=$(_now_monotonic)
-            echo "$silence_start" >"$silence_file" 2>/dev/null || true
-        fi
-
-        local now
-        now=$(_now_monotonic)
-        # A start value in the future means a stale wall-clock timestamp from a
-        # pre-monotonic run (or clock scale mismatch): restart tracking from now
-        # rather than silently never reaching the DEAD MIC threshold again.
-        if [[ ! "$silence_start" =~ ^[0-9]+$ ]] || ((silence_start > now)); then
-            silence_start=$now
-            echo "$silence_start" >"$silence_file" 2>/dev/null || true
-        fi
-        local silence_duration=$((now - silence_start))
-
-        if [[ $silence_duration -ge ${AUDIO_SILENCE_WARN_DURATION} ]]; then
-            log ERROR "DEAD MIC: $stream_name has been silent for ${silence_duration}s (>${AUDIO_SILENCE_WARN_DURATION}s)"
-        fi
-
-        return 1
-    else
-        # Audio detected - clear silence tracking
-        rm -f "/run/mediamtx-silence-${stream_name}" 2>/dev/null || true
-        log DEBUG "Audio level OK for $stream_name: max volume ${max_volume} dB"
-        return 0
-    fi
+    printf '%s' "$tenths"
 }
 
-# Check all streams for audio levels
-check_all_audio_levels() {
+# Measure the level of one published stream by reading AUDIO_LEVEL_SAMPLE_DURATION
+# seconds of it over RTSP (never an ALSA device).
+#
+#   probe_stream_level PATH [SECONDS]
+#
+# Prints one line, "<state> <max dB> <mean dB> <detail>", with "-" where a value
+# is unknown, and returns 0. state is
+#   ok             samples were read and the loudest one is above
+#                  AUDIO_SILENCE_THRESHOLD_DB
+#   silent         samples were read and max_volume is at or below the threshold
+#                  (digital silence measures -91.0)
+#   no_audio_data  the stream opened but delivered no samples
+#   unreachable    the stream could not be opened: not published, nothing
+#                  listening, timed out (the deep health probe's business)
+#   probe_error    the measurement failed: no ffmpeg or timeout, ffmpeg crashed
+#                  or printed nothing usable, or the server wants credentials
+# Only "silent" says anything about the microphone. The probe is bounded by
+# timeout(1): sample seconds + AUDIO_LEVEL_PROBE_GRACE. The RTSP port is
+# MEDIAMTX_RTSP_PORT (default 8554).
+probe_stream_level() {
+    local stream="${1:-}" seconds="${2:-${AUDIO_LEVEL_SAMPLE_DURATION}}"
+    local state="probe_error" max="-" mean="-" detail=""
+
+    if [[ ! "$stream" =~ ^[A-Za-z0-9_-]+$ ]]; then
+        detail="not a usable stream path: '${stream}'"
+    elif ! command_exists ffmpeg || ! command_exists timeout; then
+        detail="ffmpeg and timeout are both required"
+    else
+        if [[ ! "$seconds" =~ ^[0-9]+$ ]] || ((10#$seconds < 1)); then
+            seconds=1
+        fi
+        seconds=$((10#$seconds))
+        local port="${MEDIAMTX_RTSP_PORT:-8554}"
+        if [[ ! "$port" =~ ^[0-9]+$ ]] || ((10#$port < 1 || 10#$port > 65535)); then
+            port=8554
+        fi
+        port=$((10#$port))
+
+        # volumedetect reports on stderr at INFO level; LC_ALL=C pins the
+        # number format. "-f null -" discards the decoded audio.
+        local out="" rc=0
+        out="$(LC_ALL=C timeout -k 2 "$((seconds + AUDIO_LEVEL_PROBE_GRACE))" \
+            ffmpeg -nostdin -hide_banner -nostats -loglevel info -rtsp_transport tcp \
+            -i "rtsp://127.0.0.1:${port}/${stream}" -t "$seconds" -vn \
+            -af volumedetect -f null - 2>&1)" || rc=$?
+
+        # A filter graph that ffmpeg rebuilt prints one block of its own: the
+        # last block is the measurement ("n_samples: 0" blocks carry no volume)
+        local re_samples='n_samples: *([0-9]+)'
+        local re_mean='mean_volume: *(-?[A-Za-z0-9.,]+) dB'
+        local re_max='max_volume: *(-?[A-Za-z0-9.,]+) dB'
+        local marker='Input #0' # ffmpeg's first line once the input is open
+        local line last_line="" samples=0 connected=false
+        while IFS= read -r line; do
+            if [[ -n "$line" ]]; then
+                last_line="$line"
+            fi
+            if [[ "$line" == "$marker"* ]]; then
+                connected=true
+            elif [[ "$line" =~ $re_samples ]]; then
+                samples=$((10#${BASH_REMATCH[1]}))
+                max="-"
+                mean="-"
+            elif [[ "$line" =~ $re_mean ]]; then
+                mean="${BASH_REMATCH[1]}"
+            elif [[ "$line" =~ $re_max ]]; then
+                max="${BASH_REMATCH[1]}"
+            fi
+        done <<<"$out"
+
+        local max_tenths=""
+        if ((rc == 0 && samples > 0)) && max_tenths="$(_db_to_tenths "$max")"; then
+            if ((max_tenths <= AUDIO_SILENCE_THRESHOLD_DB * 10)); then
+                state="silent"
+            else
+                state="ok"
+            fi
+            _db_to_tenths "$mean" >/dev/null || mean="-"
+        else
+            max="-"
+            mean="-"
+            local re_auth='(401 Unauthorized|403 Forbidden|Server returned 40[13])'
+            local re_down='(Connection refused|Connection timed out|Connection reset|Operation timed out|No route to host|Network is unreachable|Name or service not known|404 Not Found|Server returned 4[0-9][0-9]|Server returned 5[0-9][0-9]|method DESCRIBE failed)'
+            if [[ "$connected" == "false" && "$out" =~ $re_auth ]]; then
+                detail="the server wants credentials, the probe reads anonymously"
+            elif [[ "$connected" == "true" ]] && ((rc == 0 || rc == 124)); then
+                state="no_audio_data"
+                detail="the stream opened but delivered no samples (ffmpeg exit ${rc})"
+            elif ((rc == 124)) || [[ "$out" =~ $re_down ]]; then
+                state="unreachable"
+                detail="could not open rtsp port ${port} path ${stream} (ffmpeg exit ${rc})"
+            else
+                detail="ffmpeg exit ${rc}, last line: ${last_line:0:120}"
+            fi
+        fi
+    fi
+
+    log DEBUG "Level probe ${stream}: ${state} ${max} ${mean}${detail:+ ${detail}}"
+    printf '%s %s %s%s\n' "$state" "$max" "$mean" "${detail:+ ${detail}}"
+    return 0
+}
+
+# Per-stream signal state, one file per stream under SILENCE_STATE_DIR:
+# "<silence start> <alerted 0|1> <last probe>". The times are monotonic seconds
+# (_now_monotonic): wall-clock steps cannot turn minutes into a DEAD MIC. "-"
+# means "no silence episode" / "never probed". Read into SIGNAL_START,
+# SIGNAL_ALERTED and SIGNAL_LAST.
+declare -g SIGNAL_START="-" SIGNAL_ALERTED=0 SIGNAL_LAST="-"
+
+_signal_state_read() {
+    local file="${SILENCE_STATE_DIR}/${1}.state" start="" alerted="" last=""
+    SIGNAL_START="-"
+    SIGNAL_ALERTED=0
+    SIGNAL_LAST="-"
+    [[ -r "$file" ]] || return 0
+    { IFS=' ' read -r start alerted last <"$file"; } 2>/dev/null || true
+    if [[ "$start" =~ ^[0-9]+$ ]]; then
+        SIGNAL_START="$((10#$start))"
+    fi
+    if [[ "$alerted" == "1" ]]; then
+        SIGNAL_ALERTED=1
+    fi
+    if [[ "$last" =~ ^[0-9]+$ ]]; then
+        SIGNAL_LAST="$((10#$last))"
+    fi
+    return 0
+}
+
+_signal_state_write() {
+    local stream="$1" file tmp
+    file="${SILENCE_STATE_DIR}/${stream}.state"
+    tmp="${file}.tmp.$$"
+    if mkdir -p "${SILENCE_STATE_DIR}" 2>/dev/null \
+        && printf '%s %s %s\n' "$2" "$3" "$4" >"$tmp" 2>/dev/null \
+        && mv -f "$tmp" "$file" 2>/dev/null; then
+        return 0
+    fi
+    rm -f "$tmp" 2>/dev/null || true
+    log WARN "Cannot record the audio level state of ${stream} in ${SILENCE_STATE_DIR}: silence tracking cannot persist between monitor runs"
+    return 0
+}
+
+# Feed one verdict of probe_stream_level into the stream's silence episode.
+#
+#   track_silence STREAM STATE MAX_DB NOW
+#
+# An episode starts with the first "silent" probe, raises the DEAD MIC error
+# once when it has lasted AUDIO_SILENCE_WARN_DURATION seconds, and ends with the
+# first "ok" probe (logged as recovery). unreachable, no_audio_data and
+# probe_error say nothing about the microphone: they neither start, extend, end
+# nor alert an episode. NOW is the monotonic time of the probe; it is also kept
+# as the stream's last probe time.
+track_silence() {
+    local stream="$1" state="$2" max="$3" now="$4"
+    _signal_state_read "$stream"
+    local start="$SIGNAL_START" alerted="$SIGNAL_ALERTED"
+    case "$state" in
+        ok)
+            if [[ "$start" != "-" ]]; then
+                local was=$((now - start))
+                if ((was < 0)); then
+                    was=0
+                fi
+                log INFO "Audio recovered on ${stream} after ${was}s of silence (max volume ${max} dB)"
+            fi
+            start="-"
+            alerted=0
+            ;;
+        silent)
+            # A start in the future is a value from another clock scale: begin again
+            if [[ "$start" == "-" ]] || ((start > now)); then
+                start="$now"
+                alerted=0
+                log WARN "Silence detected on ${stream}: max volume ${max} dB (threshold: ${AUDIO_SILENCE_THRESHOLD_DB} dB)"
+            fi
+            local silent_for=$((now - start))
+            if ((silent_for >= AUDIO_SILENCE_WARN_DURATION)) && [[ "$alerted" != "1" ]]; then
+                alerted=1
+                log ERROR "DEAD MIC: ${stream} has been silent for ${silent_for}s (>${AUDIO_SILENCE_WARN_DURATION}s)"
+            fi
+            ;;
+        *) ;;
+    esac
+    _signal_state_write "$stream" "$start" "$alerted" "$now"
+}
+
+# The signals step of one monitor run: for every stream this manager runs (a
+# PID file in FFMPEG_PID_DIR names a live process) that MediaMTX reports ready,
+# measure the level once and feed the verdict to the silence episode. A stream
+# probed less than AUDIO_LEVEL_CHECK_INTERVAL seconds ago is skipped, so one
+# monitor run opens at most one short reader per stream. Purely informational:
+# it changes nothing and always returns 0. AUDIO_LEVEL_CHECK_ENABLED=false turns
+# it off.
+monitor_signals() {
     if [[ "${AUDIO_LEVEL_CHECK_ENABLED}" != "true" ]]; then
         return 0
     fi
 
-    local devices=()
-    readarray -t devices < <(detect_audio_devices 2>/dev/null) || return 0
+    local nullglob_state
+    shopt -q nullglob && nullglob_state=on || nullglob_state=off
+    shopt -s nullglob
 
-    local silent_count=0
-    for device_info in "${devices[@]}"; do
-        IFS=':' read -r device_name card_num <<<"$device_info"
-        [[ -z "$device_name" ]] || [[ -z "$card_num" ]] && continue
-
-        local stream_path
-        stream_path="$(generate_stream_path "$device_name" "$card_num" 2>/dev/null)" || continue
-
-        if ! check_audio_level "$card_num" "$stream_path"; then
-            ((silent_count++)) || true
+    local pid_file stream pid now rc verdict state max mean detail
+    for pid_file in "${FFMPEG_PID_DIR}"/*.pid; do
+        stream="${pid_file##*/}"
+        stream="${stream%.pid}"
+        if [[ ! "$stream" =~ ^[A-Za-z0-9_-]+$ ]]; then
+            continue
         fi
+        pid="$(read_pid_safe "$pid_file")"
+        if [[ -z "$pid" ]]; then
+            continue
+        fi
+        rc=0
+        probe_stream_ready "$stream" || rc=$?
+        if ((rc != 0)); then
+            log DEBUG "Level probe skipped for ${stream}: path not ready or API unknown (probe_stream_ready=${rc})"
+            continue
+        fi
+        now="$(_now_monotonic)"
+        _signal_state_read "$stream"
+        if [[ "$SIGNAL_LAST" != "-" ]] && ((SIGNAL_LAST <= now && now - SIGNAL_LAST < AUDIO_LEVEL_CHECK_INTERVAL)); then
+            log DEBUG "Level probe skipped for ${stream}: probed $((now - SIGNAL_LAST))s ago (interval ${AUDIO_LEVEL_CHECK_INTERVAL}s)"
+            continue
+        fi
+
+        verdict="$(probe_stream_level "$stream")"
+        read -r state max mean detail <<<"$verdict"
+        case "$state" in
+            ok) log DEBUG "Audio level OK for ${stream}: max volume ${max} dB, mean ${mean} dB" ;;
+            silent) ;;
+            no_audio_data) log WARN "Stream ${stream} is published but delivered no audio samples during the level probe" ;;
+            unreachable) log DEBUG "Level probe: ${stream} could not be opened (${detail})" ;;
+            *) log WARN "Level probe of ${stream} failed, not counted as silence: ${detail}" ;;
+        esac
+        track_silence "$stream" "$state" "$max" "$(_now_monotonic)"
     done
 
-    if [[ $silent_count -gt 0 ]]; then
-        log WARN "Audio level check: $silent_count device(s) with silence detected"
-        return 1
+    if [[ "$nullglob_state" == "off" ]]; then
+        shopt -u nullglob
     fi
-
     return 0
 }
 
@@ -6310,6 +6488,8 @@ main() {
                 exit ${E_CRITICAL_RESOURCE}
             fi
             # Non-critical resource issues are logged but we continue
+            # Audio level / dead-mic signals (informational, never fails the run)
+            monitor_signals || true
             # Then check and restart streams (returns error codes for failures)
             monitor_streams
             exit_code=$?
