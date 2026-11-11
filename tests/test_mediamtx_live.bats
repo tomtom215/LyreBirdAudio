@@ -172,3 +172,28 @@ require_netns() {
         rm -rf "$TEST_SCRATCH/sig"
     done
 }
+
+@test "reload against a real MediaMTX and real FFmpeg: nothing is restarted, a changed key is reported with its measured effect, a dead wrapper is started, a stopped or foreign MediaMTX is refused [LB-11, X-12]" {
+    require_live
+    require_netns
+    local bin out rc
+    for bin in $LYREBIRD_TEST_MEDIAMTX_BINS; do
+        echo "# $("$bin" --version 2>/dev/null | head -n 1)" >&3
+        mkdir -p "$TEST_SCRATCH/rel"
+        rc=0
+        out="$("${NETNS_CMD[@]}" env PATH="$PATH" PROJECT_ROOT="$PROJECT_ROOT" BIN="$bin" \
+            WORK="$TEST_SCRATCH/rel" OWNER="$(id -u):$(id -g)" \
+            bash "$PROJECT_ROOT/tests/reload_e2e.bash" 2>&1 3>&-)" || rc=$?
+        if [[ $rc -eq 77 ]]; then
+            skip "$(grep E2E-SKIP <<<"$out")"
+        fi
+        if [[ $rc -ne 0 ]]; then
+            echo "$out"
+            false
+        fi
+        sed 's/^/# /' <<<"$out" >&3
+        [[ "$out" == *"E2E: DONE"* ]]
+        chmod -R u+rwx "$TEST_SCRATCH/rel"
+        rm -rf "$TEST_SCRATCH/rel"
+    done
+}

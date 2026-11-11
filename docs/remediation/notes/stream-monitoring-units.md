@@ -240,3 +240,84 @@ line names the removed settings; `setup_directories` with
 and never `AUDIO_DISK_PATH`; the warning (once, both names, where durable recording
 goes; each group separately); the default path is tmpfs and the wrapper generators
 write the segments to `AUDIO_RECORDING_PATH` and name no other recording path.
+
+## The `reload` command and what MediaMTX does with a config change (LB-11, X-12 manager side, D12)
+
+### What was wrong
+
+`config/mediamtx-audio.service` had `ExecReload=<script> reload` and the script had no
+`reload` command (`Unknown command`, exit 1: R). The signals the units sent instead were
+not handled by MediaMTX (R, real 1.21.1, scratchpad `monunits/exp2.sh`): `SIGUSR1` and
+`SIGUSR2` are ignored (the sample installer unit's `ExecReload=kill -USR1` does nothing),
+and **`SIGHUP` terminates MediaMTX** (`Hangup`; the sample `mediamtx.service`'s
+`ExecReload=kill -HUP $MAINPID` kills the server and, with `Restart=always`, restarts it:
+an outage in the name of a reload). MediaMTX reloads its configuration by itself: it watches
+the file and applies a change without restarting the process.
+
+### The command (exact)
+
+`lyrebird-stream-manager.sh reload` (root; `check_dependencies`, `setup_directories`,
+`validate_config` first, then `reload_mediamtx`). It never stops, restarts or signals
+anything. Steps: lifecycle lock (`acquire_lock`, re-entrant) -> refuse if another owner has
+MediaMTX (exit **8**) -> MediaMTX not running (exit **7**, "use start") -> re-render the
+configuration with the real generator; unchanged: say so; changed: log one `INFO` per
+changed top-level key (`MediaMTX configuration key 'X' changed: <effect>`), wait one
+second and for the API (`wait_for_mediamtx_ready`; if MediaMTX did not come back: error,
+exit 1, "run restart"), `MediaMTX (PID n) is running with the new configuration; it was
+not restarted` -> the idempotent start path (`start_mediamtx`: a stream whose wrapper runs
+is not touched, a missing one is started); the exit status is the start path's. Exit
+codes: 0, 1, 4 (configuration could not be generated or the device configuration is
+invalid), 5 (lock), 7, 8 and whatever `start_mediamtx` returns. `SKIP_CLEANUP` is set for
+the whole command: a failed reload must not leave `/run/mediamtx-audio.cleanup`, which
+makes the wrappers stop at their next loop iteration. The CLI help lists it.
+
+### What a changed key does (measured, R)
+
+Measured on real MediaMTX 1.15.0 and 1.21.1 (scratchpad `monunits/exp3.sh`: identical
+answers), and re-checked on every binary of `LYREBIRD_TEST_MEDIAMTX_BINS` by the live test; a bare FFmpeg
+publisher per case, the file replaced atomically (`tests/reload_e2e.bash`, last section;
+the table is `mediamtx_reload_effect`, and the live test fails if it lies):
+
+| key | connected publishers |
+|-----|----------------------|
+| `api`, `apiAddress`, `rtmp`, `hls`, `webrtc`, `srt`; a path entry that is added | stay connected |
+| `logLevel`, `readTimeout`, `writeTimeout`, `metrics`, `metricsAddress`, `rtsp`, `rtspAddress`, `rtspTransports` | **every publisher is disconnected** (their FFmpeg exits) |
+| a path entry whose settings change (`sourceProtocol`) | the publishers of that path are disconnected |
+
+No key the manager writes needs a restart of the MediaMTX process; `runOnInit` (not
+generated) is the only setting MediaMTX applies only at start. **A configuration file
+MediaMTX cannot load makes the running MediaMTX log the error and exit (status 0)** (R: a
+broken file, and also `sourceOnDemand: yes` with `source: publisher`): that is why `reload`
+only ever installs what the generator wrote, never an operator-supplied text.
+
+### Documentation consequences
+
+- `docs/` and README should describe `reload` as "apply a changed configuration without
+  restarting MediaMTX or the healthy streams; changes to log level, timeouts, metrics, RTSP
+  settings and path settings make MediaMTX disconnect the publishers, whose FFmpegs must
+  reconnect (a gap per stream); `restart` is the heavy hammer". `systemctl reload
+  mediamtx-audio` runs it. Exit 7 means "start it instead".
+- Per-device audio settings (`DEVICE_<NAME>_*`) are baked into a running wrapper:
+  `reload` does not apply them (a healthy stream is not restarted); `restart` does.
+- Found while testing, **not fixed** (the wrapper-generation work owns it, and its X-10 test
+  names it): in this tree a generated wrapper dies at the first FFmpeg exit (an unbound
+  `MAX_RESTART_DELAY` / `INITIAL_RESTART_DELAY` under `set -u`: log line `FFmpeg exited with
+  code 224 after 19 seconds` then `Wrapper cleanup initiated (exit code: 1)`), so a
+  publisher dropped by MediaMTX is not reconnected by its wrapper here; `reload` (and
+  `start`) then start the missing wrapper. The live test does not depend on either behaviour.
+- The SIGHUP trap of the interactive manager process (`trap '... restart_mediamtx' HUP`,
+  commented "reload configuration without full restart") still runs a full restart; with
+  `reload` it could call `reload_mediamtx`. Left as is: out of scope, never active under
+  systemd.
+
+### Tests
+
+`tests/test_stream_manager_reload.bats` (13: changed-key detection, the effect table,
+every exit path, no stop/restart/signal on any path, the command and help) and the live
+test `reload against a real MediaMTX ...` at the end of `tests/test_mediamtx_live.bats`
+(driver `tests/reload_e2e.bash`: unchanged reload keeps every PID and the reader never
+stalls; a publisher-safe change is applied with the reader alive; a `logLevel` change is
+reported as disconnecting and both streams are ready again with MediaMTX's PID unchanged;
+a dead wrapper is started and nothing else is touched; stopped -> 7; foreign MediaMTX ->
+8 with nothing touched; the per-key matrix; the unloadable-file exit). About 100 s per
+MediaMTX version.

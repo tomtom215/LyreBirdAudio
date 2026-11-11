@@ -5913,6 +5913,149 @@ restart_mediamtx() {
     start_mediamtx
 }
 
+# What MediaMTX does when it re-reads its configuration file and one top-level
+# key has changed. MediaMTX watches the file itself and applies a change without
+# restarting; no key this script writes needs a restart of the process. What a
+# change does to the publishers that are connected was measured on a real
+# MediaMTX 1.15.0 and 1.21.1 (tests/test_mediamtx_live.bats, "reload"):
+#   publishers stay      api, apiAddress, rtmp, hls, webrtc, srt, a path entry
+#                        that is added
+#   every publisher is   logLevel, readTimeout, writeTimeout, metrics,
+#   disconnected         metricsAddress, rtsp, rtspAddress, rtspTransports
+#   the publishers of    a path entry whose settings change (sourceProtocol)
+#   that path are
+#   disconnected
+# A disconnected publisher's FFmpeg exits; its wrapper restarts it, or the
+# reconcile step of `reload` starts the wrapper again when it is gone.
+# A configuration file that does not load (a syntax error, a key combination
+# MediaMTX refuses) makes the running MediaMTX log the error and exit: that is
+# why `reload` only ever installs what this script generated.
+# Prints one phrase for the key given as $1.
+mediamtx_reload_effect() {
+    case "$1" in
+        api | apiAddress | rtmp | hls | webrtc | srt)
+            printf '%s' "applied live by MediaMTX; connected publishers stay connected"
+            ;;
+        logLevel | readTimeout | writeTimeout | metrics | metricsAddress | rtsp | rtspAddress | rtspTransports)
+            printf '%s' "applied live by MediaMTX, which disconnects every publisher; each stream's FFmpeg has to reconnect (its wrapper restarts it; a wrapper that is gone is started again by this reload)"
+            ;;
+        paths)
+            printf '%s' "applied live by MediaMTX; the publishers of a path entry that changed are disconnected and have to reconnect, other paths are untouched"
+            ;;
+        *)
+            printf '%s' "applied live by MediaMTX; whether connected publishers stay was not verified for this key"
+            ;;
+    esac
+}
+
+# Print the names of the top-level keys whose text differs between two
+# configuration texts ($1 old, $2 new), one per line. A key's text is its line
+# and the indented lines under it ("paths:" is one key); comments and blank
+# lines do not count.
+mediamtx_changed_keys() {
+    local -A old_blocks=() new_blocks=()
+    local line key
+    local -a order=()
+    while IFS=$'\t' read -r key line; do
+        [[ -n "$key" ]] || continue
+        old_blocks["$key"]="$line"
+        order+=("$key")
+    done < <(_mediamtx_config_blocks "$1")
+    while IFS=$'\t' read -r key line; do
+        [[ -n "$key" ]] || continue
+        new_blocks["$key"]="$line"
+        if [[ -z "${old_blocks[$key]+set}" ]]; then
+            order+=("$key")
+        fi
+    done < <(_mediamtx_config_blocks "$2")
+    for key in "${order[@]}"; do
+        if [[ "${old_blocks[$key]-}" != "${new_blocks[$key]-}" ]]; then
+            printf '%s\n' "$key"
+        fi
+    done
+}
+
+# One line per top-level key of the configuration text $1: "<key><TAB><block>",
+# the block being the key's lines joined with a literal \n
+_mediamtx_config_blocks() {
+    printf '%s\n' "$1" | awk '
+        /^[A-Za-z][A-Za-z0-9]*:/ {
+            if (key != "") print key "\t" block
+            key = $0
+            sub(/:.*/, "", key)
+            block = $0
+            next
+        }
+        /^[[:space:]]*(#.*)?$/ { next }
+        key != "" { block = block "\\n" $0 }
+        END { if (key != "") print key "\t" block }
+    '
+}
+
+# Reload (the `reload` command, ExecReload= of the unit): re-render the MediaMTX
+# configuration and let the running MediaMTX apply it, then reconcile the
+# streams, without an outage this script causes.
+#
+# - Nothing is stopped or restarted. MediaMTX applies a changed file by itself
+#   (mediamtx_reload_effect says per key what that does to the publishers); an
+#   unchanged configuration leaves everything alone.
+# - The streams are reconciled by the idempotent start path: a stream whose
+#   wrapper is running is not touched, a missing one is started.
+# - It acts only on the MediaMTX this manager started: another owner is refused
+#   (E_OWNERSHIP), a MediaMTX that is not running is reported (E_MEDIAMTX_DOWN;
+#   use start). It never leaves the cleanup marker, which would stop the
+#   wrappers.
+reload_mediamtx() {
+    SKIP_CLEANUP=true
+    if ! acquire_lock; then
+        log ERROR "Refusing to reload: another lifecycle command holds the lock (${LOCK_FILE})"
+        return "${E_LOCK_FAILED}"
+    fi
+
+    local foreign_owner=""
+    if foreign_owner="$(foreign_mediamtx_owner)"; then
+        log ERROR "Refusing to reload: ${foreign_owner}"
+        return "${E_OWNERSHIP}"
+    fi
+
+    local mtx_pid=""
+    if ! mtx_pid="$(owned_mediamtx_pid)"; then
+        log ERROR "Cannot reload: the MediaMTX of this manager is not running (use start)"
+        return "${E_MEDIAMTX_DOWN}"
+    fi
+
+    local old_text="" new_text=""
+    if [[ -f "${CONFIG_FILE}" ]]; then
+        old_text="$(cat "${CONFIG_FILE}")"
+    fi
+    if ! generate_mediamtx_config; then
+        log ERROR "Reload failed: the MediaMTX configuration could not be generated; MediaMTX (PID ${mtx_pid}) was left alone"
+        return "${E_CONFIG_ERROR}"
+    fi
+    new_text="$(cat "${CONFIG_FILE}")"
+
+    if [[ "$old_text" == "$new_text" ]]; then
+        log INFO "MediaMTX configuration is unchanged; nothing for MediaMTX (PID ${mtx_pid}) to reload"
+    else
+        local key
+        while IFS= read -r key; do
+            log INFO "MediaMTX configuration key '${key}' changed: $(mediamtx_reload_effect "$key")"
+        done < <(mediamtx_changed_keys "$old_text" "$new_text")
+        # MediaMTX notices the file by itself; give it a moment, then make sure
+        # it survived the change and answers again
+        sleep 1
+        if ! wait_for_mediamtx_ready "$mtx_pid"; then
+            log ERROR "MediaMTX (PID ${mtx_pid}) did not come back after the new configuration was written to ${CONFIG_FILE}; run restart"
+            return "${E_GENERAL}"
+        fi
+        log INFO "MediaMTX (PID ${mtx_pid}) is running with the new configuration; it was not restarted"
+    fi
+
+    local rc=0
+    start_mediamtx || rc=$?
+    return "$rc"
+}
+
 # Show status
 show_status() {
     SKIP_CLEANUP=true
@@ -6225,6 +6368,13 @@ Commands:
                 --yes it only prints those processes and why, signals nothing
                 and exits 1.
     restart     Restart everything
+    reload      Re-render the MediaMTX configuration and let the running MediaMTX
+                apply it, then start any stream that is missing. Nothing is
+                stopped or restarted by the manager: a stream that is running is
+                left alone. Says which changed keys make MediaMTX disconnect
+                its publishers (their wrappers reconnect them). Exit 7 when
+                MediaMTX is not running (use start), 8 when another MediaMTX
+                owns the node. This is what systemd's ExecReload= runs.
     status      Show current status
     config      Show device configuration
     monitor     Check resource usage and stream health
@@ -6363,6 +6513,8 @@ parse_arguments() {
 #   stop        - Checks root, dependencies, directories, then stops service
 #   force-stop  - Checks root, directories, then force-stops service
 #   restart     - Checks root, dependencies, directories, then restarts service
+#   reload      - Checks root, dependencies, directories, then re-renders the
+#                 MediaMTX config and reconciles streams without restarting
 #   status      - Shows current status (no root check)
 #   config      - Shows configuration (no root check)
 #   monitor     - Checks root, directories, resources, then monitors streams
@@ -6431,6 +6583,14 @@ main() {
             check_dependencies
             setup_directories
             restart_mediamtx
+            exit_code=$?
+            ;;
+        reload)
+            check_root
+            check_dependencies
+            setup_directories
+            validate_config || error_exit "Configuration validation failed" ${E_CONFIG_ERROR}
+            reload_mediamtx
             exit_code=$?
             ;;
         status)
