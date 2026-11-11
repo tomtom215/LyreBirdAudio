@@ -753,6 +753,39 @@ _state() { echo "$REPO/.git/lyrebird-updater"; }
     grep -q $'\tupdate\tok\t' "$REPO/.git/lyrebird-updater/history.log"
 }
 
+@test "journal and history writes go through lyrebird_atomic_write when the shared library is loaded" {
+    run bash -c '
+        source "$1"
+        spydir="$2"
+        lyrebird_atomic_write() { echo "called: $1 $2" >"$spydir/spy"; cat >"$1"; }
+        printf "x\n" | updater_atomic_write "$spydir/target" 0600' _ "$REPO/lyrebird-updater.sh" "$NODE"
+    [ "$status" -eq 0 ]
+    grep -q "called: $NODE/target 0600" "$NODE/spy"
+    [ "$(cat "$NODE/target")" = "x" ]
+}
+
+@test "without the shared library the same write is atomic and leaves no temp file (local copy)" {
+    mkdir -p "$NODE/w"
+    echo "old" >"$NODE/w/target"
+    run bash -c '
+        source "$1"
+        unset -f lyrebird_atomic_write lyrebird_fsync_path
+        printf "new\n" | updater_atomic_write "$2/target" 0600' _ "$REPO/lyrebird-updater.sh" "$NODE/w"
+    [ "$status" -eq 0 ]
+    [ "$(cat "$NODE/w/target")" = "new" ]
+    [ "$(stat -c %a "$NODE/w/target")" = "600" ]
+    [ "$(ls -A "$NODE/w" | wc -l)" -eq 1 ] # no leftover temp file
+    # a failing writer leaves the old content in place
+    run bash -c '
+        source "$1"
+        unset -f lyrebird_atomic_write lyrebird_fsync_path
+        chmod() { return 1; }
+        printf "newer\n" | updater_atomic_write "$2/target" 0600' _ "$REPO/lyrebird-updater.sh" "$NODE/w"
+    [ "$status" -ne 0 ]
+    [ "$(cat "$NODE/w/target")" = "new" ]
+    [ "$(ls -A "$NODE/w" | wc -l)" -eq 1 ]
+}
+
 @test "an unreadable transaction journal stops a changing run with exit 8 and touches nothing" {
     updater_checkout v1.1.0
     mkdir -p "$(_state)"
