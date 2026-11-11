@@ -389,8 +389,14 @@
       "title": "SECURITY-GUIDE: literal password, regex prefix, bind scope, WebRTC",
       "severity": "P1",
       "phase": 7,
-      "status": "open",
-      "tests": []
+      "status": "fixed",
+      "tests": [
+        "SECURITY-GUIDE never uses shell-style interpolation in a MediaMTX pass line",
+        "SECURITY-GUIDE regular-expression paths carry MediaMTX's ~ prefix",
+        "SECURITY-GUIDE authentication example keeps a loopback-only password-less local user",
+        "SECURITY-GUIDE documents the MTX_ environment override instead of YAML interpolation",
+        "SECURITY-GUIDE does not call WebRTC open by default or the API localhost-only by bind scope"
+      ]
     },
     {
       "id": "DOC-02",

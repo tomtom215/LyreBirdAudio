@@ -28,13 +28,19 @@ This guide covers **optional** security features for LyreBirdAudio deployments. 
 
 ## Security Model Overview
 
-LyreBirdAudio has three main network interfaces:
+LyreBirdAudio's generated MediaMTX configuration has three network listeners:
 
 | Interface | Default Port | Purpose | Default Security |
 |-----------|--------------|---------|------------------|
-| RTSP | 8554 | Audio streaming | Open (no auth) |
-| RTSP API | 9997 | Stream management | Localhost only |
-| WebRTC | 8889 | Browser streaming | Open (no auth) |
+| RTSP | 8554 | Audio streaming | Open: anyone who can reach the port can read **and publish** |
+| Control API | 9997 | Stream management; used by the manager's own health checks | The listener accepts connections on all interfaces, but MediaMTX's default policy authorizes API calls from the local machine only (other callers get `401`) |
+| Metrics | 9998 | MediaMTX's own Prometheus metrics | Same as the control API |
+
+The stream manager's generated configuration disables WebRTC, HLS, RTMP and SRT
+(MediaMTX itself enables WebRTC on 8889 by default). The configuration written by
+`install_mediamtx.sh` disables WebRTC, HLS and RTMP but leaves MediaMTX's SRT (and,
+on 1.19+, MoQ) listeners at their defaults until the stream manager next
+regenerates the file.
 
 **Default behavior:** Suitable for home networks where all devices are trusted.
 
@@ -67,7 +73,14 @@ LyreBirdAudio has three main network interfaces:
 
 ## RTSP Authentication
 
-### Option 1: Internal Authentication (Recommended for Simplicity)
+### Option 1: Internal Authentication (Recommended)
+
+This suite's publishers (the FFmpeg processes) and health checks run on the same
+machine and connect to MediaMTX at `localhost` **without credentials**. Defining
+`authInternalUsers` *replaces* MediaMTX's built-in default users, so the file must
+keep a password-less user for the local machine that may publish, read and call
+the API. Without it the stream manager's publishers are refused (`401`) and its
+readiness and health probes fail. Remote listeners then need passwords.
 
 Edit `/etc/mediamtx/mediamtx.yml`:
 
@@ -84,64 +97,96 @@ authMethod: internal
 
 # Internal users (used when authMethod is "internal")
 authInternalUsers:
-  # Admin user - can publish and read all streams
-  - user: admin
-    pass: your_secure_password_here
+  # This machine: publishers, health checks, API. No password, loopback only.
+  - user: any
+    pass:
+    ips: ['127.0.0.1', '::1']
     permissions:
       - action: publish
       - action: read
       - action: playback
       - action: api
+      - action: metrics
+      - action: pprof
 
-  # Read-only user - can only view streams
-  - user: viewer
-    pass: viewer_password_here
+  # Remote listener - can view every stream
+  - user: listener
+    pass: change_me
     permissions:
       - action: read
-        path: "^.*$"
+      - action: playback
 
-  # Specific stream user - can only access certain streams
+  # Remote listener limited to two streams.
+  # A path that starts with '~' is a regular expression; without it, the
+  # value is a literal path name.
   - user: birdwatcher
-    pass: bird_password_here
+    pass: change_me_too
     permissions:
       - action: read
-        path: "^(mic1|mic2)$"
+        path: '~^(mic1|mic2)$'
 ```
 
-### Option 2: Using Environment Variables (More Secure)
+Checked against MediaMTX 1.21.1 with this file: a local publisher without
+credentials works; an anonymous reader or publisher connecting from a
+non-loopback address is refused with `401`; `listener` can read; a user that only
+has `read` cannot publish; `birdwatcher` is refused on a path outside the regular
+expression.
 
-For production deployments, avoid hardcoding passwords:
+> **Note:** `lyrebird-stream-manager.sh` currently regenerates
+> `/etc/mediamtx/mediamtx.yml` on every `start`, which discards these edits
+> (finding LB-22 in [`REMEDIATION-2026-11.md`](REMEDIATION-2026-11.md)). Check the
+> file after a restart until that is fixed.
 
-```yaml
-authInternalUsers:
-  - user: admin
-    pass: "${MEDIAMTX_ADMIN_PASSWORD}"
-    permissions:
-      - action: publish
-      - action: read
-      - action: api
-```
+### Option 2: Passwords from the Environment (Keeps Secrets Out of the File)
 
-Then set the environment variable in your systemd service:
+MediaMTX does **not** expand `${VAR}` inside its YAML file: a line such as
+`pass: "${MEDIAMTX_ADMIN_PASSWORD}"` makes the literal text
+`${MEDIAMTX_ADMIN_PASSWORD}` the password. (Verified on MediaMTX 1.21.1: that
+literal string was accepted and the value of the environment variable was
+refused.) Never use that form.
+
+MediaMTX instead lets an environment variable named `MTX_` plus the upper-cased
+parameter path override any setting. List entries are addressed by their
+zero-based position, so the password of the second user in the list above
+(`listener`, index 1) is `MTX_AUTHINTERNALUSERS_1_PASS`. Keep a placeholder in the
+file and put the real value in the environment of the process that starts
+MediaMTX:
 
 ```bash
+# stand-alone MediaMTX installs
 sudo systemctl edit mediamtx
+# stream-manager installs (the manager starts MediaMTX as its child process)
+sudo systemctl edit mediamtx-audio
 ```
 
 Add:
 ```ini
 [Service]
-Environment="MEDIAMTX_ADMIN_PASSWORD=your_secure_password"
+Environment="MTX_AUTHINTERNALUSERS_1_PASS=your_secure_password"
 ```
+
+(Verified: with the variable set, the file's placeholder was refused and the
+variable's value accepted. That a unit's `Environment=` reaches MediaMTX through
+the manager follows from the manager starting MediaMTX as a plain child process;
+it was not exercised through systemd.)
+
+### Option 3: Store a Hash Instead of the Password
+
+```bash
+printf '%s' 'the_password' | openssl dgst -sha256 -binary | base64
+```
+
+Use the output as `pass: sha256:<output>` (verified on MediaMTX 1.21.1: the right
+password is accepted, a wrong one is refused with `401`).
 
 ### Connecting with Authentication
 
 ```bash
 # VLC
-vlc rtsp://admin:your_password@hostname:8554/stream_name
+vlc rtsp://listener:your_password@hostname:8554/stream_name
 
 # FFplay
-ffplay rtsp://admin:your_password@hostname:8554/stream_name
+ffplay rtsp://listener:your_password@hostname:8554/stream_name
 
 # In streaming software, use URL format:
 # rtsp://username:password@host:port/path
@@ -149,12 +194,15 @@ ffplay rtsp://admin:your_password@hostname:8554/stream_name
 
 ### Testing Authentication
 
+Run these from **another machine**: with the loopback-only `any` user from Option 1,
+connections from the recorder itself never need a password.
+
 ```bash
-# Should fail (no credentials)
-ffprobe rtsp://localhost:8554/mic1
+# Should fail with 401 Unauthorized (no credentials)
+ffprobe rtsp://hostname:8554/mic1
 
 # Should succeed (with credentials)
-ffprobe rtsp://admin:your_password@localhost:8554/mic1
+ffprobe rtsp://listener:your_password@hostname:8554/mic1
 ```
 
 ---
@@ -287,14 +335,17 @@ authInternalUsers:
       - action: api
 ```
 
-API calls then require authentication:
+Callers on other machines then require authentication (calls from the recorder
+itself keep working without a password through the loopback-only `any` user from
+[RTSP Authentication](#rtsp-authentication), which the manager's health checks
+rely on):
 
 ```bash
-# Without auth (will fail if auth enabled)
-curl http://localhost:9997/v3/paths/list
+# From another machine, without auth (fails with 401)
+curl http://hostname:9997/v3/paths/list
 
 # With auth
-curl -u api_admin:api_password http://localhost:9997/v3/paths/list
+curl -u api_admin:api_password http://hostname:9997/v3/paths/list
 ```
 
 ---
