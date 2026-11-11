@@ -15,6 +15,9 @@ setup() {
     export LOCK_FILE="$(mktemp)"
     export BACKUP_DIR="$(mktemp -d)"
     export SERVICE_BACKUP_DIR="$(mktemp -d)"
+    # The updater keeps its lock, history and journal in its state directory;
+    # point it at a private one so no test writes into this checkout's .git.
+    export LYREBIRD_UPDATER_STATE_DIR="$(mktemp -d)"
 
     # Keep the git fixtures independent of the developer's git config (e.g.
     # commit.gpgsign or push.negotiate would break the fixture commits/pushes).
@@ -35,6 +38,7 @@ teardown() {
     rm -f "$LOCK_FILE" 2>/dev/null || true
     rm -rf "$BACKUP_DIR" 2>/dev/null || true
     rm -rf "$SERVICE_BACKUP_DIR" 2>/dev/null || true
+    rm -rf "$LYREBIRD_UPDATER_STATE_DIR" 2>/dev/null || true
 }
 
 # ============================================================================

@@ -78,7 +78,41 @@ readonly SCRIPT_NAME
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly SCRIPT_DIR
 readonly VERSION="1.6.1"
-readonly LOCKFILE="${SCRIPT_DIR}/.lyrebird-updater.lock"
+
+# Updater state: the lock, the update history and the transaction journal live
+# in a directory INSIDE the git directory, never in the working tree. A lock in
+# the working tree is an untracked file: every run then reported "local
+# modifications", `git stash -u` removed the lock for the whole checkout, and
+# a stash created by one process could not be restored by the re-exec'd one
+# (it collided with the new process's own lock). LYREBIRD_UPDATER_STATE_DIR
+# overrides the location (used by the test suite).
+_updater_git_dir() {
+    local dot_git="${SCRIPT_DIR}/.git" line gitdir
+    if [[ -d "$dot_git" ]]; then
+        printf '%s' "$dot_git"
+    elif [[ -f "$dot_git" ]] && IFS= read -r line <"$dot_git" && [[ "$line" == "gitdir: "* ]]; then
+        # Linked worktree or submodule: ".git" is a file naming the real directory
+        gitdir="${line#gitdir: }"
+        [[ "$gitdir" == /* ]] || gitdir="${SCRIPT_DIR}/${gitdir}"
+        printf '%s' "$gitdir"
+    else
+        return 1
+    fi
+}
+if [[ -n "${LYREBIRD_UPDATER_STATE_DIR:-}" ]]; then
+    UPDATER_STATE_DIR="$LYREBIRD_UPDATER_STATE_DIR"
+elif _updater_state_git_dir="$(_updater_git_dir)"; then
+    UPDATER_STATE_DIR="${_updater_state_git_dir}/lyrebird-updater"
+else
+    # Not a git repository: check_git_repository reports that; the directory
+    # only has to exist for the lock until then.
+    UPDATER_STATE_DIR="${SCRIPT_DIR}/.lyrebird-updater"
+fi
+unset _updater_state_git_dir
+readonly UPDATER_STATE_DIR
+readonly LOCKFILE="${UPDATER_STATE_DIR}/lock"
+# Where updaters before 1.7.0 kept the lock (an untracked directory in the repo)
+readonly LEGACY_LOCKFILE="${SCRIPT_DIR}/.lyrebird-updater.lock"
 
 # Repository configuration
 readonly REPO_OWNER="tomtom215"
@@ -255,18 +289,49 @@ log_step() {
 # Lock File Management
 ################################################################################
 
+# True (0) while an updater older than 1.7.0 still holds its in-tree lock. A
+# lock left by a dead one is removed: as an untracked directory it would
+# otherwise show up as a local modification of the repository forever.
+legacy_lock_held() {
+    [[ -d "$LEGACY_LOCKFILE" ]] || return 1
+    local legacy_pid="" legacy_cmdline=""
+    if [[ -f "${LEGACY_LOCKFILE}/pid" ]]; then
+        legacy_pid="$(cat "${LEGACY_LOCKFILE}/pid" 2>/dev/null || true)"
+    fi
+    if [[ "$legacy_pid" =~ ^[0-9]+$ && "$legacy_pid" != "$$" ]] && kill -0 "$legacy_pid" 2>/dev/null; then
+        legacy_cmdline="$(tr '\0' ' ' <"/proc/${legacy_pid}/cmdline" 2>/dev/null || true)"
+        if [[ "$legacy_cmdline" == *"lyrebird-updater"* ]]; then
+            return 0
+        fi
+    fi
+    rm -rf "$LEGACY_LOCKFILE" 2>/dev/null || true
+    return 1
+}
+
 acquire_lock() {
     local waited=0
 
-    # Verify SCRIPT_DIR is writable before attempting lock file operations
-    if [[ ! -w "$SCRIPT_DIR" ]]; then
-        log_error "Cannot write to script directory: $SCRIPT_DIR"
-        log_info "The lock file needs to be created in this directory"
+    # The lock lives in the updater state directory (inside the git directory)
+    if ! mkdir -p "$UPDATER_STATE_DIR" 2>/dev/null || [[ ! -w "$UPDATER_STATE_DIR" ]]; then
+        log_error "Cannot write to updater state directory: $UPDATER_STATE_DIR"
+        log_info "The lock file, update history and transaction journal are kept there"
         log_info "Permission denied or directory is read-only"
         return "$E_PERMISSION"
     fi
 
     while true; do
+        # An old updater (< 1.7.0) running at the same time holds the old lock
+        if legacy_lock_held; then
+            if [[ $waited -ge $LOCK_MAX_WAIT ]]; then
+                log_error "Another (older) updater instance is running: $LEGACY_LOCKFILE"
+                return "$E_LOCKED"
+            fi
+            [[ $waited -eq 0 ]] && log_info "Waiting for other instance to finish..."
+            sleep 1
+            ((waited++)) || true
+            continue
+        fi
+
         # ATOMIC OPERATION: mkdir fails if directory exists
         if mkdir "$LOCKFILE" 2>/dev/null; then
             # Write PID atomically using temp file + rename
