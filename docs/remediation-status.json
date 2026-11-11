@@ -46,7 +46,27 @@
       "severity": "P1",
       "phase": 2,
       "status": "open",
-      "tests": []
+      "tests": [
+        "a held lock is not granted to a second process [LB-05, bash invocation]",
+        "a held lock is not granted to a second process [LB-05, direct execution]",
+        "a live owner is never judged stale because the lock file is old [LB-05, bash invocation]",
+        "a live owner is never judged stale because the lock file is old [LB-05, direct execution]",
+        "a process waiting for the lock never truncates the owner record [LB-05, bash invocation]",
+        "a process waiting for the lock never truncates the owner record [LB-05, direct execution]",
+        "owner plus two openers: exactly one holder at a time [LB-05, bash invocation]",
+        "owner plus two openers: exactly one holder at a time [LB-05, direct execution]",
+        "the lock is released when its holder is SIGKILLed; the next acquire reuses the same file [LB-05, bash invocation]",
+        "the lock is released when its holder is SIGKILLed; the next acquire reuses the same file [LB-05, direct execution]",
+        "stress: 8 processes x 25 locked increments lose no update [LB-05, direct execution]",
+        "stress: 6 processes x 20 locked increments lose no update [LB-05, bash invocation]",
+        "cleanup_stale_processes removes neither lock file [LB-05]",
+        "force_stop_mediamtx waits for the lock and refuses, touching nothing, while another process holds it [LB-05]",
+        "force_stop_mediamtx takes the lock when it is free, cleans up and leaves the lock file in place [LB-05]",
+        "a force-stop started while another command holds the lock waits for it, then goes ahead [LB-05]",
+        "stop_mediamtx refuses, touching nothing, while another process holds the lock [LB-05]",
+        "a start that cannot get the lock leaves no cleanup marker behind [LB-05]"
+      ],
+      "note": "lifecycle commands (start/stop/restart/force-stop/config lock) covered and verified; monitor does not yet take the lifecycle lock (owned by the lifecycle phase); mark fixed once it does"
     },
     {
       "id": "LB-06",
@@ -275,8 +295,16 @@
       "title": "lock FD inherited by child processes",
       "severity": "P1",
       "phase": 2,
-      "status": "open",
-      "tests": []
+      "status": "fixed",
+      "tests": [
+        "spawn_detached starts the command itself with no descriptor above stderr, even an inherited one [X-02]",
+        "spawn_detached refuses to run in the foreground, where it would replace the manager itself [X-02]",
+        "every nohup launch in the script goes through spawn_detached [X-02]",
+        "the MediaMTX child holds no lock descriptor, so the lock is free once the launcher exits [X-02]",
+        "a multiplex wrapper and its ffmpeg hold no lock descriptor, so the lock is free once the launcher exits [X-02]",
+        "a per-stream wrapper and its ffmpeg hold no lock descriptor, so the lock is free once the launcher exits [X-02]",
+        "stop after start in one process does not wait for a lock its own child kept alive [X-02]"
+      ]
     },
     {
       "id": "X-03",
@@ -307,8 +335,10 @@
       "title": "exec redirection leaves stderr on /dev/null",
       "severity": "P2",
       "phase": 4,
-      "status": "open",
-      "tests": []
+      "status": "fixed",
+      "tests": [
+        "acquiring and releasing locks leaves the shell's stderr alone [X-06]"
+      ]
     },
     {
       "id": "X-09",
