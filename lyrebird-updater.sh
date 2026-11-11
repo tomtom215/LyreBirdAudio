@@ -3036,6 +3036,11 @@ switch_version_safe() {
         else
             restart_args=("--post-update-complete")
         fi
+        # --rollback is a command, not a menu session: the re-exec'd updater
+        # must finish it and exit, not open the interactive menu on stdin
+        if [[ "$kind" == "rollback" ]]; then
+            restart_args+=("--no-menu")
+        fi
 
         # NOW safe to hand the transaction over (syntax validated). The journal
         # stays, phase "handoff", until the new process has restored the saved
@@ -4058,6 +4063,7 @@ main() {
     esac
 
     # Handle command line arguments
+    local post_update_no_menu=false
     if [[ $# -gt 0 ]]; then
         case "$1" in
             --post-update-restore)
@@ -4071,6 +4077,7 @@ main() {
                 log_step "Restoring your saved changes..."
 
                 local restore_status=0 handoff_note=""
+                [[ "${3:-}" == "--no-menu" ]] && post_update_no_menu=true
                 handoff_load_journal || true
                 restore_saved_changes "$2" || restore_status=$?
                 if [[ $restore_status -eq 0 ]]; then
@@ -4091,6 +4098,9 @@ main() {
                 fi
                 handoff_finish "$handoff_note"
 
+                if [[ "$post_update_no_menu" == "true" ]]; then
+                    exit "$EXIT_STATUS"
+                fi
                 echo
                 read -r -p "Press Enter to continue..." || true
                 ;;
@@ -4099,6 +4109,7 @@ main() {
                 echo
                 log_success "Updater has been updated successfully!"
 
+                [[ "${2:-}" == "--no-menu" ]] && post_update_no_menu=true
                 handoff_load_journal || true
                 # Check for pending service update
                 if check_pending_service_update; then
@@ -4109,6 +4120,9 @@ main() {
                 fi
                 handoff_finish
 
+                if [[ "$post_update_no_menu" == "true" ]]; then
+                    exit "$EXIT_STATUS"
+                fi
                 echo
                 read -r -p "Press Enter to continue..." || true
                 ;;

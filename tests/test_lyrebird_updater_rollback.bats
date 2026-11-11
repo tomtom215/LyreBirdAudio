@@ -170,19 +170,36 @@ _update_to() {
     [ "$(updater_head)" = "v1.2.0" ]
 }
 
-@test "--rollback across a self-update goes through the same hand-over and is recorded once" {
+@test "--rollback across a self-update goes through the same hand-over, is recorded once and never opens the menu" {
     updater_checkout v1.1.0
     updater_stdin 3 v1.3.0 "" q
     updater_run
     [ "$status" -eq 0 ]
     [ "$(updater_head)" = "v1.3.0" ]
-    updater_stdin "" q
+    updater_stdin # nothing on stdin: a command must not wait for a menu answer
     updater_run --rollback
     [ "$status" -eq 0 ]
     [[ "$output" == *"Restarting with updated version"* ]]
+    [[ "$output" != *"=== UPDATE ==="* ]]
     [ "$(updater_head)" = "v1.1.0" ]
     [ "$(grep -c $'\trollback\tok\t' "$HISTORY")" -eq 1 ]
     [ ! -e "$REPO/.git/lyrebird-updater/transaction" ]
+}
+
+@test "--rollback with local changes across a self-update restores them and does not open the menu either" {
+    updater_checkout v1.1.0
+    updater_stdin 3 v1.3.0 "" q
+    updater_run
+    [ "$status" -eq 0 ]
+    echo "precious edit" >>"$REPO/config.txt"
+    updater_stdin y # save my changes; nothing else on stdin
+    updater_run --rollback
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"Restarting with updated version"* ]]
+    [[ "$output" != *"=== UPDATE ==="* ]]
+    [ "$(updater_head)" = "v1.1.0" ]
+    grep -qx "precious edit" "$REPO/config.txt"
+    [ -z "$(git -C "$REPO" stash list)" ]
 }
 
 @test "--rollback to a release whose updater cannot resume finishes in this process" {
