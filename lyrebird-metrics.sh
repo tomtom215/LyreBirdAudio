@@ -7,8 +7,12 @@
 #
 # Usage:
 #   ./lyrebird-metrics.sh              # Output metrics to stdout
-#   ./lyrebird-metrics.sh --serve 9100 # Start HTTP server on port 9100
-#   ./lyrebird-metrics.sh --file /path # Write metrics to file
+#   ./lyrebird-metrics.sh --serve 9100 # HTTP server on 127.0.0.1:9100 (also: serve --port 9100)
+#   ./lyrebird-metrics.sh serve --port 9100 --bind 0.0.0.0   # on every interface (no authentication)
+#   ./lyrebird-metrics.sh --file /path # Write metrics to file (atomic replace)
+#
+# Exit status: 0 ok, 1 command-line error, 2 nothing delivered (file not
+# published / server cannot run), 3 delivered but a collector failed.
 #
 # Integration with Prometheus:
 #   Add to prometheus.yml:
@@ -828,49 +832,595 @@ publish_metrics_file() {
     return "$gen_rc"
 }
 
-# Simple HTTP server using netcat (for basic metrics serving)
-serve_metrics() {
-    local port="${1:-9100}"
-    local nc_pid=""
+# ============================================================================
+# HTTP server (--serve)
+# ============================================================================
+#
+# A small HTTP/1.1 server for `GET /metrics` on top of netcat, one connection at
+# a time. nc is only the socket: for each connection one `nc -l` is started whose
+# stdout (the request) is a pipe we read and whose stdin is a FIFO we write the
+# response to, so the metrics are generated AFTER the request has arrived and are
+# never older than the request.
+#
+# Things this does on purpose, because the previous loop got them wrong:
+#  * binds 127.0.0.1 unless told otherwise (--bind) and says so truthfully;
+#  * knows which netcat it has (OpenBSD, ncat, traditional/GNU, BusyBox) by what
+#    `nc -h` reports and builds the right command line for it, instead of trying
+#    flags until one happens not to fail;
+#  * stops only the nc it started (pid + start time from /proc), never a process
+#    that merely has "nc ... -l ... PORT" somewhere in its command line;
+#  * refuses to start when the port is taken (nc sets SO_REUSEPORT, so a second
+#    nc would bind NEXT TO the first and split its connections) and backs off,
+#    bounded, instead of spinning;
+#  * frames responses correctly (CRLF, Content-Length in bytes, Connection: close).
+#
+# nc accepts one connection and then stops listening, so as soon as a request has
+# arrived the NEXT nc is started, before the metrics are generated: a scraper
+# that arrives while a request is being answered (a second Prometheus, a retry)
+# finds a listener, and its request waits until the current one is done. Requests
+# are still answered one at a time. What is left is a client that connects and
+# sends nothing: it occupies the one armed listener until SERVE_IDLE_ROTATE
+# recycles it. There is no authentication or TLS.
 
-    # Cleanup function to kill any lingering nc processes
-    cleanup_server() {
-        log "Shutting down metrics server..."
-        [[ -n "$nc_pid" ]] && kill "$nc_pid" 2>/dev/null || true
-        # Kill any orphaned nc processes on our port
-        pkill -f "nc.*-l.*$port" 2>/dev/null || true
-        exit 0
-    }
+SERVE_IDLE_ROTATE=10    # seconds an idle listener lives before it is recycled; bounds a client that connects and never sends
+SERVE_REQUEST_TIMEOUT=5 # seconds a client has to deliver the rest of its request after the first line
+SERVE_CLOSE_TIMEOUT=3   # seconds nc has to finish after the response was written before it is stopped
+SERVE_START_ATTEMPTS=5  # consecutive failed listener starts before giving up
+SERVE_RETRY_MS=500      # first back-off after a failed start, doubled each time
+SERVE_BIND_WAIT_MS=3000 # how long a new listener has to show up as bound
 
-    # Set up signal handlers for graceful shutdown
-    trap cleanup_server EXIT INT TERM
+# State of the running server (see serve_metrics). A listener is one nc; there are
+# two slots, the one being served and the one armed for the next connection.
+_SRV_DIR=""      # private temp directory: the FIFOs and nc's stderr
+_SRV_SLEEP=""    # fd of a FIFO nothing writes to: reading it with a timeout is an interruptible sleep
+_SRV_CUR=0       # the slot whose connection is being served
+_L_PID=("" "")   # per slot: pid of the nc we started
+_L_START=("" "") # its start time (field 22 of /proc/PID/stat): pid + start time identify it
+_L_R=("" "")     # fd: nc's stdout (the request)
+_L_W=("" "")     # fd: nc's stdin (the response)
+_L_FIFO=("" "")  # FIFO carrying the response to nc's stdin
+_L_ERR=("" "")   # nc's stderr
+_SRV_PORT=""
+_SRV_BIND=""
+_SRV_NC_BIN=""
+_SRV_NC_VARIANT=""
+_SRV_NC_HELP=""
+_SRV_NC_CMD=()
+_PS_STATE="" # set by read_proc_stat
+_PS_START=""
+_BYTES=0 # set by byte_length
 
-    if ! has_command nc && ! has_command netcat; then
-        log "ERROR: nc (netcat) required for --serve mode"
-        exit 1
+# A TCP port number, 1-65535.
+valid_port() {
+    [[ "$1" =~ ^[0-9]{1,5}$ ]] && ((10#$1 >= 1 && 10#$1 <= 65535))
+}
+
+# An IPv4 dotted quad or an IPv6 literal.
+valid_bind() {
+    local addr="$1" octet
+    if [[ "$addr" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]]; then
+        for octet in "${BASH_REMATCH[@]:1:4}"; do
+            ((10#$octet <= 255)) || return 1
+        done
+        return 0
+    fi
+    [[ "$addr" == *:*:* ]] && [[ "$addr" =~ ^[0-9A-Fa-f:.]+$ ]]
+}
+
+is_wildcard_bind() {
+    [[ "$1" == "0.0.0.0" || "$1" == "::" ]]
+}
+
+is_loopback_bind() {
+    [[ "$1" == 127.* || "$1" == "::1" ]]
+}
+
+# The help text of a netcat binary, which is how its variant is told apart.
+nc_help_text() {
+    local bin="$1"
+    if has_command timeout; then
+        timeout 3 "$bin" -h </dev/null 2>&1 || true
+    else
+        "$bin" -h </dev/null 2>&1 || true
+    fi
+}
+
+# Print the variant a help text belongs to (openbsd, ncat, traditional, busybox),
+# nothing if it is none of them.
+classify_nc() {
+    case "$1" in
+        *BusyBox*) echo busybox ;;
+        Ncat* | *"nmap.org/ncat"*) echo ncat ;;
+        *"OpenBSD netcat"* | *"usage: nc ["*) echo openbsd ;;
+        *"GNU netcat"* | *"[v1.10"* | *"connect to somewhere"*) echo traditional ;;
+        *) ;;
+    esac
+}
+
+# Find a usable netcat: sets _SRV_NC_BIN, _SRV_NC_VARIANT and _SRV_NC_HELP.
+detect_nc() {
+    local candidate bin help variant
+    for candidate in nc ncat netcat; do
+        bin="$(command -v "$candidate" 2>/dev/null)" || continue
+        [[ "$bin" == /* ]] || continue
+        help="$(nc_help_text "$bin")"
+        variant="$(classify_nc "$help")"
+        if [[ -n "$variant" ]]; then
+            _SRV_NC_BIN="$bin"
+            _SRV_NC_VARIANT="$variant"
+            _SRV_NC_HELP="$help"
+            return 0
+        fi
+        log "WARN: ${bin} is not a netcat variant this server knows how to drive; skipping it"
+    done
+    return 1
+}
+
+# Build the listen command for the detected variant into _SRV_NC_CMD. The
+# end-of-response handling is chosen from what the variant's help advertises:
+# `-q 0` (quit right after EOF on stdin) where it exists, else `-N` (shut the
+# socket down after EOF on stdin). Returns 1 if the variant cannot bind to BIND.
+build_nc_command() {
+    local bind="$1" port="$2" help="$_SRV_NC_HELP"
+    local re_has_n='\[-[A-Za-z0-9]*N'
+
+    case "$_SRV_NC_VARIANT" in
+        openbsd)
+            _SRV_NC_CMD=("$_SRV_NC_BIN" -l)
+            if [[ "$help" == *"[-q "* ]]; then
+                _SRV_NC_CMD+=(-q 0)
+            elif [[ "$help" =~ $re_has_n ]]; then
+                _SRV_NC_CMD+=(-N)
+            fi
+            _SRV_NC_CMD+=("$bind" "$port")
+            ;;
+        ncat)
+            _SRV_NC_CMD=("$_SRV_NC_BIN" -l "$bind" "$port")
+            ;;
+        traditional)
+            _SRV_NC_CMD=("$_SRV_NC_BIN" -l -p "$port" -s "$bind")
+            if [[ "$help" == *"-q secs"* ]]; then
+                _SRV_NC_CMD+=(-q 0)
+            fi
+            ;;
+        busybox)
+            if [[ "$help" == *"-s ADDR"* ]]; then
+                _SRV_NC_CMD=("$_SRV_NC_BIN" -l -p "$port" -s "$bind")
+            elif is_wildcard_bind "$bind"; then
+                _SRV_NC_CMD=("$_SRV_NC_BIN" -l -p "$port")
+            else
+                log "ERROR: this BusyBox nc cannot bind to a given address (no -s); use --bind 0.0.0.0 or install netcat-openbsd"
+                return 1
+            fi
+            ;;
+        *)
+            log "ERROR: no usable netcat variant"
+            return 1
+            ;;
+    esac
+    return 0
+}
+
+# Interruptible sleep (a signal ends it at once): a timed read of a FIFO that is
+# never written to. Takes seconds, fractions allowed.
+srv_sleep() {
+    read -r -t "$1" -u "$_SRV_SLEEP" _ || true
+}
+
+# Set _PS_STATE and _PS_START from /proc/PID/stat; returns 1 if there is no such
+# process. The command name is the only field that can contain spaces and is
+# enclosed in parentheses, so everything up to the last ") " is skipped.
+read_proc_stat() {
+    # the shutdown trap can interrupt `IFS= read` with that IFS still in effect
+    local IFS=$' \t\n'
+    local stat rest
+    local -a fields
+    _PS_STATE=""
+    _PS_START=""
+    { read -r stat <"/proc/$1/stat"; } 2>/dev/null || return 1
+    rest="${stat##*) }"
+    read -r -a fields <<<"$rest"
+    _PS_STATE="${fields[0]:-}"
+    _PS_START="${fields[19]:-}"
+    return 0
+}
+
+# Is the nc we started in slot $1 still running? A pid alone could have been
+# reused; its start time cannot. A zombie counts as gone.
+listener_alive() {
+    local slot="$1"
+    [[ -n "${_L_PID[slot]}" ]] || return 1
+    read_proc_stat "${_L_PID[slot]}" || return 1
+    [[ "$_PS_STATE" != "Z" && "$_PS_STATE" != "X" ]] || return 1
+    [[ -z "${_L_START[slot]}" || "$_PS_START" == "${_L_START[slot]}" ]]
+}
+
+# The tcp tables to look at (IPv4 and, where present, IPv6).
+_tcp_tables() {
+    local table
+    for table in /proc/net/tcp /proc/net/tcp6; do
+        [[ -r "$table" ]] && echo "$table"
+    done
+    return 0
+}
+
+# Is something already listening on PORT where we want to bind? Needed because nc
+# sets SO_REUSEPORT: a second nc on the same address binds without error and the
+# kernel then splits the connections between the two, so "nc failed" cannot be
+# relied on to notice a taken port. Returns 0 if a listener is there.
+port_in_use() {
+    local port="$1" bind="$2" hexport bindhex="" wild=0
+    local -a tables
+    mapfile -t tables < <(_tcp_tables)
+    ((${#tables[@]} > 0)) || return 1
+    printf -v hexport '%04X' "$((10#$port))"
+    if is_wildcard_bind "$bind"; then
+        wild=1
+    elif [[ "$bind" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+        # /proc/net/tcp shows an IPv4 address as its bytes in reverse order
+        printf -v bindhex '%02X%02X%02X%02X' "$((10#${BASH_REMATCH[4]}))" "$((10#${BASH_REMATCH[3]}))" \
+            "$((10#${BASH_REMATCH[2]}))" "$((10#${BASH_REMATCH[1]}))"
+    fi
+    awk -v port="$hexport" -v bind="$bindhex" -v wild="$wild" '
+        $4 == "0A" {
+            split($2, a, ":")
+            if (a[2] == port && (wild == 1 || a[1] ~ /^0+$/ || (bind != "" && a[1] == bind))) found = 1
+        }
+        END { exit(found ? 0 : 1) }' "${tables[@]}" 2>/dev/null
+}
+
+# Does the nc we started own a listening socket on PORT? Compares the inodes of
+# its sockets with those of the listeners in /proc/net/tcp*. Returns 2 where /proc
+# cannot tell.
+listener_bound() {
+    local pid="$1" port="$2" hexport inodes link fd
+    local -a tables
+    mapfile -t tables < <(_tcp_tables)
+    ((${#tables[@]} > 0)) || return 2
+    printf -v hexport '%04X' "$((10#$port))"
+    inodes="$(awk -v port="$hexport" '$4 == "0A" { split($2, a, ":"); if (a[2] == port) print $10 }' "${tables[@]}" 2>/dev/null)" || true
+    [[ -n "$inodes" ]] || return 1
+    for fd in /proc/"$pid"/fd/*; do
+        link="$(readlink "$fd" 2>/dev/null)" || continue
+        [[ "$link" =~ ^socket:\[([0-9]+)\]$ ]] || continue
+        case $'\n'"$inodes"$'\n' in
+            *$'\n'"${BASH_REMATCH[1]}"$'\n'*) return 0 ;;
+        esac
+    done
+    return 1
+}
+
+# Wait for the listener in slot $1 to be bound. 0 = bound (or running, where /proc
+# cannot confirm it and it survived a short wait), 1 = it died or never bound.
+wait_listener_bound() {
+    local slot="$1" waited=0 rc=0
+    while ((waited < SERVE_BIND_WAIT_MS)); do
+        rc=0
+        listener_bound "${_L_PID[slot]}" "$_SRV_PORT" || rc=$?
+        if ((rc == 0)); then
+            return 0
+        elif ((rc == 2)); then
+            srv_sleep 0.3
+            listener_alive "$slot"
+            return $?
+        fi
+        listener_alive "$slot" || return 1
+        srv_sleep 0.05
+        waited=$((waited + 50))
+    done
+    return 1
+}
+
+# Start nc listening in slot $1 and record its pid. The pid is taken from the
+# subshell that becomes nc by exec, so it is nc's own. The write end of the FIFO
+# is opened read-write only AFTER nc was started, and nc is made to close every
+# listener fd it inherited: a write end of ITS stdin FIFO left open anywhere else
+# would keep it from ever seeing EOF.
+start_listener() {
+    local slot="$1" pid="" rfd="" wfd="" ofd
+    local fifo="${_L_FIFO[slot]}" err="${_L_ERR[slot]}"
+    : >"$err"
+    _L_PID[slot]=""
+    _L_START[slot]=""
+    exec {rfd}< <(
+        printf '%s\n' "$BASHPID"
+        for ofd in "${_L_W[@]}" "${_L_R[@]}" "$_SRV_SLEEP"; do
+            [[ -z "$ofd" ]] || exec {ofd}>&-
+        done
+        exec "${_SRV_NC_CMD[@]}" <"$fifo" 2>"$err"
+    ) || return 1
+    _L_R[slot]="$rfd"
+    if ! exec {wfd}<>"$fifo"; then
+        stop_listener "$slot"
+        return 1
+    fi
+    _L_W[slot]="$wfd"
+    if ! IFS= read -r -t 5 -u "$rfd" pid || [[ ! "$pid" =~ ^[0-9]+$ ]]; then
+        stop_listener "$slot"
+        return 1
+    fi
+    _L_PID[slot]="$pid"
+    if read_proc_stat "$pid"; then
+        _L_START[slot]="$_PS_START"
+    fi
+    return 0
+}
+
+# Stop the nc we started in slot $1 (only that one), and close our ends.
+stop_listener() {
+    local slot="$1" i fd
+    fd="${_L_W[slot]}"
+    if [[ -n "$fd" ]]; then
+        exec {fd}>&-
+        _L_W[slot]=""
+    fi
+    fd="${_L_R[slot]}"
+    if [[ -n "$fd" ]]; then
+        exec {fd}<&-
+        _L_R[slot]=""
+    fi
+    if listener_alive "$slot"; then
+        kill "${_L_PID[slot]}" 2>/dev/null || true
+        for ((i = 0; i < 40; i++)); do
+            listener_alive "$slot" || break
+            srv_sleep 0.05
+        done
+        if listener_alive "$slot"; then
+            kill -KILL "${_L_PID[slot]}" 2>/dev/null || true
+        fi
+    fi
+    _L_PID[slot]=""
+    _L_START[slot]=""
+}
+
+# What the nc in slot $1 said on stderr (a bind error, typically), on one line.
+listener_error() {
+    local line=""
+    { read -r line <"${_L_ERR[$1]}"; } 2>/dev/null || true
+    printf '%s' "$line"
+}
+
+# Number of bytes in a string, whatever the locale: sets _BYTES. ${#var} counts
+# characters in a UTF-8 locale, and Content-Length is a count of bytes.
+byte_length() {
+    local LC_ALL=C
+    _BYTES=${#1}
+}
+
+http_status_text() {
+    case "$1" in
+        200) printf 'OK' ;;
+        400) printf 'Bad Request' ;;
+        404) printf 'Not Found' ;;
+        405) printf 'Method Not Allowed' ;;
+        *) printf 'Internal Server Error' ;;
+    esac
+}
+
+# Write one complete HTTP/1.1 response to nc: CRLF line endings, Content-Length
+# in bytes, Connection: close. Usage: send_response CODE CONTENT-TYPE BODY [HEADER]
+send_response() {
+    local code="$1" ctype="$2" body="$3" extra="${4:-}" response
+    byte_length "$body"
+    response="HTTP/1.1 ${code} $(http_status_text "$code")"$'\r\n'
+    response+="Content-Type: ${ctype}"$'\r\n'
+    response+="Content-Length: ${_BYTES}"$'\r\n'
+    if [[ -n "$extra" ]]; then
+        response+="${extra}"$'\r\n'
+    fi
+    response+="Connection: close"$'\r\n\r\n'
+    response+="$body"
+    # a dead nc would leave a large write blocked on the FIFO we hold open
+    listener_alive "$_SRV_CUR" || return 1
+    printf '%s' "$response" >&"${_L_W[_SRV_CUR]}"
+}
+
+# Consume the rest of the request head (everything up to the empty line) within
+# SERVE_REQUEST_TIMEOUT; closing with unread input would reset the connection
+# and could cut the response short.
+read_request_head() {
+    local deadline=$((SECONDS + SERVE_REQUEST_TIMEOUT)) left header count=0
+    while :; do
+        left=$((deadline - SECONDS))
+        ((left > 0)) || return 1
+        IFS= read -r -t "$left" -n 8192 -u "${_L_R[_SRV_CUR]}" header || return 1
+        header="${header%$'\r'}"
+        [[ -n "$header" ]] || return 0
+        count=$((count + 1))
+        ((count <= 100)) || return 1
+    done
+}
+
+# Answer one request. $1 is its first line. Only GET / and GET /metrics get the
+# metrics; any other path is 404, any other method on those paths 405.
+handle_connection() {
+    local line="${1%$'\r'}" method path body rc=0
+    local re_request='^([A-Z]+) (/[^ ]*) HTTP/[0-9]\.[0-9]$'
+
+    if [[ ! "$line" =~ $re_request ]]; then
+        send_response 400 "text/plain; charset=utf-8" $'Bad Request\n' || true
+        return 0
+    fi
+    method="${BASH_REMATCH[1]}"
+    path="${BASH_REMATCH[2]%%\?*}"
+
+    if ! read_request_head; then
+        send_response 400 "text/plain; charset=utf-8" $'Bad Request\n' || true
+        return 0
     fi
 
-    log "Starting metrics server on port $port"
-    log "Metrics available at http://localhost:${port}/metrics"
-    log "Press Ctrl+C to stop"
+    case "$path" in
+        / | /metrics) ;;
+        *)
+            send_response 404 "text/plain; charset=utf-8" $'Not Found\n' || true
+            return 0
+            ;;
+    esac
+    if [[ "$method" != "GET" ]]; then
+        send_response 405 "text/plain; charset=utf-8" $'Method Not Allowed\n' "Allow: GET" || true
+        return 0
+    fi
 
-    while true; do
-        local metrics
-        metrics=$(generate_all_metrics)
-        local content_length=${#metrics}
+    # Generated now, after the request arrived: never older than the request.
+    body="$(generate_all_metrics)" || rc=$?
+    if ((rc != 0 && rc != EXIT_DEGRADED)); then
+        log "ERROR: generating the metrics failed (status ${rc})"
+        send_response 500 "text/plain; charset=utf-8" $'Internal Server Error\n' || true
+        return 0
+    fi
+    send_response 200 "text/plain; version=0.0.4; charset=utf-8" "${body}"$'\n' || true
+    return 0
+}
 
-        local response="HTTP/1.1 200 OK
-Content-Type: text/plain; charset=utf-8
-Content-Length: ${content_length}
-Connection: close
+# Let the nc of the connection being served finish the response (it quits on EOF
+# of its stdin, then the peer's FIN) and stop it if it does not within
+# SERVE_CLOSE_TIMEOUT.
+finish_connection() {
+    local slot="$_SRV_CUR" fd deadline=$((SECONDS + SERVE_CLOSE_TIMEOUT))
+    fd="${_L_W[slot]}"
+    if [[ -n "$fd" ]]; then
+        exec {fd}>&-
+        _L_W[slot]=""
+    fi
+    fd="${_L_R[slot]}"
+    if [[ -n "$fd" ]]; then
+        while IFS= read -r -t "$SERVE_CLOSE_TIMEOUT" -n 65536 -u "$fd" _; do
+            ((SECONDS < deadline)) || break
+        done
+    fi
+    stop_listener "$slot"
+}
 
-${metrics}"
+# Exit trap of the server: stop our nc processes and remove the private directory.
+srv_cleanup() {
+    log "Shutting down metrics server..."
+    stop_listener 0
+    stop_listener 1
+    if [[ -n "$_SRV_SLEEP" ]]; then
+        exec {_SRV_SLEEP}<&-
+        _SRV_SLEEP=""
+    fi
+    if [[ -n "$_SRV_DIR" ]]; then
+        rm -rf -- "$_SRV_DIR"
+        _SRV_DIR=""
+    fi
+}
 
-        echo -e "$response" | nc -l -p "$port" -q 1 2>/dev/null \
-            || echo -e "$response" | nc -l "$port" 2>/dev/null \
-            || true
+# Run the server on BIND:PORT until stopped (SIGTERM/SIGINT end it cleanly with
+# status 0). Returns EXIT_FAILED when it cannot run: no usable netcat, no private
+# temp directory, or the port cannot be bound after SERVE_START_ATTEMPTS tries.
+serve_metrics() {
+    local port="$1" bind="$2"
+    local failures=0 delay_ms="$SERVE_RETRY_MS" err="" first="" rrc=0 url_host="" cur=0
 
-        sleep 0.1
+    _SRV_PORT="$port"
+    _SRV_BIND="$bind"
+
+    if ! detect_nc; then
+        log "ERROR: a netcat (nc) is required for the HTTP server; install netcat-openbsd"
+        return "$EXIT_FAILED"
+    fi
+    build_nc_command "$bind" "$port" || return "$EXIT_FAILED"
+
+    if ! _SRV_DIR="$(mktemp -d)"; then
+        log "ERROR: cannot create a temporary directory for the server"
+        return "$EXIT_FAILED"
+    fi
+    _L_FIFO=("${_SRV_DIR}/to_nc.0" "${_SRV_DIR}/to_nc.1")
+    _L_ERR=("${_SRV_DIR}/nc.err.0" "${_SRV_DIR}/nc.err.1")
+    if ! mkfifo "${_L_FIFO[0]}" "${_L_FIFO[1]}" "${_SRV_DIR}/sleep" || ! exec {_SRV_SLEEP}<>"${_SRV_DIR}/sleep"; then
+        log "ERROR: cannot create the server's FIFOs in ${_SRV_DIR}"
+        rm -rf -- "$_SRV_DIR"
+        _SRV_DIR=""
+        return "$EXIT_FAILED"
+    fi
+
+    trap 'exit 0' HUP INT TERM
+    trap srv_cleanup EXIT
+
+    # Come up, or say why not: a taken port and a failed bind are retried a few
+    # times (the previous instance may still be closing its socket), then fatal.
+    while :; do
+        if port_in_use "$port" "$bind"; then
+            err="something is already listening on ${bind}:${port}"
+        elif start_listener 0 && wait_listener_bound 0; then
+            break
+        else
+            err="$(listener_error 0)"
+            err="${err:-the netcat did not bind}"
+            stop_listener 0
+        fi
+        failures=$((failures + 1))
+        if ((failures >= SERVE_START_ATTEMPTS)); then
+            log "ERROR: cannot listen on ${bind}:${port}: ${err}"
+            return "$EXIT_FAILED"
+        fi
+        log "WARN: cannot listen on ${bind}:${port} (${err}); retrying"
+        srv_sleep "$((delay_ms / 1000)).$(printf '%03d' $((delay_ms % 1000)))"
+        delay_ms=$((delay_ms * 2))
+    done
+
+    url_host="$bind"
+    if is_wildcard_bind "$bind"; then
+        url_host="<this host>"
+    elif [[ "$bind" == *:* ]]; then
+        url_host="[${bind}]"
+    fi
+    log "Metrics server listening on http://${url_host}:${port}/metrics (netcat: ${_SRV_NC_VARIANT}; GET / and GET /metrics; one connection at a time)"
+    if ! is_loopback_bind "$bind"; then
+        log "WARN: ${bind} is not a loopback address: the metrics are served without authentication or TLS to anything that can reach ${bind}:${port}"
+    fi
+    log "Stop with SIGTERM or Ctrl+C"
+
+    failures=0
+    delay_ms="$SERVE_RETRY_MS"
+    _SRV_CUR=0
+    while :; do
+        cur="$_SRV_CUR"
+        if [[ -z "${_L_PID[cur]}" ]] && ! start_listener "$cur"; then
+            err="could not start ${_SRV_NC_BIN}"
+            rrc=1
+        else
+            rrc=0
+            first=""
+            IFS= read -r -t "$SERVE_IDLE_ROTATE" -n 8192 -u "${_L_R[cur]}" first || rrc=$?
+            err=""
+        fi
+
+        if ((rrc == 0)); then
+            # A client is connected to this nc, which no longer listens: arm the
+            # other slot before the metrics are generated, so the port is never
+            # left without a listener while a request is answered. If that fails
+            # it is noticed (and counted) when the slot becomes the current one.
+            start_listener "$((1 - cur))" || true
+            handle_connection "$first" || log "WARN: request handling failed"
+            finish_connection
+            _SRV_CUR=$((1 - cur))
+            failures=0
+            delay_ms="$SERVE_RETRY_MS"
+        elif ((rrc > 128)); then
+            # Idle: recycle the listener. This also drops a client that connected
+            # and never sent anything, which would otherwise hold the only
+            # connection for ever.
+            stop_listener "$cur"
+        else
+            # nc ended without a request: it failed (it said so on stderr), or a
+            # client connected and left without sending.
+            err="${err:-$(listener_error "$cur")}"
+            stop_listener "$cur"
+            if [[ -n "$err" ]]; then
+                failures=$((failures + 1))
+                if ((failures >= SERVE_START_ATTEMPTS)); then
+                    log "ERROR: the listener on ${bind}:${port} keeps failing: ${err}"
+                    return "$EXIT_FAILED"
+                fi
+                log "WARN: the listener on ${bind}:${port} failed (${err}); restarting"
+                srv_sleep "$((delay_ms / 1000)).$(printf '%03d' $((delay_ms % 1000)))"
+                delay_ms=$((delay_ms * 2))
+            else
+                srv_sleep 0.05
+            fi
+        fi
     done
 }
 
@@ -887,24 +1437,36 @@ Export LyreBirdAudio metrics in Prometheus format.
 Options:
   -h, --help          Show this help message
   -v, --version       Show version
-  --serve PORT        Start HTTP server on PORT (default: 9100)
+  --serve [PORT]      Serve the metrics over HTTP on PORT (default: 9100); the
+                      same as the "serve" command with --port
+  serve               Serve over HTTP; combine with --port and --bind
+  --port PORT         Port for the HTTP server (default: 9100)
+  --bind ADDR         Address the HTTP server listens on: an IPv4/IPv6 literal
+                      or "localhost" (default: 127.0.0.1). The server has no
+                      authentication or TLS; bind a non-loopback address only
+                      on a network you trust
   --file PATH         Write metrics to file (for node_exporter textfile); the file
                       is replaced atomically and the previous one is kept if
                       anything fails
   --once              Output metrics once and exit (default)
 
+The HTTP server answers GET / and GET /metrics (200), any other path with 404 and
+any other method with 405, one connection at a time. It needs netcat (OpenBSD
+nc, ncat, traditional/GNU nc or BusyBox nc). SIGTERM or SIGINT stops it cleanly.
+
 Exit status:
-  0  every collector completed
+  0  every collector completed (the server: stopped by a signal)
   1  command-line error
-  2  nothing could be delivered (--file could not publish; the previous file
-     is kept)
+  2  nothing could be delivered: --file could not publish (the previous file
+     is kept), or the HTTP server cannot run (no usable netcat, port in use)
   3  the output was delivered, but at least one collector failed
      (lyrebird_scrape_success is 0; the failing collector is named in
      lyrebird_collector_success and on stderr)
 
 Examples:
   ${SCRIPT_NAME}                        # Output to stdout
-  ${SCRIPT_NAME} --serve 9100           # Start HTTP server
+  ${SCRIPT_NAME} --serve 9100           # Start HTTP server on 127.0.0.1:9100
+  ${SCRIPT_NAME} serve --port 9100 --bind 0.0.0.0   # Same, on all interfaces
   ${SCRIPT_NAME} --file /tmp/lyrebird.prom  # Write to file
 
 Integration:
@@ -921,6 +1483,8 @@ EOF
 main() {
     local mode="once"
     local port="9100"
+    local bind="127.0.0.1"
+    local server_option_given=0
     local output_file=""
     local gen_rc=0
 
@@ -941,6 +1505,28 @@ main() {
                     shift
                 fi
                 shift
+                ;;
+            serve)
+                mode="serve"
+                shift
+                ;;
+            --port)
+                if [[ -z "${2:-}" ]]; then
+                    log "ERROR: --port requires a port number"
+                    exit 1
+                fi
+                port="$2"
+                server_option_given=1
+                shift 2
+                ;;
+            --bind)
+                if [[ -z "${2:-}" ]]; then
+                    log "ERROR: --bind requires an address"
+                    exit 1
+                fi
+                bind="$2"
+                server_option_given=1
+                shift 2
                 ;;
             --file)
                 mode="file"
@@ -965,9 +1551,27 @@ main() {
         esac
     done
 
+    if [[ "$mode" != "serve" ]] && ((server_option_given)); then
+        log "ERROR: --port and --bind apply to the HTTP server only (use serve or --serve)"
+        exit 1
+    fi
+
     case "$mode" in
         serve)
-            serve_metrics "$port"
+            if [[ "$bind" == "localhost" ]]; then
+                bind="127.0.0.1"
+            fi
+            if ! valid_port "$port"; then
+                log "ERROR: invalid port '${port}' (need 1-65535)"
+                exit 1
+            fi
+            if ! valid_bind "$bind"; then
+                log "ERROR: invalid --bind address '${bind}' (need an IPv4 or IPv6 literal, or localhost)"
+                exit 1
+            fi
+            gen_rc=0
+            serve_metrics "$port" "$bind" || gen_rc=$?
+            return "$gen_rc"
             ;;
         file)
             if [[ -z "$output_file" ]]; then
