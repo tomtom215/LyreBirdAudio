@@ -110,3 +110,43 @@ wait_probe() {
         MTX_PID=""
     done
 }
+
+# A private network, pid and mount namespace (the lifecycle test below binds the
+# manager's default ports and runs real processes in it). Needs root or
+# passwordless sudo; skipped where neither is available.
+require_netns() {
+    command -v unshare >/dev/null || skip "unshare not installed"
+    command -v python3 >/dev/null || skip "python3 not installed"
+    if unshare --net --pid --fork --mount-proc true 2>/dev/null; then
+        NETNS_CMD=(unshare --net --pid --fork --mount-proc)
+    elif sudo -n unshare --net --pid --fork --mount-proc true 2>/dev/null; then
+        NETNS_CMD=(sudo -n unshare --net --pid --fork --mount-proc)
+    else
+        skip "cannot create network, pid and mount namespaces here (needs root or passwordless sudo)"
+    fi
+}
+
+@test "start is idempotent against a real MediaMTX and real FFmpeg, a dead wrapper is reconciled, stop leaves nothing and another owner is refused [LB-01, LB-02, LB-10]" {
+    require_live
+    require_netns
+    local bin out rc
+    for bin in $LYREBIRD_TEST_MEDIAMTX_BINS; do
+        echo "# $("$bin" --version 2>/dev/null | head -n 1)" >&3
+        mkdir -p "$TEST_SCRATCH/e2e"
+        rc=0
+        out="$("${NETNS_CMD[@]}" env PATH="$PATH" PROJECT_ROOT="$PROJECT_ROOT" BIN="$bin" \
+            WORK="$TEST_SCRATCH/e2e" OWNER="$(id -u):$(id -g)" \
+            bash "$PROJECT_ROOT/tests/lifecycle_e2e.bash" 2>&1 3>&-)" || rc=$?
+        if [[ $rc -eq 77 ]]; then
+            skip "$(grep E2E-SKIP <<<"$out")"
+        fi
+        if [[ $rc -ne 0 ]]; then
+            echo "$out"
+            false
+        fi
+        sed 's/^/# /' <<<"$out" >&3
+        [[ "$out" == *"E2E: DONE"* ]]
+        chmod -R u+rwx "$TEST_SCRATCH/e2e"
+        rm -rf "$TEST_SCRATCH/e2e"
+    done
+}

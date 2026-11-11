@@ -222,6 +222,7 @@ readonly E_CONFIG_ERROR=4
 readonly E_LOCK_FAILED=5
 readonly E_USB_NO_DEVICES=6
 readonly E_MEDIAMTX_DOWN=7
+readonly E_OWNERSHIP=8
 readonly E_MONITOR_DEGRADED=10
 
 # Configurable paths with environment variable defaults
@@ -342,6 +343,10 @@ FFMPEG_LOG_MAX_SIZE=$(_uint_or "${FFMPEG_LOG_MAX_SIZE:-}" 10485760) # 10MB
 readonly FFMPEG_LOG_MAX_SIZE
 MEDIAMTX_LOG_MAX_SIZE=$(_uint_or "${MEDIAMTX_LOG_MAX_SIZE:-}" 52428800) # 50MB
 readonly MEDIAMTX_LOG_MAX_SIZE
+# Runs of each stream's FFmpeg log kept besides the live one (0-20)
+FFMPEG_LOG_KEEP=$(_uint_or "${FFMPEG_LOG_KEEP:-}" 3)
+((FFMPEG_LOG_KEEP <= 20)) || FFMPEG_LOG_KEEP=20
+readonly FFMPEG_LOG_KEEP
 
 # ============================================================================
 # Production Reliability Settings (v1.4.2 additions)
@@ -444,6 +449,7 @@ readonly SCRIPT_COMPAT_VERSION="1.5.0"
 
 # Standard timing constants
 readonly QUICK_SLEEP=0.1
+# shellcheck disable=SC2034 # timing constant; its only user, the old SIGINT wait loop, is gone
 readonly SHORT_SLEEP=1
 readonly MEDIUM_SLEEP=2
 
@@ -464,6 +470,9 @@ declare -g SKIP_CLEANUP=false
 
 # Command being executed (COMMAND used by cleanup trap, must be initialized early)
 declare -g COMMAND=""
+
+# Arguments that follow the command (force-stop --kill-all --yes)
+declare -ga COMMAND_ARGS=()
 
 # Flag to indicate if we're in a stop/force-stop operation
 declare -g STOPPING_SERVICE=false
@@ -608,10 +617,18 @@ handle_deferred_cleanup() {
             log WARN "Cleanup marker is ${marker_age}s old, might be stale"
         fi
 
-        cleanup_stale_processes
+        # The marker says an earlier run did not finish; it is no proof that
+        # anything is stale. A MediaMTX that is running and provably this
+        # manager's is kept (start then starts whatever stream is missing);
+        # anything else is cleaned up by identity.
+        if owned_mediamtx_pid >/dev/null; then
+            log INFO "MediaMTX is running and owned by this manager; keeping it"
+        else
+            cleanup_stale_processes
 
-        # Verify cleanup completeness
-        verify_cleanup_complete
+            # Verify cleanup completeness
+            verify_cleanup_complete
+        fi
 
         rm -f "${CLEANUP_MARKER}"
     fi
@@ -621,17 +638,20 @@ handle_deferred_cleanup() {
 verify_cleanup_complete() {
     local issues_found=0
 
-    # Check for orphaned wrapper scripts
-    local wrapper_count
-    wrapper_count=$(pgrep -f "${FFMPEG_PID_DIR}/.*\.sh" 2>/dev/null | wc -l || echo 0)
+    # Check for orphaned wrapper and FFmpeg processes: what is left of this
+    # installation's, by what it runs and writes (not by name)
+    local wrapper_count=0 ffmpeg_count=0 kind=""
+    while read -r _ _ kind _; do
+        case "$kind" in
+            wrapper) ((wrapper_count++)) || true ;;
+            ffmpeg) ((ffmpeg_count++)) || true ;;
+            *) ;;
+        esac
+    done < <(scan_instance_processes)
     if [[ $wrapper_count -gt 0 ]]; then
         log WARN "Found $wrapper_count orphaned wrapper processes"
         ((issues_found++)) || true
     fi
-
-    # Check for orphaned FFmpeg processes
-    local ffmpeg_count
-    ffmpeg_count=$(pgrep -f "^ffmpeg.*rtsp://${MEDIAMTX_HOST}:8554" 2>/dev/null | wc -l || echo 0)
     if [[ $ffmpeg_count -gt 0 ]]; then
         log WARN "Found $ffmpeg_count orphaned FFmpeg processes"
         ((issues_found++)) || true
@@ -772,6 +792,458 @@ error_exit() {
     exit "${exit_code}"
 }
 
+# ============================================================================
+# Process ownership (D11)
+# ============================================================================
+# This script signals a process only when it can prove that it started it:
+#
+#   - the PID is recorded in one of the script's own PID files, and the start
+#     time recorded next to it ("<pid file>.id", written by write_pid_atomic)
+#     is still the one /proc/<pid>/stat reports, so a recycled PID is never
+#     mistaken for the recorded process;
+#   - the running image is what this script launches: MediaMTX is the
+#     configured binary with the configuration file as argv[1]; a stream
+#     wrapper is a shell whose argv[1] is that stream's generated script.
+#
+# No process is ever chosen by a name or command-line pattern (pkill, pgrep -f,
+# pgrep -x): such a pattern also matches another installation's processes and
+# the operator's own tools (an FFmpeg that reads a stream, an editor open on a
+# wrapper). The one broad kill is `force-stop --kill-all --yes`, which prints
+# exactly what it would signal first.
+#
+# The identity predicates return 0 = yes, 1 = no (or no such process) and
+# 2 = cannot be told, because /proc/<pid> is not readable (another user's
+# process seen by a run without root). "Cannot be told" is never "dead": the
+# record is kept and nothing is signalled.
+
+# Set REPLY to the fields of /proc/<pid>/stat after the command name's closing
+# parenthesis ("<state> <ppid> <pgrp> <session> ... <starttime> ..."). The name
+# may contain spaces and parentheses, so the fields are counted from the last
+# ")". Returns 1 when the file is absent or unreadable.
+_proc_stat_rest() {
+    local pid="$1" stat=""
+    [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+    { IFS= read -r -d '' stat <"/proc/${pid}/stat"; } 2>/dev/null || [[ -n "$stat" ]] || return 1
+    [[ "$stat" == *") "* ]] || return 1
+    REPLY="${stat##*) }"
+}
+
+# Print one field of /proc/<pid>/stat: 0 = state, 1 = ppid, 2 = process group
+_proc_stat_field() {
+    local REPLY
+    local -a fields
+    _proc_stat_rest "$1" || return 1
+    read -ra fields <<<"$REPLY"
+    printf '%s' "${fields[$2]:-}"
+}
+
+proc_pgrp() {
+    _proc_stat_field "$1" 2
+}
+
+# Succeeds while process $1 is alive (not a zombie, which has exited and only
+# waits to be reaped) and is the process that started at time $2
+_proc_is_same_live() {
+    local REPLY
+    local -a fields
+    _proc_stat_rest "$1" || return 1
+    read -ra fields <<<"$REPLY"
+    [[ "${fields[0]}" != "Z" && "${fields[0]}" != "X" && "${fields[19]:-}" == "$2" ]]
+}
+
+# Print the resolved path of a process's executable. The image of a binary that
+# an upgrade has since replaced is reported as "<path> (deleted)"; it is still
+# the same program, so the suffix is dropped.
+proc_exe() {
+    local exe="" deleted_suffix=" (deleted)"
+    exe="$(readlink "/proc/${1}/exe" 2>/dev/null)" || return 1
+    [[ -n "$exe" ]] || return 1
+    printf '%s' "${exe%"${deleted_suffix}"}"
+}
+
+# Fill the array PROC_ARGV with the arguments of process $1
+# (/proc/<pid>/cmdline is NUL-separated). Returns 1 when it cannot be read.
+proc_load_argv() {
+    local arg=""
+    PROC_ARGV=()
+    {
+        while IFS= read -r -d '' arg || [[ -n "$arg" ]]; do
+            PROC_ARGV+=("$arg")
+            arg=""
+        done
+    } 2>/dev/null <"/proc/${1}/cmdline" || return 1
+}
+
+# Print a path with symlinks resolved, or the path itself if that fails
+_canon_path() {
+    local resolved=""
+    if resolved="$(readlink -f -- "$1" 2>/dev/null)" && [[ -n "$resolved" ]]; then
+        printf '%s' "$resolved"
+    else
+        printf '%s' "$1"
+    fi
+}
+
+# Is $1 this installation's MediaMTX: the executable is the configured binary
+# and argv[1] is the configuration file (that is how this script starts it)?
+is_managed_mediamtx_pid() {
+    local pid="$1" exe=""
+    [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 1
+    [[ -d "/proc/${pid}" ]] || return 1
+    if ! proc_load_argv "$pid"; then
+        [[ -d "/proc/${pid}" ]] && return 2
+        return 1
+    fi
+    # argv[1] first: it is read without forking and rules out almost everything
+    [[ "${PROC_ARGV[1]:-}" == "${CONFIG_FILE}" ]] || return 1
+    if ! exe="$(proc_exe "$pid")"; then
+        [[ -d "/proc/${pid}" ]] && return 2
+        return 1
+    fi
+    [[ "$exe" == "$(_canon_path "${MEDIAMTX_BIN}")" ]]
+}
+
+# Is $1 a wrapper of this installation: a bash whose argv[1] is a generated
+# stream script, "<wrapper dir>/<stream>.sh"? With a stream name, that stream's
+# script; without one, any script directly in the wrapper directory.
+is_managed_wrapper_pid() {
+    local pid="$1" stream="${2:-}" script="" exe=""
+    [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 1
+    [[ -d "/proc/${pid}" ]] || return 1
+    if ! proc_load_argv "$pid"; then
+        [[ -d "/proc/${pid}" ]] && return 2
+        return 1
+    fi
+    script="${PROC_ARGV[1]:-}"
+    if [[ -n "$stream" ]]; then
+        [[ "$script" == "${FFMPEG_PID_DIR}/${stream}.sh" ]] || return 1
+    else
+        [[ "$script" == "${FFMPEG_PID_DIR}/"*.sh ]] || return 1
+        [[ "${script#"${FFMPEG_PID_DIR}/"}" != */* ]] || return 1
+    fi
+    if ! exe="$(proc_exe "$pid")"; then
+        [[ -d "/proc/${pid}" ]] && return 2
+        return 1
+    fi
+    [[ "${exe##*/}" == "bash" ]]
+}
+
+# Succeeds when PID $1 is provably not the wrapper of stream $2 (a recycled
+# PID, or another program that happens to have the script open). A process
+# that cannot be identified is not "foreign": it is left alone.
+pid_is_foreign_wrapper() {
+    local rc=0
+    is_managed_wrapper_pid "$1" "$2" || rc=$?
+    [[ $rc -eq 1 ]]
+}
+
+# Print the start time recorded next to PID file $1 for process $2. Prints
+# nothing when there is no record, or the record is about another PID.
+pid_file_recorded_start() {
+    local rec_pid="" rec_start=""
+    { IFS=' ' read -r rec_pid rec_start _ <"${1}.id"; } 2>/dev/null || true
+    if [[ "$rec_pid" == "$2" && "$rec_start" =~ ^[0-9]+$ ]]; then
+        printf '%s' "$rec_start"
+    fi
+}
+
+# Remove PID file $1 and the start time recorded next to it
+pid_file_remove() {
+    rm -f -- "$1" "${1}.id"
+}
+
+# Print "<pid> <starttime>" for every descendant of process $1 (children,
+# grandchildren, ...), one per line, found with a single scan of /proc. A
+# wrapper's FFmpeg runs in a session of its own, so a process-group signal does
+# not reach it; it is found through the parent links instead.
+proc_descendants() {
+    local root="$1" entry pid item head=0
+    local REPLY
+    local -a fields queue
+    local -A kids=()
+    for entry in /proc/[0-9]*/stat; do
+        pid="${entry#/proc/}"
+        pid="${pid%%/*}"
+        _proc_stat_rest "$pid" || continue
+        read -ra fields <<<"$REPLY"
+        [[ "${fields[0]}" != "Z" && "${fields[0]}" != "X" ]] || continue
+        kids[${fields[1]}]+="${pid}:${fields[19]:-0} "
+    done
+    queue=("$root")
+    while ((head < ${#queue[@]})); do
+        pid="${queue[head]}"
+        ((head++)) || true
+        for item in ${kids[$pid]:-}; do
+            printf '%s %s\n' "${item%%:*}" "${item#*:}"
+            queue+=("${item%%:*}")
+        done
+    done
+}
+
+# Send signal $1 to process $2 while it is still the process that started at
+# time $3 (a PID that has been reused has another start time). There is a
+# window of microseconds between the check and the signal that bash, which has
+# no pidfd, cannot close.
+_signal_if_same() {
+    _proc_is_same_live "$2" "$3" || return 1
+    kill "-${1}" "$2" 2>/dev/null
+}
+
+# Send signal $1 to process $2 (start time $3), to its process group when $4 is
+# "true", and to every "pid:starttime" that follows
+_signal_tree() {
+    local sig="$1" pid="$2" start="$3" group="$4" victim
+    shift 4
+    if [[ "$group" == "true" ]] && _proc_is_same_live "$pid" "$start"; then
+        kill "-${sig}" -- "-${pid}" 2>/dev/null || true
+    fi
+    _signal_if_same "$sig" "$pid" "$start" || true
+    for victim in "$@"; do
+        _signal_if_same "$sig" "${victim%%:*}" "${victim#*:}" || true
+    done
+}
+
+# Succeeds while process $1 (start time $2) or any "pid:starttime" that
+# follows is still running
+_tree_alive() {
+    local pid="$1" start="$2" victim
+    shift 2
+    _proc_is_same_live "$pid" "$start" && return 0
+    for victim in "$@"; do
+        _proc_is_same_live "${victim%%:*}" "${victim#*:}" && return 0
+    done
+    return 1
+}
+
+# Terminate a process and everything below it: SIGTERM to its process group (if
+# it leads one) and to every descendant, then, after the timeout, SIGKILL. A
+# timeout of 0 sends SIGKILL at once.
+#
+# SIGTERM, not SIGINT, as the first signal. A process started as a background
+# job by a non-interactive shell that has no SIGINT trap inherits "ignore
+# SIGINT" (bash setup_async_signals; reproduced: SigIgn 7). The script run
+# directly sets a trap, so its wrappers keep SIGINT (SigIgn 5, measured), but
+# when these functions are used from a sourced script (the tests, any wrapper
+# started that way) a wrapper could be stopped only by the SIGKILL after the
+# whole timeout, having restarted the FFmpeg it had just interrupted, which the
+# SIGKILL then orphaned. The wrapper traps SIGTERM and stops its FFmpeg itself;
+# MediaMTX and FFmpeg treat SIGTERM like SIGINT, so nothing is lost.
+#
+# The descendants are listed before anything is signalled and each is signalled
+# only while its start time still matches, so nothing that appears or reuses a
+# PID in between is touched.
+#
+# Parameters:
+#   $1 = PID
+#   $2 = timeout in seconds before SIGKILL (default 10)
+#   $3 = start time the PID must have (optional). With it, a PID that has been
+#        reused since the start time was recorded is left alone.
+#
+# Returns: 0 = nothing of it is left (or it was not the recorded process),
+#          1 = something survived SIGKILL
+terminate_process_group() {
+    local pid="$1" timeout="${2:-10}" expect_start="${3:-}"
+    local root_start="" line group=false sig="TERM" waited=0
+    local -a victims=()
+
+    [[ -n "$pid" ]] || return 0
+    root_start="$(proc_starttime "$pid")" || return 0
+    if [[ -n "$expect_start" && "$expect_start" != "$root_start" ]]; then
+        log WARN "PID $pid is not the process that was started (start time $root_start, recorded $expect_start); not signalling it"
+        return 0
+    fi
+    _proc_is_same_live "$pid" "$root_start" || return 0
+
+    while read -r line; do
+        [[ -n "$line" ]] && victims+=("${line% *}:${line#* }")
+    done < <(proc_descendants "$pid")
+
+    # A process group is signalled only when the process leads one: otherwise
+    # "-PID" would name a group that is not its own
+    if [[ "$(proc_pgrp "$pid")" == "$pid" ]]; then
+        group=true
+    fi
+
+    ((timeout > 0)) || sig="KILL"
+    log DEBUG "Sending SIG${sig} to PID $pid and ${#victims[@]} descendants"
+    _signal_tree "$sig" "$pid" "$root_start" "$group" ${victims[@]+"${victims[@]}"}
+
+    if [[ "$sig" == "TERM" ]]; then
+        while ((waited < timeout * 10)) && _tree_alive "$pid" "$root_start" ${victims[@]+"${victims[@]}"}; do
+            sleep "$QUICK_SLEEP"
+            ((waited++)) || true
+        done
+        if _tree_alive "$pid" "$root_start" ${victims[@]+"${victims[@]}"}; then
+            log WARN "PID $pid did not terminate within ${timeout}s; sending SIGKILL"
+            _signal_tree KILL "$pid" "$root_start" "$group" ${victims[@]+"${victims[@]}"}
+        fi
+    fi
+
+    waited=0
+    while ((waited < 20)) && _tree_alive "$pid" "$root_start" ${victims[@]+"${victims[@]}"}; do
+        sleep "$QUICK_SLEEP"
+        ((waited++)) || true
+    done
+    if _tree_alive "$pid" "$root_start" ${victims[@]+"${victims[@]}"}; then
+        log WARN "PID $pid (or one of its children) is still running after SIGKILL"
+        return 1
+    fi
+    log DEBUG "PID $pid terminated successfully"
+    return 0
+}
+
+# Stop the process recorded in PID file $1 and drop the record, but only while
+# that process is provably the one this script started.
+#
+# Parameters:
+#   $1 = PID file
+#   $2 = kind of process: "mediamtx" or "wrapper"
+#   $3 = timeout in seconds before SIGKILL (0 = SIGKILL at once)
+#   $4 = stream name (wrapper only)
+#
+# Returns: 0 = nothing of it is left, or the recorded process was not ours (the
+#              stale record is dropped, the other process is not touched)
+#          1 = the process would not die (the record is kept)
+#          2 = the process cannot be identified (unreadable /proc entry): not
+#              signalled, record kept
+stop_recorded_process() {
+    local pid_file="$1" kind="$2" timeout="$3" stream="${4:-}"
+    local pid="" start="" rc=0 cmdline=""
+
+    pid="$(read_pid_safe "$pid_file")"
+    if [[ -z "$pid" ]]; then
+        pid_file_remove "$pid_file"
+        return 0
+    fi
+
+    case "$kind" in
+        mediamtx) is_managed_mediamtx_pid "$pid" || rc=$? ;;
+        *) is_managed_wrapper_pid "$pid" "$stream" || rc=$? ;;
+    esac
+    if [[ $rc -eq 2 ]]; then
+        log WARN "Cannot identify PID $pid recorded in $pid_file (is /proc readable? run as root); not signalling it"
+        return 2
+    fi
+    if [[ $rc -ne 0 ]]; then
+        cmdline="$(tr '\0' ' ' 2>/dev/null <"/proc/${pid}/cmdline")" || cmdline=""
+        log WARN "PID $pid recorded in $pid_file is not the ${kind} this script started (it runs: ${cmdline:0:120}); not signalling it, dropping the stale record"
+        pid_file_remove "$pid_file"
+        return 0
+    fi
+
+    start="$(pid_file_recorded_start "$pid_file" "$pid")"
+    if [[ -z "$start" ]]; then
+        # A record from before start times were kept: the image check above is
+        # all there is to go by
+        start="$(proc_starttime "$pid")" || start=""
+    fi
+    if ! terminate_process_group "$pid" "$timeout" "$start"; then
+        log ERROR "PID $pid ($kind) would not terminate"
+        return 1
+    fi
+    pid_file_remove "$pid_file"
+    return 0
+}
+
+# The PID of the MediaMTX recorded in PID_FILE, if (and only if) it is running
+# and provably the one this script started. Prints it; fails otherwise.
+owned_mediamtx_pid() {
+    local pid="" rc=0
+    pid="$(read_pid_safe "${PID_FILE}")"
+    [[ -n "$pid" ]] || return 1
+    is_managed_mediamtx_pid "$pid" || rc=$?
+    [[ $rc -eq 0 ]] || return 1
+    printf '%s' "$pid"
+}
+
+# Print the systemd service a process runs in (from its cgroup), if any
+proc_systemd_unit() {
+    local line="" unit=""
+    while IFS= read -r line; do
+        if [[ "$line" =~ /([^/]+\.service)(/|$) ]]; then
+            unit="${BASH_REMATCH[1]}"
+        fi
+    done 2>/dev/null <"/proc/${1}/cgroup" || true
+    printf '%s' "$unit"
+}
+
+# Succeeds, printing why, when a MediaMTX that this script did not start owns
+# (or is about to clash with) the one it is about to start: the standalone
+# mediamtx.service (D1), or any process that runs the configured binary on the
+# configured configuration file without being the process recorded in
+# PID_FILE. The caller refuses to start (E_OWNERSHIP) and touches nothing.
+foreign_mediamtx_owner() {
+    local owned="" dir pid unit=""
+    owned="$(owned_mediamtx_pid)" || owned=""
+
+    if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet mediamtx.service 2>/dev/null; then
+        printf 'mediamtx.service is active and owns MediaMTX (stop it first, for example: systemctl stop mediamtx.service)'
+        return 0
+    fi
+
+    for dir in /proc/[0-9]*; do
+        pid="${dir#/proc/}"
+        [[ "$pid" == "$owned" ]] && continue
+        is_managed_mediamtx_pid "$pid" || continue
+        unit="$(proc_systemd_unit "$pid")"
+        if [[ -n "$unit" ]] && command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet "$unit" 2>/dev/null; then
+            printf 'unit %s is active and runs MediaMTX (PID %s) on %s' "$unit" "$pid" "${CONFIG_FILE}"
+        else
+            printf 'MediaMTX (PID %s) is already running on %s but was not started by this script' "$pid" "${CONFIG_FILE}"
+        fi
+        return 0
+    done
+    return 1
+}
+
+# Number of running stream wrappers of this installation
+count_wrapper_processes() {
+    local dir rc count=0
+    for dir in /proc/[0-9]*; do
+        rc=0
+        is_managed_wrapper_pid "${dir#/proc/}" || rc=$?
+        if ((rc == 0)); then
+            ((count++)) || true
+        fi
+    done
+    printf '%s' "$count"
+}
+
+# Print the PID of every process below this installation's recorded wrappers
+# (their FFmpeg), one per line
+wrapper_descendant_pids() {
+    local pid_file pid line
+    for pid_file in "${FFMPEG_PID_DIR}"/*.pid; do
+        [[ -f "$pid_file" ]] || continue
+        pid="$(read_pid_safe "$pid_file")"
+        [[ -n "$pid" ]] || continue
+        if pid_is_foreign_wrapper "$pid" "$(basename "$pid_file" .pid)"; then
+            continue
+        fi
+        while read -r line; do
+            [[ -z "$line" ]] || printf '%s\n' "${line% *}"
+        done < <(proc_descendants "$pid")
+    done
+}
+
+# Succeeds when a child of process $1 was started as ffmpeg
+wrapper_has_ffmpeg_child() {
+    local dir pid
+    local REPLY
+    local -a fields
+    for dir in /proc/[0-9]*; do
+        pid="${dir#/proc/}"
+        _proc_stat_rest "$pid" || continue
+        read -ra fields <<<"$REPLY"
+        [[ "${fields[1]}" == "$1" ]] || continue
+        proc_load_argv "$pid" || continue
+        if [[ "${PROC_ARGV[0]##*/}" == "ffmpeg" ]]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
 # PID file operations with permissions set before atomic move
 write_pid_atomic() {
     local pid="$1"
@@ -850,9 +1322,28 @@ write_pid_atomic() {
         return 1
     fi
 
+    # Record the process's start time next to the PID file ("<pid> <starttime>"
+    # in "<pid file>.id"). The PID file stays a plain PID, which systemd's
+    # PIDFile= and other readers parse; the start time is what tells this
+    # process from a later one that reuses the number. It is moved into place
+    # first, so a PID file never exists without its record.
+    local start_time=""
+    if ! start_time="$(proc_starttime "$pid")"; then
+        rm -f "$temp_pid"
+        log ERROR "Cannot read the start time of PID $pid"
+        return 1
+    fi
+    if ! { printf '%s %s\n' "$pid" "$start_time" >"${temp_pid}.id" \
+        && chmod 644 "${temp_pid}.id" \
+        && mv -f "${temp_pid}.id" "${pid_file}.id"; }; then
+        rm -f "$temp_pid" "${temp_pid}.id"
+        log ERROR "Failed to record the start time of PID $pid"
+        return 1
+    fi
+
     # Atomically move into place (permissions already set)
     if ! mv -f "$temp_pid" "$pid_file"; then
-        rm -f "$temp_pid"
+        rm -f "$temp_pid" "${pid_file}.id"
         log ERROR "Failed to atomically move PID file"
         return 1
     fi
@@ -870,8 +1361,15 @@ write_pid_atomic() {
 # 4. Validates format: digits only via regex
 # 5. Removes leading zeros: 10#$pid (prevents octal interpretation)
 # 6. Validates range: 1 to SYSTEM_PID_MAX
-# 7. Verifies process exists via kill -0
-# 8. Validates process identity to detect PID reuse
+# 7. Verifies the process exists (a zombie has exited, so it does not count)
+# 8. Compares the process's start time with the one recorded next to the PID
+#    file, which tells a recycled PID from the recorded process. It does NOT
+#    judge by the program's name: a live process of another binary that is the
+#    recorded one keeps its PID file (the old comm allowlist deleted it).
+#
+# This says "the recorded process is running", nothing more. Before anything is
+# signalled, the callers prove that it is also the right program
+# (is_managed_mediamtx_pid, is_managed_wrapper_pid; see "Process ownership").
 #
 # Parameters:
 #   $1 = Path to PID file
@@ -881,9 +1379,12 @@ write_pid_atomic() {
 #   exit: Always 0 (errors return empty string, not error code)
 #
 # Side Effects:
-#   - Deletes PID file if content is invalid or process doesn't exist
+#   - Deletes the PID file (and its start-time record) if its content is invalid,
+#     the process does not exist, or the PID has been reused
+#   - A process whose /proc entry cannot be read (run without root) is
+#     "unknown", not "dead": its PID file is kept
 #   - Logs ERROR for invalid format or out-of-range PID
-#   - Logs DEBUG if process not running or identity mismatch
+#   - Logs DEBUG if the process is not running or the PID was reused
 read_pid_safe() {
     local pid_file="$1"
 
@@ -906,7 +1407,7 @@ read_pid_safe() {
     # Validate PID format
     if ! [[ "$pid" =~ ^[0-9]+$ ]]; then
         log ERROR "PID file $pid_file contains invalid data: '$pid'"
-        rm -f "$pid_file"
+        pid_file_remove "$pid_file"
         echo ""
         return 0
     fi
@@ -917,140 +1418,40 @@ read_pid_safe() {
     # Validate PID range
     if [[ $pid -lt 1 ]] || [[ $pid -gt $SYSTEM_PID_MAX ]]; then
         log ERROR "PID file $pid_file contains out-of-range PID: $pid"
-        rm -f "$pid_file"
+        pid_file_remove "$pid_file"
         echo ""
         return 0
     fi
 
-    # Check if process exists
-    if ! kill -0 "$pid" 2>/dev/null; then
+    # Check if the process exists. /proc is asked, not kill -0: kill -0 also
+    # fails (EPERM) for another user's live process, which is not "dead".
+    if [[ ! -d "/proc/${pid}" ]]; then
         log DEBUG "PID $pid from $pid_file is not running"
-        rm -f "$pid_file"
+        pid_file_remove "$pid_file"
         echo ""
         return 0
     fi
 
-    # Validate process identity to detect PID reuse
-    # This is a defensive check against the rare case where a PID is recycled
-    local proc_cmd
-    proc_cmd="$(ps -p "$pid" -o comm= 2>/dev/null || true)"
-
-    if [[ -n "$proc_cmd" ]]; then
-        # Check if process matches expected patterns for our services
-        # - mediamtx: the main MediaMTX binary
-        # - bash: wrapper scripts that manage FFmpeg streams
-        # - ffmpeg: FFmpeg processes (though typically tracked via wrapper)
-        if [[ "$proc_cmd" != "mediamtx" ]] && [[ "$proc_cmd" != "bash" ]] && [[ "$proc_cmd" != "ffmpeg" ]]; then
-            # Process exists but is not one of our expected types
-            # This could indicate PID reuse - log and reject
-            log DEBUG "PID $pid from $pid_file has unexpected process '$proc_cmd' (possible PID reuse)"
-            rm -f "$pid_file"
+    local live_start="" recorded_start=""
+    if live_start="$(proc_starttime "$pid")"; then
+        if ! _proc_is_same_live "$pid" "$live_start"; then
+            log DEBUG "PID $pid from $pid_file has exited (zombie)"
+            pid_file_remove "$pid_file"
+            echo ""
+            return 0
+        fi
+        recorded_start="$(pid_file_recorded_start "$pid_file" "$pid")"
+        if [[ -n "$recorded_start" && "$recorded_start" != "$live_start" ]]; then
+            log DEBUG "PID $pid from $pid_file was reused (start time $live_start, recorded $recorded_start)"
+            pid_file_remove "$pid_file"
             echo ""
             return 0
         fi
     fi
-    # If proc_cmd is empty, ps failed but kill -0 succeeded
-    # This can happen in edge cases, so we accept it (defensive)
+    # else: /proc/<pid>/stat cannot be read; the process exists, so it is
+    # reported as running and left alone
 
     echo "$pid"
-}
-
-# Process termination with SIGINT for RTSP cleanup
-wait_for_pid_termination() {
-    local pid="$1"
-    local timeout="${2:-${PID_TERMINATION_TIMEOUT}}"
-
-    if [[ -z "$pid" ]] || ! kill -0 "$pid" 2>/dev/null; then
-        return 0
-    fi
-
-    log DEBUG "Waiting for PID $pid to terminate (timeout: ${timeout}s)"
-
-    local elapsed=0
-    while kill -0 "$pid" 2>/dev/null && [[ $elapsed -lt $timeout ]]; do
-        sleep "$SHORT_SLEEP"
-        ((elapsed++)) || true
-    done
-
-    if kill -0 "$pid" 2>/dev/null; then
-        log WARN "PID $pid did not terminate within ${timeout}s"
-        return 1
-    fi
-
-    log DEBUG "PID $pid terminated successfully"
-    return 0
-}
-
-# Process group termination with recursive descendant finding
-terminate_process_group() {
-    local pid="$1"
-    local timeout="${2:-10}"
-
-    if [[ -z "$pid" ]] || ! kill -0 "$pid" 2>/dev/null; then
-        return 0
-    fi
-
-    # Helper function to recursively find all descendants
-    get_descendants() {
-        local parent_pid="$1"
-        local descendants=""
-
-        # Get immediate children
-        local children
-        children=$(pgrep -P "$parent_pid" 2>/dev/null || true)
-
-        if [[ -n "$children" ]]; then
-            for child in $children; do
-                # Add this child
-                descendants="$descendants $child"
-                # Recursively get this child's descendants
-                local child_descendants
-                child_descendants=$(get_descendants "$child")
-                descendants="$descendants$child_descendants"
-            done
-        fi
-
-        echo "$descendants"
-    }
-
-    # Get all descendants (children, grandchildren, etc.)
-    local all_pids
-    all_pids=$(get_descendants "$pid")
-    all_pids="$pid $all_pids"
-
-    # Try process group first if it exists
-    if kill -INT -- -"$pid" 2>/dev/null; then
-        log DEBUG "Sent SIGINT to process group $pid"
-    else
-        # Fall back to individual process
-        log DEBUG "Process group not available, sending SIGINT to PID $pid"
-        kill -INT "$pid" 2>/dev/null || true
-    fi
-
-    # Also kill all descendants explicitly
-    for descendant_pid in $all_pids; do
-        if [[ "$descendant_pid" != "$pid" ]]; then
-            kill -INT "$descendant_pid" 2>/dev/null || true
-        fi
-    done
-
-    if ! wait_for_pid_termination "$pid" "$timeout"; then
-        # Force kill if needed
-        if kill -KILL -- -"$pid" 2>/dev/null; then
-            log DEBUG "Sent SIGKILL to process group $pid"
-        else
-            kill -KILL "$pid" 2>/dev/null || true
-        fi
-
-        # Force kill all descendants
-        for descendant_pid in $all_pids; do
-            if [[ "$descendant_pid" != "$pid" ]]; then
-                kill -KILL "$descendant_pid" 2>/dev/null || true
-            fi
-        done
-
-        wait_for_pid_termination "$pid" 2
-    fi
 }
 
 # ============================================================================
@@ -1523,7 +1924,7 @@ check_resource_usage() {
 
     # Check wrapper processes
     local wrapper_count
-    wrapper_count=$(pgrep -f "${FFMPEG_PID_DIR}/.*\.sh" 2>/dev/null | wc -l || echo 0)
+    wrapper_count=$(count_wrapper_processes)
     local expected_wrappers
     expected_wrappers=$(find "${FFMPEG_PID_DIR}" -maxdepth 1 -name "*.pid" -type f 2>/dev/null | wc -l)
 
@@ -1615,7 +2016,7 @@ check_memory_usage() {
             pid_rss=$(grep "VmRSS:" "/proc/$pid/status" 2>/dev/null | awk '{print $2}' || echo 0)
             ffmpeg_rss=$((ffmpeg_rss + pid_rss))
         fi
-    done < <(pgrep -f "^ffmpeg.*rtsp://${MEDIAMTX_HOST}:8554" 2>/dev/null || true)
+    done < <(wrapper_descendant_pids)
 
     local total_rss_mb=$(((rss_kb + ffmpeg_rss) / 1024))
 
@@ -2917,7 +3318,7 @@ monitor_streams() {
                     ((streams_failed++)) || true
                     log WARN "Multiplex stream $stream_path PID is invalid (cron mode: not restarting)"
                 fi
-            elif ! pgrep -f "${FFMPEG_PID_DIR}/${stream_path}.sh" | grep -q "^${pid}$" 2>/dev/null; then
+            elif pid_is_foreign_wrapper "$pid" "$stream_path"; then
                 if should_restart_stream "$stream_path"; then
                     log WARN "Multiplex stream $stream_path PID $pid is stale - restarting"
                     rm -f "$pid_file"
@@ -3022,7 +3423,7 @@ monitor_streams() {
             fi
 
             # Verify the PID actually belongs to our wrapper
-            if ! pgrep -f "${FFMPEG_PID_DIR}/${stream_path}.sh" | grep -q "^${pid}$" 2>/dev/null; then
+            if pid_is_foreign_wrapper "$pid" "$stream_path"; then
                 if should_restart_stream "$stream_path"; then
                     # v1.4.2: Check ALSA device availability before restart
                     if ! check_alsa_device_available "$card_num"; then
@@ -3137,7 +3538,7 @@ validate_stream() {
             pid="$(read_pid_safe "$pid_file")"
             if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
                 # Check if FFmpeg child exists
-                if pgrep -P "$pid" -f "ffmpeg" >/dev/null 2>&1; then
+                if wrapper_has_ffmpeg_child "$pid"; then
                     log DEBUG "Stream $stream_path validated via process (attempt ${attempt})"
                     return 0
                 fi
@@ -3159,13 +3560,21 @@ is_restart_scenario() {
         fi
     fi
 
-    if pgrep -x "$(basename "${MEDIAMTX_BIN}")" >/dev/null 2>&1; then
+    # Processes of an earlier run of THIS manager that are still up, found by
+    # identity. (The old test matched every process called mediamtx and every
+    # RTSP FFmpeg on the host, so any other installation looked like a restart.)
+    if owned_mediamtx_pid >/dev/null; then
         return 0
     fi
-
-    if pgrep -f "^ffmpeg.*rtsp://${MEDIAMTX_HOST}:8554" >/dev/null 2>&1; then
-        return 0
-    fi
+    local pid_file pid
+    for pid_file in "${FFMPEG_PID_DIR}"/*.pid; do
+        [[ -f "$pid_file" ]] || continue
+        pid="$(read_pid_safe "$pid_file")"
+        [[ -n "$pid" ]] || continue
+        if ! pid_is_foreign_wrapper "$pid" "$(basename "$pid_file" .pid)"; then
+            return 0
+        fi
+    done
 
     return 1
 }
@@ -3178,38 +3587,48 @@ clear_restart_marker() {
     rm -f "${RESTART_MARKER}"
 }
 
-# Clean up all processes and temporary files
+# Clean up what is left of this manager's own processes and files, by identity
 #
 # Execution order (as implemented):
 # 1. Wrapper processes (via PID files in FFMPEG_PID_DIR)
+#    - Each recorded PID is signalled only if it is provably this manager's
+#      wrapper (start time matches the record, a bash running that stream's
+#      script): terminate_process_group with 5s timeout, which also stops the
+#      wrapper's FFmpeg children
+#    - A recorded PID that is something else (recycled) is NOT signalled; only
+#      the stale record is dropped
+#    - Deletes the PID files and their start-time records
+# 2. MediaMTX process (via PID_FILE), under the same proof: the recorded PID, the
+#    configured binary as its executable and the configuration file as argv[1]
 #    - Calls terminate_process_group with 5s timeout
-#    - Deletes PID files
-# 2. Orphaned FFmpeg processes (via pgrep pattern match)
-#    - Matches: ^ffmpeg.*rtsp://${MEDIAMTX_HOST}:8554
-#    - Calls terminate_process_group with 2s timeout
-# 3. MediaMTX process (via PID_FILE)
-#    - Calls terminate_process_group with 5s timeout
-#    - Deletes PID file
-# 4. MediaMTX processes using our config (via pgrep pattern match)
-#    - Matches: ^${MEDIAMTX_BIN}.*${CONFIG_FILE}$
-#    - Calls terminate_process_group with 2s timeout
-# 5. Temporary files
-#    - Deletes: *.pid, *.sh, *.log, *.log.old from FFMPEG_PID_DIR
-# 6. Marker files
+#    - Deletes the PID file and its record
+# 3. Generated wrapper scripts whose wrapper is gone
+# 4. Marker files
 #    - Deletes: CLEANUP_MARKER, RESTART_MARKER
 #    - Never deletes a lock file (LOCK_FILE, CONFIG_LOCK_FILE): the inode is the
 #      lock, and removing it while another process holds it splits the lock
 #
-# Parameters: None
+# No process is chosen by name or command-line pattern, so another
+# installation's MediaMTX or FFmpeg, mediamtx.service's process or an operator's
+# FFmpeg that reads a stream are never touched. The FFmpeg logs are kept: they
+# are the post-mortem of the run that is being cleaned up (rotate_ffmpeg_log
+# bounds them).
+#
+# start_mediamtx calls this only when it cannot prove that the MediaMTX it finds
+# is its own and healthy, or on a restart; a healthy start changes nothing.
+#
+# Parameters:
+#   $1 = seconds before SIGKILL (default 5; 0 = SIGKILL at once, for force-stop)
 #
 # Returns: 0 (always - best-effort cleanup)
 #
 # Side Effects:
-#   - Terminates processes (wrappers, FFmpeg, MediaMTX)
-#   - Deletes files (PID files, scripts, logs, markers)
+#   - Terminates processes (wrappers, FFmpeg, MediaMTX) that are provably ours
+#   - Deletes files (PID files, scripts, markers)
 #   - Modifies nullglob shell option (saves and restores state)
 #   - Logs INFO at start and completion, DEBUG for each operation
 cleanup_stale_processes() {
+    local timeout="${1:-5}"
     log INFO "Cleaning up stale processes and files"
 
     # Save and set nullglob
@@ -3217,55 +3636,25 @@ cleanup_stale_processes() {
     shopt -q nullglob && nullglob_state=on || nullglob_state=off
     shopt -s nullglob
 
-    # Clean up wrapper scripts
+    # Clean up wrapper scripts (and their FFmpeg children)
+    local pid_file script
     for pid_file in "${FFMPEG_PID_DIR}"/*.pid; do
         if [[ -f "$pid_file" ]]; then
-            local pid
-            pid="$(read_pid_safe "$pid_file")"
-            if [[ -n "$pid" ]]; then
-                terminate_process_group "$pid" 5
-            fi
-            rm -f "$pid_file"
+            stop_recorded_process "$pid_file" wrapper "$timeout" "$(basename "$pid_file" .pid)" || true
         fi
     done
 
-    # Kill orphaned FFmpeg processes
-    while IFS= read -r pid; do
-        if [[ -n "$pid" ]]; then
-            log DEBUG "Killing orphaned FFmpeg PID $pid"
-            terminate_process_group "$pid" 2
-        fi
-    done < <(pgrep -f "^ffmpeg.*rtsp://${MEDIAMTX_HOST}:8554" 2>/dev/null || true)
-
     # Clean up MediaMTX
-    if [[ -f "${PID_FILE}" ]]; then
-        local mediamtx_pid
-        mediamtx_pid="$(read_pid_safe "${PID_FILE}")"
-        if [[ -n "$mediamtx_pid" ]]; then
-            log DEBUG "Terminating MediaMTX PID $mediamtx_pid"
-            terminate_process_group "$mediamtx_pid" 5
-        fi
-        rm -f "${PID_FILE}"
-    fi
+    stop_recorded_process "${PID_FILE}" mediamtx "$timeout" || true
 
-    # Kill any MediaMTX processes using our config
-    if [[ -f "${CONFIG_FILE}" ]]; then
-        local mediamtx_pids
-        mediamtx_pids="$(pgrep -f "^${MEDIAMTX_BIN}.*${CONFIG_FILE}$" 2>/dev/null || true)"
-        if [[ -n "$mediamtx_pids" ]]; then
-            echo "$mediamtx_pids" | while read -r pid; do
-                if [[ -n "$pid" ]]; then
-                    terminate_process_group "$pid" 2
-                fi
-            done
-        fi
-    fi
-
-    # Clean temporary files
-    rm -f "${FFMPEG_PID_DIR}"/*.pid
-    rm -f "${FFMPEG_PID_DIR}"/*.sh
-    rm -f "${FFMPEG_PID_DIR}"/*.log
-    rm -f "${FFMPEG_PID_DIR}"/*.log.old
+    # Records whose PID file is gone, and the generated scripts of wrappers that
+    # are gone (a wrapper that could not be identified keeps both)
+    for pid_file in "${FFMPEG_PID_DIR}"/*.pid.id; do
+        [[ -e "${pid_file%.id}" ]] || rm -f -- "$pid_file"
+    done
+    for script in "${FFMPEG_PID_DIR}"/*.sh; do
+        [[ -e "${script%.sh}.pid" ]] || rm -f -- "$script"
+    done
 
     # Clean up markers
     rm -f "${CLEANUP_MARKER}"
@@ -3275,6 +3664,96 @@ cleanup_stale_processes() {
     [[ "$nullglob_state" == "off" ]] && shopt -u nullglob
 
     log INFO "Cleanup completed"
+}
+
+# Print one line per process of this installation, found by what it runs or
+# writes, never by its name: `<pid> <starttime> <kind> <why>`. Used by
+# `force-stop --kill-all` (the preview and the kill) and the cleanup check.
+# kind is
+#   mediamtx  the executable is the configured MediaMTX binary
+#   wrapper   an argument is a path inside the wrapper directory
+#   ffmpeg    an FFmpeg that writes its log into the wrapper directory, or any
+#             other child of such a wrapper
+# The calling process and its ancestors are never listed.
+scan_instance_processes() {
+    local dir pid ppid start state arg base want_exe log_file
+    local REPLY
+    local -a fields
+    local -A seen=() kids=() starts=() kinds=() whys=()
+    want_exe="$(_canon_path "${MEDIAMTX_BIN}")"
+
+    # This process, its subshell and every ancestor
+    pid="$$"
+    while [[ -n "$pid" && "$pid" != "0" && "$pid" != "1" ]]; do
+        seen[$pid]=1
+        pid="$(_proc_stat_field "$pid" 1)" || break
+    done
+    seen[${BASHPID}]=1
+
+    for dir in /proc/[0-9]*; do
+        pid="${dir#/proc/}"
+        [[ -z "${seen[$pid]:-}" ]] || continue
+        _proc_stat_rest "$pid" || continue
+        read -ra fields <<<"$REPLY"
+        state="${fields[0]}"
+        [[ "$state" != "Z" && "$state" != "X" ]] || continue
+        ppid="${fields[1]}"
+        start="${fields[19]:-0}"
+        starts[$pid]="$start"
+        kids[$ppid]+="${pid} "
+        proc_load_argv "$pid" || continue
+        [[ ${#PROC_ARGV[@]} -gt 0 ]] || continue
+        base="${PROC_ARGV[0]##*/}"
+
+        if [[ "/proc/${pid}/exe" -ef "${MEDIAMTX_BIN}" ]] \
+            || { [[ "$base" == "${MEDIAMTX_BIN##*/}" ]] && [[ "$(proc_exe "$pid")" == "$want_exe" ]]; }; then
+            kinds[$pid]="mediamtx"
+            whys[$pid]="its executable is the configured MediaMTX binary ${MEDIAMTX_BIN}"
+            continue
+        fi
+        for arg in "${PROC_ARGV[@]}"; do
+            if [[ "$arg" == "${FFMPEG_PID_DIR}/"* ]]; then
+                kinds[$pid]="wrapper"
+                whys[$pid]="its command line names ${arg}, in this installation's wrapper directory ${FFMPEG_PID_DIR}"
+                break
+            fi
+        done
+        [[ -z "${kinds[$pid]:-}" ]] || continue
+        if [[ "$base" == "ffmpeg" ]]; then
+            for log_file in "${FFMPEG_PID_DIR}"/*.log; do
+                if [[ "/proc/${pid}/fd/1" -ef "$log_file" || "/proc/${pid}/fd/2" -ef "$log_file" ]]; then
+                    kinds[$pid]="ffmpeg"
+                    whys[$pid]="FFmpeg writing its log ${log_file} in this installation's wrapper directory"
+                    break
+                fi
+            done
+        fi
+    done
+
+    [[ ${#kinds[@]} -gt 0 ]] || return 0
+
+    # Everything below a wrapper goes with it
+    local wrapper_pid child head
+    local -a queue
+    for wrapper_pid in "${!kinds[@]}"; do
+        [[ "${kinds[$wrapper_pid]}" == "wrapper" ]] || continue
+        queue=("$wrapper_pid")
+        head=0
+        while ((head < ${#queue[@]})); do
+            pid="${queue[head]}"
+            ((head++)) || true
+            for child in ${kids[$pid]:-}; do
+                [[ -z "${kinds[$child]:-}" ]] || continue
+                kinds[$child]="ffmpeg"
+                whys[$child]="child of wrapper ${wrapper_pid}"
+                queue+=("$child")
+            done
+        done
+    done
+
+    for pid in "${!kinds[@]}"; do
+        printf '%s %s %s %s\n' "$pid" "${starts[$pid]}" "${kinds[$pid]}" "${whys[$pid]}"
+    done | sort -n
 }
 
 # Wait for USB stabilization
@@ -3689,7 +4168,7 @@ start_ffmpeg_multiplex_stream() {
         existing_pid="$(read_pid_safe "$pid_file")"
         if [[ -n "$existing_pid" ]] && kill -0 "$existing_pid" 2>/dev/null; then
             # Verify PID actually belongs to our wrapper script
-            if pgrep -f "${FFMPEG_PID_DIR}/${stream_path}.sh" | grep -q "^${existing_pid}$"; then
+            if ! pid_is_foreign_wrapper "$existing_pid" "$stream_path"; then
                 log DEBUG "Multiplex stream $stream_path already running"
                 return 0
             else
@@ -3747,6 +4226,7 @@ start_ffmpeg_multiplex_stream() {
     # Create wrapper script
     local wrapper_script="${FFMPEG_PID_DIR}/${stream_path}.sh"
     local ffmpeg_log="${FFMPEG_PID_DIR}/${stream_path}.log"
+    rotate_ffmpeg_log "$ffmpeg_log"
 
     # Create wrapper with all variables properly quoted
     cat >"$wrapper_script" <<'WRAPPER_START'
@@ -4180,7 +4660,7 @@ start_ffmpeg_stream() {
         existing_pid="$(read_pid_safe "$pid_file")"
         if [[ -n "$existing_pid" ]] && kill -0 "$existing_pid" 2>/dev/null; then
             # Verify PID actually belongs to our wrapper script
-            if pgrep -f "${FFMPEG_PID_DIR}/${stream_path}.sh" | grep -q "^${existing_pid}$"; then
+            if ! pid_is_foreign_wrapper "$existing_pid" "$stream_path"; then
                 log DEBUG "Stream $stream_path already running"
                 return 0
             else
@@ -4208,6 +4688,7 @@ start_ffmpeg_stream() {
     # Create wrapper script
     local wrapper_script="${FFMPEG_PID_DIR}/${stream_path}.sh"
     local ffmpeg_log="${FFMPEG_PID_DIR}/${stream_path}.log"
+    rotate_ffmpeg_log "$ffmpeg_log"
 
     # Create wrapper with all variables properly quoted
     cat >"$wrapper_script" <<'WRAPPER_START'
@@ -4625,15 +5106,47 @@ stop_ffmpeg_stream() {
     local pid
     pid="$(read_pid_safe "$pid_file")"
 
-    if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+    if [[ -n "$pid" ]]; then
         log INFO "Stopping FFmpeg for $stream_path (PID: $pid)"
-        terminate_process_group "$pid" 10
     fi
 
-    rm -f "$pid_file"
-    rm -f "${FFMPEG_PID_DIR}/${stream_path}.sh"
-    rm -f "${FFMPEG_PID_DIR}/${stream_path}.log"
-    rm -f "${FFMPEG_PID_DIR}/${stream_path}.log.old"
+    # Only a wrapper that is provably this manager's is signalled, and only the
+    # stream's wrapper and its children: no other FFmpeg is touched. The log
+    # stays (rotate_ffmpeg_log keeps it bounded): it is the post-mortem.
+    local rc=0
+    stop_recorded_process "$pid_file" wrapper 10 "$stream_path" || rc=$?
+    if [[ $rc -eq 0 ]]; then
+        rm -f "${FFMPEG_PID_DIR}/${stream_path}.sh"
+    fi
+    return "$rc"
+}
+
+# Keep the last FFMPEG_LOG_KEEP runs of a stream's FFmpeg log. Called before a
+# new wrapper is started: the log of the previous run becomes <log>.prev.1,
+# older ones move up, and the ones beyond the limit are removed (also after the
+# limit was lowered). Nothing is deleted just because a stream is started,
+# stopped or cleaned up: the log of a run that went wrong is the post-mortem.
+# The archives are not named *.log, so logrotate's glob does not truncate them.
+rotate_ffmpeg_log() {
+    local log_file="$1" keep="${FFMPEG_LOG_KEEP}" archive n i
+    for archive in "${log_file}.prev."*; do
+        [[ -e "$archive" ]] || continue
+        n="${archive##*.prev.}"
+        if [[ "$n" =~ ^[0-9]+$ ]] && ((10#$n > keep)); then
+            rm -f -- "$archive"
+        fi
+    done
+    [[ -s "$log_file" ]] || return 0
+    if ((keep == 0)); then
+        rm -f -- "$log_file"
+        return 0
+    fi
+    for ((i = keep - 1; i >= 1; i--)); do
+        if [[ -e "${log_file}.prev.${i}" ]]; then
+            mv -f -- "${log_file}.prev.${i}" "${log_file}.prev.$((i + 1))"
+        fi
+    done
+    mv -f -- "$log_file" "${log_file}.prev.1"
 }
 
 # Start all streams with stable device list
@@ -4697,18 +5210,26 @@ stop_all_ffmpeg_streams() {
     shopt -q nullglob && nullglob_state=on || nullglob_state=off
     shopt -s nullglob
 
+    local failed=0
     for pid_file in "${FFMPEG_PID_DIR}"/*.pid; do
         if [[ -f "$pid_file" ]]; then
             local stream_path
             stream_path="$(basename "$pid_file" .pid)"
-            stop_ffmpeg_stream "$stream_path"
+            stop_ffmpeg_stream "$stream_path" || ((failed++)) || true
         fi
     done
 
     # Restore nullglob only if it was originally off (avoids redundant shopt -s)
     [[ "$nullglob_state" == "off" ]] && shopt -u nullglob
 
-    pkill -f "^ffmpeg.*rtsp://${MEDIAMTX_HOST}:8554" 2>/dev/null || true
+    # No pattern kill of "every FFmpeg that talks to localhost:8554" here: it
+    # also killed other installations' FFmpeg and the operator's own readers.
+    # Each wrapper's FFmpeg is stopped with its wrapper above.
+    if ((failed > 0)); then
+        log ERROR "$failed stream wrapper(s) could not be stopped"
+        return 1
+    fi
+    return 0
 }
 
 # Does the installed MediaMTX accept the top-level "moq" key (>= 1.19.0)?
@@ -4830,19 +5351,30 @@ EOF
     return 0
 }
 
-# Check if MediaMTX is running
+# Check if MediaMTX is running: the process recorded in PID_FILE is alive and is
+# not provably some other program. A process that cannot be identified (its
+# /proc entry is unreadable without root) counts as running.
 is_mediamtx_running() {
-    if [[ -f "${PID_FILE}" ]]; then
-        local pid
-        pid="$(read_pid_safe "${PID_FILE}")"
-        if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
-            return 0
-        fi
-    fi
-    return 1
+    local pid rc=0
+    pid="$(read_pid_safe "${PID_FILE}")"
+    [[ -n "$pid" ]] || return 1
+    is_managed_mediamtx_pid "$pid" || rc=$?
+    [[ $rc -ne 1 ]]
 }
 
 # Start MediaMTX with single device detection
+#
+# One owner (D1): the MediaMTX this manager runs is the one it started and
+# recorded in PID_FILE. A MediaMTX that someone else started (the standalone
+# mediamtx.service, another unit, a manual run on the same configuration) is
+# not replaced, stopped or signalled: the start is refused with E_OWNERSHIP and
+# nothing is touched.
+#
+# Idempotent (LB-01): when that MediaMTX is running, `start` changes nothing
+# that works. It does not clean up, wait for the USB subsystem, regenerate the
+# configuration or restart anything; it only starts the streams that are
+# missing. Cleanup runs only when the recorded ownership is not provably intact
+# (the PID is dead, was reused, or is not MediaMTX) or on a restart.
 start_mediamtx() {
     if ! acquire_lock; then
         # Nothing was started or stopped, so there is nothing to clean up: an
@@ -4852,8 +5384,29 @@ start_mediamtx() {
         error_exit "Failed to acquire lock" "${E_LOCK_FAILED}"
     fi
 
+    local foreign_owner=""
+    if foreign_owner="$(foreign_mediamtx_owner)"; then
+        # Nothing was started or stopped: no exit marker, for the same reason
+        SKIP_CLEANUP=true
+        log ERROR "Refusing to start: ${foreign_owner}"
+        error_exit "This manager runs only the MediaMTX it started itself and never signals another; nothing was changed. Stop the other MediaMTX first, or remove it with: ${SCRIPT_NAME} force-stop --kill-all" "${E_OWNERSHIP}"
+    fi
+
     # Handle deferred cleanup from previous termination
     handle_deferred_cleanup
+
+    local owned_pid=""
+    if owned_pid="$(owned_mediamtx_pid)"; then
+        log INFO "MediaMTX is already running (PID: ${owned_pid}) and owned by this manager; leaving it and its streams alone"
+        local running_devices=()
+        readarray -t running_devices < <(detect_audio_devices)
+        if [[ ${#running_devices[@]} -eq 0 ]]; then
+            log WARN "No USB audio devices detected; no stream to start"
+            return 0
+        fi
+        start_streams_and_report "${running_devices[@]}"
+        return $?
+    fi
 
     if is_restart_scenario; then
         log INFO "Detected restart scenario, cleaning up"
@@ -4930,19 +5483,33 @@ start_mediamtx() {
         return 1
     fi
 
-    if ! wait_for_mediamtx_ready "$pid"; then
-        terminate_process_group "$pid" 5
-        log ERROR "MediaMTX failed to become ready"
-        return 1
-    fi
-
+    # Record the process (and its start time) before the readiness wait, not
+    # after it: a start that is interrupted while waiting would otherwise leave
+    # a running MediaMTX that no PID file names, which this manager (which only
+    # signals what it can prove it started) could not take over again
     if ! write_pid_atomic "$pid" "${PID_FILE}"; then
         log ERROR "Failed to write PID file"
         terminate_process_group "$pid" 5
         return 1
     fi
 
+    if ! wait_for_mediamtx_ready "$pid"; then
+        terminate_process_group "$pid" 5
+        pid_file_remove "${PID_FILE}"
+        log ERROR "MediaMTX failed to become ready"
+        return 1
+    fi
+
     log INFO "MediaMTX started successfully (PID: $pid)"
+
+    start_streams_and_report "${devices[@]}"
+}
+
+# Start the streams of DEVICES (one per device, or the single multiplexed
+# stream) that are not running yet, and print their RTSP URLs. A stream that is
+# already running is left alone: the per-stream start checks its wrapper.
+start_streams_and_report() {
+    local devices=("$@")
 
     # Start streams based on mode
     if [[ "${STREAM_MODE}" == "multiplex" ]]; then
@@ -5013,34 +5580,135 @@ stop_mediamtx() {
         return "${E_LOCK_FAILED}"
     fi
 
-    stop_all_ffmpeg_streams
+    local stop_failed=false
+    stop_all_ffmpeg_streams || stop_failed=true
 
     if ! is_mediamtx_running; then
         log WARN "MediaMTX is not running"
+        # A record of a process that is gone, or is not MediaMTX, is dropped
+        stop_recorded_process "${PID_FILE}" mediamtx 0 || true
         STOPPING_SERVICE=false
+        [[ "$stop_failed" == "false" ]] || return 1
         return 0
     fi
 
     log INFO "Stopping MediaMTX..."
 
-    local pid
-    pid="$(read_pid_safe "${PID_FILE}")"
-
-    if [[ -n "$pid" ]]; then
-        terminate_process_group "$pid" 30
+    # Only the MediaMTX recorded in PID_FILE, and only while it is provably the
+    # one this manager started (never another instance's, never mediamtx.service's)
+    if ! stop_recorded_process "${PID_FILE}" mediamtx 30; then
+        log ERROR "MediaMTX could not be stopped"
+        STOPPING_SERVICE=false
+        return 1
     fi
-
-    rm -f "${PID_FILE}"
 
     log INFO "MediaMTX stopped"
     STOPPING_SERVICE=false
+    [[ "$stop_failed" == "false" ]] || return 1
+    return 0
+}
+
+# Print what `force-stop --kill-all` would signal, and why
+print_kill_all_preview() {
+    local pid start kind why cmdline
+    local -a found=()
+    mapfile -t found < <(scan_instance_processes)
+    if [[ ${#found[@]} -eq 0 ]]; then
+        echo "force-stop --kill-all: no process of this installation was found; there is nothing to signal."
+        return 0
+    fi
+    echo "force-stop --kill-all would send SIGKILL to these ${#found[@]} process(es):"
+    local line
+    for line in "${found[@]}"; do
+        read -r pid start kind why <<<"$line"
+        cmdline="$(tr '\0' ' ' 2>/dev/null <"/proc/${pid}/cmdline")" || cmdline=""
+        printf '  PID %s (%s): %s\n' "$pid" "$kind" "$why"
+        printf '      command line: %s\n' "${cmdline:0:200}"
+    done
+}
+
+# The broad kill: SIGKILL to every process scan_instance_processes lists, but
+# each only while it is still the process that was listed (same start time).
+# Wrappers and FFmpeg first, so nothing restarts what is being killed, then
+# MediaMTX. Returns 1 when one of them survives.
+kill_all_instance_processes() {
+    local pid start kind why line waited=0 survivors=0 kind_wanted
+    local -a found=()
+    mapfile -t found < <(scan_instance_processes)
+    [[ ${#found[@]} -gt 0 ]] || return 0
+    for kind_wanted in wrapper ffmpeg mediamtx; do
+        for line in "${found[@]}"; do
+            read -r pid start kind why <<<"$line"
+            [[ "$kind" == "$kind_wanted" ]] || continue
+            log WARN "Sending SIGKILL to PID $pid ($kind): $why"
+            _signal_if_same KILL "$pid" "$start" || true
+        done
+    done
+    while ((waited < 30)); do
+        survivors=0
+        for line in "${found[@]}"; do
+            read -r pid start _ <<<"$line"
+            if _proc_is_same_live "$pid" "$start"; then
+                survivors=$((survivors + 1))
+            fi
+        done
+        ((survivors > 0)) || break
+        sleep "$QUICK_SLEEP"
+        ((waited++)) || true
+    done
+    if ((survivors > 0)); then
+        log ERROR "$survivors process(es) survived SIGKILL"
+        return 1
+    fi
     return 0
 }
 
 # Force stop. Takes the lifecycle lock (bounded wait) so it never overlaps a
 # start/stop/restart; if the lock cannot be taken it reports the holder and
 # refuses without touching anything. The lock file itself is never deleted.
+#
+#   force-stop                    SIGKILL at once to the wrappers (with their
+#                                 FFmpeg) and the MediaMTX recorded in this
+#                                 manager's PID files, each only while it is
+#                                 provably the process this manager started
+#   force-stop --kill-all         the one broad kill. Prints every process of
+#                                 this installation found by what it runs (the
+#                                 configured MediaMTX binary, a command line in
+#                                 the wrapper directory, FFmpeg that logs
+#                                 there) and why, and exits 1 without signalling
+#   force-stop --kill-all --yes   sends SIGKILL to exactly that list
+#
+# The FFmpeg logs are kept (they are the post-mortem), the lock files are never
+# removed.
 force_stop_mediamtx() {
+    local kill_all=false confirmed=false arg
+    for arg in "$@"; do
+        case "$arg" in
+            --kill-all) kill_all=true ;;
+            --yes) confirmed=true ;;
+            *)
+                log ERROR "Unknown force-stop option: $arg (usage: force-stop [--kill-all [--yes]])"
+                SKIP_CLEANUP=true
+                return "${E_GENERAL}"
+                ;;
+        esac
+    done
+    if [[ "$confirmed" == "true" && "$kill_all" != "true" ]]; then
+        log ERROR "force-stop: --yes only applies to --kill-all (usage: force-stop [--kill-all [--yes]])"
+        SKIP_CLEANUP=true
+        return "${E_GENERAL}"
+    fi
+
+    # Without --yes the broad kill is only a preview: nothing is signalled or
+    # removed, so no lock is needed, and the non-zero exit must not leave the
+    # cleanup marker that stops the wrappers
+    if [[ "$kill_all" == "true" && "$confirmed" != "true" ]]; then
+        print_kill_all_preview
+        echo "Nothing was signalled. To signal exactly these processes run: ${SCRIPT_NAME} force-stop --kill-all --yes"
+        SKIP_CLEANUP=true
+        return "${E_GENERAL}"
+    fi
+
     STOPPING_SERVICE=true
 
     if ! acquire_lock "${STOP_LOCK_TIMEOUT}"; then
@@ -5053,40 +5721,50 @@ force_stop_mediamtx() {
 
     log WARN "Force stopping MediaMTX and all related processes"
 
-    # Kill all FFmpeg processes
-    pkill -f "^ffmpeg.*rtsp://${MEDIAMTX_HOST}:8554" 2>/dev/null || true
-
-    # Kill all wrapper scripts
-    pkill -f "${FFMPEG_PID_DIR}/.*\.sh" 2>/dev/null || true
-
-    # Kill MediaMTX
-    if [[ -f "${PID_FILE}" ]]; then
-        local pid
-        pid="$(read_pid_safe "${PID_FILE}")"
-        if [[ -n "$pid" ]]; then
-            kill -KILL "$pid" 2>/dev/null || true
-        fi
+    local rc=0
+    if [[ "$kill_all" == "true" ]]; then
+        print_kill_all_preview
+        kill_all_instance_processes || rc=1
     fi
 
-    # Kill any MediaMTX process
-    pkill -f "^${MEDIAMTX_BIN}" 2>/dev/null || true
+    # Wrappers (with their FFmpeg) and MediaMTX from the PID files, then the
+    # records, generated scripts and markers they leave. SIGKILL at once.
+    cleanup_stale_processes 0
 
-    # Clean up all files
-    rm -f "${PID_FILE}"
-    rm -f "${FFMPEG_PID_DIR}"/*.pid
-    rm -f "${FFMPEG_PID_DIR}"/*.sh
-    rm -f "${FFMPEG_PID_DIR}"/*.log
-    rm -f "${FFMPEG_PID_DIR}"/*.log.old
-    rm -f "${RESTART_MARKER}"
-    rm -f "${CLEANUP_MARKER}"
+    local leftover
+    for leftover in "${PID_FILE}" "${FFMPEG_PID_DIR}"/*.pid; do
+        if [[ -f "$leftover" ]]; then
+            log ERROR "Could not stop the process recorded in $leftover"
+            rc=1
+        fi
+    done
 
     log INFO "Force stop completed"
     STOPPING_SERVICE=false
-    return 0
+    return "$rc"
 }
 
 # Restart MediaMTX
+#
+# The lifecycle lock is taken first and kept across the stop and the start. A
+# restart that cannot get it is refused before anything is written: it used to
+# mark the restart first, so a refused restart left the restart marker behind
+# and the next start treated the node as being in a restart for 60 seconds.
+# Nothing is changed either when another unit owns MediaMTX (E_OWNERSHIP).
 restart_mediamtx() {
+    if ! acquire_lock; then
+        log ERROR "Refusing to restart: another lifecycle command holds the lock (${LOCK_FILE})"
+        SKIP_CLEANUP=true
+        return "${E_LOCK_FAILED}"
+    fi
+
+    local foreign_owner=""
+    if foreign_owner="$(foreign_mediamtx_owner)"; then
+        SKIP_CLEANUP=true
+        log ERROR "Refusing to restart: ${foreign_owner}"
+        return "${E_OWNERSHIP}"
+    fi
+
     mark_restart
     stop_mediamtx
     sleep "$MEDIUM_SLEEP"
@@ -5388,9 +6066,22 @@ Environment Variables:
                              - amerge: Merge sources keeping channels separate
 
 Commands:
-    start       Start MediaMTX and FFmpeg streams
-    stop        Stop MediaMTX and FFmpeg streams
-    force-stop  Force stop all processes (emergency use)
+    start       Start MediaMTX and FFmpeg streams. Safe to repeat: when this
+                manager's own MediaMTX is running it is left alone (same PIDs,
+                no outage) and only streams that are missing are started.
+                Refused with exit 8 while another MediaMTX owns the node
+                (mediamtx.service, or a MediaMTX this manager did not start).
+    stop        Stop MediaMTX and FFmpeg streams. Only processes this manager
+                started are signalled (PID files + process start time).
+    force-stop  SIGKILL, at once, the processes this manager started (emergency
+                use; the FFmpeg logs are kept)
+    force-stop --kill-all [--yes]
+                The only broad kill: every process whose executable is the
+                configured MediaMTX binary, whose command line names a file in
+                the wrapper directory, or that is an FFmpeg logging there (this
+                also stops another MediaMTX that uses the same binary). Without
+                --yes it only prints those processes and why, signals nothing
+                and exits 1.
     restart     Restart everything
     status      Show current status
     config      Show device configuration
@@ -5450,7 +6141,13 @@ Exit Codes:
     5  - Lock acquisition failed
     6  - No USB devices found (logged only)
     7  - MediaMTX not running (logged only)
+    8  - Another MediaMTX owns the node (start/restart refused, nothing changed)
     10 - Stream monitoring degraded (logged only)
+
+FFmpeg logs:
+    The log of each stream's previous run is kept as <stream>.log.prev.1 ...
+    in ${FFMPEG_PID_DIR}: FFMPEG_LOG_KEEP runs (default 3, at most 20). start,
+    stop and force-stop never delete them.
 
 EOF
 }
@@ -5499,6 +6196,8 @@ parse_arguments() {
             *)
                 # This is the command - return it and preserve remaining args
                 COMMAND="$1"
+                shift
+                COMMAND_ARGS=("$@")
                 return 0
                 ;;
         esac
@@ -5540,6 +6239,7 @@ parse_arguments() {
 #   5 = Lock acquisition failed (E_LOCK_FAILED)
 #   6 = No USB devices found (E_USB_NO_DEVICES)
 #   7 = MediaMTX not running (E_MEDIAMTX_DOWN)
+#   8 = Another MediaMTX owns the node; start/restart refused (E_OWNERSHIP)
 #   10 = Stream monitoring degraded (E_MONITOR_DEGRADED)
 #
 # Side Effects:
@@ -5581,7 +6281,7 @@ main() {
         force-stop)
             check_root
             setup_directories
-            force_stop_mediamtx
+            force_stop_mediamtx ${COMMAND_ARGS[@]+"${COMMAND_ARGS[@]}"}
             exit_code=$?
             ;;
         restart)
