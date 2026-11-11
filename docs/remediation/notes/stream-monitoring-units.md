@@ -514,3 +514,29 @@ transaction when both units are enabled at boot and when one is started over the
 `TimeoutStartSec`); (5) `ProtectHome=read-only` with the script under `/home`; (6) the start
 limit and `Restart=always` timing at boot with a late USB hub; (7) every sandbox directive
 against real ALSA/udev hotplug. A hardware watchdog (`RuntimeWatchdogSec=`) was not tried.
+
+## For `tests/README.md` and the finding register
+
+- New files and their test counts: `test_stream_manager_signals.bats` 25,
+  `test_stream_manager_removed_features.bats` 14, `test_stream_manager_reload.bats` 13,
+  `test_stream_manager_unit.bats` 24. `test_mediamtx_live.bats` gained three live tests (signals,
+  reload, unit sandbox; each skipped without `LYREBIRD_TEST_MEDIAMTX_BINS` and a network + mount
+  namespace) on top of the lifecycle one. New live drivers: `signals_e2e.bash`, `reload_e2e.bash`,
+  `unit_sandbox_e2e.bash` (the signals and reload drivers run once per MediaMTX binary, about 35 s and
+  100 s each; the sandbox driver runs on the first binary only, about 80 s). `bats --count tests/` is
+  **1153** on this branch (the full suite: 1135 passed, 18 skipped, 0 failed, `tests/check_tmp_leaks.sh`
+  reports no leftovers). Removed tests: `test_monotonic_timing` "silence tracking does not fire a false
+  DEAD MIC after a forward clock jump", `test_pipefail_aborts` "stream-manager: check_audio_level survives
+  ffmpeg exiting 0 with NO volumedetect output" (they called the deleted `check_audio_level`; covered by
+  real-function tests, see the signals section), `test_stream_manager` "heartbeat file update writes
+  timestamp" (an inline copy of `update_heartbeat`). Changed: `test_stream_manager` "default values are
+  set for timeouts" (no `HEARTBEAT_INTERVAL` any more).
+- Register tests for `docs/remediation-status.json` (names, all in the files above): LB-14/X-05 the
+  `monitor_signals`/`probe_stream_level` tests and the live "audio level signals ..." test; LB-15 and X-13
+  (manager side) the `[LB-15 ...]`/`[X-13]` tests of `test_stream_manager_removed_features.bats` and the
+  config test "no shipped unit sets or mentions the LYREBIRD_WATCHDOG_* variables ..."; LB-16 the `[LB-16, D8]`
+  tests; LB-11/LB-12/X-12 the `[LB-11 ...]`, `[LB-12]` tests of `test_stream_manager_unit.bats` and
+  `test_stream_manager_reload.bats`, and the live "reload against ..." and "every path the manager writes ..."
+  tests. LB-12 stays a placement finding. X-12: no unit sends a signal MediaMTX does not handle, the standalone
+  unit has no ExecReload, the manager unit runs the real `reload`; the installer-generated unit text
+  (`ExecReload=kill -USR1`) is the installer worker's later pass (D12: it should render the same template).
