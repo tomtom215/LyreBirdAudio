@@ -200,7 +200,9 @@ suggest_name() {
         name="usb-${name}"
     fi
     name="${name:0:$MAX_NAME_LENGTH}"
-    while [[ "$name" == *- ]]; do name="${name%-}"; done
+    while [[ "$name" == *- ]]; do
+        name="${name%-}"
+    done
     if ! name_problem "$name" >/dev/null; then
         name="usb-audio"
     fi
@@ -389,8 +391,12 @@ assert_rules_safe() {
     local tail_re='(ATTR[{]id[}]!="[a-z][a-z0-9-]*", ATTR[{]id[}]="[a-z][a-z0-9-]*"|SYMLINK[+]="sound/by-id/[a-z][a-z0-9-]*"), ENV[{]USB_AUDIO_MAPPER[}]="[a-z][a-z0-9-]*"$'
     while IFS= read -r line; do
         count=$((count + 1))
-        if [[ "$line" =~ $c_re ]]; then continue; fi
-        if [[ "$line" =~ $m_re$tail_re ]]; then continue; fi
+        if [[ "$line" =~ $c_re ]]; then
+            continue
+        fi
+        if [[ "$line" =~ $m_re$tail_re ]]; then
+            continue
+        fi
         error_exit "Internal: refusing to write unexpected rule line: $line"
     done <<<"$1"
     ((count == 3)) || error_exit "Internal: expected 3 rule lines, got $count"
@@ -643,7 +649,9 @@ verify_mapping() {
     error "Card $card is still named '$got', not '$name'."
     while IFS= read -r n; do
         [[ -n "$n" ]] || continue
-        if [[ "$n" != "$card" && "$(card_id "$n")" == "$name" ]]; then holder="$n"; fi
+        if [[ "$n" != "$card" && "$(card_id "$n")" == "$name" ]]; then
+            holder="$n"
+        fi
     done <<<"$(list_card_numbers)"
     if [[ -n "$holder" ]]; then
         error "Card $holder still holds the name '$name' (ALSA ids must be unique)."
@@ -707,7 +715,9 @@ map_device() {
         elif [[ "$any_port" != "true" ]]; then
             local ports=()
             local p
-            while IFS= read -r p; do [[ -n "$p" ]] && ports+=("$p"); done <<<"$(find_ports_by_id "$vid" "$pid")"
+            while IFS= read -r p; do
+                [[ -n "$p" ]] && ports+=("$p")
+            done <<<"$(find_ports_by_id "$vid" "$pid")"
             if ((${#ports[@]} == 1)); then
                 port="${ports[0]}"
                 info "Found ${vid}:${pid} on USB port $port; the name will follow this port."
@@ -902,7 +912,9 @@ cmd_interactive() {
     vid=$(read_attr "$d/idVendor")
     pid=$(read_attr "$d/idProduct")
     desc=$(device_desc "$port")
-    while IFS= read -r n; do [[ -n "$n" && "$n" != "$port" ]] && others+=("$n"); done <<<"$(find_ports_by_id "$vid" "$pid")"
+    while IFS= read -r n; do
+        [[ -n "$n" && "$n" != "$port" ]] && others+=("$n")
+    done <<<"$(find_ports_by_id "$vid" "$pid")"
     printf '\nCard %s: %s (%s:%s) on USB port %s\n' "$card" "$desc" "$vid" "$pid" "$port" >&2
 
     local use_port="$port" answer

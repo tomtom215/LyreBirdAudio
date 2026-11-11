@@ -2456,7 +2456,7 @@ check_file_permissions_validity() {
             # The old `^64` anchor accepted 646/647 (rw-r--rw-/rwx), reporting a
             # WORLD-WRITABLE config as secure; check the other-write bit
             # explicitly (8# forces octal parsing).
-            if [[ "${config_perms}" =~ ^6[04][0-7]$ ]] && (( (8#${config_perms} & 2) == 0 )); then
+            if [[ "${config_perms}" =~ ^6[04][0-7]$ ]] && (((8#${config_perms} & 2) == 0)); then
                 print_status "Config Permissions" "PASS" "Mode: ${config_perms}"
             else
                 print_status "Config Permissions" "WARN" "Permissive: ${config_perms} (expected: ${MEDIAMTX_CONFIG_MODE}+)"

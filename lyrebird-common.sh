@@ -611,7 +611,7 @@ if ! declare -f lyrebird_spinner_start &>/dev/null; then
             while true; do
                 local char="${chars:$i:1}"
                 printf '\r%s %s ' "${char}" "${message}"
-                i=$(( (i + 1) % len ))
+                i=$(((i + 1) % len))
                 sleep 0.1
             done
         ) &
@@ -633,8 +633,8 @@ if ! declare -f lyrebird_spinner_stop &>/dev/null; then
 
         # Show cursor and clear line
         if [[ -t 1 ]] && [[ -z "${NO_COLOR:-}" ]]; then
-            printf '\033[?25h'  # Show cursor
-            printf '\r\033[K'   # Clear line
+            printf '\033[?25h' # Show cursor
+            printf '\r\033[K'  # Clear line
         fi
 
         # Print status message if provided
@@ -730,7 +730,7 @@ if ! declare -f lyrebird_countdown &>/dev/null; then
         done
 
         if [[ -t 1 ]] && [[ -z "${NO_COLOR:-}" ]]; then
-            printf '\r\033[K'  # Clear line
+            printf '\r\033[K' # Clear line
         fi
     }
 fi

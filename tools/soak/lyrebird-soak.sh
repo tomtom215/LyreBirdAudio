@@ -630,7 +630,11 @@ inject() {
             if [[ "$SOAK_USB_METHOD" == uhubctl ]]; then
                 need uhubctl
                 local loc p
-                if [[ "$port" == *.* ]]; then loc="${port%.*}" p="${port##*.}"; else loc="${port%%-*}" p="${port#*-}"; fi
+                if [[ "$port" == *.* ]]; then
+                    loc="${port%.*}" p="${port##*.}"
+                else
+                    loc="${port%%-*}" p="${port#*-}"
+                fi
                 FAULT_DETAIL="port=$port uhubctl -l $loc -p $p"
                 arm_restore usb $((FAULT_HOLD + 30)) "uhubctl -a on -l '$loc' -p '$p' >/dev/null"
                 act uhubctl -a off -l "$loc" -p "$p"
@@ -639,7 +643,11 @@ inject() {
                 [[ -e "$auth" ]] || return 1
                 FAULT_DETAIL="port=$port authorized=0"
                 arm_restore usb $((FAULT_HOLD + 30)) "echo 1 > '$auth'"
-                if [[ "$SOAK_DRY_RUN" == 1 ]]; then act tee "$auth" <<<0; else echo 0 >"$auth"; fi
+                if [[ "$SOAK_DRY_RUN" == 1 ]]; then
+                    act tee "$auth" <<<0
+                else
+                    echo 0 >"$auth"
+                fi
             fi
             ;;
         net-down)
@@ -696,7 +704,9 @@ inject() {
 
 enabled_faults() {
     local f
-    for f in ${SOAK_FAULTS//,/ }; do printf '%s\n' "$f"; done
+    for f in ${SOAK_FAULTS//,/ }; do
+        printf '%s\n' "$f"
+    done
 }
 
 # ----------------------------------------------------------------------------

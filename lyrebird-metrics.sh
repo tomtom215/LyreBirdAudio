@@ -75,9 +75,9 @@ get_timestamp_ms() {
 # scrape — so every dynamic label value must pass through here.
 prom_escape_label() {
     local v="$1"
-    v="${v//\\/\\\\}"      # backslash first
-    v="${v//\"/\\\"}"      # then double-quote
-    v="${v//$'\n'/\\n}"    # then newline
+    v="${v//\\/\\\\}"   # backslash first
+    v="${v//\"/\\\"}"   # then double-quote
+    v="${v//$'\n'/\\n}" # then newline
     printf '%s' "$v"
 }
 
@@ -617,7 +617,7 @@ ${metrics}"
 # ============================================================================
 
 show_help() {
-    cat << EOF
+    cat <<EOF
 Usage: ${SCRIPT_NAME} [OPTIONS]
 
 Export LyreBirdAudio metrics in Prometheus format.
@@ -652,11 +652,11 @@ main() {
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            -h|--help)
+            -h | --help)
                 show_help
                 exit 0
                 ;;
-            -v|--version)
+            -v | --version)
                 echo "${SCRIPT_NAME} v${VERSION}"
                 exit 0
                 ;;
@@ -703,14 +703,14 @@ main() {
             # Only replace the published file on a successful, complete
             # generation; on failure keep the previous file and drop the partial
             # temp rather than orphaning a `.tmp` (and never crash the cron).
-            if generate_all_metrics > "${output_file}.tmp"; then
+            if generate_all_metrics >"${output_file}.tmp"; then
                 mv "${output_file}.tmp" "$output_file"
             else
                 log "ERROR: metric generation failed; leaving previous ${output_file} in place"
                 rm -f "${output_file}.tmp" 2>/dev/null || true
             fi
             ;;
-        once|*)
+        once | *)
             generate_all_metrics
             ;;
     esac

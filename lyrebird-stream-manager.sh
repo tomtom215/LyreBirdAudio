@@ -333,9 +333,9 @@ MAX_RESTART_DELAY=$(_uint_or "${MAX_RESTART_DELAY:-}" 300)
 readonly MAX_RESTART_DELAY
 
 # Log rotation settings
-MAIN_LOG_MAX_SIZE=$(_uint_or "${MAIN_LOG_MAX_SIZE:-}" 104857600)        # 100MB
+MAIN_LOG_MAX_SIZE=$(_uint_or "${MAIN_LOG_MAX_SIZE:-}" 104857600) # 100MB
 readonly MAIN_LOG_MAX_SIZE
-FFMPEG_LOG_MAX_SIZE=$(_uint_or "${FFMPEG_LOG_MAX_SIZE:-}" 10485760)     # 10MB
+FFMPEG_LOG_MAX_SIZE=$(_uint_or "${FFMPEG_LOG_MAX_SIZE:-}" 10485760) # 10MB
 readonly FFMPEG_LOG_MAX_SIZE
 MEDIAMTX_LOG_MAX_SIZE=$(_uint_or "${MEDIAMTX_LOG_MAX_SIZE:-}" 52428800) # 50MB
 readonly MEDIAMTX_LOG_MAX_SIZE
@@ -366,7 +366,7 @@ readonly DEEP_HEALTH_STATE_DIR="${DEEP_HEALTH_STATE_DIR:-/run/lyrebird/deep-heal
 
 # Watchdog/Heartbeat settings
 # Heartbeat runs more frequently than cron for faster failure detection
-HEARTBEAT_INTERVAL=$(_uint_or "${HEARTBEAT_INTERVAL:-}" 30)             # Seconds between heartbeats
+HEARTBEAT_INTERVAL=$(_uint_or "${HEARTBEAT_INTERVAL:-}" 30) # Seconds between heartbeats
 readonly HEARTBEAT_INTERVAL
 readonly HEARTBEAT_FILE="${HEARTBEAT_FILE:-/run/mediamtx-audio.heartbeat}"
 readonly ENABLE_HARDWARE_WATCHDOG="${ENABLE_HARDWARE_WATCHDOG:-auto}" # auto, yes, no
@@ -379,7 +379,7 @@ DISK_SPACE_WARNING_PERCENT=$(_uint_or "${DISK_SPACE_WARNING_PERCENT:-}" 80)
 readonly DISK_SPACE_WARNING_PERCENT
 DISK_SPACE_CRITICAL_PERCENT=$(_uint_or "${DISK_SPACE_CRITICAL_PERCENT:-}" 95)
 readonly DISK_SPACE_CRITICAL_PERCENT
-DISK_SPACE_MIN_FREE_MB=$(_uint_or "${DISK_SPACE_MIN_FREE_MB:-}" 100)    # Minimum free MB
+DISK_SPACE_MIN_FREE_MB=$(_uint_or "${DISK_SPACE_MIN_FREE_MB:-}" 100) # Minimum free MB
 readonly DISK_SPACE_MIN_FREE_MB
 
 # Memory monitoring and leak detection
@@ -387,37 +387,37 @@ MEM_WARNING_PERCENT=$(_uint_or "${MEM_WARNING_PERCENT:-}" 80)
 readonly MEM_WARNING_PERCENT
 MEM_CRITICAL_PERCENT=$(_uint_or "${MEM_CRITICAL_PERCENT:-}" 95)
 readonly MEM_CRITICAL_PERCENT
-MEM_GROWTH_THRESHOLD_MB=$(_uint_or "${MEM_GROWTH_THRESHOLD_MB:-}" 100)  # MB growth triggers restart
+MEM_GROWTH_THRESHOLD_MB=$(_uint_or "${MEM_GROWTH_THRESHOLD_MB:-}" 100) # MB growth triggers restart
 readonly MEM_GROWTH_THRESHOLD_MB
 readonly MEM_SAMPLE_FILE="${MEM_SAMPLE_FILE:-/var/lib/mediamtx-ffmpeg/.mem_samples}"
 
 # Network connectivity monitoring
 readonly NETWORK_CHECK_ENABLED="${NETWORK_CHECK_ENABLED:-true}"
-readonly NETWORK_CHECK_TARGET="${NETWORK_CHECK_TARGET:-gateway}"    # gateway, specific IP, or hostname
-NETWORK_CHECK_TIMEOUT=$(_uint_or "${NETWORK_CHECK_TIMEOUT:-}" 5)        # Seconds
+readonly NETWORK_CHECK_TARGET="${NETWORK_CHECK_TARGET:-gateway}" # gateway, specific IP, or hostname
+NETWORK_CHECK_TIMEOUT=$(_uint_or "${NETWORK_CHECK_TIMEOUT:-}" 5) # Seconds
 readonly NETWORK_CHECK_TIMEOUT
-NETWORK_FAIL_THRESHOLD=$(_uint_or "${NETWORK_FAIL_THRESHOLD:-}" 3)      # Consecutive failures before alert
+NETWORK_FAIL_THRESHOLD=$(_uint_or "${NETWORK_FAIL_THRESHOLD:-}" 3) # Consecutive failures before alert
 readonly NETWORK_FAIL_THRESHOLD
 
 # Audio buffering (memory-based with optional disk persistence)
 # Memory buffering is done via FFmpeg's rtbufsize option (no SD card wear)
-readonly AUDIO_BUFFER_ENABLED="${AUDIO_BUFFER_ENABLED:-true}"       # Enable enhanced memory buffering
-AUDIO_BUFFER_SIZE_MB=$(_uint_or "${AUDIO_BUFFER_SIZE_MB:-}" 64)         # Memory buffer size per stream (MB)
+readonly AUDIO_BUFFER_ENABLED="${AUDIO_BUFFER_ENABLED:-true}"   # Enable enhanced memory buffering
+AUDIO_BUFFER_SIZE_MB=$(_uint_or "${AUDIO_BUFFER_SIZE_MB:-}" 64) # Memory buffer size per stream (MB)
 readonly AUDIO_BUFFER_SIZE_MB
-AUDIO_RTBUFSIZE=$(_uint_or "${AUDIO_RTBUFSIZE:-}" 33554432)             # Real-time buffer size in bytes (32MB default)
+AUDIO_RTBUFSIZE=$(_uint_or "${AUDIO_RTBUFSIZE:-}" 33554432) # Real-time buffer size in bytes (32MB default)
 readonly AUDIO_RTBUFSIZE
 # Local recording (ring buffer) - writes audio to tmpfs or disk alongside streaming
-readonly AUDIO_LOCAL_RECORDING="${AUDIO_LOCAL_RECORDING:-false}"    # Enable local recording backup
+readonly AUDIO_LOCAL_RECORDING="${AUDIO_LOCAL_RECORDING:-false}"                  # Enable local recording backup
 readonly AUDIO_RECORDING_PATH="${AUDIO_RECORDING_PATH:-/dev/shm/lyrebird-buffer}" # Default to tmpfs (RAM)
-AUDIO_RECORDING_SEGMENT_TIME=$(_uint_or "${AUDIO_RECORDING_SEGMENT_TIME:-}" 300) # 5 min segments
+AUDIO_RECORDING_SEGMENT_TIME=$(_uint_or "${AUDIO_RECORDING_SEGMENT_TIME:-}" 300)  # 5 min segments
 readonly AUDIO_RECORDING_SEGMENT_TIME
 AUDIO_RECORDING_SEGMENTS=$(_uint_or "${AUDIO_RECORDING_SEGMENTS:-}" 12) # Keep last 12 segments (1 hour)
 readonly AUDIO_RECORDING_SEGMENTS
-readonly AUDIO_DISK_PERSIST="${AUDIO_DISK_PERSIST:-false}"          # Move segments to disk (SD card wear!)
+readonly AUDIO_DISK_PERSIST="${AUDIO_DISK_PERSIST:-false}" # Move segments to disk (SD card wear!)
 readonly AUDIO_DISK_PATH="${AUDIO_DISK_PATH:-/var/lib/mediamtx-ffmpeg/recordings}"
 
 # Audio level monitoring (detect dead/silent microphones)
-readonly AUDIO_LEVEL_CHECK_ENABLED="${AUDIO_LEVEL_CHECK_ENABLED:-true}"  # Enable silence detection
+readonly AUDIO_LEVEL_CHECK_ENABLED="${AUDIO_LEVEL_CHECK_ENABLED:-true}"      # Enable silence detection
 AUDIO_LEVEL_SAMPLE_DURATION=$(_uint_or "${AUDIO_LEVEL_SAMPLE_DURATION:-}" 3) # Seconds to sample for level check
 readonly AUDIO_LEVEL_SAMPLE_DURATION
 AUDIO_SILENCE_THRESHOLD_DB=$(_int_or "${AUDIO_SILENCE_THRESHOLD_DB:-}" -60) # dB below which is "silence"
@@ -426,11 +426,11 @@ AUDIO_SILENCE_WARN_DURATION=$(_uint_or "${AUDIO_SILENCE_WARN_DURATION:-}" 60) # 
 readonly AUDIO_SILENCE_WARN_DURATION
 
 # MediaMTX API version compatibility
-readonly MEDIAMTX_API_VERSION="${MEDIAMTX_API_VERSION:-auto}"       # auto, v3, v2, v1
-readonly MEDIAMTX_API_FALLBACK="${MEDIAMTX_API_FALLBACK:-true}"     # Try older API versions
+readonly MEDIAMTX_API_VERSION="${MEDIAMTX_API_VERSION:-auto}"   # auto, v3, v2, v1
+readonly MEDIAMTX_API_FALLBACK="${MEDIAMTX_API_FALLBACK:-true}" # Try older API versions
 
 # USB device health checks
-readonly USB_ALSA_CHECK_ENABLED="${USB_ALSA_CHECK_ENABLED:-true}"   # Check ALSA availability before restart
+readonly USB_ALSA_CHECK_ENABLED="${USB_ALSA_CHECK_ENABLED:-true}"             # Check ALSA availability before restart
 USB_DISCONNECT_GRACE_PERIOD=$(_uint_or "${USB_DISCONNECT_GRACE_PERIOD:-}" 10) # Seconds to wait after disconnect
 readonly USB_DISCONNECT_GRACE_PERIOD
 
@@ -1528,16 +1528,16 @@ check_memory_usage() {
     sample_dir=$(dirname "${MEM_SAMPLE_FILE}")
 
     if [[ -d "$sample_dir" ]] || mkdir -p "$sample_dir" 2>/dev/null; then
-        echo "${timestamp}:${total_rss_mb}" >> "${MEM_SAMPLE_FILE}" 2>/dev/null || true
+        echo "${timestamp}:${total_rss_mb}" >>"${MEM_SAMPLE_FILE}" 2>/dev/null || true
 
         # Keep only last 100 samples
         if [[ -f "${MEM_SAMPLE_FILE}" ]]; then
-            tail -100 "${MEM_SAMPLE_FILE}" > "${MEM_SAMPLE_FILE}.tmp" 2>/dev/null \
+            tail -100 "${MEM_SAMPLE_FILE}" >"${MEM_SAMPLE_FILE}.tmp" 2>/dev/null \
                 && mv "${MEM_SAMPLE_FILE}.tmp" "${MEM_SAMPLE_FILE}" 2>/dev/null || true
         fi
 
         # Check for memory growth trend (compare first and last sample)
-        if [[ -f "${MEM_SAMPLE_FILE}" ]] && [[ $(wc -l < "${MEM_SAMPLE_FILE}") -ge 10 ]]; then
+        if [[ -f "${MEM_SAMPLE_FILE}" ]] && [[ $(wc -l <"${MEM_SAMPLE_FILE}") -ge 10 ]]; then
             local first_sample last_sample
             first_sample=$(head -1 "${MEM_SAMPLE_FILE}" | cut -d: -f2)
             last_sample=$(tail -1 "${MEM_SAMPLE_FILE}" | cut -d: -f2)
@@ -1560,7 +1560,7 @@ check_memory_usage() {
         mem_total=$(grep "MemTotal:" /proc/meminfo | awk '{print $2}')
         mem_available=$(grep "MemAvailable:" /proc/meminfo | awk '{print $2}')
         if [[ -n "$mem_total" ]] && [[ -n "$mem_available" ]] && [[ "$mem_total" -gt 0 ]]; then
-            mem_used_percent=$(( (mem_total - mem_available) * 100 / mem_total ))
+            mem_used_percent=$(((mem_total - mem_available) * 100 / mem_total))
 
             if [[ $mem_used_percent -ge ${MEM_CRITICAL_PERCENT} ]]; then
                 log ERROR "Critical: System memory usage at ${mem_used_percent}%"
@@ -1603,14 +1603,14 @@ check_network_connectivity() {
         if ping -c 1 -W "${NETWORK_CHECK_TIMEOUT}" "$target" >/dev/null 2>&1; then
             log DEBUG "Network connectivity OK (gateway: $target)"
             # Reset failure counter
-            echo "0" > /run/mediamtx-network-failures 2>/dev/null || true
+            echo "0" >/run/mediamtx-network-failures 2>/dev/null || true
             return 0
         else
             # Increment failure counter
             local failures=0
             [[ -f /run/mediamtx-network-failures ]] && failures=$(cat /run/mediamtx-network-failures 2>/dev/null || echo 0)
             failures=$((failures + 1))
-            echo "$failures" > /run/mediamtx-network-failures 2>/dev/null || true
+            echo "$failures" >/run/mediamtx-network-failures 2>/dev/null || true
 
             if [[ $failures -ge ${NETWORK_FAIL_THRESHOLD} ]]; then
                 log ERROR "Network connectivity lost: $failures consecutive failures to reach $target"
@@ -2130,7 +2130,10 @@ mediamtx_refresh_jwks() {
 # Get total count of active RTSP sessions (listeners)
 mediamtx_count_rtsp_sessions() {
     local sessions
-    sessions=$(mediamtx_list_rtsp_sessions) || { echo "0"; return; }
+    sessions=$(mediamtx_list_rtsp_sessions) || {
+        echo "0"
+        return
+    }
     local count
     count=$(_json_count_matches "$sessions" '"id"')
     echo "${count:-0}"
@@ -2175,7 +2178,10 @@ mediamtx_count_all_connections() {
 # Get count of ready paths
 mediamtx_count_ready_paths() {
     local paths
-    paths=$(mediamtx_list_paths) || { echo "0"; return; }
+    paths=$(mediamtx_list_paths) || {
+        echo "0"
+        return
+    }
     local count
     count=$(mediamtx_json_count_ready "$paths")
     echo "${count:-0}"
@@ -2302,7 +2308,7 @@ check_audio_level() {
 
     # Compare with threshold (both are negative dB values)
     # Note: -30 dB is louder than -60 dB, so we check if max > threshold
-    local max_int="${max_volume%.*}"  # Remove decimal for integer comparison
+    local max_int="${max_volume%.*}" # Remove decimal for integer comparison
     local threshold_int="${silence_threshold%.*}"
 
     if [[ $max_int -lt $threshold_int ]]; then
@@ -2315,7 +2321,7 @@ check_audio_level() {
             silence_start=$(cat "$silence_file" 2>/dev/null || echo "0")
         else
             silence_start=$(_now_monotonic)
-            echo "$silence_start" > "$silence_file" 2>/dev/null || true
+            echo "$silence_start" >"$silence_file" 2>/dev/null || true
         fi
 
         local now
@@ -2325,7 +2331,7 @@ check_audio_level() {
         # rather than silently never reaching the DEAD MIC threshold again.
         if [[ ! "$silence_start" =~ ^[0-9]+$ ]] || ((silence_start > now)); then
             silence_start=$now
-            echo "$silence_start" > "$silence_file" 2>/dev/null || true
+            echo "$silence_start" >"$silence_file" 2>/dev/null || true
         fi
         local silence_duration=$((now - silence_start))
 
@@ -2411,7 +2417,7 @@ update_heartbeat() {
     [[ -d "$heartbeat_dir" ]] || mkdir -p "$heartbeat_dir" 2>/dev/null || true
 
     # Write timestamp atomically
-    echo "$timestamp" > "${HEARTBEAT_FILE}.tmp" 2>/dev/null \
+    echo "$timestamp" >"${HEARTBEAT_FILE}.tmp" 2>/dev/null \
         && mv "${HEARTBEAT_FILE}.tmp" "${HEARTBEAT_FILE}" 2>/dev/null \
         || true
 
@@ -2428,18 +2434,18 @@ update_heartbeat() {
 init_hardware_watchdog() {
     # Check if hardware watchdog should be enabled
     case "${ENABLE_HARDWARE_WATCHDOG}" in
-        no|false|0)
+        no | false | 0)
             log DEBUG "Hardware watchdog disabled by configuration"
             return 0
             ;;
-        yes|true|1)
+        yes | true | 1)
             # Explicitly enabled - warn if not available
             if [[ ! -c "${HARDWARE_WATCHDOG_DEVICE}" ]]; then
                 log WARN "Hardware watchdog enabled but device ${HARDWARE_WATCHDOG_DEVICE} not found"
                 return 0
             fi
             ;;
-        auto|*)
+        auto | *)
             # Auto-detect - silently skip if not available
             if [[ ! -c "${HARDWARE_WATCHDOG_DEVICE}" ]]; then
                 log DEBUG "Hardware watchdog not available (auto-detect)"
@@ -2470,7 +2476,7 @@ kick_hardware_watchdog() {
 
     # Write any character to the watchdog device to kick it
     if [[ -w "${HARDWARE_WATCHDOG_DEVICE}" ]]; then
-        echo "1" > "${HARDWARE_WATCHDOG_DEVICE}" 2>/dev/null || true
+        echo "1" >"${HARDWARE_WATCHDOG_DEVICE}" 2>/dev/null || true
     fi
 }
 
@@ -2485,8 +2491,8 @@ check_version_compatibility() {
         # Simple version comparison (major.minor.patch)
         local required="${MIN_COMPATIBLE_COMMON_VERSION}"
         local IFS='.'
-        read -ra req_parts <<< "$required"
-        read -ra cur_parts <<< "$common_version"
+        read -ra req_parts <<<"$required"
+        read -ra cur_parts <<<"$common_version"
 
         for i in 0 1 2; do
             local req_num="${req_parts[$i]:-0}"
@@ -2613,7 +2619,10 @@ _now_monotonic() {
 _cron_restart_count() {
     local stream_path="$1"
     local state_file="${CRON_RESTART_STATE_DIR}/${stream_path}.restarts"
-    [[ -f "$state_file" ]] || { printf '0'; return 0; }
+    [[ -f "$state_file" ]] || {
+        printf '0'
+        return 0
+    }
     local now cutoff count=0 ts
     now="$(_now_monotonic)"
     cutoff=$((now - 3600))

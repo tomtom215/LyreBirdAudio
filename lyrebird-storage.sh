@@ -38,7 +38,7 @@ readonly SCRIPT_NAME
 readonly RECORDING_DIR="${LYREBIRD_RECORDING_DIR:-/var/lib/mediamtx-ffmpeg/recordings}"
 readonly LOG_DIR="${LYREBIRD_LOG_DIR:-/var/log/lyrebird}"
 readonly MEDIAMTX_LOG="${MEDIAMTX_LOG:-/var/log/mediamtx.out}"
-readonly MEDIAMTX_LOG_DIR="${MEDIAMTX_LOG%/*}"  # Directory containing MediaMTX log
+readonly MEDIAMTX_LOG_DIR="${MEDIAMTX_LOG%/*}" # Directory containing MediaMTX log
 readonly TEMP_DIR="${LYREBIRD_TEMP_DIR:-/tmp}"
 readonly BUFFER_DIR="${LYREBIRD_BUFFER_DIR:-/dev/shm/lyrebird-buffer}"
 
@@ -64,9 +64,9 @@ _log_ret=$(_coerce_uint "${LOG_RETENTION_DAYS:-7}" 7)
 _tmp_ret=$(_coerce_uint "${TEMP_RETENTION_HOURS:-24}" 24)
 
 # Ensure retention values are positive (minimum 1)
-(( _rec_ret < 1 )) && _rec_ret=1
-(( _log_ret < 1 )) && _log_ret=1
-(( _tmp_ret < 1 )) && _tmp_ret=1
+((_rec_ret < 1)) && _rec_ret=1
+((_log_ret < 1)) && _log_ret=1
+((_tmp_ret < 1)) && _tmp_ret=1
 
 readonly RECORDING_RETENTION_DAYS="$_rec_ret"
 readonly LOG_RETENTION_DAYS="$_log_ret"
@@ -91,9 +91,9 @@ _disk_critical=$(_coerce_uint "${DISK_CRITICAL_PERCENT:-90}" 90)
 _disk_emergency=$(_coerce_uint "${DISK_EMERGENCY_PERCENT:-95}" 95)
 
 # Clamp percentage values to valid range
-(( _disk_warning > 100 )) && _disk_warning=100
-(( _disk_critical > 100 )) && _disk_critical=100
-(( _disk_emergency > 100 )) && _disk_emergency=100
+((_disk_warning > 100)) && _disk_warning=100
+((_disk_critical > 100)) && _disk_critical=100
+((_disk_emergency > 100)) && _disk_emergency=100
 
 readonly DISK_WARNING_PERCENT="$_disk_warning"
 readonly DISK_CRITICAL_PERCENT="$_disk_critical"
@@ -107,8 +107,8 @@ unset _min_free
 
 # Log file size limits (bytes)
 _max_log_size=$(_coerce_uint "${MAX_LOG_SIZE:-104857600}" 104857600)
-(( _max_log_size < 1 )) && _max_log_size=104857600
-readonly MAX_LOG_SIZE="$_max_log_size"  # default 100MB
+((_max_log_size < 1)) && _max_log_size=104857600
+readonly MAX_LOG_SIZE="$_max_log_size" # default 100MB
 unset _max_log_size
 
 # Dry run mode (set to true to see what would be deleted)
@@ -399,8 +399,8 @@ truncate_large_logs() {
                 # writing to the now-unlinked old inode: its space was never
                 # reclaimed and it grew invisibly until the disk filled, while
                 # `stat` on the path still showed ~10MB so this never re-fired.
-                if tail -c 10485760 "$MEDIAMTX_LOG" > "${MEDIAMTX_LOG}.tmp" 2>/dev/null; then
-                    cat "${MEDIAMTX_LOG}.tmp" > "$MEDIAMTX_LOG" 2>/dev/null || true
+                if tail -c 10485760 "$MEDIAMTX_LOG" >"${MEDIAMTX_LOG}.tmp" 2>/dev/null; then
+                    cat "${MEDIAMTX_LOG}.tmp" >"$MEDIAMTX_LOG" 2>/dev/null || true
                     log_info "Truncated MediaMTX log"
                 fi
                 rm -f "${MEDIAMTX_LOG}.tmp" 2>/dev/null || true
@@ -420,8 +420,8 @@ truncate_large_logs() {
                     # Truncate in place (preserve inode) so a process holding
                     # the file open keeps writing to the same inode. See the
                     # MediaMTX-log note above.
-                    if tail -c 10485760 "$logfile" > "${logfile}.tmp" 2>/dev/null; then
-                        cat "${logfile}.tmp" > "$logfile" 2>/dev/null || true
+                    if tail -c 10485760 "$logfile" >"${logfile}.tmp" 2>/dev/null; then
+                        cat "${logfile}.tmp" >"$logfile" 2>/dev/null || true
                         log_info "Truncated $logfile"
                     fi
                     rm -f "${logfile}.tmp" 2>/dev/null || true
@@ -608,7 +608,7 @@ cmd_emergency() {
 # ============================================================================
 
 show_help() {
-    cat << EOF
+    cat <<EOF
 Usage: ${SCRIPT_NAME} [OPTIONS] COMMAND
 
 Storage management for LyreBirdAudio.
@@ -655,23 +655,23 @@ main() {
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            -h|--help)
+            -h | --help)
                 show_help
                 exit 0
                 ;;
-            -v|--version)
+            -v | --version)
                 echo "${SCRIPT_NAME} v${VERSION}"
                 exit 0
                 ;;
-            -n|--dry-run)
+            -n | --dry-run)
                 DRY_RUN="true"
                 shift
                 ;;
-            -d|--debug)
+            -d | --debug)
                 DEBUG="true"
                 shift
                 ;;
-            status|cleanup|monitor|emergency)
+            status | cleanup | monitor | emergency)
                 command="$1"
                 shift
                 ;;

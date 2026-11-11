@@ -1122,12 +1122,12 @@ migration_stream_manager_rename() {
 
     # Mark migration complete if no critical errors
     if [[ $errors -eq 0 ]]; then
-        echo "$(date -Iseconds)" > "$marker_file" 2>/dev/null || true
+        echo "$(date -Iseconds)" >"$marker_file" 2>/dev/null || true
         if [[ $changes_made -gt 0 ]]; then
             log_success "Migration 'stream-manager-rename' completed ($changes_made changes)"
         else
             log_debug "Migration 'stream-manager-rename' - no changes needed"
-            echo "$(date -Iseconds) - no changes needed" > "$marker_file" 2>/dev/null || true
+            echo "$(date -Iseconds) - no changes needed" >"$marker_file" 2>/dev/null || true
         fi
         return 0
     else
