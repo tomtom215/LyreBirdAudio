@@ -19,6 +19,7 @@ setup() {
 }
 
 teardown() {
+    updater_blackhole_stop
     scratch_teardown
 }
 
@@ -429,6 +430,77 @@ _updater_vars() {
     [[ "$output" == *"Rollback incomplete"* ]]
     # the operator's edit is safe in the stash, not lost
     git -C "$REPO" stash list | grep -q lyrebird-tx
+}
+
+# ============================================================================
+# The network goes away
+# ============================================================================
+
+# updater_run with a deadline: a command that waits on the network shows up as status 124
+_run_within() {
+    local seconds="$1"
+    shift
+    [[ -n "${UPDATER_INPUT+set}" ]] || updater_stdin
+    run timeout "$seconds" env "${UPDATER_SIGNAL_ARGS[@]}" PATH="$SHIMS:$PATH" bash "$REPO/lyrebird-updater.sh" "$@" \
+        <<<"${UPDATER_INPUT%$'\n'}"
+    unset UPDATER_INPUT
+}
+
+@test "with a black-holed origin the commands that need no network still answer promptly" {
+    updater_checkout v1.1.0
+    updater_blackhole
+    # A bounded probe would still take up to 10 s here; these must not probe at all.
+    export LYREBIRD_REMOTE_PROBE_TIMEOUT=10
+    local arg
+    for arg in --version --help --status --history; do
+        _run_within 6 "$arg"
+        [ "$status" -eq 0 ] || { echo "$arg: status $status"; return 1; }
+    done
+    [ "$(updater_head)" = "v1.1.0" ]
+}
+
+@test "get_default_branch asks the network only when allowed, and never for longer than the probe timeout" {
+    updater_checkout v1.1.0
+    updater_blackhole
+    local started=$SECONDS
+    run timeout 30 env LYREBIRD_REMOTE_PROBE_TIMEOUT=2 bash -c \
+        'source "$1" && cd "$2" && printf "offline=%s\n" "$(get_default_branch offline)" && printf "online=%s\n" "$(get_default_branch)"' \
+        _ "$REPO/lyrebird-updater.sh" "$REPO"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"offline=main"* ]]
+    [[ "$output" == *"online=main"* ]] # fell back to what the clone already knows
+    [ "$((SECONDS - started))" -lt 20 ]
+}
+
+@test "--list with an unreachable origin still lists the cached versions, says so and exits 4" {
+    updater_checkout v1.1.0
+    updater_blackhole
+    LYREBIRD_FETCH_TIMEOUT=2 LYREBIRD_FETCH_RETRIES=1 _run_within 40 --list
+    [ "$status" -eq 4 ]
+    [[ "$output" == *"Failed to fetch updates after 1 attempts"* ]]
+    [[ "$output" == *"git said:"* ]]
+    [[ "$output" == *"origin could not be reached"* ]]
+    [[ "$output" == *"v1.3.0"* ]] # from the last successful fetch
+    [ "$(updater_head)" = "v1.1.0" ]
+    updater_git_clean
+}
+
+@test "a DNS failure is reported with the reason and exit 4, and the tree is untouched" {
+    updater_checkout v1.1.0
+    updater_inject fetch before DNS
+    export FAULT_REPEAT=1 # the network stays down for every attempt
+    _run_within 30 --list
+    [ "$status" -eq 4 ]
+    [[ "$output" == *"Could not resolve host: github.com"* ]]
+    [ "$(updater_head)" = "v1.1.0" ]
+    updater_git_clean
+}
+
+@test "--list with a reachable origin exits 0" {
+    updater_checkout v1.1.0
+    _run_within 30 --list
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"v1.3.0"* ]]
 }
 
 # ============================================================================

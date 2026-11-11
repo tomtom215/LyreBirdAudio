@@ -107,6 +107,7 @@ updater_node_setup() {
     export NODE ORIGIN WORK REPO SYSROOT SHIMS FAULT_LOG FAULT_REAL_GIT
     export LYREBIRD_UPDATER_SYSROOT="$SYSROOT"
     export LYREBIRD_FETCH_TIMEOUT=5 LYREBIRD_FETCH_RETRIES=2 LYREBIRD_FETCH_RETRY_DELAY=1
+    export LYREBIRD_REMOTE_PROBE_TIMEOUT=3
     export TERM=xterm USER=fixture
     export FAULT_STATE="$NODE/fault.count"
     unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY all_proxy
@@ -122,6 +123,41 @@ updater_checkout() {
     git -C "$REPO" checkout -q "$1" 2>/dev/null
 }
 
+# updater_install_fake_service [running|stopped]: a mediamtx-audio.service in
+# the sysroot and a stateful systemctl on PATH (state in $FAKE_SVC_STATE, calls
+# in $FAKE_SVC_LOG), so the updater's stop / reinstall / start handling runs for real.
+updater_install_fake_service() {
+    cp "$UPDATER_HELPER_DIR/helpers/updater/bin/systemctl" "$SHIMS/"
+    printf '[Unit]\nDescription=fake\n[Service]\nExecStart=%s/lyrebird-stream-manager.sh\n' "$REPO" \
+        >"$SYSROOT/etc/systemd/system/mediamtx-audio.service"
+    export FAKE_SVC_STATE="$NODE/svc.state" FAKE_SVC_LOG="$NODE/svc.log"
+    echo "${1:-running}" >"$FAKE_SVC_STATE"
+    : >"$FAKE_SVC_LOG"
+}
+
+# updater_blackhole: point the node's origin at a local TCP server that accepts
+# connections and never answers (what a dead uplink looks like to git: no
+# error, no data). Stopped by updater_blackhole_stop (call it from teardown).
+updater_blackhole() {
+    python3 -I "$UPDATER_HELPER_DIR/helpers/updater/hang_server.py" >"$NODE/blackhole.port" &
+    BLACKHOLE_PID=$!
+    local tries=0
+    while [[ ! -s "$NODE/blackhole.port" && "$tries" -lt 100 ]]; do
+        sleep 0.05
+        tries=$((tries + 1))
+    done
+    git -C "$REPO" remote set-url origin \
+        "http://127.0.0.1:$(head -n1 "$NODE/blackhole.port")/github.com/tomtom215/LyreBirdAudio.git"
+}
+
+updater_blackhole_stop() {
+    if [[ -n "${BLACKHOLE_PID:-}" ]]; then
+        kill "$BLACKHOLE_PID" 2>/dev/null || true
+        wait "$BLACKHOLE_PID" 2>/dev/null || true
+        BLACKHOLE_PID=""
+    fi
+}
+
 # updater_inject ON WHEN ACT [SKIP]: arm the git fault shim for the next run(s).
 updater_inject() {
     export FAULT_ON="$1" FAULT_WHEN="$2" FAULT_ACT="$3" FAULT_SKIP="${4:-0}"
@@ -130,7 +166,7 @@ updater_inject() {
 }
 
 updater_inject_clear() {
-    unset FAULT_ON FAULT_WHEN FAULT_ACT FAULT_SKIP
+    unset FAULT_ON FAULT_WHEN FAULT_ACT FAULT_SKIP FAULT_REPEAT
 }
 
 # updater_stdin LINES...: what the next updater_run sees on stdin. A leading

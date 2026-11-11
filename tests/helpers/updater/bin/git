@@ -15,6 +15,7 @@
 #               DNS                print a curl-style DNS error and exit 128
 #               PROBE              log whether FAULT_PROBE_PATH exists, then carry on
 #   FAULT_SKIP  matching calls to let through before injecting (default 0)
+#   FAULT_REPEAT  when set, inject on every matching call from then on, not just once
 #   FAULT_STATE file used to count matching calls (required with FAULT_ON)
 #   FAULT_LOG   file the injection is logged to
 #
@@ -29,7 +30,11 @@ if [[ -n "${FAULT_ON:-}" && "$key" == "$FAULT_ON" ]]; then
     n=0
     [[ -s "$FAULT_STATE" ]] && n="$(<"$FAULT_STATE")"
     echo "$((n + 1))" >"$FAULT_STATE"
-    ((n == ${FAULT_SKIP:-0})) && hit=1
+    if [[ -n "${FAULT_REPEAT:-}" ]]; then
+        ((n >= ${FAULT_SKIP:-0})) && hit=1
+    else
+        ((n == ${FAULT_SKIP:-0})) && hit=1
+    fi
 fi
 
 updater_pid() {

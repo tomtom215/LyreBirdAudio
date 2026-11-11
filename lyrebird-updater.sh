@@ -144,7 +144,8 @@ readonly MIN_BASH_MINOR=0
 
 # Operation timeouts and retries. Slow or metered uplinks can raise these (and
 # the test suite lowers them) through LYREBIRD_FETCH_TIMEOUT, LYREBIRD_FETCH_RETRIES,
-# LYREBIRD_FETCH_RETRY_DELAY and LYREBIRD_UPDATER_LOCK_WAIT (whole seconds / counts, at least 1; anything else
+# LYREBIRD_FETCH_RETRY_DELAY, LYREBIRD_REMOTE_PROBE_TIMEOUT and
+# LYREBIRD_UPDATER_LOCK_WAIT (whole seconds / counts, at least 1; anything else
 # falls back to the default).
 _updater_positive_int() {
     local value="${1:-}" default="$2"
@@ -160,6 +161,8 @@ FETCH_RETRIES="$(_updater_positive_int "${LYREBIRD_FETCH_RETRIES:-}" 3)"
 readonly FETCH_RETRIES
 FETCH_RETRY_DELAY="$(_updater_positive_int "${LYREBIRD_FETCH_RETRY_DELAY:-}" 2)"
 readonly FETCH_RETRY_DELAY
+REMOTE_PROBE_TIMEOUT="$(_updater_positive_int "${LYREBIRD_REMOTE_PROBE_TIMEOUT:-}" 10)"
+readonly REMOTE_PROBE_TIMEOUT
 LOCK_MAX_WAIT="$(_updater_positive_int "${LYREBIRD_UPDATER_LOCK_WAIT:-}" 30)"
 readonly LOCK_MAX_WAIT
 readonly TAG_LIST_LIMIT=20
@@ -1818,7 +1821,27 @@ validate_clean_state() {
 # Repository State Functions
 ################################################################################
 
+# Ask origin which branch its HEAD points to. Bounded: on a dead uplink
+# `git ls-remote` waits for ever, and this ran at the start of every command
+# (even --version and --help), so a node that had lost its network could not
+# be asked anything, nor rolled back.
+query_remote_default_branch() {
+    local out
+    if command -v timeout >/dev/null 2>&1; then
+        out="$(GIT_HTTP_LOW_SPEED_LIMIT=1000 GIT_HTTP_LOW_SPEED_TIME="$REMOTE_PROBE_TIMEOUT" \
+            timeout "$REMOTE_PROBE_TIMEOUT" git ls-remote --symref origin HEAD 2>/dev/null)" || return 1
+    else
+        out="$(GIT_HTTP_LOW_SPEED_LIMIT=1000 GIT_HTTP_LOW_SPEED_TIME="$REMOTE_PROBE_TIMEOUT" \
+            git ls-remote --symref origin HEAD 2>/dev/null)" || return 1
+    fi
+    awk '/^ref:/ {sub(/refs\/heads\//, "", $2); print $2; exit}' <<<"$out"
+}
+
+# Usage: get_default_branch [offline]
+# With "offline" the network is not asked at all: the answer comes from what is
+# already in the clone (the cached refs/remotes/origin/HEAD, then the branches).
 get_default_branch() {
+    local offline="${1:-}"
     log_debug "Detecting default branch..."
 
     # Special handling for git-flow: if both main and develop exist, develop is development branch
@@ -1845,12 +1868,21 @@ get_default_branch() {
     fi
 
     # Try to get remote HEAD (but only use if not in git-flow pattern)
-    if remote_head="$(git ls-remote --symref origin HEAD 2>/dev/null | awk '/^ref:/ {sub(/refs\/heads\//, "", $2); print $2; exit}')"; then
-        if [[ -n "$remote_head" ]]; then
+    if [[ "$offline" != "offline" ]]; then
+        if remote_head="$(query_remote_default_branch)" && [[ -n "$remote_head" ]]; then
             log_debug "Remote HEAD points to: $remote_head"
             echo "$remote_head"
             return 0
         fi
+    fi
+
+    # What the last successful fetch recorded (git remote set-head origin --auto)
+    remote_head="$(git symbolic-ref -q --short refs/remotes/origin/HEAD 2>/dev/null || true)"
+    remote_head="${remote_head#origin/}"
+    if [[ -n "$remote_head" ]]; then
+        log_debug "Cached remote HEAD points to: $remote_head"
+        echo "$remote_head"
+        return 0
     fi
 
     log_debug "Remote HEAD detection failed, checking local branches..."
@@ -2660,15 +2692,18 @@ fetch_updates_safe() {
             sleep "$FETCH_RETRY_DELAY"
         fi
 
-        # Try fetch with timeout if available
+        # Try fetch with timeout if available (the low-speed limits also bound a
+        # stalled http transfer where there is no timeout command)
         if command -v timeout >/dev/null 2>&1; then
-            if fetch_output=$(timeout "$FETCH_TIMEOUT" git fetch --all --tags --prune 2>&1); then
+            if fetch_output=$(GIT_HTTP_LOW_SPEED_LIMIT=1000 GIT_HTTP_LOW_SPEED_TIME="$FETCH_TIMEOUT" \
+                timeout "$FETCH_TIMEOUT" git fetch --all --tags --prune 2>&1); then
                 fetch_succeeded=true
                 break
             fi
         else
             # No timeout command, try without it
-            if fetch_output=$(git fetch --all --tags --prune 2>&1); then
+            if fetch_output=$(GIT_HTTP_LOW_SPEED_LIMIT=1000 GIT_HTTP_LOW_SPEED_TIME="$FETCH_TIMEOUT" \
+                git fetch --all --tags --prune 2>&1); then
                 fetch_succeeded=true
                 break
             fi
@@ -2681,12 +2716,17 @@ fetch_updates_safe() {
     if [[ "$fetch_succeeded" != "true" ]]; then
         log_error "Failed to fetch updates after $FETCH_RETRIES attempts"
         log_error "Please check your internet connection"
-        log_debug "Last error: $fetch_output"
+        # what git said (its first line: "Could not resolve host", "timed out", ...)
+        log_info "git said: ${fetch_output%%$'\n'*}"
         return "$E_NO_REMOTE"
     fi
 
-    # Update remote HEAD reference
-    git remote set-head origin --auto >/dev/null 2>&1 || true
+    # Update remote HEAD reference (this asks the remote again: bounded too)
+    if command -v timeout >/dev/null 2>&1; then
+        timeout "$FETCH_TIMEOUT" git remote set-head origin --auto >/dev/null 2>&1 || true
+    else
+        git remote set-head origin --auto >/dev/null 2>&1 || true
+    fi
 
     log_success "Updates fetched successfully"
     return 0
@@ -3847,7 +3887,15 @@ main() {
     save_git_config
 
     # Detect default branch (CRITICAL: Must be done early and consistently used)
-    DEFAULT_BRANCH="$(get_default_branch)"
+    # Only the commands that fetch (the menu, --list) ask the remote; the rest
+    # must work with the network down.
+    local branch_probe=""
+    case "${1:-}" in
+        --version | -v | --help | -h | --status | -s | --migrate | --rollback | --post-update-complete | --post-update-restore)
+            branch_probe="offline"
+            ;;
+    esac
+    DEFAULT_BRANCH="$(get_default_branch "$branch_probe")"
     log_debug "Default branch: $DEFAULT_BRANCH"
 
     # An update that an earlier run did not finish (killed, crashed, power cut):
@@ -3937,9 +3985,14 @@ main() {
                 ;;
 
             --list | -l)
-                fetch_updates_safe || true
+                # Cached data is still listed, but the exit status says it is not fresh
+                local list_status="$E_SUCCESS"
+                fetch_updates_safe || list_status=$?
                 list_available_releases
-                exit "$E_SUCCESS"
+                if [[ $list_status -ne 0 ]]; then
+                    log_warn "The list above is from the last successful fetch: origin could not be reached."
+                fi
+                exit "$list_status"
                 ;;
 
             --migrate)
