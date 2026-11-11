@@ -20,11 +20,12 @@
 # Integration with node_exporter:
 #   ./lyrebird-metrics.sh --file /var/lib/node_exporter/textfile_collector/lyrebird.prom
 #
-# Version: 1.2.0 - Tolerant readiness parsing, in-band staleness timestamp
+# Version: 1.3.0 - Valid-by-construction exposition, collector/scrape status,
+#                  atomic --file publishing, hardened --serve, heartbeat max age
 
 set -euo pipefail
 
-readonly VERSION="1.2.0"
+readonly VERSION="1.3.0"
 SCRIPT_NAME="$(basename "${BASH_SOURCE[0]}")"
 readonly SCRIPT_NAME
 
@@ -81,13 +82,34 @@ prom_escape_label() {
     printf '%s' "$v"
 }
 
-# Output a metric in Prometheus format
+# Number of samples emit_metric has refused in this shell, so a caller can tell
+# that a document is missing samples.
+_EMIT_ERRORS=0
+
+# A Prometheus sample value: a float, +/-Inf or NaN. Anything else (an empty
+# string from a failed read, "N/A", a locale decimal comma) makes the text parser
+# reject the WHOLE scrape.
+is_prom_number() {
+    local re_float='^[-+]?([0-9]+(\.[0-9]*)?|\.[0-9]+)([eE][-+]?[0-9]+)?$'
+    [[ "$1" =~ $re_float ]] || [[ "$1" == "NaN" ]] || [[ "$1" =~ ^[-+]?Inf$ ]]
+}
+
+# Output a metric in Prometheus format. A value that is not a valid sample value
+# prints nothing, so one failed read can never poison the document. The refusal
+# is logged and counted in _EMIT_ERRORS rather than returned as a failure status,
+# so it cannot abort a collector that runs under `set -e`.
 emit_metric() {
     local name="$1"
     local value="$2"
     local help="${3:-}"
     local type="${4:-gauge}"
     local labels="${5:-}"
+
+    if ! is_prom_number "$value"; then
+        log "ERROR: refusing to emit ${METRIC_PREFIX}_${name}: '${value}' is not a numeric sample value"
+        _EMIT_ERRORS=$((_EMIT_ERRORS + 1))
+        return 0
+    fi
 
     if [[ -n "$help" ]]; then
         echo "# HELP ${METRIC_PREFIX}_${name} ${help}"
@@ -470,58 +492,70 @@ collect_api_metrics() {
 }
 
 # Collect per-stream metrics
+#
+# The text exposition format requires every sample of a metric family to be in
+# one contiguous group (with HELP/TYPE first), so the streams are read once into
+# arrays and then written family by family; emitting up/memory/cpu per stream
+# interleaves the families as soon as there are two streams.
 collect_stream_metrics() {
     if [[ ! -d "$FFMPEG_PID_DIR" ]]; then
         return
     fi
 
-    local _stream_hdr=0
+    local -a stream_names=() stream_pids=() stream_alive=()
+    local pid_file stream_name pid i n labels
     for pid_file in "${FFMPEG_PID_DIR}"/*.pid; do
         [[ -f "$pid_file" ]] || continue
-
-        local stream_name
         stream_name=$(basename "$pid_file" .pid)
-        local pid
-        pid=$(cat "$pid_file" 2>/dev/null)
-
-        # Emit HELP/TYPE for the per-stream families exactly once, before samples.
-        if [[ $_stream_hdr -eq 0 ]]; then
-            emit_help_type "stream_up" "Stream running status" "gauge"
-            emit_help_type "stream_memory_bytes" "Stream memory usage in bytes" "gauge"
-            emit_help_type "stream_cpu_percent" "Stream CPU usage percentage" "gauge"
-            _stream_hdr=1
-        fi
-
-        # Stream status
-        local status=0
+        pid=$(cat "$pid_file" 2>/dev/null) || true
+        stream_names+=("$stream_name")
+        stream_pids+=("$pid")
         if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
-            status=1
-        fi
-
-        local labels
-        labels="stream=\"$(prom_escape_label "${stream_name}")\""
-        emit_metric "stream_up" "$status" "" "gauge" "$labels"
-
-        if [[ $status -eq 1 ]] && [[ -d "/proc/${pid}" ]]; then
-            # Stream memory usage
-            if [[ -f "/proc/${pid}/status" ]]; then
-                local vm_rss
-                vm_rss=$(grep "^VmRSS:" "/proc/${pid}/status" 2>/dev/null | awk '{print $2}' || echo 0)
-                if [[ "$vm_rss" =~ ^[0-9]+$ ]]; then
-                    emit_metric "stream_memory_bytes" "$((vm_rss * 1024))" "" "gauge" "$labels"
-                fi
-            fi
-
-            # Stream CPU usage. ps may print nothing if the process just exited;
-            # default to 0 so we never emit a metric line with an empty value.
-            if has_command ps; then
-                local cpu
-                cpu=$(ps -p "$pid" -o %cpu= 2>/dev/null | tr -d ' ' || true)
-                cpu="${cpu:-0}"
-                emit_metric "stream_cpu_percent" "${cpu%.*}" "" "gauge" "$labels"
-            fi
+            stream_alive+=(1)
+        else
+            stream_alive+=(0)
         fi
     done
+
+    n=${#stream_names[@]}
+    if ((n == 0)); then
+        return
+    fi
+
+    emit_help_type "stream_up" "Stream running status" "gauge"
+    for ((i = 0; i < n; i++)); do
+        labels="stream=\"$(prom_escape_label "${stream_names[i]}")\""
+        emit_metric "stream_up" "${stream_alive[i]}" "" "gauge" "$labels"
+    done
+
+    emit_help_type "stream_memory_bytes" "Stream memory usage in bytes" "gauge"
+    for ((i = 0; i < n; i++)); do
+        [[ "${stream_alive[i]}" -eq 1 ]] || continue
+        pid="${stream_pids[i]}"
+        [[ -d "/proc/${pid}" ]] && [[ -f "/proc/${pid}/status" ]] || continue
+        local vm_rss
+        vm_rss=$(grep "^VmRSS:" "/proc/${pid}/status" 2>/dev/null | awk '{print $2}' || echo 0)
+        if [[ "$vm_rss" =~ ^[0-9]+$ ]]; then
+            labels="stream=\"$(prom_escape_label "${stream_names[i]}")\""
+            emit_metric "stream_memory_bytes" "$((vm_rss * 1024))" "" "gauge" "$labels"
+        fi
+    done
+
+    emit_help_type "stream_cpu_percent" "Stream CPU usage percentage" "gauge"
+    if has_command ps; then
+        for ((i = 0; i < n; i++)); do
+            [[ "${stream_alive[i]}" -eq 1 ]] || continue
+            pid="${stream_pids[i]}"
+            [[ -d "/proc/${pid}" ]] || continue
+            # ps may print nothing if the process just exited; default to 0 so we
+            # never emit a metric line with an empty value.
+            local cpu
+            cpu=$(ps -p "$pid" -o %cpu= 2>/dev/null | tr -d ' ' || true)
+            cpu="${cpu:-0}"
+            labels="stream=\"$(prom_escape_label "${stream_names[i]}")\""
+            emit_metric "stream_cpu_percent" "${cpu%.*}" "" "gauge" "$labels"
+        done
+    fi
 }
 
 # ============================================================================

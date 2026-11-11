@@ -8,6 +8,8 @@ load bats_shell_state
 
 load scratch_tmpdir
 
+load prom_validate
+
 setup() {
     scratch_setup
     # Get the directory of this test file
@@ -338,4 +340,139 @@ CURLEOF
     [[ "$ts" =~ ^[0-9]+$ ]]
     now=$(date +%s)
     (( now - ts < 120 ))     # fresh, not a stale leftover value
+}
+
+# ============================================================================
+# Exposition validity (LB-18): the document must be accepted by a real parser
+# ============================================================================
+
+# A curl that answers like a healthy MediaMTX API, so full scrapes do not wait
+# for the real API's retry back-off.
+_stub_curl() {
+    local dir="$1"
+    mkdir -p "$dir"
+    cat >"$dir/curl" <<'CURLEOF'
+#!/bin/bash
+for a in "$@"; do
+    case "$a" in *"/v3/info") echo '{"version":"1.19.2","upTime":100}'; exit 0;; esac
+done
+echo '{"itemCount":0,"items":[]}'
+exit 0
+CURLEOF
+    chmod +x "$dir/curl"
+}
+
+# A pid that is guaranteed dead.
+_dead_pid() {
+    sleep 0 &
+    local p=$!
+    wait "$p" || true
+    printf '%s' "$p"
+}
+
+@test "prom_validate accepts a well-formed exposition [test helper]" {
+    printf '%b' '# HELP a_x help\n# TYPE a_x gauge\na_x{l="v\\\\n\\"q\\n"} 1\na_x{l="w"} 2.5e3 1700000000\n# comment\n\nb_y 3\nc +Inf\nd NaN\ne{l="Studio-é-麦克风"} 1\n' >"$TEST_SCRATCH/good.prom"
+    run prom_validate "$TEST_SCRATCH/good.prom"
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+}
+
+@test "prom_validate rejects every class of malformed exposition [test helper]" {
+    local -a bad=(
+        '# HELP a 1\n# HELP a 2\na 1\n'
+        '# TYPE a gauge\n# TYPE a gauge\na 1\n'
+        'a_x \n'
+        'a_x{l="v"} \n'
+        'a_x\n'
+        'a_x N/A\n'
+        'a_x 1,5\n'
+        'a_x{l="a\\tb"} 1\n'
+        'a_x{l="abc} 1\n'
+        'a 1\nb 1\na{x="1"} 2\n'
+        'a{x="1"} 1\na{x="1"} 2\n'
+        'a 1\n# HELP a late\n'
+        'a 1 2 3\n'
+        '1abc 1\n'
+        'a{l="x\ny"} 1\n'
+        'a 1'
+        'a{l="\xff"} 1\n'
+    )
+    local doc
+    for doc in "${bad[@]}"; do
+        printf '%b' "$doc" >"$TEST_SCRATCH/bad.prom"
+        if prom_validate "$TEST_SCRATCH/bad.prom" >/dev/null; then
+            echo "validator accepted: $doc"
+            return 1
+        fi
+    done
+}
+
+@test "a full scrape with several live streams and hostile stream names is valid exposition [LB-18]" {
+    local dir="$TEST_SCRATCH/pids" dead name
+    mkdir -p "$dir"
+    dead="$(_dead_pid)"
+    for name in plain 'Studio "A"' 'a\nb' $'tab\there' $'real\nnewline' 'back\slash' 'é麦克风'; do
+        echo $$ >"$dir/${name}.pid"
+    done
+    echo "$dead" >"$dir/stopped.pid"
+    _stub_curl "$TEST_SCRATCH/bin"
+
+    run env PROJECT_ROOT="$PROJECT_ROOT" PATH="$TEST_SCRATCH/bin:$PATH" \
+        FFMPEG_PID_DIR="$dir" PID_FILE="$PID_FILE" HEARTBEAT_FILE="$HEARTBEAT_FILE" \
+        bash -c 'set -euo pipefail; source "$PROJECT_ROOT/lyrebird-metrics.sh"; generate_all_metrics 2>/dev/null'
+    [ "$status" -eq 0 ]
+    printf '%s\n' "$output" >"$TEST_SCRATCH/scrape.prom"
+    run prom_validate "$TEST_SCRATCH/scrape.prom"
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    # the hostile names are present, escaped, and the dead stream reports 0
+    grep -qF 'lyrebird_stream_up{stream="Studio \"A\""} 1' "$TEST_SCRATCH/scrape.prom"
+    grep -qF 'lyrebird_stream_up{stream="real\nnewline"} 1' "$TEST_SCRATCH/scrape.prom"
+    grep -qF 'lyrebird_stream_up{stream="stopped"} 0' "$TEST_SCRATCH/scrape.prom"
+}
+
+@test "collect_stream_metrics keeps every family's samples contiguous with two live streams [LB-18]" {
+    echo $$ >"$FFMPEG_PID_DIR/mic1.pid"
+    echo $$ >"$FFMPEG_PID_DIR/mic2.pid"
+    collect_stream_metrics >"$TEST_SCRATCH/streams.prom" 2>/dev/null
+    run prom_validate "$TEST_SCRATCH/streams.prom"
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    # all three families carry both streams
+    [ "$(grep -c '^lyrebird_stream_up{' "$TEST_SCRATCH/streams.prom")" -eq 2 ]
+    [ "$(grep -c '^lyrebird_stream_memory_bytes{' "$TEST_SCRATCH/streams.prom")" -eq 2 ]
+    [ "$(grep -c '^lyrebird_stream_cpu_percent{' "$TEST_SCRATCH/streams.prom")" -eq 2 ]
+}
+
+@test "emit_metric refuses an empty or non-numeric value: no output, counted, status 0 [LB-18]" {
+    local v expected=0
+    for v in '' 'N/A' '1,5' 'abc' '1 2' '--1'; do
+        emit_metric "x" "$v" "help" "gauge" 'a="b"' >"$TEST_SCRATCH/refused.out" 2>/dev/null
+        expected=$((expected + 1))
+        [ ! -s "$TEST_SCRATCH/refused.out" ] || { echo "value '$v' produced output"; return 1; }
+        [ "$_EMIT_ERRORS" -eq "$expected" ] || { echo "value '$v' was not counted ($_EMIT_ERRORS)"; return 1; }
+    done
+    for v in 0 -1 3.14 .5 1e3 -2.5E-3 +Inf -Inf NaN; do
+        emit_metric "x" "$v" "" "gauge" >"$TEST_SCRATCH/accepted.out" 2>/dev/null
+        [ "$(cat "$TEST_SCRATCH/accepted.out")" = "lyrebird_x $v" ] || { echo "value '$v' refused"; return 1; }
+    done
+    [ "$_EMIT_ERRORS" -eq "$expected" ]
+}
+
+@test "configured_devices is omitted, never emitted empty, when the device config cannot be read [LB-18]" {
+    local cfgdir="$TEST_SCRATCH/cfg" real_grep
+    mkdir -p "$cfgdir" "$TEST_SCRATCH/bin"
+    : >"$cfgdir/audio-devices.conf"
+    real_grep="$(command -v grep)"
+    # grep -c failing the way it does on an unreadable file: status 2, no output
+    cat >"$TEST_SCRATCH/bin/grep" <<EOF
+#!/bin/bash
+for a in "\$@"; do [[ "\$a" == "-c" ]] && exit 2; done
+exec "$real_grep" "\$@"
+EOF
+    chmod +x "$TEST_SCRATCH/bin/grep"
+    run env PROJECT_ROOT="$PROJECT_ROOT" PATH="$TEST_SCRATCH/bin:$PATH" MEDIAMTX_CONFIG_DIR="$cfgdir" \
+        PID_FILE="$PID_FILE" FFMPEG_PID_DIR="$FFMPEG_PID_DIR" HEARTBEAT_FILE="$HEARTBEAT_FILE" \
+        bash -c 'set -euo pipefail; source "$PROJECT_ROOT/lyrebird-metrics.sh"; collect_stream_manager_metrics 2>/dev/null'
+    [ "$status" -eq 0 ]
+    printf '%s\n' "$output" >"$TEST_SCRATCH/mgr.prom"
+    run prom_validate "$TEST_SCRATCH/mgr.prom"
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
 }
