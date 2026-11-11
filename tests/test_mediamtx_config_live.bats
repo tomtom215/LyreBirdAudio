@@ -199,6 +199,120 @@ default_listeners() {
     done
 }
 
+# A users file for RTSP_AUTH_MODE=local-only-publish: arguments are user:password
+make_users_file() {
+    local pair
+    : >"$TEST_SCRATCH/users.conf"
+    for pair in "$@"; do
+        printf '%s:sha256:%s\n' "${pair%%:*}" "$(printf '%s' "${pair#*:}" | openssl dgst -sha256 -binary | base64)" >>"$TEST_SCRATCH/users.conf"
+    done
+}
+
+@test "RTSP_AUTH_MODE=local-only-publish: this machine needs no credentials, a remote client needs a listed user, who can read but not publish [LB-06]" {
+    require_live
+    require_remote_address
+    local bin
+    for bin in $LYREBIRD_TEST_MEDIAMTX_BINS; do
+        each_binary_begin "$bin"
+        make_users_file alice:alice-pw carol:Pa55w0rd-x
+        rm -rf "$TEST_SCRATCH/mg"
+        manager_generate "$TEST_SCRATCH/mg" "$bin" RTSP_AUTH_MODE=local-only-publish RTSP_USERS_FILE="$TEST_SCRATCH/users.conf" >"$TEST_SCRATCH/gen.out" || {
+            cat "$TEST_SCRATCH/gen.out"
+            false
+        }
+        [ "$(stat -c %a "$TEST_SCRATCH/mg/cfg/mediamtx.yml")" = "640" ]
+        mtx_start "$bin" "$TEST_SCRATCH/mg/cfg/mediamtx.yml"
+
+        # this machine: publish, read and call the API with no credentials
+        mtx_publish "rtsp://127.0.0.1:${P_RTSP}/mic1"
+        mtx_wait_path_ready mic1 || {
+            cat "$TEST_SCRATCH/publisher.log" "$TEST_SCRATCH/mediamtx.log"
+            false
+        }
+        mtx_can_read "rtsp://127.0.0.1:${P_RTSP}/mic1"
+
+        # a remote client without credentials: neither read nor publish
+        ! mtx_can_read "rtsp://${REMOTE}:${P_RTSP}/mic1"
+        grep -q '401' "$TEST_SCRATCH/read.err"
+        ! mtx_publish_once "rtsp://${REMOTE}:${P_RTSP}/other"
+        grep -q '401' "$TEST_SCRATCH/publish-once.log"
+
+        # a listed user reads, with the password the hash was made from
+        mtx_can_read "rtsp://alice:alice-pw@${REMOTE}:${P_RTSP}/mic1" || {
+            cat "$TEST_SCRATCH/read.err"
+            false
+        }
+        mtx_can_read "rtsp://carol:Pa55w0rd-x@${REMOTE}:${P_RTSP}/mic1"
+
+        # wrong password, another user's password, an unknown user, the hash
+        # itself: 401
+        local url
+        for url in "alice:wrong" "alice:Pa55w0rd-x" "mallory:alice-pw" "alice:sha256"; do
+            ! mtx_can_read "rtsp://${url}@${REMOTE}:${P_RTSP}/mic1"
+            grep -q '401' "$TEST_SCRATCH/read.err"
+        done
+
+        # a read-only user cannot publish, here or from anywhere else
+        ! mtx_publish_once "rtsp://alice:alice-pw@${REMOTE}:${P_RTSP}/other"
+        grep -q '401' "$TEST_SCRATCH/publish-once.log"
+
+        # the API is not reachable from outside (bound to loopback)
+        [ "$(mtx_http_status "http://${REMOTE}:${P_API}/v3/paths/list")" = 000 ]
+        [ "$(mtx_http_status "http://127.0.0.1:${P_API}/v3/paths/list")" = 200 ]
+        mtx_unpublish
+        mtx_stop
+    done
+}
+
+@test "RTSP_AUTH_MODE=local-only-publish: the manager's own readiness and stream probes keep working on every version, with no credentials [LB-06, LB-13]" {
+    require_live
+    local bin rc
+    for bin in $LYREBIRD_TEST_MEDIAMTX_BINS; do
+        each_binary_begin "$bin"
+        make_users_file alice:alice-pw
+        rm -rf "$TEST_SCRATCH/mg"
+        manager_generate "$TEST_SCRATCH/mg" "$bin" RTSP_AUTH_MODE=local-only-publish RTSP_USERS_FILE="$TEST_SCRATCH/users.conf" >/dev/null
+        mtx_start "$bin" "$TEST_SCRATCH/mg/cfg/mediamtx.yml"
+        mtx_publish "rtsp://127.0.0.1:${P_RTSP}/mic1"
+        mtx_wait_path_ready mic1
+        run env MEDIAMTX_HOST=127.0.0.1 MEDIAMTX_API_PORT="$P_API" MEDIAMTX_LOG_FILE="$TEST_SCRATCH/sm.log" MEDIAMTX_API_TIMEOUT=5 \
+            bash -c 'source "$1" >/dev/null 2>&1; set +e; wait_for_mediamtx_ready "$2"' _ "$PROJECT_ROOT/lyrebird-stream-manager.sh" "$MTX_PID"
+        [ "$status" -eq 0 ]
+        ! grep -q 'requires credentials' "$TEST_SCRATCH/sm.log"
+        rc=0
+        env MEDIAMTX_HOST=127.0.0.1 MEDIAMTX_API_PORT="$P_API" MEDIAMTX_LOG_FILE="$TEST_SCRATCH/sm.log" \
+            bash -c 'source "$1" >/dev/null 2>&1; set +e; probe_stream_ready mic1' _ "$PROJECT_ROOT/lyrebird-stream-manager.sh" || rc=$?
+        [ "$rc" -eq 0 ]
+        mtx_unpublish
+        mtx_stop
+    done
+}
+
+@test "an API bound to every interface under local-only-publish still answers 401 to a remote caller, the local machine keeps its access [LB-06]" {
+    require_live
+    require_remote_address
+    local bin
+    for bin in $LYREBIRD_TEST_MEDIAMTX_BINS; do
+        each_binary_begin "$bin"
+        make_users_file alice:alice-pw
+        rm -rf "$TEST_SCRATCH/mg"
+        manager_generate "$TEST_SCRATCH/mg" "$bin" RTSP_AUTH_MODE=local-only-publish RTSP_USERS_FILE="$TEST_SCRATCH/users.conf" \
+            MEDIAMTX_API_BIND= MEDIAMTX_METRICS_BIND= >/dev/null
+        mtx_start "$bin" "$TEST_SCRATCH/mg/cfg/mediamtx.yml"
+        [ "$(mtx_http_status "http://127.0.0.1:${P_API}/v3/paths/list")" = 200 ]
+        [ "$(mtx_http_status "http://127.0.0.1:${P_METRICS}/metrics")" = 200 ]
+        [ "$(mtx_http_status "http://${REMOTE}:${P_API}/v3/paths/list")" = 401 ]
+        # even a listed RTSP user has no right to the API or the metrics
+        [ "$(mtx_http_status "http://${REMOTE}:${P_API}/v3/paths/list" -u alice:alice-pw --max-time 15)" = 401 ]
+        [ "$(mtx_http_status "http://${REMOTE}:${P_METRICS}/metrics" -u alice:alice-pw --max-time 15)" = 401 ] || {
+            echo "metrics from ${REMOTE} as alice: $(mtx_http_status "http://${REMOTE}:${P_METRICS}/metrics" -u alice:alice-pw --max-time 15)"
+            grep -n 'metricsAddress' "$TEST_SCRATCH/mg/cfg/mediamtx.yml"
+            false
+        }
+        mtx_stop
+    done
+}
+
 # Run the real generate_mediamtx_config (the manager's own validation, with
 # this binary) in a private configuration directory $1; $2... are environment
 # assignments. Prints its messages; the status is generate's.

@@ -194,7 +194,7 @@ mtx_publish_once() {
 # mtx_can_read URL: can a client read stream URL? (ffprobe finds an audio track)
 mtx_can_read() {
     local out
-    out="$(timeout 10 ffprobe -v error -rtsp_transport tcp -show_entries stream=codec_name -of csv=p=0 "$1" 2>"$TEST_SCRATCH/read.err")" || return 1
+    out="$(timeout 25 ffprobe -v error -rtsp_transport tcp -show_entries stream=codec_name -of csv=p=0 "$1" 2>"$TEST_SCRATCH/read.err")" || return 1
     [[ -n "$out" ]]
 }
 

@@ -637,7 +637,8 @@ jobs:
           LYREBIRD_TEST_MEDIAMTX_BINS="$(tests/fetch_mediamtx.sh "$RUNNER_TEMP/mediamtx" "$MEDIAMTX_VERSION")"
           export LYREBIRD_TEST_MEDIAMTX_BINS
           tests/check_tmp_leaks.sh --print-output-on-failure --timing \
-            tests/test_mediamtx_live.bats tests/test_soak_live.bats tests/test_soak_observer.bats
+            tests/test_mediamtx_live.bats tests/test_soak_live.bats tests/test_soak_observer.bats \
+            tests/test_mediamtx_config_live.bats tests/test_mediamtx_api_live.bats tests/test_mediamtx_e2e_ports.bats
 
   # ===========================================================================
   # Job 7c: Canary against the newest upstream MediaMTX release
@@ -672,7 +673,8 @@ jobs:
           version="$(basename "$(dirname "$LYREBIRD_TEST_MEDIAMTX_BINS")")"
           echo "Canary (advisory): MediaMTX ${version}, newest upstream release" >> "$GITHUB_STEP_SUMMARY"
           tests/check_tmp_leaks.sh --print-output-on-failure --timing \
-            tests/test_mediamtx_live.bats tests/test_soak_live.bats tests/test_soak_observer.bats
+            tests/test_mediamtx_live.bats tests/test_soak_live.bats tests/test_soak_observer.bats \
+            tests/test_mediamtx_config_live.bats tests/test_mediamtx_api_live.bats tests/test_mediamtx_e2e_ports.bats
 
   # ===========================================================================
   # Job 8: Final Summary
