@@ -250,6 +250,7 @@ readonly MEDIAMTX_HOST="${MEDIAMTX_HOST:-localhost}"
 # Note: These are NOT readonly to allow command-line option overrides
 STREAM_MODE="${STREAM_MODE:-individual}"
 MULTIPLEX_STREAM_NAME="${MULTIPLEX_STREAM_NAME:-all_mics}"
+MULTIPLEX_NAME_EXPLICIT=false # set by -n/--name
 MULTIPLEX_FILTER_TYPE="${MULTIPLEX_FILTER_TYPE:-amix}"
 readonly RESTART_MARKER="${MEDIAMTX_RESTART_MARKER:-/run/mediamtx-audio.restart}"
 readonly CLEANUP_MARKER="${MEDIAMTX_CLEANUP_MARKER:-/run/mediamtx-audio.cleanup}"
@@ -2878,12 +2879,8 @@ monitor_streams() {
     if [[ "${STREAM_MODE}" == "multiplex" ]]; then
         ((streams_checked++)) || true
 
-        # Sanitize stream name (same logic as start_ffmpeg_multiplex_stream)
-        local stream_path
-        stream_path="$(sanitize_path_name "${MULTIPLEX_STREAM_NAME}")"
-        if [[ "$stream_path" =~ ^[0-9] ]]; then
-            stream_path="stream_${stream_path}"
-        fi
+        # The canonical name, the one start_ffmpeg_multiplex_stream publishes to
+        local stream_path="${MULTIPLEX_STREAM_NAME}"
 
         local pid_file="${FFMPEG_PID_DIR}/${stream_path}.pid"
 
@@ -3505,6 +3502,102 @@ sanitize_path_name() {
     echo "$sanitized"
 }
 
+# ============================================================================
+# Canonical stream names (decision D13)
+# ============================================================================
+# One spelling of a stream name is used everywhere: the MediaMTX path, the
+# publisher URL, the PID/wrapper/log file names, status, validate, the display
+# and the systemd Environment= line. MULTIPLEX_STREAM_NAME is turned into that
+# spelling once, right after the command line is parsed (resolve_multiplex_
+# stream_name); nothing downstream sanitizes it again. It used to be sanitized
+# for the publisher URL but written raw as the MediaMTX path, so "Studio Mix"
+# stopped MediaMTX from starting and "Studio" was published to a path MediaMTX
+# did not have.
+readonly CANONICAL_STREAM_NAME_MAX=64
+# Words that are not an ordinary stream name: the control/API words this suite
+# reserves, and "all" / "all_others", which MediaMTX (1.15.0 and 1.21.1, checked
+# against the real binaries) treats as a catch-all path.
+readonly CANONICAL_RESERVED_STREAM_NAMES="control|stats|api|metrics|health|all|all_others"
+
+# A string from outside (config file, command line) in a form that is safe to
+# put in a log line: control characters and backslashes become '?' (log() hands
+# its message to `echo -e`), and a long value is cut.
+# Usage: visible_text STRING [MAX_CHARS]
+visible_text() {
+    local s="${1-}" max="${2:-64}" cut=false
+    if ((${#s} > max)); then
+        s="${s:0:max}"
+        cut=true
+    fi
+    s="$(printf '%s' "$s" | LC_ALL=C tr -c '[:print:]' '?' | LC_ALL=C tr '\\' '?')"
+    [[ "$cut" == "true" ]] && s+="..."
+    printf '%s' "$s"
+}
+
+# The canonical form of a stream name: lower-case, only [a-z0-9_-] (every run of
+# any other character, including a newline or a multi-byte character, becomes one
+# "_"), starting with a letter or a digit, at most CANONICAL_STREAM_NAME_MAX
+# characters, and not one of the reserved words. A name that is already canonical
+# is returned unchanged.
+# Usage: canonical_stream_name NAME
+# Output: the canonical name on stdout. On failure nothing on stdout, the reason on
+#         stderr, and status 1.
+canonical_stream_name() {
+    local raw="${1-}" name
+    if ((${#raw} > 256)); then
+        echo "Stream name '$(visible_text "$raw" 32)' is too long (${#raw} characters; at most ${CANONICAL_STREAM_NAME_MAX} are allowed after normalisation)" >&2
+        return 1
+    fi
+    name="$(printf '%s' "$raw" | LC_ALL=C tr 'A-Z' 'a-z' | LC_ALL=C tr -c 'a-z0-9_-' ' ' | LC_ALL=C tr -s ' ' '_')"
+    while [[ "$name" == [_-]* ]]; do
+        name="${name#?}"
+    done
+    if [[ -z "$name" ]]; then
+        echo "Stream name '$(visible_text "$raw")' has no letters or digits to build a stream path from" >&2
+        return 1
+    fi
+    if ((${#name} > CANONICAL_STREAM_NAME_MAX)); then
+        echo "Stream name '$(visible_text "$raw")' is too long (${#name} characters after normalisation; at most ${CANONICAL_STREAM_NAME_MAX} are allowed)" >&2
+        return 1
+    fi
+    if [[ "$name" =~ ^(${CANONICAL_RESERVED_STREAM_NAMES})$ ]]; then
+        echo "Stream name '$(visible_text "$raw")' is reserved (${CANONICAL_RESERVED_STREAM_NAMES//|/, } are used by MediaMTX or by this suite); choose another name" >&2
+        return 1
+    fi
+    printf '%s' "$name"
+}
+
+# Is NAME exactly its own canonical form? Used where a name becomes a file name
+# or a URL path, as a check that the name was canonicalised on the way in.
+is_canonical_stream_name() {
+    local canon
+    canon="$(canonical_stream_name "${1-}" 2>/dev/null)" || return 1
+    [[ "$canon" == "${1-}" ]]
+}
+
+# Canonicalise MULTIPLEX_STREAM_NAME (the -n/--name value or the environment
+# variable) once. Logs one line when the name differs from what was typed. A name
+# that cannot be made canonical is fatal when it will be used (multiplex mode) or
+# was given explicitly with -n; otherwise (a stale environment value in individual
+# mode, where the name is not used) it is replaced by the default with a warning.
+resolve_multiplex_stream_name() {
+    local raw="${MULTIPLEX_STREAM_NAME-}" canon why
+    if canon="$(canonical_stream_name "$raw" 2>/dev/null)"; then
+        if [[ "$canon" != "$raw" ]]; then
+            log INFO "Multiplex stream name '$(visible_text "$raw")' is used as '${canon}' (lower-case letters, digits, '_' and '-' only)"
+        fi
+        MULTIPLEX_STREAM_NAME="$canon"
+        return 0
+    fi
+    why="$(canonical_stream_name "$raw" 2>&1 >/dev/null || true)"
+    if [[ "${STREAM_MODE}" == "multiplex" ]] || [[ "${MULTIPLEX_NAME_EXPLICIT}" == "true" ]]; then
+        SKIP_CLEANUP=true # nothing has been started, so there is nothing to clean up after
+        error_exit "Invalid multiplex stream name: ${why}" "${E_CONFIG_ERROR}"
+    fi
+    log WARN "Ignoring MULTIPLEX_STREAM_NAME (stream mode is not multiplex): ${why}; using 'all_mics'"
+    MULTIPLEX_STREAM_NAME="all_mics"
+}
+
 get_device_config() {
     local device_name="$1"
     local param="$2"
@@ -3653,6 +3746,14 @@ generate_stream_path() {
         base_path="${base_path:0:64}"
     fi
 
+    # Same canonical form as the multiplex stream (a name that already is one,
+    # which is every name this function has built until now, is unchanged); a
+    # reserved word keeps its stream under a "stream_" prefix.
+    if ! is_canonical_stream_name "$base_path"; then
+        base_path="$(canonical_stream_name "stream_${base_path}" 2>/dev/null)" \
+            || base_path="stream_$(date +%s)"
+    fi
+
     echo "$base_path"
 }
 
@@ -3665,23 +3766,13 @@ start_ffmpeg_multiplex_stream() {
         return 1
     fi
 
-    # Sanitize stream name to prevent RTSP URL parsing failures
-    local stream_path
-    stream_path="$(sanitize_path_name "${MULTIPLEX_STREAM_NAME}")"
-
-    # Ensure stream name doesn't start with a digit
-    if [[ "$stream_path" =~ ^[0-9] ]]; then
-        stream_path="stream_${stream_path}"
-    fi
-
-    # Validate final stream name
-    if [[ ${#stream_path} -gt $MAX_STREAM_NAME_LENGTH ]]; then
-        log ERROR "Stream name too long after sanitization: $stream_path (max: $MAX_STREAM_NAME_LENGTH)"
-        return 1
-    fi
-
-    if [[ "$stream_path" =~ ^(${RESERVED_STREAM_NAMES})$ ]]; then
-        log ERROR "Stream name '$stream_path' conflicts with reserved MediaMTX path"
+    # The name was made canonical once, when the command line was parsed
+    # (resolve_multiplex_stream_name), and is the same everywhere: the MediaMTX
+    # path, this publisher URL, the PID file, status. It becomes a file name and a
+    # URL path below, so refuse one that was set some other way.
+    local stream_path="${MULTIPLEX_STREAM_NAME}"
+    if ! is_canonical_stream_name "$stream_path"; then
+        log ERROR "Multiplex stream name '$(visible_text "$stream_path")' is not canonical; refusing to use it as a stream path"
         return 1
     fi
 
@@ -5383,6 +5474,9 @@ Options:
     -m, --mode MODE      Stream mode (individual|multiplex) [default: individual]
     -f, --filter TYPE    Multiplex filter type (amix|amerge) [default: amix]
     -n, --name NAME      Multiplex stream name [default: all_mics]
+                         Lower-case letters, digits, '_' and '-', at most 64
+                         characters; anything else is replaced by '_' and the
+                         result is logged
     -d, --debug          Enable debug output
     -h, --help           Show this help message
 
@@ -5485,6 +5579,7 @@ parse_arguments() {
             -n | --name)
                 shift
                 MULTIPLEX_STREAM_NAME="${1}"
+                MULTIPLEX_NAME_EXPLICIT=true
                 shift
                 ;;
             -d | --debug)
@@ -5557,6 +5652,12 @@ main() {
     # Note: COMMAND is global so cleanup() can check it
     COMMAND=""
     parse_arguments "$@"
+
+    # One canonical stream name for everything that follows (D13)
+    case "${COMMAND}" in
+        help | --help | -h | "") ;;
+        *) resolve_multiplex_stream_name ;;
+    esac
 
     # Log stream mode if set
     if [[ -n "${STREAM_MODE}" ]] && [[ "${STREAM_MODE}" != "individual" ]]; then
