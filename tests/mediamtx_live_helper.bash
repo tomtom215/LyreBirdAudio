@@ -2,28 +2,31 @@
 # Helpers for tests that start a real MediaMTX binary (decision D15).
 #
 # Nothing here binds a default port (8554, 9997, 9998, 8000, 8001, 8890-8893):
-# each test gets its own free ports, and MediaMTX's two UDP ports (RTP/RTCP,
-# which the generated configuration leaves at their defaults) are moved with
-# MediaMTX's own environment overrides. Set LYREBIRD_TEST_PORT_BASE to pin the
-# ports to BASE..BASE+11 instead (one test at a time).
+# each test gets its own free ports, and every other port MediaMTX could open
+# by default (the two UDP ports of RTSP, RTMP, HLS, WebRTC, SRT, MoQ) is moved
+# with MediaMTX's own environment overrides to a spare port, so even a
+# configuration with a defect cannot take a default port of the machine. Set
+# LYREBIRD_TEST_PORT_BASE to pin the ports to BASE..BASE+19 instead (one test
+# at a time).
 #
 # Usage: load mediamtx_live_helper; call mtx_ports_setup in the test, then
-# mtx_start / mtx_stop / mtx_publish / ...; call mtx_cleanup in teardown.
-#
-# The test using these helpers must call scratch_setup first (tests/
-# scratch_tmpdir.bash): the logs and configuration files go to $TEST_SCRATCH.
+# mtx_render / mtx_start / mtx_stop / mtx_publish / ...; call mtx_cleanup in
+# teardown. The test must call scratch_setup first (tests/scratch_tmpdir.bash):
+# the logs and configuration files go to $TEST_SCRATCH.
 
 MTX_PID=""
 PUB_PID=""
 STUB_PID=""
 
-# Allocate the ports of this test: P_RTSP P_API P_METRICS P_RTP P_RTCP and
-# three spare TCP ports P_SPARE1..3.
+# Allocate the ports of this test: P_RTSP P_API P_METRICS (TCP), P_RTP P_RTCP
+# (an adjacent UDP pair) and P_SPARE1..P_SPARE8 (TCP numbers, used to move
+# MediaMTX's other listeners out of the way).
 mtx_ports_setup() {
     local ports
     if [[ -n "${LYREBIRD_TEST_PORT_BASE:-}" ]]; then
         local b=$LYREBIRD_TEST_PORT_BASE
-        ports="$b $((b + 1)) $((b + 2)) $((b + 10)) $((b + 11)) $((b + 3)) $((b + 4)) $((b + 5))"
+        ports="$b $((b + 1)) $((b + 2)) $((b + 10)) $((b + 11))"
+        ports+=" $((b + 3)) $((b + 4)) $((b + 5)) $((b + 6)) $((b + 7)) $((b + 8)) $((b + 9)) $((b + 12))"
     else
         ports="$(
             python3 -I - <<'PY'
@@ -44,13 +47,13 @@ while True:
     held.extend(pair)
     out += [p, p + 1]
     break
-out += [tcp(), tcp(), tcp()]
+out += [tcp() for _ in range(8)]
 print(*out)
 PY
         )"
     fi
-    read -r P_RTSP P_API P_METRICS P_RTP P_RTCP P_SPARE1 P_SPARE2 P_SPARE3 <<<"$ports"
-    export P_RTSP P_API P_METRICS P_RTP P_RTCP P_SPARE1 P_SPARE2 P_SPARE3
+    read -r P_RTSP P_API P_METRICS P_RTP P_RTCP P_SPARE1 P_SPARE2 P_SPARE3 P_SPARE4 P_SPARE5 P_SPARE6 P_SPARE7 P_SPARE8 <<<"$ports"
+    export P_RTSP P_API P_METRICS P_RTP P_RTCP P_SPARE1 P_SPARE2 P_SPARE3 P_SPARE4 P_SPARE5 P_SPARE6 P_SPARE7 P_SPARE8
 }
 
 # The first non-loopback IPv4 address of this machine (what a remote client
@@ -72,23 +75,51 @@ print(s.getsockname()[0])' 2>/dev/null)" || return 1
     printf '%s\n' "$a"
 }
 
-# mtx_start BIN CONFIG [extra env VAR=value ...]: run MediaMTX on CONFIG with
-# its RTP/RTCP ports moved to this test's, then wait (at most ~10 s) until it
-# stays up and its API answers (200 or 401) on P_API. Sets MTX_PID; the output
+# mtx_version BIN: the first line of `BIN --version` (e.g. v1.21.1)
+mtx_version() {
+    "$1" --version 2>/dev/null | head -n 1
+}
+
+# mtx_render BIN [renderer options]: render the configuration for BIN's
+# version on this test's ports into $TEST_SCRATCH/mediamtx.yml (later options
+# override these defaults)
+mtx_render() {
+    local bin="$1" version
+    shift
+    version="$(mtx_version "$bin")"
+    lyrebird_render_mediamtx_config --mediamtx-version "$version" \
+        --rtsp-port "$P_RTSP" --api-port "$P_API" --metrics-port "$P_METRICS" "$@" \
+        >"$TEST_SCRATCH/mediamtx.yml"
+}
+
+# mtx_start BIN CONFIG [VAR=value ...]: run MediaMTX on CONFIG with all of its
+# other listeners moved to this test's spare ports, then wait (at most ~10 s)
+# for the TCP port $MTX_WAIT_PORT (default P_API) to accept connections, and
+# check that the process is still up a moment later. Sets MTX_PID; the output
 # goes to $TEST_SCRATCH/mediamtx.log.
 mtx_start() {
-    local bin="$1" conf="$2" i code
+    local bin="$1" conf="$2" i up=false
     shift 2
-    (cd "$TEST_SCRATCH" && exec env "MTX_RTPADDRESS=:${P_RTP}" "MTX_RTCPADDRESS=:${P_RTCP}" "$@" "$bin" "$conf") \
-        >"$TEST_SCRATCH/mediamtx.log" 2>&1 3>&- &
+    (cd "$TEST_SCRATCH" && exec env \
+        "MTX_RTPADDRESS=:${P_RTP}" "MTX_RTCPADDRESS=:${P_RTCP}" \
+        "MTX_RTMPADDRESS=:${P_SPARE1}" "MTX_HLSADDRESS=:${P_SPARE2}" "MTX_WEBRTCADDRESS=:${P_SPARE3}" \
+        "MTX_WEBRTCLOCALUDPADDRESS=:${P_SPARE4}" "MTX_SRTADDRESS=:${P_SPARE5}" \
+        "MTX_MOQHTTP2ADDRESS=:${P_SPARE6}" "MTX_MOQHTTP3ADDRESS=:${P_SPARE6}" "MTX_MOQQUICADDRESS=:${P_SPARE7}" \
+        "$@" "$bin" "$conf") >"$TEST_SCRATCH/mediamtx.log" 2>&1 3>&- &
     MTX_PID=$!
     for ((i = 0; i < 50; i++)); do
-        code="$(curl -s -o /dev/null --max-time 1 -w '%{http_code}' "http://127.0.0.1:${P_API}/v3/paths/list" 2>/dev/null)" || code=000
-        [[ "$code" == 200 || "$code" == 401 ]] && return 0
+        if (exec 4<>"/dev/tcp/127.0.0.1/${MTX_WAIT_PORT:-$P_API}") 2>/dev/null; then
+            up=true
+            break
+        fi
         kill -0 "$MTX_PID" 2>/dev/null || break
         sleep 0.2
     done
-    echo "MediaMTX ($bin) did not come up:"
+    if [[ "$up" == true ]]; then
+        sleep 0.5
+        kill -0 "$MTX_PID" 2>/dev/null && return 0
+    fi
+    echo "MediaMTX ($bin) did not come up or did not stay up:"
     cat "$TEST_SCRATCH/mediamtx.log"
     return 1
 }
@@ -102,7 +133,9 @@ mtx_stop() {
 }
 
 # mtx_listeners PID: one "proto address:port" line per listening TCP socket and
-# every UDP socket of the process, sorted. IPv6 sockets are listed as v6.
+# every UDP socket of the process, sorted. A socket on the IPv6 wildcard
+# address (what a dual-stack listener on ":port" is) is listed as 0.0.0.0, so
+# the answer does not depend on whether the machine has IPv6.
 mtx_listeners() {
     python3 -I - "$1" <<'PY'
 import os, sys
@@ -118,17 +151,19 @@ for fd in os.listdir("/proc/%s/fd" % pid):
 def addr(hexaddr):
     if len(hexaddr) == 8:
         return ".".join(map(str, bytes.fromhex(hexaddr)[::-1]))
+    if hexaddr == "0" * 32:
+        return "0.0.0.0"
     return "v6:" + hexaddr
-out = []
+out = set()
 for proto, path, state in (("tcp", "/proc/net/tcp", "0A"), ("udp", "/proc/net/udp", None),
-                           ("tcp6", "/proc/net/tcp6", "0A"), ("udp6", "/proc/net/udp6", None)):
+                           ("tcp", "/proc/net/tcp6", "0A"), ("udp", "/proc/net/udp6", None)):
     if not os.path.exists(path):
         continue
     for line in open(path).read().splitlines()[1:]:
         c = line.split()
         if c[9] in inodes and (state is None or c[3] == state):
             host, port = c[1].split(":")
-            out.append("%s %s:%d" % (proto, addr(host), int(port, 16)))
+            out.add("%s %s:%d" % (proto, addr(host), int(port, 16)))
 print("\n".join(sorted(out)))
 PY
 }
@@ -163,7 +198,8 @@ mtx_can_read() {
     [[ -n "$out" ]]
 }
 
-# mtx_wait_path_ready PATH [SECONDS]: wait until the API lists PATH as ready
+# mtx_wait_path_ready PATH [SECONDS]: wait until the API (reached from this
+# machine) lists PATH as ready
 mtx_wait_path_ready() {
     local i limit="${2:-10}"
     for ((i = 0; i < limit * 5; i++)); do

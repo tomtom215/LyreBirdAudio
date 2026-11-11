@@ -217,17 +217,24 @@ lyrebird_fsync_path() {
 # have been requested from stable storage. Whether the medium honours that
 # request is up to the storage stack (flash media included). If DEST is a
 # symbolic link, the link itself is replaced.
-# Usage: lyrebird_atomic_write DEST [MODE] < content
+# If a third argument names an existing file, the new file also takes that
+# file's owner and group (best effort: only root can give a file away, and a
+# failed chown leaves the invoking user as the owner).
+# Usage: lyrebird_atomic_write DEST [MODE [OWNER_REFERENCE_FILE]] < content
 # Returns: 0 on success; 1 on any failure, with DEST untouched and the temp
 #          file removed (a SIGKILL can still leave a ".<name>.XXXXXX" temp file
 #          behind, which is never read as DEST).
 lyrebird_atomic_write() {
     local dest="${1:?lyrebird_atomic_write: destination required}"
     local mode="${2:-0644}"
+    local owner_ref="${3:-}"
     local dir base tmp
     dir="$(dirname -- "$dest")"
     base="$(basename -- "$dest")"
     tmp="$(mktemp "${dir}/.${base}.XXXXXX")" || return 1
+    if [[ -n "$owner_ref" && -e "$owner_ref" ]]; then
+        chown --reference="$owner_ref" -- "$tmp" 2>/dev/null || true
+    fi
     if ! cat >"$tmp" \
         || ! chmod "$mode" -- "$tmp" \
         || ! lyrebird_fsync_path "$tmp" \
@@ -793,6 +800,306 @@ if ! declare -f lyrebird_step &>/dev/null; then
         echo "${prefix} ${message}"
     }
 fi
+
+#=============================================================================
+# MediaMTX Configuration Renderer (decisions D9, D10)
+#=============================================================================
+
+# First line of every configuration this library renders. The stream manager
+# rewrites a configuration file only while its first line is exactly this; a
+# file without it belongs to the operator and is never overwritten.
+readonly LYREBIRD_MEDIAMTX_CONFIG_MARKER='# Managed by LyreBirdAudio'
+
+# Is $1 a TCP/UDP port: decimal digits only, 1-65535 (leading zeros allowed)?
+# Usage: lyrebird_is_valid_port VALUE
+lyrebird_is_valid_port() {
+    local value="${1-}"
+    [[ "$value" =~ ^[0-9]{1,5}$ ]] && ((10#$value >= 1 && 10#$value <= 65535))
+}
+
+# Is $1 usable as the host part of a MediaMTX listen address: empty (every
+# interface), an IPv4 literal or an IPv6 literal (without brackets)? A shape
+# check (characters and layout, so a value can never carry anything else into a
+# configuration file); MediaMTX itself refuses an address that does not parse.
+# Usage: lyrebird_is_valid_bind_address VALUE
+lyrebird_is_valid_bind_address() {
+    local value="${1-}" octet
+    [[ -z "$value" ]] && return 0
+    if [[ "$value" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]]; then
+        for octet in "${BASH_REMATCH[@]:1:4}"; do
+            ((10#$octet <= 255)) || return 1
+        done
+        return 0
+    fi
+    [[ "$value" =~ ^[0-9A-Fa-f]{0,4}(:[0-9A-Fa-f]{0,4}){2,7}$ ]]
+}
+
+# Print "MAJOR MINOR PATCH" for a MediaMTX version string such as "v1.21.1"
+# (the first line of `mediamtx --version`). Fails for anything else.
+# Usage: lyrebird_mediamtx_version_parts VERSION
+lyrebird_mediamtx_version_parts() {
+    [[ "${1-}" =~ ^v?([0-9]+)\.([0-9]+)\.([0-9]+) ]] || return 1
+    printf '%s %s %s\n' "$((10#${BASH_REMATCH[1]}))" "$((10#${BASH_REMATCH[2]}))" "$((10#${BASH_REMATCH[3]}))"
+}
+
+# Quote $1 as a YAML single-quoted scalar ('' stands for a quote). Only
+# printable ASCII is accepted: a control character, a newline or a byte above
+# 0x7e fails (status 1, nothing printed), so a value can never end the scalar,
+# start a new key or smuggle in a line break.
+# Usage: lyrebird_yaml_quote VALUE
+lyrebird_yaml_quote() {
+    local value="${1-}"
+    local LC_ALL=C
+    [[ "$value" == *[^[:print:]]* ]] && return 1
+    printf "'%s'" "${value//\'/\'\'}"
+}
+
+# Print a MediaMTX listen address: ":PORT", "1.2.3.4:PORT" or "[::1]:PORT".
+# Usage: _lyrebird_mediamtx_address BIND PORT
+_lyrebird_mediamtx_address() {
+    local bind="$1" port="$2"
+    if [[ "$bind" == *:* ]]; then
+        printf '[%s]:%s' "$bind" "$port"
+    else
+        printf '%s:%s' "$bind" "$port"
+    fi
+}
+
+# Print the "any" user and one read-only user per line of a users file, as
+# MediaMTX authInternalUsers entries. The file holds "user:sha256:<base64>"
+# lines (blank lines and lines starting with '#' are ignored); the base64 is
+# that of the raw SHA-256 digest of the password:
+#   printf '%s' 'the password' | openssl dgst -sha256 -binary | base64
+# Anything else, a plaintext password included, is refused without echoing the
+# line.
+# Usage: _lyrebird_mediamtx_auth_block USERS_FILE   (USERS_FILE may be empty)
+_lyrebird_mediamtx_auth_block() {
+    local users_file="$1" line lineno=0 name hash quoted_name quoted_hash
+    local -A seen=()
+    printf 'authMethod: internal\n'
+    printf 'authInternalUsers:\n'
+    printf '  # This machine: publishers, health checks, API and metrics. No password; loopback only.\n'
+    printf '  - user: any\n'
+    printf '    pass:\n'
+    printf "    ips: ['127.0.0.1', '::1']\n"
+    printf '    permissions:\n'
+    printf '      - action: publish\n'
+    printf '      - action: read\n'
+    printf '      - action: playback\n'
+    printf '      - action: api\n'
+    printf '      - action: metrics\n'
+    printf '      - action: pprof\n'
+    [[ -n "$users_file" ]] || return 0
+    if ! [[ -r "$users_file" && -f "$users_file" ]]; then
+        printf 'lyrebird_render_mediamtx_config: users file %s is not a readable file\n' "$users_file" >&2
+        return 1
+    fi
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        lineno=$((lineno + 1))
+        line="${line%$'\r'}"
+        line="${line#"${line%%[![:space:]]*}"}"
+        [[ -z "$line" || "$line" == '#'* ]] && continue
+        if ! [[ "$line" =~ ^([A-Za-z0-9._@-]{1,64}):(sha256:[A-Za-z0-9+/]{43}=)$ ]]; then
+            printf 'lyrebird_render_mediamtx_config: %s line %d is not "user:sha256:<base64 of the SHA-256 digest>" (plaintext passwords are refused)\n' "$users_file" "$lineno" >&2
+            return 1
+        fi
+        name="${BASH_REMATCH[1]}"
+        hash="${BASH_REMATCH[2]}"
+        if [[ "$name" == any ]]; then
+            printf 'lyrebird_render_mediamtx_config: %s line %d: the user name "any" is reserved for this machine\n' "$users_file" "$lineno" >&2
+            return 1
+        fi
+        if [[ -n "${seen[$name]:-}" ]]; then
+            printf 'lyrebird_render_mediamtx_config: %s line %d: user "%s" is listed twice\n' "$users_file" "$lineno" "$name" >&2
+            return 1
+        fi
+        seen[$name]=1
+        quoted_name="$(lyrebird_yaml_quote "$name")" || return 1
+        quoted_hash="$(lyrebird_yaml_quote "$hash")" || return 1
+        printf '  # Remote listener, read only.\n'
+        printf '  - user: %s\n' "$quoted_name"
+        printf '    pass: %s\n' "$quoted_hash"
+        printf '    permissions:\n'
+        printf '      - action: read\n'
+        printf '      - action: playback\n'
+    done <"$users_file"
+}
+
+# Render a complete MediaMTX configuration on stdout. Nothing is written
+# anywhere and nothing is printed unless the whole file could be rendered.
+#
+# Every listener MediaMTX would start by default and this project does not use
+# is switched off (RTMP, HLS, WebRTC, SRT and, from 1.19.0, MoQ); the control
+# API and the metrics endpoint listen on the loopback address unless told
+# otherwise; RTSP listens on every interface.
+#
+# Options (all optional; defaults in brackets):
+#   --rtsp-port N / --api-port N / --metrics-port N   [8554 / 9997 / 9998]
+#   --rtsp-bind ADDR   [every interface]   ADDR is empty, an IPv4 or an IPv6
+#   --api-bind ADDR    [127.0.0.1]         literal; "" means every interface
+#   --metrics-bind ADDR [127.0.0.1]
+#   --api yes|no  --metrics yes|no   [yes / yes]
+#   --log-level error|warn|info|debug   [info]
+#   --read-timeout DUR / --write-timeout DUR   [30s]  (Go duration: 30s, 2m)
+#   --mediamtx-version VERSION   [unknown]  e.g. v1.21.1; keys that older
+#                                MediaMTX rejects (moq: 1.19.0) are written
+#                                only for a version known to accept them
+#   --stream-name NAME   [one catch-all path]  accept exactly this publisher
+#                        path (multiplex mode); quoted as a YAML scalar, any
+#                        control character or non-ASCII byte is refused
+#   --auth-mode open|local-only-publish   [open]  local-only-publish turns on
+#                        internal authentication: this machine (127.0.0.1, ::1)
+#                        may publish, read and call the API without a password;
+#                        everyone else needs a user from --users-file
+#   --users-file FILE    remote read-only users, "user:sha256:<base64>" lines
+# The first line of the output is $LYREBIRD_MEDIAMTX_CONFIG_MARKER.
+# Returns: 0, or 1 with a message on stderr (invalid option or value).
+lyrebird_render_mediamtx_config() {
+    local rtsp_port=8554 api_port=9997 metrics_port=9998
+    local rtsp_bind="" api_bind="127.0.0.1" metrics_bind="127.0.0.1"
+    local api=yes metrics=yes log_level=info version="" stream_name=""
+    local read_timeout=30s write_timeout=30s auth_mode=open users_file=""
+    local opt="" parts="" major=0 minor=0 quoted_name="" auth_block="" out=""
+
+    while (($#)); do
+        opt="$1"
+        if (($# < 2)); then
+            printf 'lyrebird_render_mediamtx_config: option %s needs a value\n' "$opt" >&2
+            return 1
+        fi
+        case "$opt" in
+            --rtsp-port) rtsp_port="$2" ;;
+            --api-port) api_port="$2" ;;
+            --metrics-port) metrics_port="$2" ;;
+            --rtsp-bind) rtsp_bind="$2" ;;
+            --api-bind) api_bind="$2" ;;
+            --metrics-bind) metrics_bind="$2" ;;
+            --api) api="$2" ;;
+            --metrics) metrics="$2" ;;
+            --log-level) log_level="$2" ;;
+            --read-timeout) read_timeout="$2" ;;
+            --write-timeout) write_timeout="$2" ;;
+            --mediamtx-version) version="$2" ;;
+            --stream-name) stream_name="$2" ;;
+            --auth-mode) auth_mode="$2" ;;
+            --users-file) users_file="$2" ;;
+            *)
+                printf 'lyrebird_render_mediamtx_config: unknown option %s\n' "$opt" >&2
+                return 1
+                ;;
+        esac
+        shift 2
+    done
+
+    local name value
+    for name in rtsp_port api_port metrics_port; do
+        value="${!name}"
+        if ! lyrebird_is_valid_port "$value"; then
+            printf 'lyrebird_render_mediamtx_config: --%s must be an integer from 1 to 65535 (got: %q)\n' "${name//_/-}" "$value" >&2
+            return 1
+        fi
+        printf -v "$name" '%s' "$((10#$value))"
+    done
+    if [[ "$rtsp_port" == "$api_port" || "$rtsp_port" == "$metrics_port" || "$api_port" == "$metrics_port" ]]; then
+        printf 'lyrebird_render_mediamtx_config: the RTSP, API and metrics ports must differ (got %s, %s, %s)\n' "$rtsp_port" "$api_port" "$metrics_port" >&2
+        return 1
+    fi
+    for name in rtsp_bind api_bind metrics_bind; do
+        value="${!name}"
+        if ! lyrebird_is_valid_bind_address "$value"; then
+            printf 'lyrebird_render_mediamtx_config: --%s must be empty or an IPv4/IPv6 address (got: %q)\n' "${name//_/-}" "$value" >&2
+            return 1
+        fi
+    done
+    for name in api metrics; do
+        value="${!name}"
+        if [[ "$value" != yes && "$value" != no ]]; then
+            printf 'lyrebird_render_mediamtx_config: --%s must be yes or no (got: %q)\n' "$name" "$value" >&2
+            return 1
+        fi
+    done
+    case "$log_level" in
+        error | warn | info | debug) ;;
+        *)
+            printf 'lyrebird_render_mediamtx_config: --log-level must be error, warn, info or debug (got: %q)\n' "$log_level" >&2
+            return 1
+            ;;
+    esac
+    for name in read_timeout write_timeout; do
+        value="${!name}"
+        if ! [[ "$value" =~ ^[0-9]+(ms|s|m|h)$ ]]; then
+            printf 'lyrebird_render_mediamtx_config: --%s must be a duration such as 30s or 2m (got: %q)\n' "${name//_/-}" "$value" >&2
+            return 1
+        fi
+    done
+    case "$auth_mode" in
+        open | local-only-publish) ;;
+        *)
+            printf 'lyrebird_render_mediamtx_config: --auth-mode must be open or local-only-publish (got: %q)\n' "$auth_mode" >&2
+            return 1
+            ;;
+    esac
+    if [[ "$auth_mode" == open && -n "$users_file" ]]; then
+        printf 'lyrebird_render_mediamtx_config: --users-file only applies to --auth-mode local-only-publish\n' >&2
+        return 1
+    fi
+    if [[ -n "$stream_name" ]]; then
+        if ! quoted_name="$(lyrebird_yaml_quote "$stream_name")"; then
+            printf 'lyrebird_render_mediamtx_config: --stream-name contains a control character or a non-ASCII byte\n' >&2
+            return 1
+        fi
+    else
+        quoted_name="'~^[a-zA-Z0-9_-]+\$'"
+    fi
+    if [[ "$auth_mode" == local-only-publish ]]; then
+        # The trailing "x" keeps $(...) from stripping the final newline
+        auth_block="$(_lyrebird_mediamtx_auth_block "$users_file" && printf x)" || return 1
+        auth_block="${auth_block%x}"
+    fi
+
+    out="${LYREBIRD_MEDIAMTX_CONFIG_MARKER}"$'\n'
+    out+="# Rendered by lyrebird_render_mediamtx_config (lyrebird-common.sh). The stream manager"$'\n'
+    out+="# rewrites this file only while the first line above is present. To keep hand edits,"$'\n'
+    out+="# delete that line: the file is then yours and is never overwritten."$'\n'
+    out+="logLevel: ${log_level}"$'\n'
+    out+="readTimeout: ${read_timeout}"$'\n'
+    out+="writeTimeout: ${write_timeout}"$'\n'
+    out+=$'\n'
+    out+="api: ${api}"$'\n'
+    out+="apiAddress: $(_lyrebird_mediamtx_address "$api_bind" "$api_port")"$'\n'
+    out+=$'\n'
+    out+="metrics: ${metrics}"$'\n'
+    out+="metricsAddress: $(_lyrebird_mediamtx_address "$metrics_bind" "$metrics_port")"$'\n'
+    out+=$'\n'
+    out+="rtsp: yes"$'\n'
+    out+="rtspAddress: $(_lyrebird_mediamtx_address "$rtsp_bind" "$rtsp_port")"$'\n'
+    out+="rtspTransports: [tcp, udp]"$'\n'
+    out+=$'\n'
+    out+="rtmp: no"$'\n'
+    out+="hls: no"$'\n'
+    out+="webrtc: no"$'\n'
+    out+="srt: no"$'\n'
+    # MediaMTX >= 1.19.0 starts a MoQ (Media over QUIC) server by default
+    # (:8892/tcp+udp and :8893/udp on every interface), so it is switched off
+    # there; 1.15-1.18 reject the key and refuse to start, and a version that
+    # cannot be read leaves the key out.
+    if parts="$(lyrebird_mediamtx_version_parts "$version")"; then
+        read -r major minor _ <<<"$parts"
+        if ((major > 1 || (major == 1 && minor >= 19))); then
+            out+="moq: no"$'\n'
+        fi
+    fi
+    if [[ -n "$auth_block" ]]; then
+        out+=$'\n'"${auth_block}"
+    fi
+    out+=$'\n'
+    out+="paths:"$'\n'
+    out+="  ${quoted_name}:"$'\n'
+    out+="    source: publisher"$'\n'
+    out+="    sourceProtocol: automatic"$'\n'
+    out+="    sourceOnDemand: no"$'\n'
+    printf '%s' "$out"
+}
 
 #=============================================================================
 # Version Information
