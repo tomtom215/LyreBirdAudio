@@ -231,11 +231,12 @@ readonly DEVICE_CONFIG_FILE="${MEDIAMTX_DEVICE_CONFIG:-${CONFIG_DIR}/audio-devic
 readonly PID_FILE="${MEDIAMTX_PID_FILE:-/run/mediamtx-audio.pid}"
 readonly FFMPEG_PID_DIR="${MEDIAMTX_FFMPEG_DIR:-/var/lib/mediamtx-ffmpeg}"
 readonly LOCK_FILE="${MEDIAMTX_LOCK_FILE:-/run/mediamtx-audio.lock}"
-# Lock file strategy:
-# - Uses flock() for exclusive access (kernel-enforced)
+# Lock file strategy (see the "Locking" section below for the details):
+# - Uses flock() for exclusive access (kernel-enforced); the kernel drops the
+#   lock when the holder exits, however it exits
 # - File descriptor stored in MAIN_LOCK_FD global variable
-# - Deleted only when demonstrably stale (via is_lock_stale function)
-# - NOT deleted on timeout failure (avoids race conditions)
+# - The lock file is NEVER removed and NEVER truncated, and there is no
+#   age- or process-name-based staleness (LOCK_STALE_THRESHOLD is ignored)
 # - Separate monitor lock (/run/mediamtx-monitor.lock) used by cron
 #   to avoid contention with service lock during start/stop operations
 readonly LOG_FILE="${MEDIAMTX_LOG_FILE:-/var/log/lyrebird-stream-manager.log}"
@@ -258,7 +259,6 @@ readonly SYSTEM_PID_MAX
 readonly PID_TERMINATION_TIMEOUT="${PID_TERMINATION_TIMEOUT:-10}"
 readonly MEDIAMTX_API_TIMEOUT="${MEDIAMTX_API_TIMEOUT:-60}"
 readonly LOCK_ACQUISITION_TIMEOUT="${LOCK_ACQUISITION_TIMEOUT:-30}"
-readonly LOCK_STALE_THRESHOLD="${LOCK_STALE_THRESHOLD:-300}" # 5 minutes
 
 # Audio settings
 readonly DEFAULT_SAMPLE_RATE="${DEFAULT_SAMPLE_RATE:-48000}"
@@ -309,6 +309,9 @@ USB_STABILIZATION_DELAY=$(_uint_or "${USB_STABILIZATION_DELAY:-}" 5)
 readonly USB_STABILIZATION_DELAY
 RESTART_STABILIZATION_DELAY=$(_uint_or "${RESTART_STABILIZATION_DELAY:-}" 15)
 readonly RESTART_STABILIZATION_DELAY
+# How long stop and force-stop wait for the lifecycle lock before refusing
+STOP_LOCK_TIMEOUT=$(_uint_or "${STOP_LOCK_TIMEOUT:-}" 5)
+readonly STOP_LOCK_TIMEOUT
 
 # Resource monitoring thresholds
 MAX_FD_WARNING=$(_uint_or "${MAX_FD_WARNING:-}" 500)
@@ -450,11 +453,16 @@ declare -gi MAIN_LOCK_FD=-1
 # Global config lock file descriptor
 declare -gi CONFIG_LOCK_FD=-1
 
+# Descriptor handed back by lock_open_and_acquire (-1 when it failed)
+declare -gi LOCK_OPENED_FD=-1
+
+# Set once the LOCK_STALE_THRESHOLD deprecation line has been logged
+declare -g LOCK_DEPRECATION_LOGGED=false
+
 # Skip cleanup flag
 declare -g SKIP_CLEANUP=false
 
 # Command being executed (COMMAND used by cleanup trap, must be initialized early)
-declare -g CURRENT_COMMAND="${1:-}"
 declare -g COMMAND=""
 
 # Flag to indicate if we're in a stop/force-stop operation
@@ -661,10 +669,12 @@ verify_cleanup_complete() {
     fi
 }
 
-# Release config lock safely
+# Release config lock safely. No "2>/dev/null" on the exec: an exec with only
+# redirections applies them to the shell itself, which would silence stderr for
+# the rest of the process.
 release_config_lock_unsafe() {
     if [[ "${CONFIG_LOCK_FD}" -gt 2 ]]; then
-        exec {CONFIG_LOCK_FD}>&- 2>/dev/null || true
+        exec {CONFIG_LOCK_FD}>&- || true
     fi
     CONFIG_LOCK_FD=-1
 }
@@ -689,9 +699,10 @@ log() {
         local lock_fd=-1
         local lock_file="${LOG_FILE}.lock"
 
-        # Try to acquire lock with proper FD management
+        # Try to acquire lock with proper FD management (">>": like every lock
+        # in this script, never truncate the lock file)
         {
-            exec {lock_fd}>"${lock_file}" 2>/dev/null
+            exec {lock_fd}>>"${lock_file}" 2>/dev/null
         } || {
             # Can't create lock, output to stderr only
             case "${level}" in
@@ -1042,90 +1053,134 @@ terminate_process_group() {
     fi
 }
 
-# Lock management with stale lock detection
-# Uses multiple verification methods to prevent PID recycling attacks
-is_lock_stale() {
-    if [[ ! -f "${LOCK_FILE}" ]]; then
-        return 1 # No lock file, not stale
-    fi
+# ============================================================================
+# Locking
+# ============================================================================
+# Every lock in this script is a plain flock(2) lock on a file that is never
+# removed and never truncated:
+#
+#   - The file is opened read-write WITHOUT O_TRUNC ("<>"). A process that is
+#     only waiting for the lock cannot disturb the owner's record, and the path
+#     keeps one inode for the life of the node: a removed-and-recreated path is
+#     a different lock, so two processes could both "hold" it.
+#   - The kernel drops the flock when its holder dies, however it dies, so no
+#     lock is ever "stale": there is no lock-age test and no process-name test
+#     (a script run directly has the 15-character comm "lyrebird-stream", which
+#     such a test would never match).
+#   - After winning the lock the owner overwrites the first line of the file in
+#     place with "<pid> <starttime>" (starttime = field 22 of /proc/<pid>/stat).
+#     The record is informational: it is what a refused process shows the
+#     operator. It is never used to decide whether the lock is held.
+#   - A flock belongs to an open file description, which a child inherits. A
+#     long-lived child that inherits the descriptor would keep the lock held
+#     after this process exits, so every such child is started through
+#     spawn_detached.
 
-    # Check if lock file has a PID
-    local lock_pid
-    lock_pid="$(head -n1 "${LOCK_FILE}" 2>/dev/null | tr -d '[:space:]')"
-
-    if [[ -z "$lock_pid" ]] || ! [[ "$lock_pid" =~ ^[0-9]+$ ]]; then
-        log WARN "Lock file exists but contains no valid PID"
-        return 0 # Stale
-    fi
-
-    # Validate PID is in reasonable range (prevent injection/overflow)
-    if [[ ${#lock_pid} -gt 10 ]] || [[ "$lock_pid" -gt 4194304 ]]; then
-        log WARN "Lock file contains invalid PID: $lock_pid"
-        return 0 # Stale
-    fi
-
-    # Check if the process is still running
-    if ! kill -0 "$lock_pid" 2>/dev/null; then
-        log WARN "Lock file PID $lock_pid is not running"
-        return 0 # Stale
-    fi
-
-    # Robust PID verification: check /proc/PID/cmdline to prevent PID recycling
-    # This is more reliable than ps -p which could return stale data
-    if [[ -d "/proc/$lock_pid" ]]; then
-        local proc_cmdline
-        proc_cmdline=$(tr '\0' ' ' <"/proc/$lock_pid/cmdline" 2>/dev/null || echo "")
-        if [[ -n "$proc_cmdline" ]]; then
-            # Verify it's actually our script (check for script name in cmdline)
-            if [[ "$proc_cmdline" != *"lyrebird-stream-manager"* ]] \
-                && [[ "$proc_cmdline" != *"${SCRIPT_NAME}"* ]]; then
-                log WARN "Lock file PID $lock_pid is now a different process (PID recycled)"
-                log DEBUG "Found cmdline: ${proc_cmdline:0:100}"
-                return 0 # Stale - PID was recycled
-            fi
-        fi
-    else
-        # /proc entry doesn't exist but kill -0 succeeded - race condition or zombie
-        log WARN "Process $lock_pid exists but /proc entry missing"
-        return 0 # Stale
-    fi
-
-    # Fallback: also check via ps for non-Linux systems
-    local proc_cmd
-    proc_cmd="$(ps -p "$lock_pid" -o comm= 2>/dev/null || true)"
-    if [[ -n "$proc_cmd" ]] && [[ "$proc_cmd" != "bash" ]] && [[ "$proc_cmd" != "${SCRIPT_NAME}" ]]; then
-        log WARN "Lock file PID $lock_pid command mismatch (found: $proc_cmd)"
-        return 0 # Stale
-    fi
-
-    # Check lock file age
-    local lock_age
-    lock_age="$(($(date +%s) - $(stat -c %Y "${LOCK_FILE}" 2>/dev/null || echo 0)))"
-    if [[ $lock_age -gt ${LOCK_STALE_THRESHOLD} ]]; then
-        log WARN "Lock file is ${lock_age} seconds old (threshold: ${LOCK_STALE_THRESHOLD})"
-        # Additional check: is it really stuck or just long-running?
-        if [[ "${CURRENT_COMMAND}" == "start" ]] || [[ "${CURRENT_COMMAND}" == "restart" ]]; then
-            return 0 # Consider stale for start/restart
-        fi
-    fi
-
-    return 1 # Not stale
+# Print the start time (clock ticks since boot, field 22 of /proc/<pid>/stat)
+# of a process. PID plus start time identify one process for the life of the
+# machine; a recycled PID has a different start time.
+# Returns 1 when the process does not exist or the value cannot be read.
+proc_starttime() {
+    local pid="$1" stat="" rest
+    local -a fields
+    [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+    # Read the whole file: the command name (field 2) may contain spaces,
+    # parentheses and even a newline, so the fields are counted from the last ")".
+    { IFS= read -r -d '' stat <"/proc/${pid}/stat"; } 2>/dev/null || [[ -n "$stat" ]] || return 1
+    [[ "$stat" == *") "* ]] || return 1
+    rest="${stat##*) }"
+    read -ra fields <<<"$rest"
+    [[ "${fields[19]:-}" =~ ^[0-9]+$ ]] || return 1
+    printf '%s\n' "${fields[19]}"
 }
 
-# Acquire exclusive file-based lock with timeout
+# Record this process as the owner of the lock held on descriptor $1: overwrite
+# the first line in place (the descriptor is at offset 0 and the line has a
+# fixed width, so the file never shrinks and is never empty while it is read).
+lock_record_owner() {
+    # BASHPID is this process; inside $(...) it would be the command
+    # substitution's own subshell, so capture it first.
+    local fd="$1" start self="${BASHPID}"
+    start="$(proc_starttime "$self")" || start=0
+    { printf '%-64s\n' "${self} ${start}" >&"${fd}"; } 2>/dev/null || true
+}
+
+# Print a one-line description of the lock owner recorded in lock file $1. The
+# recorded PID is only believed when its start time still matches, so a PID
+# that has been recycled by an unrelated process is never blamed.
+lock_describe_holder() {
+    local path="$1" rec_pid="" rec_start="" now_start="" cmdline=""
+    { IFS=' ' read -r rec_pid rec_start _ <"$path"; } 2>/dev/null || true
+    if ! [[ "$rec_pid" =~ ^[0-9]+$ ]] || ! [[ "$rec_start" =~ ^[0-9]+$ ]]; then
+        printf 'no owner recorded'
+        return 0
+    fi
+    now_start="$(proc_starttime "$rec_pid")" || now_start=""
+    if [[ "$now_start" != "$rec_start" ]]; then
+        printf 'last recorded owner PID %s (start time %s) is not running' "$rec_pid" "$rec_start"
+        return 0
+    fi
+    cmdline="$(tr '\0' ' ' 2>/dev/null <"/proc/${rec_pid}/cmdline")" || cmdline=""
+    printf 'PID %s (start time %s): %s' "$rec_pid" "$rec_start" "${cmdline:0:200}"
+}
+
+# Print "PID(comm)" for every other process that has lock file $1 open. After
+# an upgrade from a release that let children inherit the lock descriptor this
+# is how a lock held by an old MediaMTX or wrapper shows up.
+lock_list_open_holders() {
+    local path="$1" entry pid comm out=""
+    [[ -e "$path" ]] || return 0
+    for entry in /proc/[0-9]*/fd/*; do
+        [[ "$entry" -ef "$path" ]] || continue
+        pid="${entry#/proc/}"
+        pid="${pid%%/*}"
+        [[ "$pid" == "$$" || "$pid" == "${BASHPID}" ]] && continue
+        [[ " $out " == *" ${pid}("* ]] && continue
+        comm="$(tr -d '\n' 2>/dev/null <"/proc/${pid}/comm")" || comm="?"
+        out+="${out:+ }${pid}(${comm})"
+    done
+    printf '%s' "$out"
+}
+
+# Open lock file $1 (created if absent; never truncated or removed), take an
+# exclusive flock on it waiting at most $2 seconds and record this process as
+# the owner. On success the descriptor number is left in LOCK_OPENED_FD.
+# Returns: 0 = acquired, 1 = timed out, 2 = the lock file cannot be opened.
+# Nothing is redirected persistently: stderr of this shell is left alone.
+lock_open_and_acquire() {
+    local path="$1" timeout="$2" fd=-1
+    LOCK_OPENED_FD=-1
+    if ! { exec {fd}<>"${path}"; } 2>/dev/null; then
+        return 2
+    fi
+    if ! flock -w "${timeout}" "${fd}"; then
+        exec {fd}>&- || true
+        return 1
+    fi
+    lock_record_owner "${fd}"
+    LOCK_OPENED_FD=${fd}
+    return 0
+}
+
+# The LOCK_STALE_THRESHOLD setting no longer does anything: say so once.
+lock_warn_deprecated_settings() {
+    [[ -n "${LOCK_STALE_THRESHOLD:-}" ]] || return 0
+    [[ "${LOCK_DEPRECATION_LOGGED}" == "true" ]] && return 0
+    LOCK_DEPRECATION_LOGGED=true
+    log WARN "LOCK_STALE_THRESHOLD is deprecated and ignored: locks are released by the kernel when the holder exits, so a lock is never considered stale"
+}
+
+# Acquire the exclusive lifecycle lock (LOCK_FILE) with timeout.
 #
 # Acquisition sequence:
-# 1. Closes any existing file descriptor
+# 1. If this process already holds the lock, keep it (restart runs stop and
+#    start in one process; releasing in between would let another command in)
 # 2. Creates lock directory if needed
-# 3. Checks for stale lock (via is_lock_stale) and removes if stale
-# 4. Opens LOCK_FILE and gets file descriptor
-# 5. Validates file descriptor > 2
-# 6. Calls flock -w with timeout
-# 7. Writes current PID to lock file
+# 3. Opens LOCK_FILE without truncating it and calls flock -w with the timeout
+# 4. Records "<pid> <starttime>" as the owner
 #
-# Lock file deletion:
-# - Deleted only if is_lock_stale() returns true (age > threshold AND process dead)
-# - NOT deleted on timeout failure (another process legitimately holds lock)
+# The lock file is never removed or truncated and is never judged stale: a
+# held flock is held, and a released one is free.
 #
 # Parameters:
 #   $1 = Timeout in seconds (default: LOCK_ACQUISITION_TIMEOUT)
@@ -1133,25 +1188,34 @@ is_lock_stale() {
 #        If "true": returns 0 even if lock acquisition fails
 #
 # Returns:
-#   0 = Lock acquired successfully OR force="true"
+#   0 = Lock acquired (or already held) OR force="true"
 #   1 = Lock acquisition failed AND force="false"
 #
 # Side Effects:
 #   - Sets global MAIN_LOCK_FD to file descriptor number (or -1 on failure)
 #   - Creates LOCK_FILE if doesn't exist
-#   - Writes current PID to lock file
-#   - May delete lock file if demonstrably stale
-#   - Logs DEBUG on success, ERROR/WARN on failure
+#   - Overwrites the owner record in LOCK_FILE
+#   - Logs DEBUG on success; ERROR/WARN, with the recorded owner, on failure
 acquire_lock() {
     local timeout="${1:-${LOCK_ACQUISITION_TIMEOUT}}"
     local force="${2:-false}"
 
+    lock_warn_deprecated_settings
+
+    # Already held by this process? (the descriptor must still be open on the
+    # file the path names now)
+    if [[ ${MAIN_LOCK_FD} -gt 2 ]] && [[ "/proc/self/fd/${MAIN_LOCK_FD}" -ef "${LOCK_FILE}" ]]; then
+        log DEBUG "Lock already held (PID: ${BASHPID}, FD: ${MAIN_LOCK_FD})"
+        return 0
+    fi
+
     # Enter critical section to prevent signal handlers from interrupting lock operations
     enter_critical_section
 
-    # Always close existing FD before reuse
+    # A descriptor left over from an earlier acquisition that no longer matches
+    # the lock file is closed before taking a new one
     if [[ ${MAIN_LOCK_FD} -gt 2 ]]; then
-        exec {MAIN_LOCK_FD}>&- 2>/dev/null || true
+        exec {MAIN_LOCK_FD}>&- || true
     fi
     MAIN_LOCK_FD=-1
 
@@ -1166,73 +1230,107 @@ acquire_lock() {
         }
     fi
 
-    # Check for stale lock
-    if is_lock_stale; then
-        log INFO "Removing stale lock file"
-        rm -f "${LOCK_FILE}"
-    fi
+    local rc=0
+    lock_open_and_acquire "${LOCK_FILE}" "$timeout" || rc=$?
 
-    # Open lock file and get file descriptor
-    {
-        exec {MAIN_LOCK_FD}>"${LOCK_FILE}" 2>/dev/null
-    } || {
-        log ERROR "Cannot create lock file ${LOCK_FILE}"
-        MAIN_LOCK_FD=-1
-        exit_critical_section
-        return 1
-    }
-
-    # Validate FD is valid (> 2)
-    if [[ ${MAIN_LOCK_FD} -le 2 ]]; then
-        log ERROR "Invalid lock file descriptor: ${MAIN_LOCK_FD}"
-        MAIN_LOCK_FD=-1
-        exit_critical_section
-        return 1
-    fi
-
-    # Try to acquire lock
-    if ! flock -w "$timeout" "${MAIN_LOCK_FD}"; then
-        # Enhanced error handling for FD closure failure
-        if ! exec {MAIN_LOCK_FD}>&- 2>/dev/null; then
-            log WARN "Failed to close lock FD properly during acquisition failure"
-        fi
-        MAIN_LOCK_FD=-1
-
-        exit_critical_section
-        if [[ "$force" == "true" ]]; then
-            log WARN "Failed to acquire lock, forcing due to force flag"
-            return 0 # Continue anyway
-        else
-            log ERROR "Failed to acquire lock after ${timeout} seconds"
-            return 1
-        fi
-    fi
-
-    # Write our PID to the lock file
-    echo "$$" >&"${MAIN_LOCK_FD}" || true
-
-    # Exit critical section - lock is acquired, safe to allow signals again
+    # Lock is acquired or given up on: safe to allow signals again
     exit_critical_section
 
-    log DEBUG "Acquired lock (PID: $$, FD: ${MAIN_LOCK_FD})"
+    if [[ $rc -eq 2 ]]; then
+        log ERROR "Cannot create lock file ${LOCK_FILE}"
+        return 1
+    fi
+
+    if [[ $rc -ne 0 ]]; then
+        local holder
+        holder="$(lock_describe_holder "${LOCK_FILE}")"
+        local open_by
+        open_by="$(lock_list_open_holders "${LOCK_FILE}")"
+        if [[ "$force" == "true" ]]; then
+            log WARN "Failed to acquire lock, forcing due to force flag"
+            log WARN "Lock ${LOCK_FILE} is held; ${holder}"
+            return 0 # Continue anyway
+        fi
+        log ERROR "Failed to acquire lock after ${timeout} seconds"
+        log ERROR "Lock ${LOCK_FILE} is held; ${holder}"
+        if [[ -n "$open_by" ]]; then
+            log ERROR "Processes with the lock file open: ${open_by}"
+        fi
+        return 1
+    fi
+
+    MAIN_LOCK_FD=${LOCK_OPENED_FD}
+    log DEBUG "Acquired lock (PID: ${BASHPID}, FD: ${MAIN_LOCK_FD})"
     return 0
 }
 
 release_lock() {
     if [[ "${MAIN_LOCK_FD}" -gt 2 ]]; then
         log DEBUG "Releasing lock (FD: ${MAIN_LOCK_FD})"
-        exec {MAIN_LOCK_FD}>&- 2>/dev/null || true
+        exec {MAIN_LOCK_FD}>&- || true
     fi
     MAIN_LOCK_FD=-1
-    # Don't remove lock file - let next process reuse it
+    # Never remove the lock file: its inode is the lock
 }
 
 # Unsafe lock release for cleanup trap
 release_lock_unsafe() {
     if [[ "${MAIN_LOCK_FD}" -gt 2 ]]; then
-        exec {MAIN_LOCK_FD}>&- 2>/dev/null || true
+        exec {MAIN_LOCK_FD}>&- || true
     fi
     MAIN_LOCK_FD=-1
+}
+
+# Acquire the configuration lock (CONFIG_LOCK_FILE) with the same primitive as
+# the lifecycle lock. A descriptor still open from an earlier call is closed
+# first, as before. Sets CONFIG_LOCK_FD.
+# Parameters:
+#   $1 = Timeout in seconds (default: 10)
+# Returns: 0 = acquired, 1 = could not create or acquire the lock
+acquire_config_lock() {
+    local timeout="${1:-10}"
+    local rc=0
+    release_config_lock_unsafe
+    lock_open_and_acquire "${CONFIG_LOCK_FILE}" "$timeout" || rc=$?
+    if [[ $rc -eq 2 ]]; then
+        log ERROR "Failed to create config lock file"
+        return 1
+    fi
+    if [[ $rc -ne 0 ]]; then
+        log ERROR "Failed to acquire config lock"
+        log ERROR "Config lock ${CONFIG_LOCK_FILE} is held; $(lock_describe_holder "${CONFIG_LOCK_FILE}")"
+        return 1
+    fi
+    CONFIG_LOCK_FD=${LOCK_OPENED_FD}
+    return 0
+}
+
+# Run a long-lived child (MediaMTX, a per-stream wrapper) without any of this
+# shell's file descriptors above stderr: a child that inherited a lock
+# descriptor would keep the lock held after this process exited. The same goes
+# for a lock descriptor inherited from a parent, e.g. the monitor lock that
+# `flock FILE -c ...` leaves open in everything it starts.
+#
+# Use it as a background command; it replaces the forked subshell with the
+# command, so $! is the PID of the command itself:
+#   spawn_detached nohup setsid some-command args >>log 2>&1 &
+# Called in the foreground it would replace this very process, so it refuses.
+spawn_detached() {
+    if [[ "${BASHPID}" == "$$" ]]; then
+        log ERROR "spawn_detached must run as a background command"
+        return 1
+    fi
+    local entry fd
+    for entry in /proc/self/fd/*; do
+        fd="${entry##*/}"
+        [[ "$fd" =~ ^[0-9]+$ ]] || continue
+        # 0-2 are the child's stdio; 255 is bash's own script descriptor, which
+        # is close-on-exec
+        if [[ $fd -gt 2 && $fd -ne 255 ]]; then
+            exec {fd}>&- || true
+        fi
+    done
+    exec "$@"
 }
 
 # Check if running as root
@@ -3098,7 +3196,9 @@ clear_restart_marker() {
 # 5. Temporary files
 #    - Deletes: *.pid, *.sh, *.log, *.log.old from FFMPEG_PID_DIR
 # 6. Marker files
-#    - Deletes: CLEANUP_MARKER, RESTART_MARKER, CONFIG_LOCK_FILE
+#    - Deletes: CLEANUP_MARKER, RESTART_MARKER
+#    - Never deletes a lock file (LOCK_FILE, CONFIG_LOCK_FILE): the inode is the
+#      lock, and removing it while another process holds it splits the lock
 #
 # Parameters: None
 #
@@ -3170,7 +3270,6 @@ cleanup_stale_processes() {
     # Clean up markers
     rm -f "${CLEANUP_MARKER}"
     rm -f "${RESTART_MARKER}"
-    rm -f "${CONFIG_LOCK_FILE}"
 
     # Restore nullglob only if it was originally off (avoids redundant shopt -s)
     [[ "$nullglob_state" == "off" ]] && shopt -u nullglob
@@ -4040,9 +4139,9 @@ WRAPPER_LOGIC
     # Start wrapper with process group using setsid if available
     log DEBUG "Starting multiplex wrapper script: $wrapper_script"
     if command_exists setsid; then
-        nohup setsid bash "$wrapper_script" >/dev/null 2>&1 &
+        spawn_detached nohup setsid bash "$wrapper_script" >/dev/null 2>&1 &
     else
-        nohup bash "$wrapper_script" >/dev/null 2>&1 &
+        spawn_detached nohup bash "$wrapper_script" >/dev/null 2>&1 &
     fi
 
     local wrapper_pid=$!
@@ -4464,9 +4563,9 @@ WRAPPER_LOGIC
     # Start wrapper with process group using setsid if available
     log DEBUG "Starting wrapper script: $wrapper_script"
     if command_exists setsid; then
-        nohup setsid bash "$wrapper_script" >/dev/null 2>&1 &
+        spawn_detached nohup setsid bash "$wrapper_script" >/dev/null 2>&1 &
     else
-        nohup bash "$wrapper_script" >/dev/null 2>&1 &
+        spawn_detached nohup bash "$wrapper_script" >/dev/null 2>&1 &
     fi
     local pid=$!
 
@@ -4646,32 +4745,7 @@ generate_mediamtx_config() {
     fi
 
     # Don't use subshell for locking - keep lock in main shell
-    # Close any existing config lock first
-    if [[ ${CONFIG_LOCK_FD} -gt 2 ]]; then
-        exec {CONFIG_LOCK_FD}>&- 2>/dev/null || true
-    fi
-    CONFIG_LOCK_FD=-1
-
-    # Create lock file with proper error handling
-    {
-        exec {CONFIG_LOCK_FD}>"${CONFIG_LOCK_FILE}" 2>/dev/null
-    } || {
-        log ERROR "Failed to create config lock file"
-        return 1
-    }
-
-    # Validate FD
-    if [[ ${CONFIG_LOCK_FD} -le 2 ]]; then
-        log ERROR "Invalid config lock FD"
-        exec {CONFIG_LOCK_FD}>&- 2>/dev/null || true
-        CONFIG_LOCK_FD=-1
-        return 1
-    fi
-
-    if ! flock -x -w 10 ${CONFIG_LOCK_FD}; then
-        log ERROR "Failed to acquire config lock"
-        exec {CONFIG_LOCK_FD}>&- 2>/dev/null || true
-        CONFIG_LOCK_FD=-1
+    if ! acquire_config_lock 10; then
         return 1
     fi
 
@@ -4681,7 +4755,7 @@ generate_mediamtx_config() {
 
     # Ensure temp file and lock are cleaned up on any failure
     local _config_cleanup_needed=true
-    trap 'if [[ "${_config_cleanup_needed:-}" == "true" ]]; then rm -f "$tmp_config" 2>/dev/null; exec {CONFIG_LOCK_FD}>&- 2>/dev/null; CONFIG_LOCK_FD=-1; fi' RETURN
+    trap 'if [[ "${_config_cleanup_needed:-}" == "true" ]]; then rm -f "$tmp_config" 2>/dev/null; release_config_lock_unsafe; fi' RETURN
 
     cat >"$tmp_config" <<'EOF'
 # MediaMTX Configuration - Audio Streams
@@ -4736,8 +4810,7 @@ EOF
     chmod 644 "$tmp_config" 2>/dev/null || {
         rm -f "$tmp_config"
         log ERROR "Failed to set permissions on temp config file"
-        exec {CONFIG_LOCK_FD}>&- 2>/dev/null || true
-        CONFIG_LOCK_FD=-1
+        release_config_lock_unsafe
         return 1
     }
 
@@ -4745,14 +4818,12 @@ EOF
     mv -f "$tmp_config" "${CONFIG_FILE}" || {
         rm -f "$tmp_config"
         log ERROR "Failed to move config file into place"
-        exec {CONFIG_LOCK_FD}>&- 2>/dev/null || true
-        CONFIG_LOCK_FD=-1
+        release_config_lock_unsafe
         return 1
     }
 
     # Release config lock
-    exec {CONFIG_LOCK_FD}>&- 2>/dev/null || true
-    CONFIG_LOCK_FD=-1
+    release_config_lock_unsafe
 
     _config_cleanup_needed=false
     log INFO "Configuration generated successfully"
@@ -4774,6 +4845,10 @@ is_mediamtx_running() {
 # Start MediaMTX with single device detection
 start_mediamtx() {
     if ! acquire_lock; then
+        # Nothing was started or stopped, so there is nothing to clean up: an
+        # exit marker here would make the NEXT start tear down the healthy
+        # stack that holds the lock.
+        SKIP_CLEANUP=true
         error_exit "Failed to acquire lock" "${E_LOCK_FAILED}"
     fi
 
@@ -4842,9 +4917,9 @@ start_mediamtx() {
 
     # Start MediaMTX with process group
     if command_exists setsid; then
-        nohup setsid "${MEDIAMTX_BIN}" "${CONFIG_FILE}" >>"${MEDIAMTX_LOG_FILE}" 2>&1 &
+        spawn_detached nohup setsid "${MEDIAMTX_BIN}" "${CONFIG_FILE}" >>"${MEDIAMTX_LOG_FILE}" 2>&1 &
     else
-        nohup "${MEDIAMTX_BIN}" "${CONFIG_FILE}" >>"${MEDIAMTX_LOG_FILE}" 2>&1 &
+        spawn_detached nohup "${MEDIAMTX_BIN}" "${CONFIG_FILE}" >>"${MEDIAMTX_LOG_FILE}" 2>&1 &
     fi
     local pid=$!
 
@@ -4927,9 +5002,15 @@ start_mediamtx() {
 stop_mediamtx() {
     STOPPING_SERVICE=true
 
-    # Try to acquire lock but don't fail if we can't
-    if ! acquire_lock 5; then
-        log WARN "Could not acquire lock, proceeding with stop anyway"
+    # Wait (bounded) for the lifecycle lock. A stop that ran while a start is
+    # mid-flight would tear down processes that start is still creating, so if
+    # the lock cannot be taken, report the holder (acquire_lock logged it) and
+    # refuse without touching anything.
+    if ! acquire_lock "${STOP_LOCK_TIMEOUT}"; then
+        log ERROR "Refusing to stop: another lifecycle command holds the lock (${LOCK_FILE})"
+        STOPPING_SERVICE=false
+        SKIP_CLEANUP=true
+        return "${E_LOCK_FAILED}"
     fi
 
     stop_all_ffmpeg_streams
@@ -4956,9 +5037,19 @@ stop_mediamtx() {
     return 0
 }
 
-# Force stop without locks
+# Force stop. Takes the lifecycle lock (bounded wait) so it never overlaps a
+# start/stop/restart; if the lock cannot be taken it reports the holder and
+# refuses without touching anything. The lock file itself is never deleted.
 force_stop_mediamtx() {
     STOPPING_SERVICE=true
+
+    if ! acquire_lock "${STOP_LOCK_TIMEOUT}"; then
+        log ERROR "Refusing to force-stop: another lifecycle command holds the lock (${LOCK_FILE})"
+        log ERROR "Wait for it to finish, or stop the process reported above, then run force-stop again"
+        STOPPING_SERVICE=false
+        SKIP_CLEANUP=true
+        return "${E_LOCK_FAILED}"
+    fi
 
     log WARN "Force stopping MediaMTX and all related processes"
 
@@ -4988,8 +5079,6 @@ force_stop_mediamtx() {
     rm -f "${FFMPEG_PID_DIR}"/*.log.old
     rm -f "${RESTART_MARKER}"
     rm -f "${CLEANUP_MARKER}"
-    rm -f "${LOCK_FILE}"
-    rm -f "${CONFIG_LOCK_FILE}"
 
     log INFO "Force stop completed"
     STOPPING_SERVICE=false

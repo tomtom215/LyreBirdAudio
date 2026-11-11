@@ -314,37 +314,10 @@ teardown() {
 # ============================================================================
 # Lock File Tests
 # ============================================================================
-
-@test "lock acquisition creates lock file" {
-    TEST_LOCK=$(mktemp)
-    rm "$TEST_LOCK"
-
-    acquire_lock() {
-        local lock_file="$1"
-        exec 200>"$lock_file"
-        flock -n 200
-    }
-
-    run acquire_lock "$TEST_LOCK"
-    # Lock file should be created
-    [ -f "$TEST_LOCK" ]
-
-    rm -f "$TEST_LOCK"
-}
-
-@test "lock is exclusive - second acquisition fails" {
-    TEST_LOCK=$(mktemp)
-
-    # First lock
-    exec 200>"$TEST_LOCK"
-    flock -n 200
-
-    # Try second lock from subshell
-    run bash -c "exec 201>\"$TEST_LOCK\"; flock -n 201"
-    [ "$status" -eq 1 ]
-
-    rm -f "$TEST_LOCK"
-}
+# The lock tests that used to live here exercised inline copies of the code
+# (an `acquire_lock` redefined in the test, and a bare `flock`). The real
+# acquire_lock/release_lock, the config lock and their callers are tested in
+# test_stream_manager_locks.bats, with real concurrent processes.
 
 # ============================================================================
 # API URL Construction Tests
