@@ -1699,28 +1699,31 @@ generate_config() {
 # Generated: $(date '+%Y-%m-%d %H:%M:%S')
 # Quality Tier: $QUALITY_TIER
 #
-# This file is sourced by lyrebird-stream-manager.sh to configure
-# per-device audio capture parameters.
+# This file is read by lyrebird-stream-manager.sh to configure per-device
+# audio capture parameters. It is data, never executed: one assignment per line,
+# a value bare or in quotes, no shell syntax. Check it with:
+#   lyrebird-stream-manager.sh validate
 #
 # Configuration Format:
-#   DEVICE_<sanitized_name>_<PARAMETER>=value
+#   DEVICE_<sanitized_name>_<PARAMETER>="value"
 #
 # Where:
 #   - <sanitized_name> is the device name with special chars replaced by
 #     underscore and then UPPERCASED, so the key matches the exact lookup the
-#     stream manager performs (DEVICE_${name^^}_${param^^}). A case mismatch
-#     here silently drops every per-device setting.
-#   - <PARAMETER> is one of: SAMPLE_RATE, CHANNELS, BITRATE
+#     stream manager performs (DEVICE_<NAME>_<PARAMETER>, both upper-case). A
+#     case mismatch here silently drops every per-device setting.
+#   - <PARAMETER> is one of: SAMPLE_RATE, CHANNELS, BITRATE (written here),
+#     CODEC (opus, aac or mp3), THREAD_QUEUE (you can add them by hand)
 #
 # Example (device "Blue Yeti"):
-#   DEVICE_BLUE_YETI_SAMPLE_RATE=48000
-#   DEVICE_BLUE_YETI_CHANNELS=2
-#   DEVICE_BLUE_YETI_BITRATE=192k
+#   DEVICE_BLUE_YETI_SAMPLE_RATE="48000"
+#   DEVICE_BLUE_YETI_CHANNELS="2"
+#   DEVICE_BLUE_YETI_BITRATE="192k"
 #
 # Fallback defaults (used when no device-specific value is set) are NOT read
 # from this file: the stream manager fixes them at startup from its
 # environment (DEFAULT_SAMPLE_RATE, DEFAULT_CHANNELS, DEFAULT_BITRATE, ...),
-# and assigning them here only logs "readonly variable" on every load.
+# and a DEFAULT_* line here is reported as a problem and ignored.
 # Built-in values:
 #   DEFAULT_SAMPLE_RATE=48000
 #   DEFAULT_CHANNELS=2
@@ -1736,8 +1739,9 @@ EOF
     local devices_configured=0
     local devices_skipped=0
 
-    # Scan all USB audio devices
-    for card_dir in /proc/asound/card[0-9]*; do
+    # Scan all USB audio devices (ASOUND_PROC_ROOT: where the card directories are,
+    # /proc/asound unless a test points it at a fake tree)
+    for card_dir in "${ASOUND_PROC_ROOT:-/proc/asound}"/card[0-9]*; do
         [[ -d "$card_dir" ]] || continue
 
         local card_num="${card_dir##*/card}"
@@ -1808,9 +1812,9 @@ EOF
 #   Channels: ${PARSED_CAPS[channels]:-unknown}
 #   Formats: ${PARSED_CAPS[formats]:-unknown}
 # Selected settings (quality tier: $QUALITY_TIER):
-DEVICE_${safe_name^^}_SAMPLE_RATE=$optimal_rate
-DEVICE_${safe_name^^}_CHANNELS=$optimal_channels
-DEVICE_${safe_name^^}_BITRATE=${enc_bitrate}k
+DEVICE_${safe_name^^}_SAMPLE_RATE="$optimal_rate"
+DEVICE_${safe_name^^}_CHANNELS="$optimal_channels"
+DEVICE_${safe_name^^}_BITRATE="${enc_bitrate}k"
 
 EOF
 

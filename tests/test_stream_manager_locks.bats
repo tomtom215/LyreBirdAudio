@@ -32,7 +32,8 @@ setup() {
     # Private paths for everything the script writes
     export LB_REAL_SCRIPT="$PROJECT_ROOT/lyrebird-stream-manager.sh"
     export MEDIAMTX_LOCK_FILE="$LK/run.lock"
-    export MEDIAMTX_LOG_FILE="$LK/sm.log"
+    export STREAM_MANAGER_LOG_FILE="$LK/sm.log"
+    export MEDIAMTX_LOG_FILE="$LK/mtx.out"
     export MEDIAMTX_CONFIG_DIR="$LK/cfg"
     export MEDIAMTX_PID_FILE="$LK/mtx.pid"
     export MEDIAMTX_FFMPEG_DIR="$LK/ff"
@@ -194,7 +195,7 @@ _wait_nonempty() {
     done
     echo "timed out waiting for $file" >&2
     cat "$LK"/bg.*.out >&2 2>/dev/null || true
-    tail -n 20 "$MEDIAMTX_LOG_FILE" >&2 2>/dev/null || true
+    tail -n 20 "$STREAM_MANAGER_LOG_FILE" >&2 2>/dev/null || true
     return 1
 }
 
@@ -473,15 +474,15 @@ _t_sigkill() {
         printf "first=%s second=%s\n" "$a" "$b"'
     [[ "$output" == *"first=1 second=1"* ]]
     local lines
-    lines="$(grep -c 'LOCK_STALE_THRESHOLD is deprecated and ignored' "$MEDIAMTX_LOG_FILE")"
+    lines="$(grep -c 'LOCK_STALE_THRESHOLD is deprecated and ignored' "$STREAM_MANAGER_LOG_FILE")"
     [ "$lines" -eq 1 ]
     _stop_holder
 
     # Without the variable there is no deprecation line at all
-    : >"$MEDIAMTX_LOG_FILE"
+    : >"$STREAM_MANAGER_LOG_FILE"
     run bash "$ROLE" try 1
     [[ "$output" == *"rc=0"* ]]
-    ! grep -q 'LOCK_STALE_THRESHOLD' "$MEDIAMTX_LOG_FILE" || false
+    ! grep -q 'LOCK_STALE_THRESHOLD' "$STREAM_MANAGER_LOG_FILE" || false
 }
 
 @test "a process that already holds the lock keeps it when it acquires again (restart = stop + start) [D2]" {
@@ -500,8 +501,8 @@ _t_sigkill() {
     [ "$status" -eq 0 ]
     [ "$output" = "rc=1 rc=1 same-file" ]
     # The second call kept the lock instead of releasing and re-taking it
-    [ "$(grep -c 'Acquired lock' "$MEDIAMTX_LOG_FILE")" -eq 1 ]
-    grep -q 'Lock already held' "$MEDIAMTX_LOG_FILE"
+    [ "$(grep -c 'Acquired lock' "$STREAM_MANAGER_LOG_FILE")" -eq 1 ]
+    grep -q 'Lock already held' "$STREAM_MANAGER_LOG_FILE"
 }
 
 @test "acquiring and releasing locks leaves the shell's stderr alone [X-06]" {
@@ -803,28 +804,38 @@ validate_stream() { return 0; }
 check_audio_device() { return 0; }
 '
 
-# The generated wrapper checks /dev/snd/pcmC<N>D0c, which a machine without
-# sound hardware (CI) does not have, and drives a real ffmpeg. For the tests of
-# the wrapper launch sites only, `bash` on PATH is a shim that runs the wrapper
-# the manager generated with those two hardware dependencies pointed at stand-
-# ins (an existing path, and a stub ffmpeg that just waits). The launch itself,
+# The generated wrapper looks for the card's capture device node, which a machine
+# without sound hardware (CI) does not have (a fake /proc/asound and /dev/snd with
+# a capture PCM 0 for cards 1 and 2 stand in for it: ASOUND_PROC_ROOT and
+# DEV_SND_ROOT), and drives a real ffmpeg. For the tests of the wrapper launch
+# sites only, `bash` on PATH is a shim that runs the wrapper the manager generated
+# with a stub ffmpeg that just waits in front of the real one. The launch itself,
 # the wrapper text and the lock are the real ones.
 _use_wrapper_hardware_stand_ins() {
+    local card
+    for card in 1 2; do
+        mkdir -p "$LK/asound/card${card}/pcm0c" "$LK/dev-snd"
+        : >"$LK/dev-snd/pcmC${card}D0c"
+    done
+    export ASOUND_PROC_ROOT="$LK/asound" DEV_SND_ROOT="$LK/dev-snd"
     mkdir -p "$LK/wrapbin"
     cat >"$LK/wrapbin/bash" <<'SHIM_EOF'
 #!/bin/bash
 if [[ "${1:-}" == "$LB_DIR/ff/"*.sh ]]; then
     script="$1"
     shift
-    sed -e 's#/dev/snd/pcmC${card_num}D0c#/dev/null#' \
-        -e 's#/dev/snd/pcmC${CARD_NUM}D0c#/dev/null#' \
-        -e 's#export PATH="/usr/local/sbin#export PATH="'"$LB_DIR"'/bin:/usr/local/sbin#' \
+    sed -e 's#export PATH="/usr/local/sbin#export PATH="'"$LB_DIR"'/bin:/usr/local/sbin#' \
         "$script" >"${script%.sh}.standin"
     exec /bin/bash "${script%.sh}.standin" "$@"
 fi
 exec /bin/bash "$@"
 SHIM_EOF
-    printf '#!/bin/bash\nexec sleep 600\n' >"$LK/bin/ffmpeg"
+    # The stub ffmpeg waits when it is run as a stream; the manager's own quick questions to
+    # FFmpeg before it generates a multiplex wrapper (the amix help, the encoding check that
+    # ends in "-f null -") are answered at once
+    printf '%s\n' '#!/bin/bash' \
+        'case "$*" in *"-h filter=amix"* | *"-f null -") exit 0 ;; esac' \
+        'exec sleep 600' >"$LK/bin/ffmpeg"
     chmod +x "$LK/wrapbin/bash" "$LK/bin/ffmpeg"
     export PATH="$LK/wrapbin:$PATH"
 }
@@ -917,5 +928,5 @@ _assert_child_holds_no_lock() {
     [[ "$output" == *"stop rc=0 mediamtx-alive=no"* ]]
     # The old code waited out 5 s for the lock its own child kept alive and
     # then went ahead without it
-    ! grep -q 'Could not acquire lock\|Failed to acquire lock\|Refusing to stop' "$MEDIAMTX_LOG_FILE" || false
+    ! grep -q 'Could not acquire lock\|Failed to acquire lock\|Refusing to stop' "$STREAM_MANAGER_LOG_FILE" || false
 }
