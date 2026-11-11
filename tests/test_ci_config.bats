@@ -235,15 +235,27 @@ step_env() {
 }
 
 # run_step JOB STEP [NAME=value...]: run the step's real script the way the
-# runner does (bash --noprofile --norc -eo pipefail), with its static env plus
-# the given variables, in the current directory.
+# runner does, with its static env plus the given variables, in the current
+# directory. The runner runs `shell: bash` as bash --noprofile --norc -eo
+# pipefail and a step with no shell set as bash -e; the workflow decides.
 run_step() {
     local job="$1" step="$2"
     shift 2
-    local -a envs
+    local -a envs flags
+    local shell
+    shell="$(jq -r --arg j "$job" --arg s "$step" '
+        (.jobs[$j].steps[] | select(.name == $s) | .shell) // .jobs[$j].defaults.run.shell // .defaults.run.shell // ""' <<<"$WF")"
+    case "$shell" in
+        bash) flags=(--noprofile --norc -eo pipefail) ;;
+        "") flags=(-e) ;;
+        *)
+            echo "run_step does not know shell '$shell'" >&2
+            return 1
+            ;;
+    esac
     step_script "$job" "$step" >"$TEST_SCRATCH/step.sh"
     mapfile -t envs < <(step_env "$job" "$step")
-    run env "${envs[@]}" "$@" bash --noprofile --norc -eo pipefail "$TEST_SCRATCH/step.sh"
+    run env "${envs[@]}" "$@" bash "${flags[@]}" "$TEST_SCRATCH/step.sh"
 }
 
 @test "bash-ci runs on pull requests and pushes to main/master, weekly, on demand and when called" {
@@ -753,4 +765,226 @@ SH
     run_step security-scan "Security Summary Report" \
         WARNING_COUNT=0 WARNING_LIST=None GITHUB_STEP_SUMMARY="$TEST_SCRATCH/summary.md"
     grep -qF 'No pattern matched' "$TEST_SCRATCH/summary.md"
+}
+
+# ---------------------------------------------------------------------------
+# release.yml: validated by the same pipeline as a pull request, then an
+# idempotent publish with a source tarball and SHA256SUMS.
+# ---------------------------------------------------------------------------
+
+ARCHIVE_STEP="Build source archive and checksums"
+PUBLISH_STEP="Publish GitHub Release (create, or update an existing one)"
+
+@test "release validates the tagged commit with the full Bash CI before it publishes" {
+    load_wf release
+    run jq -e '
+        (.jobs.validate.uses == "./.github/workflows/bash-ci.yml")
+        and (.jobs.validate | has("steps") | not)
+        and ([.jobs.release.needs] | flatten | index("validate") != null)
+        and (.permissions == {"contents": "read"})
+        and (.jobs.release.permissions == {"contents": "write"})
+        and (.defaults.run.shell == "bash")' <<<"$WF"
+    [ "$status" -eq 0 ]
+    # ... and bash-ci can be called.
+    run jq -e '.on | has("workflow_call")' <<<"$(wf_json "$ROOT/.github/workflows/bash-ci.yml")"
+    [ "$status" -eq 0 ]
+}
+
+# make_tagged_repo: a git repository with one tracked commit and an untracked
+# file; sets GITHUB_SHA.
+make_tagged_repo() {
+    mkdir -p "$TEST_SCRATCH/repo/sub"
+    cd "$TEST_SCRATCH/repo" || return 1
+    git init -q .
+    echo tracked >a.sh
+    echo nested >sub/b.txt
+    git add a.sh sub/b.txt
+    GIT_COMMITTER_DATE="2026-11-01T12:00:00Z" GIT_AUTHOR_DATE="2026-11-01T12:00:00Z" \
+        git -c user.name=t -c user.email=t@example.invalid commit -q -m "release content"
+    echo untracked >untracked.txt
+    GITHUB_SHA="$(git rev-parse HEAD)"
+}
+
+@test "release source archive is the tracked files of the tagged commit and SHA256SUMS verifies it" {
+    load_wf release
+    command -v git >/dev/null || skip "git not installed"
+    make_tagged_repo
+    run_step release "$ARCHIVE_STEP" GITHUB_REF_NAME=v1.3.0 GITHUB_SHA="$GITHUB_SHA" RUNNER_TEMP="$TEST_SCRATCH/r1"
+    [ "$status" -eq 0 ]
+    local dir="$TEST_SCRATCH/r1/release-assets"
+    [ -f "$dir/LyreBirdAudio-1.3.0.tar.gz" ]
+    # The checksum file names the tarball without a path, so it verifies in place.
+    [ "$(cut -d' ' -f3- "$dir/SHA256SUMS")" = "LyreBirdAudio-1.3.0.tar.gz" ]
+    (cd "$dir" && sha256sum -c SHA256SUMS)
+    # Layout: one top-level directory; tracked files only.
+    run tar -tzf "$dir/LyreBirdAudio-1.3.0.tar.gz"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"LyreBirdAudio-1.3.0/a.sh"* ]]
+    [[ "$output" == *"LyreBirdAudio-1.3.0/sub/b.txt"* ]]
+    [[ "$output" != *"untracked.txt"* ]]
+    [[ "$output" != *".git/"* ]]
+    [ "$(grep -vc '^LyreBirdAudio-1.3.0/' <<<"$output")" -eq 0 ]
+}
+
+@test "release source archive is reproducible: rebuilding the same commit gives the same bytes" {
+    load_wf release
+    command -v git >/dev/null || skip "git not installed"
+    make_tagged_repo
+    run_step release "$ARCHIVE_STEP" GITHUB_REF_NAME=v1.3.0 GITHUB_SHA="$GITHUB_SHA" RUNNER_TEMP="$TEST_SCRATCH/r1"
+    [ "$status" -eq 0 ]
+    # Later, in another directory, with an extra untracked file and a changed
+    # working tree: the archive comes from the commit, not from the checkout.
+    echo changed >a.sh
+    echo more >another-untracked.txt
+    sleep 1
+    run_step release "$ARCHIVE_STEP" GITHUB_REF_NAME=v1.3.0 GITHUB_SHA="$GITHUB_SHA" RUNNER_TEMP="$TEST_SCRATCH/r2"
+    [ "$status" -eq 0 ]
+    cmp "$TEST_SCRATCH/r1/release-assets/LyreBirdAudio-1.3.0.tar.gz" "$TEST_SCRATCH/r2/release-assets/LyreBirdAudio-1.3.0.tar.gz"
+    cmp "$TEST_SCRATCH/r1/release-assets/SHA256SUMS" "$TEST_SCRATCH/r2/release-assets/SHA256SUMS"
+}
+
+@test "release archive step fails, and writes no checksums, when git archive fails" {
+    load_wf release
+    command -v git >/dev/null || skip "git not installed"
+    make_tagged_repo
+    run_step release "$ARCHIVE_STEP" GITHUB_REF_NAME=v1.3.0 \
+        GITHUB_SHA=0000000000000000000000000000000000000000 RUNNER_TEMP="$TEST_SCRATCH/r1"
+    [ "$status" -ne 0 ]
+    [ ! -e "$TEST_SCRATCH/r1/release-assets/SHA256SUMS" ]
+}
+
+# gh_shim: a `gh` that keeps state in $FAKE_STATE (the file "exists" is the
+# release), logs every call to $FAKE_LOG and saves the notes file it is given.
+# FAKE_CREATE_RACE=1: create fails because the release appears meanwhile;
+# FAKE_CREATE_FAIL=1: create fails and the release does not exist.
+gh_shim() {
+    mkdir -p "$TEST_SCRATCH/bin" "$TEST_SCRATCH/state" "$TEST_SCRATCH/pub/rt/release-assets"
+    cat >"$TEST_SCRATCH/bin/gh" <<'SH'
+#!/bin/bash
+echo "gh $*" >>"$FAKE_LOG"
+args=("$@")
+for i in "${!args[@]}"; do
+    if [[ "${args[$i]}" == --notes-file ]]; then
+        cp "${args[$((i + 1))]}" "$FAKE_STATE/notes-$1-$2"
+    fi
+done
+case "$1 $2" in
+    "release view") [[ -e "$FAKE_STATE/exists" ]] ;;
+    "release create")
+        if [[ -n "${FAKE_CREATE_RACE:-}" ]]; then
+            : >"$FAKE_STATE/exists"
+            echo "a release with that tag already exists" >&2
+            exit 1
+        fi
+        if [[ -n "${FAKE_CREATE_FAIL:-}" ]]; then
+            echo "HTTP 500" >&2
+            exit 1
+        fi
+        : >"$FAKE_STATE/exists"
+        ;;
+    "release edit" | "release upload") ;;
+    *)
+        echo "unexpected gh call: $*" >&2
+        exit 99
+        ;;
+esac
+SH
+    chmod +x "$TEST_SCRATCH/bin/gh"
+    mkdir -p "$TEST_SCRATCH/pubrepo"
+    cat >"$TEST_SCRATCH/pubrepo/CHANGELOG.md" <<'MD'
+# Changelog
+
+## [1.3.0] - 2026-11-11
+- A fix that shipped in 1.3.0
+
+## [1.2.0] - 2026-10-01
+- Old news
+MD
+}
+
+# publish TAG [NAME=value...]: run the publish step for TAG in a directory with
+# a CHANGELOG.md.
+publish() {
+    local tag="$1"
+    shift
+    cd "$TEST_SCRATCH/pubrepo" || return 1
+    run_step release "$PUBLISH_STEP" GITHUB_REF_NAME="$tag" GH_TOKEN=x \
+        PATH="$TEST_SCRATCH/bin:$PATH" RUNNER_TEMP="$TEST_SCRATCH/pub/rt" \
+        FAKE_LOG="$TEST_SCRATCH/log" FAKE_STATE="$TEST_SCRATCH/state" "$@"
+}
+
+# calls PATTERN: how many logged gh calls match the grep pattern.
+calls() {
+    grep -c -- "$1" "$TEST_SCRATCH/log" || true
+}
+
+@test "release publish creates the release when none exists, with the CHANGELOG section and both assets" {
+    load_wf release
+    gh_shim
+    publish v1.3.0
+    [ "$status" -eq 0 ]
+    [ "$(calls '^gh release create v1.3.0 ')" -eq 1 ]
+    [ "$(calls '^gh release edit ')" -eq 0 ]
+    grep -qE '^gh release create v1\.3\.0 --title v1\.3\.0 --notes-file [^ ]+ --verify-tag --prerelease=false$' "$TEST_SCRATCH/log"
+    grep -qF 'A fix that shipped in 1.3.0' "$TEST_SCRATCH/state/notes-release-create"
+    if grep -qF 'Old news' "$TEST_SCRATCH/state/notes-release-create"; then
+        echo "the notes include another version's section"
+        return 1
+    fi
+    grep -qF "gh release upload v1.3.0 $TEST_SCRATCH/pub/rt/release-assets/LyreBirdAudio-1.3.0.tar.gz $TEST_SCRATCH/pub/rt/release-assets/SHA256SUMS --clobber" "$TEST_SCRATCH/log"
+}
+
+@test "release publish updates an existing release instead of failing, and replaces its assets" {
+    load_wf release
+    gh_shim
+    : >"$TEST_SCRATCH/state/exists"
+    publish v1.3.0
+    [ "$status" -eq 0 ]
+    [ "$(calls '^gh release create ')" -eq 0 ]
+    [ "$(calls '^gh release edit v1.3.0 ')" -eq 1 ]
+    grep -qE '^gh release edit v1\.3\.0 --title v1\.3\.0 --notes-file [^ ]+ --prerelease=false$' "$TEST_SCRATCH/log"
+    [ "$(calls '^gh release upload v1.3.0 .* --clobber$')" -eq 1 ]
+}
+
+@test "release publish survives losing the race to create: the release appears during create, so it is updated" {
+    load_wf release
+    gh_shim
+    publish v1.3.0 FAKE_CREATE_RACE=1
+    [ "$status" -eq 0 ]
+    [ "$(calls '^gh release create ')" -eq 1 ]
+    [ "$(calls '^gh release edit v1.3.0 ')" -eq 1 ]
+    [ "$(calls '^gh release upload v1.3.0 .* --clobber$')" -eq 1 ]
+    [[ "$output" == *"appeared while it was being created"* ]]
+}
+
+@test "release publish still fails when the release cannot be created and does not exist" {
+    load_wf release
+    gh_shim
+    publish v1.3.0 FAKE_CREATE_FAIL=1
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"::error::Could not create release v1.3.0"* ]]
+    [ "$(calls '^gh release upload ')" -eq 0 ]
+}
+
+@test "release publish marks a hyphenated tag as a pre-release, on create and on update" {
+    load_wf release
+    gh_shim
+    publish v1.3.0-rc1
+    [ "$status" -eq 0 ]
+    grep -qE '^gh release create v1\.3\.0-rc1 .* --prerelease=true$' "$TEST_SCRATCH/log"
+    publish v1.3.0-rc1
+    [ "$status" -eq 0 ]
+    grep -qE '^gh release edit v1\.3\.0-rc1 .* --prerelease=true$' "$TEST_SCRATCH/log"
+}
+
+@test "release publish without a CHANGELOG section generates notes on create and keeps the notes of an existing release" {
+    load_wf release
+    gh_shim
+    publish v1.4.0
+    [ "$status" -eq 0 ]
+    grep -qE '^gh release create v1\.4\.0 --title v1\.4\.0 --generate-notes --verify-tag --prerelease=false$' "$TEST_SCRATCH/log"
+    publish v1.4.0
+    [ "$status" -eq 0 ]
+    grep -qE '^gh release edit v1\.4\.0 --title v1\.4\.0 --prerelease=false$' "$TEST_SCRATCH/log"
+    [ "$(calls '^gh release edit .*--notes-file')" -eq 0 ]
 }

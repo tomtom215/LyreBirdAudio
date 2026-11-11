@@ -1,15 +1,26 @@
 # LyreBirdAudio - Release
 #
-# Fires when a version tag (vX.Y.Z) is pushed. It first re-runs the required
-# quality gates against the EXACT tagged commit, then publishes a GitHub Release
-# whose notes are the matching section of CHANGELOG.md. This keeps release
-# creation a deliberate, tested step (push the tag after your soak test) while
-# guaranteeing a broken commit can never become a release.
+# Fires when a version tag (vX.Y.Z) is pushed. It first runs the complete Bash
+# CI pipeline (bash-ci.yml, called as a reusable workflow) against the EXACT
+# tagged commit, so a release is validated by every check a pull request
+# passes: syntax, ShellCheck, shfmt, bashate, security scan, workflow lint, the
+# full bats suite and the live MediaMTX matrix. Only then does it publish a
+# GitHub Release whose notes are the matching section of CHANGELOG.md, with a
+# source tarball and its SHA256SUMS. This keeps release creation a deliberate,
+# tested step (push the tag after your soak test) while guaranteeing a broken
+# commit can never become a release.
+#
+# Publishing is idempotent: re-running the workflow (or a release that already
+# exists, created by hand or by an earlier attempt) updates that release and
+# replaces its assets instead of failing.
 #
 # Usage after merging to main:
 #   git checkout main && git pull
 #   git tag -a v1.3.0 -m "v1.3.0"
 #   git push origin v1.3.0
+#
+# Verifying a download:
+#   sha256sum -c SHA256SUMS      # in the directory with the tarball
 #
 # Author: Tom F (https://github.com/tomtom215)
 # License: Apache 2.0
@@ -26,111 +37,102 @@ on:
 permissions:
   contents: read
 
-env:
-  SHELLCHECK_VERSION: 'v0.11.0'
-  # sha256 of shellcheck-v0.11.0.linux.x86_64.tar.xz (see bash-ci.yml)
-  SHELLCHECK_SHA256: '8c3be12b05d5c177a04c29e3c78ce89ac86f1595681cab149b65b97c4e227198'
+defaults:
+  run:
+    shell: bash
 
 jobs:
   # ---------------------------------------------------------------------------
-  # Re-validate the tagged commit (syntax + ShellCheck + the full bats suite)
+  # Re-validate the tagged commit with the same pipeline pull requests pass
   # ---------------------------------------------------------------------------
   validate:
-    name: Validate tagged commit
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
-
-      - name: Bash syntax (bash -n)
-        run: |
-          errors=0
-          while IFS= read -r script; do
-            bash -n "$script" || { echo "::error::syntax: $script"; errors=$((errors + 1)); }
-          done < <(find . -name '*.sh' -type f | sort)
-          [ "$errors" -eq 0 ]
-
-      - name: Install ShellCheck (pinned, sha256-verified)
-        run: |
-          archive="shellcheck-${SHELLCHECK_VERSION}.linux.x86_64.tar.xz"
-          curl -sSfL --retry 3 -o "${RUNNER_TEMP}/${archive}" \
-            "https://github.com/koalaman/shellcheck/releases/download/${SHELLCHECK_VERSION}/${archive}"
-          echo "${SHELLCHECK_SHA256}  ${RUNNER_TEMP}/${archive}" | sha256sum -c -
-          tar -xJf "${RUNNER_TEMP}/${archive}" -C "${RUNNER_TEMP}"
-          sudo install -m 0755 "${RUNNER_TEMP}/shellcheck-${SHELLCHECK_VERSION}/shellcheck" /usr/local/bin/shellcheck
-          shellcheck --version | grep version:
-
-      - name: ShellCheck (--severity=warning, required gate)
-        run: |
-          rc=0
-          while IFS= read -r script; do
-            shellcheck --format=gcc --severity=warning --external-sources --shell=bash "$script" || rc=1
-          done < <(find . -name '*.sh' -type f | sort)
-          [ "$rc" -eq 0 ]
-
-      - name: Install bats
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq bats
-
-      - name: Bats test suite
-        run: |
-          export TMPDIR="${RUNNER_TEMP:-/tmp}" BATS_TMPDIR="${RUNNER_TEMP:-/tmp}"
-          bats --print-output-on-failure tests/
+    name: Validate tagged commit (full Bash CI)
+    uses: ./.github/workflows/bash-ci.yml
 
   # ---------------------------------------------------------------------------
-  # Publish the GitHub Release with notes from CHANGELOG.md
+  # Publish the GitHub Release: notes from CHANGELOG.md, source tarball, SHA256SUMS
   # ---------------------------------------------------------------------------
   release:
     name: Publish GitHub Release
     runs-on: ubuntu-latest
     needs: validate
     permissions:
-      contents: write   # create the release / tag notes
+      contents: write   # create or update the release and upload its assets
     steps:
       - name: Checkout code
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
-      - name: Extract release notes from CHANGELOG
-        id: notes
+      - name: Build source archive and checksums
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          name="LyreBirdAudio-${tag#v}"
+          assets="${RUNNER_TEMP}/release-assets"
+          rm -rf "$assets"
+          mkdir -p "$assets"
+
+          # Exactly the tracked files of the tagged commit, in a fixed layout,
+          # so rebuilding from the same commit gives the same bytes.
+          git archive --format=tar --prefix="${name}/" "${GITHUB_SHA}" | gzip -n -9 > "${assets}/${name}.tar.gz"
+
+          (cd "$assets" && sha256sum "${name}.tar.gz" > SHA256SUMS && sha256sum -c SHA256SUMS)
+          cat "${assets}/SHA256SUMS"
+
+      - name: Publish GitHub Release (create, or update an existing one)
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           tag="${GITHUB_REF_NAME}"
           ver="${tag#v}"
+          assets="${RUNNER_TEMP}/release-assets"
+
+          # Release notes: the '## [<ver>] ...' section of CHANGELOG.md, up to
+          # the next '## [' heading.
           notes_file="$(mktemp)"
-          # Pull the '## [<ver>] ...' section up to the next '## [' heading.
           awk -v ver="$ver" '
             $0 ~ ("^## \\[" ver "\\]") { flag=1; print; next }
             flag && /^## \[/ { exit }
             flag { print }
           ' CHANGELOG.md > "$notes_file"
-
           if [ ! -s "$notes_file" ]; then
             echo "No CHANGELOG section for ${ver}; GitHub will auto-generate notes."
-            echo "have_notes=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "have_notes=true" >> "$GITHUB_OUTPUT"
           fi
-          echo "notes_file=${notes_file}" >> "$GITHUB_OUTPUT"
 
-          # Mark pre-releases (tags containing a hyphen, e.g. v1.3.0-rc1).
+          # Tags containing a hyphen (e.g. v1.3.0-rc1) are pre-releases.
+          prerelease=false
           case "$tag" in
-            *-*) echo "prerelease=--prerelease" >> "$GITHUB_OUTPUT" ;;
-            *)   echo "prerelease=" >> "$GITHUB_OUTPUT" ;;
+            *-*) prerelease=true ;;
           esac
 
-      - name: Create GitHub Release
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          tag="${GITHUB_REF_NAME}"
-          if [ "${{ steps.notes.outputs.have_notes }}" = "true" ]; then
-            gh release create "$tag" \
-              --title "$tag" \
-              --notes-file "${{ steps.notes.outputs.notes_file }}" \
-              --verify-tag \
-              ${{ steps.notes.outputs.prerelease }}
+          create_release() {
+            if [ -s "$notes_file" ]; then
+              gh release create "$tag" --title "$tag" --notes-file "$notes_file" --verify-tag --prerelease="$prerelease"
+            else
+              gh release create "$tag" --title "$tag" --generate-notes --verify-tag --prerelease="$prerelease"
+            fi
+          }
+
+          # An existing release keeps its notes unless CHANGELOG.md has a section.
+          update_release() {
+            if [ -s "$notes_file" ]; then
+              gh release edit "$tag" --title "$tag" --notes-file "$notes_file" --prerelease="$prerelease"
+            else
+              gh release edit "$tag" --title "$tag" --prerelease="$prerelease"
+            fi
+          }
+
+          if gh release view "$tag" > /dev/null 2>&1; then
+            echo "Release ${tag} already exists; updating it."
+            update_release
+          elif create_release; then
+            echo "Created release ${tag}."
+          elif gh release view "$tag" > /dev/null 2>&1; then
+            # Someone else created it between the check and the create.
+            echo "Release ${tag} appeared while it was being created; updating it."
+            update_release
           else
-            gh release create "$tag" \
-              --title "$tag" \
-              --generate-notes \
-              --verify-tag \
-              ${{ steps.notes.outputs.prerelease }}
+            echo "::error::Could not create release ${tag}"
+            exit 1
           fi
+
+          # --clobber replaces assets of the same name, so a re-run is safe.
+          gh release upload "$tag" "${assets}/LyreBirdAudio-${ver}.tar.gz" "${assets}/SHA256SUMS" --clobber
