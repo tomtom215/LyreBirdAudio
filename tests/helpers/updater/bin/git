@@ -1,0 +1,81 @@
+#!/bin/bash
+# Fault-injection wrapper for the updater tests. Placed first on PATH it runs the
+# real git ($FAULT_REAL_GIT) and, when the call matches FAULT_ON, injects one
+# fault at that point of an update:
+#
+#   FAULT_ON    "checkout", "checkout-force", "stash-push", "stash-pop", "merge",
+#               "fetch", "ls-remote" ("stash <x>" is keyed stash-<x>; a checkout
+#               carrying --force is checkout-force)
+#   FAULT_WHEN  before | after (default after): relative to the real git call
+#   FAULT_ACT   KILL | TERM | INT  signal the updater process (the outermost
+#                                  ancestor whose command line names
+#                                  lyrebird-updater.sh)
+#               FAIL               exit 128 as if git failed
+#               SKIP               exit 0 without running git (with FAULT_WHEN=before)
+#               DNS                print a curl-style DNS error and exit 128
+#               PROBE              log whether FAULT_PROBE_PATH exists, then carry on
+#   FAULT_SKIP  matching calls to let through before injecting (default 0)
+#   FAULT_STATE file used to count matching calls (required with FAULT_ON)
+#   FAULT_LOG   file the injection is logged to
+#
+# Without FAULT_ON it is a transparent pass-through.
+real="${FAULT_REAL_GIT:?FAULT_REAL_GIT not set}"
+key="$1"
+[[ "$1" == stash ]] && key="stash-${2:-}"
+[[ "$1" == checkout && " $* " == *" --force "* ]] && key="checkout-force"
+
+hit=0
+if [[ -n "${FAULT_ON:-}" && "$key" == "$FAULT_ON" ]]; then
+    n=0
+    [[ -s "$FAULT_STATE" ]] && n="$(<"$FAULT_STATE")"
+    echo "$((n + 1))" >"$FAULT_STATE"
+    ((n == ${FAULT_SKIP:-0})) && hit=1
+fi
+
+updater_pid() {
+    local p="$PPID" top=""
+    while [[ -n "$p" && "$p" -gt 1 ]]; do
+        if tr '\0' ' ' <"/proc/$p/cmdline" 2>/dev/null | grep -q 'lyrebird-updater\.sh'; then
+            top="$p"
+        fi
+        p="$(awk '{print $4}' "/proc/$p/stat" 2>/dev/null)" || break
+    done
+    echo "$top"
+}
+
+inject() {
+    local pid
+    pid="$(updater_pid)"
+    echo "fault ${FAULT_ACT} ${FAULT_WHEN:-after} ${key} updater=${pid}" >>"${FAULT_LOG:-/dev/null}"
+    case "$FAULT_ACT" in
+        KILL) kill -KILL "$pid" ;;
+        TERM)
+            kill -TERM "$pid"
+            sleep 0.3
+            ;;
+        INT)
+            kill -INT "$pid"
+            sleep 0.3
+            ;;
+        FAIL) exit 128 ;;
+        SKIP) exit 0 ;; # "succeed" without running git (only meaningful with FAULT_WHEN=before)
+        PROBE)
+            # record whether FAULT_PROBE_PATH exists (and its content) and carry on
+            if [[ -e "$FAULT_PROBE_PATH" ]]; then
+                echo "probe present $FAULT_PROBE_PATH" >>"${FAULT_LOG:-/dev/null}"
+            else
+                echo "probe MISSING $FAULT_PROBE_PATH" >>"${FAULT_LOG:-/dev/null}"
+            fi
+            ;;
+        DNS)
+            echo "fatal: unable to access 'https://github.com/tomtom215/LyreBirdAudio.git/': Could not resolve host: github.com" >&2
+            exit 128
+            ;;
+    esac
+}
+
+((hit)) && [[ "${FAULT_WHEN:-after}" == before ]] && inject
+"$real" "$@"
+rc=$?
+((hit)) && [[ "${FAULT_WHEN:-after}" == after ]] && inject
+exit "$rc"

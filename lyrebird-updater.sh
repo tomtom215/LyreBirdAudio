@@ -102,27 +102,52 @@ readonly MIN_GIT_MINOR=0
 readonly MIN_BASH_MAJOR=4
 readonly MIN_BASH_MINOR=0
 
-# Operation timeouts and retries
-readonly FETCH_TIMEOUT=30
-readonly FETCH_RETRIES=3
-readonly FETCH_RETRY_DELAY=2
-readonly LOCK_MAX_WAIT=30
+# Operation timeouts and retries. Slow or metered uplinks can raise these (and
+# the test suite lowers them) through LYREBIRD_FETCH_TIMEOUT, LYREBIRD_FETCH_RETRIES,
+# LYREBIRD_FETCH_RETRY_DELAY and LYREBIRD_UPDATER_LOCK_WAIT (whole seconds / counts, at least 1; anything else
+# falls back to the default).
+_updater_positive_int() {
+    local value="${1:-}" default="$2"
+    if [[ "$value" =~ ^[0-9]+$ ]] && ((10#$value >= 1)); then
+        printf '%s' "$((10#$value))"
+    else
+        printf '%s' "$default"
+    fi
+}
+FETCH_TIMEOUT="$(_updater_positive_int "${LYREBIRD_FETCH_TIMEOUT:-}" 30)"
+readonly FETCH_TIMEOUT
+FETCH_RETRIES="$(_updater_positive_int "${LYREBIRD_FETCH_RETRIES:-}" 3)"
+readonly FETCH_RETRIES
+FETCH_RETRY_DELAY="$(_updater_positive_int "${LYREBIRD_FETCH_RETRY_DELAY:-}" 2)"
+readonly FETCH_RETRY_DELAY
+LOCK_MAX_WAIT="$(_updater_positive_int "${LYREBIRD_UPDATER_LOCK_WAIT:-}" 30)"
+readonly LOCK_MAX_WAIT
 readonly TAG_LIST_LIMIT=20
+
+# Every absolute system path the updater touches (service unit, cron job,
+# /run marker, migration state, /usr/local/bin, /var/log) can be re-rooted
+# under LYREBIRD_UPDATER_SYSROOT. Unset (the normal case) it is empty and the
+# paths are the real ones. The test suite points it at a temp directory so a
+# full update can run without writing to the host.
+UPDATER_SYSROOT="${LYREBIRD_UPDATER_SYSROOT:-}"
+UPDATER_SYSROOT="${UPDATER_SYSROOT%/}"
+readonly UPDATER_SYSROOT
 
 # Service update configuration
 readonly SERVICE_NAME="mediamtx-audio"
-readonly SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
-readonly SERVICE_CRON_FILE="/etc/cron.d/mediamtx-monitor"
+readonly SERVICE_FILE="${UPDATER_SYSROOT}/etc/systemd/system/${SERVICE_NAME}.service"
+readonly SERVICE_CRON_FILE="${UPDATER_SYSROOT}/etc/cron.d/mediamtx-monitor"
 readonly SERVICE_SCRIPT="lyrebird-stream-manager.sh"
-readonly SERVICE_UPDATE_MARKER="/run/lyrebird-service-update.marker"
+readonly SERVICE_UPDATE_MARKER="${UPDATER_SYSROOT}/run/lyrebird-service-update.marker"
 readonly SERVICE_STOP_TIMEOUT=30
 readonly SERVICE_START_TIMEOUT=10
 
 # Migration configuration
-readonly MIGRATION_MARKER_DIR="/var/lib/lyrebird/migrations"
+readonly MIGRATION_MARKER_DIR="${UPDATER_SYSROOT}/var/lib/lyrebird/migrations"
 readonly OLD_STREAM_MANAGER="mediamtx-stream-manager.sh"
-readonly OLD_STREAM_MANAGER_LOG="/var/log/mediamtx-stream-manager.log"
-readonly NEW_STREAM_MANAGER_LOG="/var/log/lyrebird-stream-manager.log"
+readonly OLD_STREAM_MANAGER_LOG="${UPDATER_SYSROOT}/var/log/mediamtx-stream-manager.log"
+readonly NEW_STREAM_MANAGER_LOG="${UPDATER_SYSROOT}/var/log/lyrebird-stream-manager.log"
+readonly STREAM_MANAGER_BIN_DIR="${UPDATER_SYSROOT}/usr/local/bin"
 
 # Colors for output (using tput for portability)
 if command -v tput >/dev/null 2>&1 && [[ -t 1 ]]; then
@@ -1057,11 +1082,11 @@ migration_stream_manager_rename() {
     fi
 
     # 2. Handle /usr/local/bin installation
-    local old_bin="/usr/local/bin/${OLD_STREAM_MANAGER}"
-    local new_bin="/usr/local/bin/${SERVICE_SCRIPT}"
+    local old_bin="${STREAM_MANAGER_BIN_DIR}/${OLD_STREAM_MANAGER}"
+    local new_bin="${STREAM_MANAGER_BIN_DIR}/${SERVICE_SCRIPT}"
 
     if [[ -f "$old_bin" ]] || [[ -L "$old_bin" ]]; then
-        log_info "  Removing old script from /usr/local/bin..."
+        log_info "  Removing old script from ${STREAM_MANAGER_BIN_DIR}..."
         if rm -f "$old_bin" 2>/dev/null; then
             log_success "  Removed $old_bin"
             ((changes_made++)) || true
