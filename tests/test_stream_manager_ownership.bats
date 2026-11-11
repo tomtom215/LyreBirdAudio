@@ -41,7 +41,7 @@ setup() {
     export MEDIAMTX_PID_FILE="$OW/mtx.pid"
     export MEDIAMTX_FFMPEG_DIR="$OW/ff"
     export MEDIAMTX_LOCK_FILE="$OW/run.lock"
-    export MEDIAMTX_LOG_FILE="$OW/sm.log"
+    export MEDIAMTX_LOG_FILE="$OW/sm.log" STREAM_MANAGER_LOG_FILE="$OW/sm.log"
     export MEDIAMTX_RESTART_MARKER="$OW/restart.marker"
     export MEDIAMTX_CLEANUP_MARKER="$OW/cleanup.marker"
     export MEDIAMTX_BINARY="$OW/bin/mediamtx"
@@ -250,6 +250,18 @@ SHIM_EOF
     printf '#!/bin/bash\nexec -a ffmpeg sleep 120\n' >"$OW/bin/ffmpeg"
     chmod +x "$OW/wrapbin/bash" "$OW/bin/ffmpeg"
     PATH="$OW/wrapbin:$PATH"
+    # A capture PCM for the stand-in cards: the manager reads the card's capture
+    # PCMs from ASOUND_PROC_ROOT and checks their device nodes under DEV_SND_ROOT
+    # (the wrapper carries both roots), instead of a fixed /dev/snd/pcmC<N>D0c
+    local card
+    export ASOUND_PROC_ROOT="$OW/asound" DEV_SND_ROOT="$OW/dev-snd"
+    mkdir -p "$ASOUND_PROC_ROOT" "$DEV_SND_ROOT"
+    for card in 31 32; do
+        mkdir -p "$ASOUND_PROC_ROOT/card${card}/pcm0c"
+        echo "0d8c:0014" >"$ASOUND_PROC_ROOT/card${card}/usbid"
+        : >"$DEV_SND_ROOT/controlC${card}"
+        : >"$DEV_SND_ROOT/pcmC${card}D0c"
+    done
 }
 
 # A MediaMTX the real start_mediamtx can launch: a copy of bash at the configured
@@ -362,7 +374,7 @@ STUB_EOF
     # the PID file is deletable by that user, as it would be for a user who owns it
     chmod 777 "$OW"
     run setpriv --reuid="$who" --regid="$who" --clear-groups \
-        env MEDIAMTX_LOG_FILE="$TEST_SCRATCH/nobody/sm.log" \
+        env MEDIAMTX_LOG_FILE="$TEST_SCRATCH/nobody/sm.log" STREAM_MANAGER_LOG_FILE="$TEST_SCRATCH/nobody/sm.log" \
         bash -c '
             cd "$1" || exit 9
             source ./lyrebird-stream-manager.sh
