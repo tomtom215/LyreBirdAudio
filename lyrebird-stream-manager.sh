@@ -565,6 +565,19 @@ cleanup() {
     exit "${exit_code}"
 }
 
+# Is this process run by systemd (the mediamtx-audio unit)? The unit says so
+# with LYREBIRD_UNDER_SYSTEMD=1. systemd (232 and later) also sets INVOCATION_ID
+# for every service process, which is honoured too so that a unit written by an
+# older version of this script (it set INVOCATION_ID=systemd by hand) keeps
+# working. Defined before its first use, at load time, below.
+lyrebird_under_systemd() {
+    case "${LYREBIRD_UNDER_SYSTEMD:-}" in
+        1 | true | yes) return 0 ;;
+        *) ;;
+    esac
+    [[ -n "${INVOCATION_ID:-}" ]]
+}
+
 # Set trap for cleanup only in main script
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]] && [[ $$ -eq $BASHPID ]]; then
     # Comprehensive signal handling for production reliability
@@ -575,14 +588,14 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]] && [[ $$ -eq $BASHPID ]]; then
 
     # Enhanced signal handlers
     # Only set custom handlers when NOT running under systemd
-    if [[ -z "${INVOCATION_ID:-}" ]]; then
+    if ! lyrebird_under_systemd; then
         # Not running under systemd - safe to use custom handlers
         # SIGHUP: Reload configuration without full restart
         trap 'log INFO "Received SIGHUP, reloading configuration"; restart_mediamtx' HUP
         # SIGUSR1: Dump status for debugging
         trap 'log INFO "Received SIGUSR1, dumping status"; show_status >/dev/null 2>&1 || log INFO "Status dump completed"' USR1
     fi
-    # Note: When running under systemd (INVOCATION_ID is set), default signal handlers are used
+    # Note: When running under systemd (lyrebird_under_systemd), default signal handlers are used
 fi
 
 # Critical section protection - prevents signal handlers from interrupting
@@ -608,7 +621,7 @@ exit_critical_section() {
     fi
     CRITICAL_SECTION_ACTIVE=false
     # Restore signal handlers (only when not running under systemd)
-    if [[ -z "${INVOCATION_ID:-}" ]]; then
+    if ! lyrebird_under_systemd; then
         trap 'log INFO "Received SIGHUP, reloading configuration"; restart_mediamtx' HUP
         trap 'log INFO "Received SIGUSR1, dumping status"; show_status >/dev/null 2>&1 || log INFO "Status dump completed"' USR1
     fi
@@ -1813,7 +1826,7 @@ setup_directories() {
 # Setup MediaMTX log rotation
 setup_mediamtx_logrotate() {
     # Skip if running under systemd with protected filesystem
-    if [[ -n "${INVOCATION_ID:-}" ]] || [[ ! -w /etc/logrotate.d ]]; then
+    if lyrebird_under_systemd || [[ ! -w /etc/logrotate.d ]]; then
         log DEBUG "Skipping logrotate setup (read-only filesystem or systemd environment)"
         return 0
     fi
@@ -6214,7 +6227,7 @@ Environment="USB_STABILIZATION_DELAY=10"
 Environment="STREAM_MODE=${stream_mode}"
 Environment="MULTIPLEX_FILTER_TYPE=${multiplex_filter}"
 Environment="MULTIPLEX_STREAM_NAME=${multiplex_name}"
-Environment="INVOCATION_ID=systemd"
+Environment="LYREBIRD_UNDER_SYSTEMD=1"
 WorkingDirectory=${SCRIPT_DIR}
 
 [Install]
