@@ -7,8 +7,12 @@
 #
 # Usage:
 #   ./lyrebird-metrics.sh              # Output metrics to stdout
-#   ./lyrebird-metrics.sh --serve 9100 # Start HTTP server on port 9100
-#   ./lyrebird-metrics.sh --file /path # Write metrics to file
+#   ./lyrebird-metrics.sh --serve 9100 # HTTP server on 127.0.0.1:9100 (also: serve --port 9100)
+#   ./lyrebird-metrics.sh serve --port 9100 --bind 0.0.0.0   # on every interface (no authentication)
+#   ./lyrebird-metrics.sh --file /path # Write metrics to file (atomic replace)
+#
+# Exit status: 0 ok, 1 command-line error, 2 nothing delivered (file not
+# published / server cannot run), 3 delivered but a collector failed.
 #
 # Integration with Prometheus:
 #   Add to prometheus.yml:
@@ -20,11 +24,12 @@
 # Integration with node_exporter:
 #   ./lyrebird-metrics.sh --file /var/lib/node_exporter/textfile_collector/lyrebird.prom
 #
-# Version: 1.2.0 - Tolerant readiness parsing, in-band staleness timestamp
+# Version: 1.3.0 - Valid-by-construction exposition, collector/scrape status,
+#                  atomic --file publishing, hardened --serve, heartbeat max age
 
 set -euo pipefail
 
-readonly VERSION="1.2.0"
+readonly VERSION="1.3.0"
 SCRIPT_NAME="$(basename "${BASH_SOURCE[0]}")"
 readonly SCRIPT_NAME
 
@@ -41,6 +46,10 @@ readonly DEVICE_CONFIG="${CONFIG_DIR}/audio-devices.conf"
 
 # Metric prefix
 readonly METRIC_PREFIX="lyrebird"
+
+# Exit statuses (also in --help). 1 is a command-line error.
+readonly EXIT_FAILED=2   # nothing could be delivered (the file was not published, the server cannot run)
+readonly EXIT_DEGRADED=3 # the output was delivered but a collector failed (lyrebird_scrape_success 0)
 
 # ============================================================================
 # Helper Functions
@@ -64,6 +73,28 @@ get_timestamp_ms() {
     fi
 }
 
+# The longest age, in seconds, at which the stream-manager heartbeat file still
+# counts as "the monitor ran recently" (lyrebird_heartbeat_healthy). The file is
+# written by the manager's monitor pass, which cron runs every 5 minutes, so the
+# default is three cycles (900 s); a threshold below the cadence would report
+# "unhealthy" on most scrapes of a healthy node. Override with
+# LYREBIRD_HEARTBEAT_MAX_AGE (a positive integer number of seconds).
+resolve_heartbeat_max_age() {
+    local raw="${LYREBIRD_HEARTBEAT_MAX_AGE-}"
+    local default=900
+
+    if [[ -z "$raw" ]]; then
+        printf '%s' "$default"
+    elif [[ "$raw" =~ ^[0-9]+$ ]] && ((10#$raw > 0)); then
+        printf '%s' "$((10#$raw))"
+    else
+        log "WARN: ignoring LYREBIRD_HEARTBEAT_MAX_AGE='${raw}' (need a positive integer number of seconds); using ${default}"
+        printf '%s' "$default"
+    fi
+}
+HEARTBEAT_MAX_AGE="$(resolve_heartbeat_max_age)"
+readonly HEARTBEAT_MAX_AGE
+
 # ============================================================================
 # Metric Collection Functions
 # ============================================================================
@@ -81,13 +112,34 @@ prom_escape_label() {
     printf '%s' "$v"
 }
 
-# Output a metric in Prometheus format
+# Number of samples emit_metric has refused in this shell, so a caller can tell
+# that a document is missing samples.
+_EMIT_ERRORS=0
+
+# A Prometheus sample value: a float, +/-Inf or NaN. Anything else (an empty
+# string from a failed read, "N/A", a locale decimal comma) makes the text parser
+# reject the WHOLE scrape.
+is_prom_number() {
+    local re_float='^[-+]?([0-9]+(\.[0-9]*)?|\.[0-9]+)([eE][-+]?[0-9]+)?$'
+    [[ "$1" =~ $re_float ]] || [[ "$1" == "NaN" ]] || [[ "$1" =~ ^[-+]?Inf$ ]]
+}
+
+# Output a metric in Prometheus format. A value that is not a valid sample value
+# prints nothing, so one failed read can never poison the document. The refusal
+# is logged and counted in _EMIT_ERRORS rather than returned as a failure status,
+# so it cannot abort a collector that runs under `set -e`.
 emit_metric() {
     local name="$1"
     local value="$2"
     local help="${3:-}"
     local type="${4:-gauge}"
     local labels="${5:-}"
+
+    if ! is_prom_number "$value"; then
+        log "ERROR: refusing to emit ${METRIC_PREFIX}_${name}: '${value}' is not a numeric sample value"
+        _EMIT_ERRORS=$((_EMIT_ERRORS + 1))
+        return 0
+    fi
 
     if [[ -n "$help" ]]; then
         echo "# HELP ${METRIC_PREFIX}_${name} ${help}"
@@ -117,6 +169,13 @@ emit_help_type() {
 collect_mediamtx_metrics() {
     local mediamtx_running=0
     local mediamtx_pid=0
+
+    # Without pgrep "not running" cannot be told from "cannot tell"; report the
+    # collector as failed instead of publishing a false lyrebird_mediamtx_up 0.
+    if ! has_command pgrep; then
+        log "ERROR: pgrep not found; cannot tell whether MediaMTX is running (install procps)"
+        return 1
+    fi
 
     # Check if MediaMTX is running
     if pgrep -f "mediamtx" >/dev/null 2>&1; then
@@ -167,87 +226,142 @@ collect_mediamtx_metrics() {
             fi
         fi
     fi
+    return 0
 }
 
 # Collect stream manager metrics
+#
+# A source that exists but cannot be read makes the corresponding metric unknown:
+# it is left out and the collector is reported as failed, rather than publishing
+# a made-up 0 that would fire "stream manager down" alerts for a permission error.
 collect_stream_manager_metrics() {
     local stream_mgr_running=0
     local active_streams=0
     local configured_devices=0
+    local failed=0
 
     # Check if stream manager is running
     if [[ -f "$PID_FILE" ]]; then
         local pid
-        pid=$(cat "$PID_FILE" 2>/dev/null)
-        if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
-            stream_mgr_running=1
+        if pid=$(cat "$PID_FILE" 2>/dev/null); then
+            if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+                stream_mgr_running=1
+            fi
+        elif [[ -e "$PID_FILE" ]]; then
+            log "ERROR: cannot read ${PID_FILE}"
+            failed=1
+            stream_mgr_running=""
         fi
     fi
 
-    emit_metric "stream_manager_up" "$stream_mgr_running" "Stream manager running (1=up, 0=down)"
+    [[ -z "$stream_mgr_running" ]] || emit_metric "stream_manager_up" "$stream_mgr_running" "Stream manager running (1=up, 0=down)"
 
     # Count active FFmpeg streams
     if [[ -d "$FFMPEG_PID_DIR" ]]; then
         for pid_file in "${FFMPEG_PID_DIR}"/*.pid; do
             [[ -f "$pid_file" ]] || continue
             local pid
-            pid=$(cat "$pid_file" 2>/dev/null)
+            if ! pid=$(cat "$pid_file" 2>/dev/null); then
+                # a pid file removed while we looked is a stopped stream, not an error
+                [[ -e "$pid_file" ]] || continue
+                log "ERROR: cannot read ${pid_file}"
+                failed=1
+                active_streams=""
+                break
+            fi
             if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
                 ((++active_streams))
             fi
         done
     fi
 
-    emit_metric "active_streams" "$active_streams" "Number of active audio streams"
+    [[ -z "$active_streams" ]] || emit_metric "active_streams" "$active_streams" "Number of active audio streams"
 
-    # Count configured devices
+    # Count configured devices (grep -c: 0 = matches, 1 = none, 2 = cannot read)
     if [[ -f "$DEVICE_CONFIG" ]]; then
-        configured_devices=$(grep -c "^DEVICE_" "$DEVICE_CONFIG" 2>/dev/null || true)
+        local grep_rc=0
+        configured_devices=$(grep -c "^DEVICE_" "$DEVICE_CONFIG" 2>/dev/null) || grep_rc=$?
+        if ((grep_rc > 1)); then
+            log "ERROR: cannot read ${DEVICE_CONFIG}"
+            failed=1
+            configured_devices=""
+        fi
     fi
 
-    emit_metric "configured_devices" "$configured_devices" "Number of configured audio devices"
+    [[ -z "$configured_devices" ]] || emit_metric "configured_devices" "$configured_devices" "Number of configured audio devices"
 
-    # Heartbeat freshness
+    # Heartbeat freshness. The file holds the Unix time of the stream manager's
+    # last monitor pass (run from cron every 5 minutes), so what it can prove is
+    # that the monitor ran recently: not that MediaMTX or any stream is up (the
+    # monitor also writes it while MediaMTX is down). Streams are lyrebird_stream_up
+    # and lyrebird_api_up.
+    local heartbeat_age_help="Seconds since the stream-manager monitor last wrote its heartbeat file (-1 if there is none)"
+    local heartbeat_healthy_help="1 if the stream-manager monitor ran within the last ${HEARTBEAT_MAX_AGE} seconds (LYREBIRD_HEARTBEAT_MAX_AGE), else 0; proves only that the monitor ran, not that streams are healthy"
+    local heartbeat_time=""
+    local heartbeat_state="missing" # missing | read | unreadable
     if [[ -f "$HEARTBEAT_FILE" ]]; then
-        local heartbeat_time
-        heartbeat_time=$(cat "$HEARTBEAT_FILE" 2>/dev/null || echo 0)
-        # Validate numeric to prevent arithmetic crash on corrupted file
-        [[ "$heartbeat_time" =~ ^[0-9]+$ ]] || heartbeat_time=0
-        local now
-        now=$(date +%s)
-        local heartbeat_age=$((now - heartbeat_time))
-        emit_metric "heartbeat_age_seconds" "$heartbeat_age" "Seconds since last heartbeat"
-
-        # Heartbeat healthy (< 60 seconds old)
-        local heartbeat_healthy=0
-        [[ $heartbeat_age -lt 60 ]] && heartbeat_healthy=1
-        emit_metric "heartbeat_healthy" "$heartbeat_healthy" "Heartbeat is recent (1=healthy, 0=stale)"
-    else
-        emit_metric "heartbeat_age_seconds" "-1" "Seconds since last heartbeat"
-        emit_metric "heartbeat_healthy" "0" "Heartbeat is recent (1=healthy, 0=stale)"
+        if heartbeat_time=$(cat "$HEARTBEAT_FILE" 2>/dev/null); then
+            heartbeat_state="read"
+        elif [[ -e "$HEARTBEAT_FILE" ]]; then
+            log "ERROR: cannot read ${HEARTBEAT_FILE}"
+            heartbeat_state="unreadable"
+            failed=1
+        fi
     fi
+
+    case "$heartbeat_state" in
+        read)
+            # a corrupt or non-numeric file reads as "never" (age = now)
+            [[ "$heartbeat_time" =~ ^[0-9]+$ ]] || heartbeat_time=0
+            local now
+            now=$(date +%s)
+            local heartbeat_age=$((now - 10#$heartbeat_time))
+            emit_metric "heartbeat_age_seconds" "$heartbeat_age" "$heartbeat_age_help"
+
+            # Within the maximum age, and not from the future: a clock that was
+            # stepped back cannot vouch for recency.
+            local heartbeat_healthy=0
+            ((heartbeat_age >= 0 && heartbeat_age <= HEARTBEAT_MAX_AGE)) && heartbeat_healthy=1
+            emit_metric "heartbeat_healthy" "$heartbeat_healthy" "$heartbeat_healthy_help"
+            ;;
+        missing)
+            emit_metric "heartbeat_age_seconds" "-1" "$heartbeat_age_help"
+            emit_metric "heartbeat_healthy" "0" "$heartbeat_healthy_help"
+            ;;
+    esac
+    return "$failed"
 }
 
 # Collect USB audio device metrics
 collect_usb_audio_metrics() {
     local usb_audio_count=0
     local total_audio_cards=0
+    local failed=0
+    local cards=""
 
     # Count audio cards from ALSA
     if [[ -f "/proc/asound/cards" ]]; then
-        while IFS= read -r line; do
-            if [[ "$line" =~ ^[[:space:]]*([0-9]+)[[:space:]]*\[ ]]; then
-                ((++total_audio_cards))
-                local card_num="${BASH_REMATCH[1]}"
-                if [[ -f "/proc/asound/card${card_num}/usbid" ]]; then
-                    ((++usb_audio_count))
+        if cards=$(cat /proc/asound/cards 2>/dev/null); then
+            while IFS= read -r line; do
+                if [[ "$line" =~ ^[[:space:]]*([0-9]+)[[:space:]]*\[ ]]; then
+                    ((++total_audio_cards))
+                    local card_num="${BASH_REMATCH[1]}"
+                    if [[ -f "/proc/asound/card${card_num}/usbid" ]]; then
+                        ((++usb_audio_count))
+                    fi
                 fi
-            fi
-        done </proc/asound/cards
+            done <<<"$cards"
+        else
+            log "ERROR: cannot read /proc/asound/cards"
+            failed=1
+        fi
     fi
 
-    emit_metric "usb_audio_devices" "$usb_audio_count" "Number of USB audio devices detected"
-    emit_metric "total_audio_cards" "$total_audio_cards" "Total ALSA audio cards"
+    if ((failed == 0)); then
+        emit_metric "usb_audio_devices" "$usb_audio_count" "Number of USB audio devices detected"
+        emit_metric "total_audio_cards" "$total_audio_cards" "Total ALSA audio cards"
+    fi
+    return "$failed"
 }
 
 # Collect system resource metrics
@@ -257,10 +371,16 @@ collect_system_metrics() {
     # scrape. df -P forces single-line POSIX output; a wrapped long device name
     # (LVM/dm/ZFS) would otherwise shift columns and yield a non-numeric percent.
     local _disk_hdr=0
+    local failed=0
     for path in "/" "/var" "/tmp"; do
         if [[ -d "$path" ]] && has_command df; then
-            local usage
-            usage=$(df -P "$path" 2>/dev/null | awk 'NR==2 {gsub(/%/,"",$5); print $5}')
+            local usage df_out
+            if ! df_out=$(df -P "$path" 2>/dev/null); then
+                log "ERROR: df failed for ${path}"
+                failed=1
+                continue
+            fi
+            usage=$(awk 'NR==2 {gsub(/%/,"",$5); print $5}' <<<"$df_out")
             if [[ "$usage" =~ ^[0-9]+$ ]]; then
                 if [[ $_disk_hdr -eq 0 ]]; then
                     emit_help_type "disk_usage_percent" "Disk usage percentage" "gauge"
@@ -301,6 +421,7 @@ collect_system_metrics() {
         entropy=$(cat /proc/sys/kernel/random/entropy_avail)
         emit_metric "system_entropy_available" "$entropy" "Available entropy bytes"
     fi
+    return "$failed"
 }
 
 # Helper function for API calls with retry for transient network failures
@@ -325,8 +446,10 @@ api_call_with_retry() {
 # Collect MediaMTX API metrics (if available)
 # Enhanced in v1.1.0 with MediaMTX /v3 API coverage (validated v1.15.5 - v1.19.x)
 collect_api_metrics() {
+    # Without curl the API state is unknown (not "down"); fail the collector.
     if ! has_command curl; then
-        return
+        log "ERROR: curl not found; cannot query the MediaMTX API (install curl)"
+        return 1
     fi
 
     local api_url="http://${MEDIAMTX_API_HOST}:${MEDIAMTX_API_PORT}"
@@ -467,148 +590,837 @@ collect_api_metrics() {
         [[ "${srt_conn_count:-0}" =~ ^[0-9]+$ ]] && total_connections=$((total_connections + srt_conn_count))
         emit_metric "api_total_connections" "$total_connections" "Total active connections across all protocols"
     fi
+    return 0
 }
 
 # Collect per-stream metrics
+#
+# The text exposition format requires every sample of a metric family to be in
+# one contiguous group (with HELP/TYPE first), so the streams are read once into
+# arrays and then written family by family; emitting up/memory/cpu per stream
+# interleaves the families as soon as there are two streams.
 collect_stream_metrics() {
     if [[ ! -d "$FFMPEG_PID_DIR" ]]; then
-        return
+        return 0
     fi
 
-    local _stream_hdr=0
+    local -a stream_names=() stream_pids=() stream_alive=()
+    local pid_file stream_name pid i n labels
+    local failed=0
     for pid_file in "${FFMPEG_PID_DIR}"/*.pid; do
         [[ -f "$pid_file" ]] || continue
-
-        local stream_name
         stream_name=$(basename "$pid_file" .pid)
-        local pid
-        pid=$(cat "$pid_file" 2>/dev/null)
-
-        # Emit HELP/TYPE for the per-stream families exactly once, before samples.
-        if [[ $_stream_hdr -eq 0 ]]; then
-            emit_help_type "stream_up" "Stream running status" "gauge"
-            emit_help_type "stream_memory_bytes" "Stream memory usage in bytes" "gauge"
-            emit_help_type "stream_cpu_percent" "Stream CPU usage percentage" "gauge"
-            _stream_hdr=1
+        if ! pid=$(cat "$pid_file" 2>/dev/null); then
+            # a pid file removed while we looked is a stopped stream, not an error;
+            # one that exists but cannot be read leaves that stream's state unknown
+            [[ -e "$pid_file" ]] || continue
+            log "ERROR: cannot read ${pid_file}"
+            failed=1
+            continue
         fi
-
-        # Stream status
-        local status=0
+        stream_names+=("$stream_name")
+        stream_pids+=("$pid")
         if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
-            status=1
-        fi
-
-        local labels
-        labels="stream=\"$(prom_escape_label "${stream_name}")\""
-        emit_metric "stream_up" "$status" "" "gauge" "$labels"
-
-        if [[ $status -eq 1 ]] && [[ -d "/proc/${pid}" ]]; then
-            # Stream memory usage
-            if [[ -f "/proc/${pid}/status" ]]; then
-                local vm_rss
-                vm_rss=$(grep "^VmRSS:" "/proc/${pid}/status" 2>/dev/null | awk '{print $2}' || echo 0)
-                if [[ "$vm_rss" =~ ^[0-9]+$ ]]; then
-                    emit_metric "stream_memory_bytes" "$((vm_rss * 1024))" "" "gauge" "$labels"
-                fi
-            fi
-
-            # Stream CPU usage. ps may print nothing if the process just exited;
-            # default to 0 so we never emit a metric line with an empty value.
-            if has_command ps; then
-                local cpu
-                cpu=$(ps -p "$pid" -o %cpu= 2>/dev/null | tr -d ' ' || true)
-                cpu="${cpu:-0}"
-                emit_metric "stream_cpu_percent" "${cpu%.*}" "" "gauge" "$labels"
-            fi
+            stream_alive+=(1)
+        else
+            stream_alive+=(0)
         fi
     done
+
+    n=${#stream_names[@]}
+    if ((n == 0)); then
+        return "$failed"
+    fi
+
+    emit_help_type "stream_up" "Stream running status" "gauge"
+    for ((i = 0; i < n; i++)); do
+        labels="stream=\"$(prom_escape_label "${stream_names[i]}")\""
+        emit_metric "stream_up" "${stream_alive[i]}" "" "gauge" "$labels"
+    done
+
+    emit_help_type "stream_memory_bytes" "Stream memory usage in bytes" "gauge"
+    for ((i = 0; i < n; i++)); do
+        [[ "${stream_alive[i]}" -eq 1 ]] || continue
+        pid="${stream_pids[i]}"
+        [[ -d "/proc/${pid}" ]] && [[ -f "/proc/${pid}/status" ]] || continue
+        local vm_rss
+        vm_rss=$(grep "^VmRSS:" "/proc/${pid}/status" 2>/dev/null | awk '{print $2}' || echo 0)
+        if [[ "$vm_rss" =~ ^[0-9]+$ ]]; then
+            labels="stream=\"$(prom_escape_label "${stream_names[i]}")\""
+            emit_metric "stream_memory_bytes" "$((vm_rss * 1024))" "" "gauge" "$labels"
+        fi
+    done
+
+    emit_help_type "stream_cpu_percent" "Stream CPU usage percentage" "gauge"
+    if has_command ps; then
+        for ((i = 0; i < n; i++)); do
+            [[ "${stream_alive[i]}" -eq 1 ]] || continue
+            pid="${stream_pids[i]}"
+            [[ -d "/proc/${pid}" ]] || continue
+            # ps may print nothing if the process just exited; default to 0 so we
+            # never emit a metric line with an empty value.
+            local cpu
+            cpu=$(ps -p "$pid" -o %cpu= 2>/dev/null | tr -d ' ' || true)
+            cpu="${cpu:-0}"
+            labels="stream=\"$(prom_escape_label "${stream_names[i]}")\""
+            emit_metric "stream_cpu_percent" "${cpu%.*}" "" "gauge" "$labels"
+        done
+    fi
+    return "$failed"
 }
 
 # ============================================================================
 # Output Functions
 # ============================================================================
 
+# The collectors, as a fixed list: the name is the stable, bounded value of the
+# `collector` label of lyrebird_collector_success, the function produces the
+# metrics.
+COLLECTOR_NAMES=(mediamtx stream_manager usb_audio system api streams)
+COLLECTOR_FUNCS=(
+    collect_mediamtx_metrics
+    collect_stream_manager_metrics
+    collect_usb_audio_metrics
+    collect_system_metrics
+    collect_api_metrics
+    collect_stream_metrics
+)
+
+# Run one collector isolated in a subshell, so that nothing it does (an `exit`, a
+# clobbered variable, a hung-up pipe) can take the document or its neighbours
+# down. Sets COLLECTOR_OUTPUT to whatever it printed and COLLECTOR_STATUS to 0
+# when it completed cleanly: it returned 0 and emit_metric refused no sample.
+# The status is read from the return value, not from `set -e`, which is switched
+# off for any function called from an `if`/`||` and so cannot be relied on.
+run_collector() {
+    local fn="$1"
+    local out=""
+    local status=0
+
+    out="$(
+        _EMIT_ERRORS=0
+        collector_rc=0
+        "$fn" || collector_rc=$?
+        if ((collector_rc == 0 && _EMIT_ERRORS > 0)); then
+            collector_rc=1
+        fi
+        exit "$collector_rc"
+    )" || status=$?
+
+    COLLECTOR_OUTPUT="$out"
+    COLLECTOR_STATUS="$status"
+}
+
+# Print the whole document. Returns 0 when every collector completed, EXIT_DEGRADED
+# when the document is complete and valid but at least one collector failed (the
+# failure is in lyrebird_scrape_success / lyrebird_collector_success), and 1 when
+# the document could not be written. Collector failures are logged, never fatal.
 generate_all_metrics() {
-    echo "# LyreBirdAudio Prometheus Metrics"
-    echo "# Generated at $(date -Iseconds)"
-    echo ""
+    local doc="" i name fn ok failed=0
+    local -a status_names=() status_values=()
 
-    # Build info
-    emit_metric "build_info" "1" "LyreBirdAudio metrics exporter version" "gauge" "version=\"${VERSION}\""
-    echo ""
+    doc+="# LyreBirdAudio Prometheus Metrics"$'\n'
+    doc+="# Generated at $(date -Iseconds)"$'\n\n'
+    doc+="$(emit_metric "build_info" "1" "LyreBirdAudio metrics exporter version" "gauge" "version=\"${VERSION}\"")"$'\n\n'
 
-    # Each collector is best-effort: a `|| true` ensures one collector failing
-    # (a probe error, an API blip) can never abort generate_all_metrics and
-    # leave a stale/empty scrape that hides a dead recorder. The per-line guards
-    # inside the collectors already prevent this; these are defense in depth.
-    collect_mediamtx_metrics || true
-    echo ""
+    for ((i = 0; i < ${#COLLECTOR_NAMES[@]}; i++)); do
+        name="${COLLECTOR_NAMES[i]}"
+        fn="${COLLECTOR_FUNCS[i]}"
+        run_collector "$fn"
+        if [[ -n "$COLLECTOR_OUTPUT" ]]; then
+            doc+="${COLLECTOR_OUTPUT}"$'\n\n'
+        fi
+        ok=1
+        if ((COLLECTOR_STATUS != 0)); then
+            ok=0
+            failed=$((failed + 1))
+            log "WARN: collector '${name}' failed (status ${COLLECTOR_STATUS}); its metrics may be missing or partial"
+        fi
+        status_names+=("$name")
+        status_values+=("$ok")
+    done
 
-    collect_stream_manager_metrics || true
-    echo ""
+    doc+="$(emit_help_type "collector_success" "1 if the collector completed without error, 0 if it failed and its metrics may be missing or partial" "gauge")"$'\n'
+    for ((i = 0; i < ${#status_names[@]}; i++)); do
+        doc+="$(emit_metric "collector_success" "${status_values[i]}" "" "gauge" "collector=\"${status_names[i]}\"")"$'\n'
+    done
+    doc+=$'\n'
 
-    collect_usb_audio_metrics || true
-    echo ""
-
-    collect_system_metrics || true
-    echo ""
-
-    collect_api_metrics || true
-    echo ""
-
-    collect_stream_metrics || true
-    echo ""
+    ok=1
+    ((failed == 0)) || ok=0
+    doc+="$(emit_metric "scrape_success" "$ok" "1 if every collector completed without error, 0 if any failed (see lyrebird_collector_success); alert on == 0")"$'\n\n'
 
     # In-band staleness marker. A textfile .prom left behind by a dead exporter
     # is otherwise indistinguishable from a live one -- the node "looks alive"
     # while recording nothing. Alert on:
     #   time() - lyrebird_scrape_timestamp_seconds > <2x scrape interval>
-    emit_metric "scrape_timestamp_seconds" "$(date +%s)" "Unix time this scrape was generated (alert when stale)"
+    doc+="$(emit_metric "scrape_timestamp_seconds" "$(date +%s)" "Unix time this scrape was generated (alert when stale)")"$'\n'
+
+    printf '%s' "$doc" || return 1
+    ((failed == 0)) || return "$EXIT_DEGRADED"
+    return 0
 }
 
-# Simple HTTP server using netcat (for basic metrics serving)
-serve_metrics() {
-    local port="${1:-9100}"
-    local nc_pid=""
+# The hidden temp file of the publish in progress, for the signal handlers.
+_PUBLISH_TMP=""
 
-    # Cleanup function to kill any lingering nc processes
-    cleanup_server() {
-        log "Shutting down metrics server..."
-        [[ -n "$nc_pid" ]] && kill "$nc_pid" 2>/dev/null || true
-        # Kill any orphaned nc processes on our port
-        pkill -f "nc.*-l.*$port" 2>/dev/null || true
-        exit 0
-    }
+# Publish the document as FILE (the node_exporter textfile collector reads it).
+#
+# The document is written to a hidden, uniquely named temp file in the same
+# directory (so writers never collide and rename(2) is atomic) and renamed over
+# FILE only once it is complete: readers see the previous document or the new
+# one, never a partial one, and a failed run leaves the last good file in place.
+# The temp name starts with "." and does not end in ".prom", so the textfile
+# collector never reads it.
+#
+# There is deliberately no fsync of the file or the directory: the document is
+# regenerated every interval, and if a power cut loses the newest rename the
+# worst case is the previous document (or an empty file after a crash on a
+# delayed-allocation filesystem), which the in-band lyrebird_scrape_timestamp_seconds
+# alert already treats as stale. A SIGKILL can still leave one ".FILE.XXXXXX"
+# temp file behind; it is never read as FILE.
+#
+# Returns 0 when published, EXIT_DEGRADED when published with a failed collector,
+# EXIT_FAILED when nothing was published. Never fatal to the calling shell.
+publish_metrics_file() {
+    local output_file="$1"
+    local dir base tmp mode gen_rc=0
 
-    # Set up signal handlers for graceful shutdown
-    trap cleanup_server EXIT INT TERM
+    if [[ -d "$output_file" ]]; then
+        log "ERROR: ${output_file} is a directory; not publishing"
+        return "$EXIT_FAILED"
+    fi
+    dir="$(dirname -- "$output_file")"
+    base="$(basename -- "$output_file")"
 
-    if ! has_command nc && ! has_command netcat; then
-        log "ERROR: nc (netcat) required for --serve mode"
-        exit 1
+    if ! tmp="$(mktemp "${dir}/.${base}.XXXXXX" 2>/dev/null)"; then
+        log "ERROR: cannot create a temporary file in ${dir}; ${output_file} was not updated"
+        return "$EXIT_FAILED"
     fi
 
-    log "Starting metrics server on port $port"
-    log "Metrics available at http://localhost:${port}/metrics"
-    log "Press Ctrl+C to stop"
+    # Drop the temp file if we are stopped mid-run (cron overrun, shutdown).
+    _PUBLISH_TMP="$tmp"
+    trap 'rm -f -- "$_PUBLISH_TMP"; exit 129' HUP
+    trap 'rm -f -- "$_PUBLISH_TMP"; exit 130' INT
+    trap 'rm -f -- "$_PUBLISH_TMP"; exit 143' TERM
 
-    while true; do
-        local metrics
-        metrics=$(generate_all_metrics)
-        local content_length=${#metrics}
+    # mktemp creates 0600; keep the mode a plain redirect would have given (a
+    # node_exporter running as another user must be able to read the file).
+    mode="$(printf '%04o' $((0666 & ~$(umask))))"
 
-        local response="HTTP/1.1 200 OK
-Content-Type: text/plain; charset=utf-8
-Content-Length: ${content_length}
-Connection: close
+    generate_all_metrics >"$tmp" || gen_rc=$?
+    if ((gen_rc != 0 && gen_rc != EXIT_DEGRADED)); then
+        log "ERROR: writing the metrics failed (status ${gen_rc}); keeping the previous ${output_file}"
+    elif [[ ! -s "$tmp" ]]; then
+        gen_rc=1
+        log "ERROR: the generated metrics are empty; keeping the previous ${output_file}"
+    elif ! chmod "$mode" -- "$tmp"; then
+        gen_rc=1
+        log "ERROR: cannot set the mode of ${tmp}; keeping the previous ${output_file}"
+    elif ! mv -f -- "$tmp" "$output_file"; then
+        gen_rc=1
+        log "ERROR: cannot replace ${output_file}; keeping the previous file"
+    fi
 
-${metrics}"
+    rm -f -- "$tmp"
+    _PUBLISH_TMP=""
+    trap - HUP INT TERM
 
-        echo -e "$response" | nc -l -p "$port" -q 1 2>/dev/null \
-            || echo -e "$response" | nc -l "$port" 2>/dev/null \
-            || true
+    if ((gen_rc != 0 && gen_rc != EXIT_DEGRADED)); then
+        return "$EXIT_FAILED"
+    fi
+    return "$gen_rc"
+}
 
-        sleep 0.1
+# ============================================================================
+# HTTP server (--serve)
+# ============================================================================
+#
+# A small HTTP/1.1 server for `GET /metrics` on top of netcat, one connection at
+# a time. nc is only the socket: for each connection one `nc -l` is started whose
+# stdout (the request) is a pipe we read and whose stdin is a FIFO we write the
+# response to, so the metrics are generated AFTER the request has arrived and are
+# never older than the request.
+#
+# Things this does on purpose, because the previous loop got them wrong:
+#  * binds 127.0.0.1 unless told otherwise (--bind) and says so truthfully;
+#  * knows which netcat it has (OpenBSD, ncat, traditional/GNU, BusyBox) by what
+#    `nc -h` reports and builds the right command line for it, instead of trying
+#    flags until one happens not to fail;
+#  * stops only the nc it started (pid + start time from /proc), never a process
+#    that merely has "nc ... -l ... PORT" somewhere in its command line;
+#  * refuses to start when the port is taken (nc sets SO_REUSEPORT, so a second
+#    nc would bind NEXT TO the first and split its connections) and backs off,
+#    bounded, instead of spinning;
+#  * frames responses correctly (CRLF, Content-Length in bytes, Connection: close).
+#
+# nc accepts one connection and then stops listening, so as soon as a request has
+# arrived the NEXT nc is started, before the metrics are generated: a scraper
+# that arrives while a request is being answered (a second Prometheus, a retry)
+# finds a listener, and its request waits until the current one is done. Requests
+# are still answered one at a time. What is left is a client that connects and
+# sends nothing: it occupies the one armed listener until SERVE_IDLE_ROTATE
+# recycles it. There is no authentication or TLS.
+
+SERVE_IDLE_ROTATE=10    # seconds an idle listener lives before it is recycled; bounds a client that connects and never sends
+SERVE_REQUEST_TIMEOUT=5 # seconds a client has to deliver the rest of its request after the first line
+SERVE_CLOSE_TIMEOUT=3   # seconds nc has to finish after the response was written before it is stopped
+SERVE_START_ATTEMPTS=5  # consecutive failed listener starts before giving up
+SERVE_RETRY_MS=500      # first back-off after a failed start, doubled each time
+SERVE_BIND_WAIT_MS=3000 # how long a new listener has to show up as bound
+
+# State of the running server (see serve_metrics). A listener is one nc; there are
+# two slots, the one being served and the one armed for the next connection.
+_SRV_DIR=""      # private temp directory: the FIFOs and nc's stderr
+_SRV_SLEEP=""    # fd of a FIFO nothing writes to: reading it with a timeout is an interruptible sleep
+_SRV_CUR=0       # the slot whose connection is being served
+_L_PID=("" "")   # per slot: pid of the nc we started
+_L_START=("" "") # its start time (field 22 of /proc/PID/stat): pid + start time identify it
+_L_R=("" "")     # fd: nc's stdout (the request)
+_L_W=("" "")     # fd: nc's stdin (the response)
+_L_FIFO=("" "")  # FIFO carrying the response to nc's stdin
+_L_ERR=("" "")   # nc's stderr
+_SRV_PORT=""
+_SRV_BIND=""
+_SRV_NC_BIN=""
+_SRV_NC_VARIANT=""
+_SRV_NC_HELP=""
+_SRV_NC_CMD=()
+_PS_STATE="" # set by read_proc_stat
+_PS_START=""
+_BYTES=0 # set by byte_length
+
+# A TCP port number, 1-65535.
+valid_port() {
+    [[ "$1" =~ ^[0-9]{1,5}$ ]] && ((10#$1 >= 1 && 10#$1 <= 65535))
+}
+
+# An IPv4 dotted quad or an IPv6 literal.
+valid_bind() {
+    local addr="$1" octet
+    if [[ "$addr" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]]; then
+        for octet in "${BASH_REMATCH[@]:1:4}"; do
+            ((10#$octet <= 255)) || return 1
+        done
+        return 0
+    fi
+    [[ "$addr" == *:*:* ]] && [[ "$addr" =~ ^[0-9A-Fa-f:.]+$ ]]
+}
+
+is_wildcard_bind() {
+    [[ "$1" == "0.0.0.0" || "$1" == "::" ]]
+}
+
+is_loopback_bind() {
+    [[ "$1" == 127.* || "$1" == "::1" ]]
+}
+
+# The help text of a netcat binary, which is how its variant is told apart.
+nc_help_text() {
+    local bin="$1"
+    if has_command timeout; then
+        timeout 3 "$bin" -h </dev/null 2>&1 || true
+    else
+        "$bin" -h </dev/null 2>&1 || true
+    fi
+}
+
+# Print the variant a help text belongs to (openbsd, ncat, traditional, busybox),
+# nothing if it is none of them.
+classify_nc() {
+    case "$1" in
+        *BusyBox*) echo busybox ;;
+        Ncat* | *"nmap.org/ncat"*) echo ncat ;;
+        *"OpenBSD netcat"* | *"usage: nc ["*) echo openbsd ;;
+        *"GNU netcat"* | *"[v1.10"* | *"connect to somewhere"*) echo traditional ;;
+        *) ;;
+    esac
+}
+
+# Find a usable netcat: sets _SRV_NC_BIN, _SRV_NC_VARIANT and _SRV_NC_HELP.
+detect_nc() {
+    local candidate bin help variant
+    for candidate in nc ncat netcat; do
+        bin="$(command -v "$candidate" 2>/dev/null)" || continue
+        [[ "$bin" == /* ]] || continue
+        help="$(nc_help_text "$bin")"
+        variant="$(classify_nc "$help")"
+        if [[ -n "$variant" ]]; then
+            _SRV_NC_BIN="$bin"
+            _SRV_NC_VARIANT="$variant"
+            _SRV_NC_HELP="$help"
+            return 0
+        fi
+        log "WARN: ${bin} is not a netcat variant this server knows how to drive; skipping it"
+    done
+    return 1
+}
+
+# Build the listen command for the detected variant into _SRV_NC_CMD. The
+# end-of-response handling is chosen from what the variant's help advertises:
+# `-q 0` (quit right after EOF on stdin) where it exists, else `-N` (shut the
+# socket down after EOF on stdin). Returns 1 if the variant cannot bind to BIND.
+build_nc_command() {
+    local bind="$1" port="$2" help="$_SRV_NC_HELP"
+    local re_has_n='\[-[A-Za-z0-9]*N'
+
+    case "$_SRV_NC_VARIANT" in
+        openbsd)
+            _SRV_NC_CMD=("$_SRV_NC_BIN" -l)
+            if [[ "$help" == *"[-q "* ]]; then
+                _SRV_NC_CMD+=(-q 0)
+            elif [[ "$help" =~ $re_has_n ]]; then
+                _SRV_NC_CMD+=(-N)
+            fi
+            _SRV_NC_CMD+=("$bind" "$port")
+            ;;
+        ncat)
+            _SRV_NC_CMD=("$_SRV_NC_BIN" -l "$bind" "$port")
+            ;;
+        traditional)
+            _SRV_NC_CMD=("$_SRV_NC_BIN" -l -p "$port" -s "$bind")
+            if [[ "$help" == *"-q secs"* ]]; then
+                _SRV_NC_CMD+=(-q 0)
+            fi
+            ;;
+        busybox)
+            if [[ "$help" == *"-s ADDR"* ]]; then
+                _SRV_NC_CMD=("$_SRV_NC_BIN" -l -p "$port" -s "$bind")
+            elif is_wildcard_bind "$bind"; then
+                _SRV_NC_CMD=("$_SRV_NC_BIN" -l -p "$port")
+            else
+                log "ERROR: this BusyBox nc cannot bind to a given address (no -s); use --bind 0.0.0.0 or install netcat-openbsd"
+                return 1
+            fi
+            ;;
+        *)
+            log "ERROR: no usable netcat variant"
+            return 1
+            ;;
+    esac
+    return 0
+}
+
+# Interruptible sleep (a signal ends it at once): a timed read of a FIFO that is
+# never written to. Takes seconds, fractions allowed.
+srv_sleep() {
+    read -r -t "$1" -u "$_SRV_SLEEP" _ || true
+}
+
+# Set _PS_STATE and _PS_START from /proc/PID/stat; returns 1 if there is no such
+# process. The command name is the only field that can contain spaces and is
+# enclosed in parentheses, so everything up to the last ") " is skipped.
+read_proc_stat() {
+    # the shutdown trap can interrupt `IFS= read` with that IFS still in effect
+    local IFS=$' \t\n'
+    local stat rest
+    local -a fields
+    _PS_STATE=""
+    _PS_START=""
+    { read -r stat <"/proc/$1/stat"; } 2>/dev/null || return 1
+    rest="${stat##*) }"
+    read -r -a fields <<<"$rest"
+    _PS_STATE="${fields[0]:-}"
+    _PS_START="${fields[19]:-}"
+    return 0
+}
+
+# Is the nc we started in slot $1 still running? A pid alone could have been
+# reused; its start time cannot. A zombie counts as gone.
+listener_alive() {
+    local slot="$1"
+    [[ -n "${_L_PID[slot]}" ]] || return 1
+    read_proc_stat "${_L_PID[slot]}" || return 1
+    [[ "$_PS_STATE" != "Z" && "$_PS_STATE" != "X" ]] || return 1
+    [[ -z "${_L_START[slot]}" || "$_PS_START" == "${_L_START[slot]}" ]]
+}
+
+# The tcp tables to look at (IPv4 and, where present, IPv6).
+_tcp_tables() {
+    local table
+    for table in /proc/net/tcp /proc/net/tcp6; do
+        [[ -r "$table" ]] && echo "$table"
+    done
+    return 0
+}
+
+# Is something already listening on PORT where we want to bind? Needed because nc
+# sets SO_REUSEPORT: a second nc on the same address binds without error and the
+# kernel then splits the connections between the two, so "nc failed" cannot be
+# relied on to notice a taken port. Returns 0 if a listener is there.
+port_in_use() {
+    local port="$1" bind="$2" hexport bindhex="" wild=0
+    local -a tables
+    mapfile -t tables < <(_tcp_tables)
+    ((${#tables[@]} > 0)) || return 1
+    printf -v hexport '%04X' "$((10#$port))"
+    if is_wildcard_bind "$bind"; then
+        wild=1
+    elif [[ "$bind" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+        # /proc/net/tcp shows an IPv4 address as its bytes in reverse order
+        printf -v bindhex '%02X%02X%02X%02X' "$((10#${BASH_REMATCH[4]}))" "$((10#${BASH_REMATCH[3]}))" \
+            "$((10#${BASH_REMATCH[2]}))" "$((10#${BASH_REMATCH[1]}))"
+    fi
+    awk -v port="$hexport" -v bind="$bindhex" -v wild="$wild" '
+        $4 == "0A" {
+            split($2, a, ":")
+            if (a[2] == port && (wild == 1 || a[1] ~ /^0+$/ || (bind != "" && a[1] == bind))) found = 1
+        }
+        END { exit(found ? 0 : 1) }' "${tables[@]}" 2>/dev/null
+}
+
+# Does the nc we started own a listening socket on PORT? Compares the inodes of
+# its sockets with those of the listeners in /proc/net/tcp*. Returns 2 where /proc
+# cannot tell.
+listener_bound() {
+    local pid="$1" port="$2" hexport inodes link fd
+    local -a tables
+    mapfile -t tables < <(_tcp_tables)
+    ((${#tables[@]} > 0)) || return 2
+    printf -v hexport '%04X' "$((10#$port))"
+    inodes="$(awk -v port="$hexport" '$4 == "0A" { split($2, a, ":"); if (a[2] == port) print $10 }' "${tables[@]}" 2>/dev/null)" || true
+    [[ -n "$inodes" ]] || return 1
+    for fd in /proc/"$pid"/fd/*; do
+        link="$(readlink "$fd" 2>/dev/null)" || continue
+        [[ "$link" =~ ^socket:\[([0-9]+)\]$ ]] || continue
+        case $'\n'"$inodes"$'\n' in
+            *$'\n'"${BASH_REMATCH[1]}"$'\n'*) return 0 ;;
+        esac
+    done
+    return 1
+}
+
+# Wait for the listener in slot $1 to be bound. 0 = bound (or running, where /proc
+# cannot confirm it and it survived a short wait), 1 = it died or never bound.
+wait_listener_bound() {
+    local slot="$1" waited=0 rc=0
+    while ((waited < SERVE_BIND_WAIT_MS)); do
+        rc=0
+        listener_bound "${_L_PID[slot]}" "$_SRV_PORT" || rc=$?
+        if ((rc == 0)); then
+            return 0
+        elif ((rc == 2)); then
+            srv_sleep 0.3
+            listener_alive "$slot"
+            return $?
+        fi
+        listener_alive "$slot" || return 1
+        srv_sleep 0.05
+        waited=$((waited + 50))
+    done
+    return 1
+}
+
+# Start nc listening in slot $1 and record its pid. The pid is taken from the
+# subshell that becomes nc by exec, so it is nc's own. The write end of the FIFO
+# is opened read-write only AFTER nc was started, and nc is made to close every
+# listener fd it inherited: a write end of ITS stdin FIFO left open anywhere else
+# would keep it from ever seeing EOF.
+start_listener() {
+    local slot="$1" pid="" rfd="" wfd="" ofd
+    local fifo="${_L_FIFO[slot]}" err="${_L_ERR[slot]}"
+    : >"$err"
+    _L_PID[slot]=""
+    _L_START[slot]=""
+    exec {rfd}< <(
+        printf '%s\n' "$BASHPID"
+        for ofd in "${_L_W[@]}" "${_L_R[@]}" "$_SRV_SLEEP"; do
+            [[ -z "$ofd" ]] || exec {ofd}>&-
+        done
+        exec "${_SRV_NC_CMD[@]}" <"$fifo" 2>"$err"
+    ) || return 1
+    _L_R[slot]="$rfd"
+    if ! exec {wfd}<>"$fifo"; then
+        stop_listener "$slot"
+        return 1
+    fi
+    _L_W[slot]="$wfd"
+    if ! IFS= read -r -t 5 -u "$rfd" pid || [[ ! "$pid" =~ ^[0-9]+$ ]]; then
+        stop_listener "$slot"
+        return 1
+    fi
+    _L_PID[slot]="$pid"
+    if read_proc_stat "$pid"; then
+        _L_START[slot]="$_PS_START"
+    fi
+    return 0
+}
+
+# Stop the nc we started in slot $1 (only that one), and close our ends.
+stop_listener() {
+    local slot="$1" i fd
+    fd="${_L_W[slot]}"
+    if [[ -n "$fd" ]]; then
+        exec {fd}>&-
+        _L_W[slot]=""
+    fi
+    fd="${_L_R[slot]}"
+    if [[ -n "$fd" ]]; then
+        exec {fd}<&-
+        _L_R[slot]=""
+    fi
+    if listener_alive "$slot"; then
+        kill "${_L_PID[slot]}" 2>/dev/null || true
+        for ((i = 0; i < 40; i++)); do
+            listener_alive "$slot" || break
+            srv_sleep 0.05
+        done
+        if listener_alive "$slot"; then
+            kill -KILL "${_L_PID[slot]}" 2>/dev/null || true
+        fi
+    fi
+    _L_PID[slot]=""
+    _L_START[slot]=""
+}
+
+# What the nc in slot $1 said on stderr (a bind error, typically), on one line.
+listener_error() {
+    local line=""
+    { read -r line <"${_L_ERR[$1]}"; } 2>/dev/null || true
+    printf '%s' "$line"
+}
+
+# Number of bytes in a string, whatever the locale: sets _BYTES. ${#var} counts
+# characters in a UTF-8 locale, and Content-Length is a count of bytes.
+byte_length() {
+    local LC_ALL=C
+    _BYTES=${#1}
+}
+
+http_status_text() {
+    case "$1" in
+        200) printf 'OK' ;;
+        400) printf 'Bad Request' ;;
+        404) printf 'Not Found' ;;
+        405) printf 'Method Not Allowed' ;;
+        *) printf 'Internal Server Error' ;;
+    esac
+}
+
+# Write one complete HTTP/1.1 response to nc: CRLF line endings, Content-Length
+# in bytes, Connection: close. Usage: send_response CODE CONTENT-TYPE BODY [HEADER]
+send_response() {
+    local code="$1" ctype="$2" body="$3" extra="${4:-}" response
+    byte_length "$body"
+    response="HTTP/1.1 ${code} $(http_status_text "$code")"$'\r\n'
+    response+="Content-Type: ${ctype}"$'\r\n'
+    response+="Content-Length: ${_BYTES}"$'\r\n'
+    if [[ -n "$extra" ]]; then
+        response+="${extra}"$'\r\n'
+    fi
+    response+="Connection: close"$'\r\n\r\n'
+    response+="$body"
+    # a dead nc would leave a large write blocked on the FIFO we hold open
+    listener_alive "$_SRV_CUR" || return 1
+    printf '%s' "$response" >&"${_L_W[_SRV_CUR]}"
+}
+
+# Consume the rest of the request head (everything up to the empty line) within
+# SERVE_REQUEST_TIMEOUT; closing with unread input would reset the connection
+# and could cut the response short.
+read_request_head() {
+    local deadline=$((SECONDS + SERVE_REQUEST_TIMEOUT)) left header count=0
+    while :; do
+        left=$((deadline - SECONDS))
+        ((left > 0)) || return 1
+        IFS= read -r -t "$left" -n 8192 -u "${_L_R[_SRV_CUR]}" header || return 1
+        header="${header%$'\r'}"
+        [[ -n "$header" ]] || return 0
+        count=$((count + 1))
+        ((count <= 100)) || return 1
+    done
+}
+
+# Answer one request. $1 is its first line. Only GET / and GET /metrics get the
+# metrics; any other path is 404, any other method on those paths 405.
+handle_connection() {
+    local line="${1%$'\r'}" method path body rc=0
+    local re_request='^([A-Z]+) (/[^ ]*) HTTP/[0-9]\.[0-9]$'
+
+    if [[ ! "$line" =~ $re_request ]]; then
+        send_response 400 "text/plain; charset=utf-8" $'Bad Request\n' || true
+        return 0
+    fi
+    method="${BASH_REMATCH[1]}"
+    path="${BASH_REMATCH[2]%%\?*}"
+
+    if ! read_request_head; then
+        send_response 400 "text/plain; charset=utf-8" $'Bad Request\n' || true
+        return 0
+    fi
+
+    case "$path" in
+        / | /metrics) ;;
+        *)
+            send_response 404 "text/plain; charset=utf-8" $'Not Found\n' || true
+            return 0
+            ;;
+    esac
+    if [[ "$method" != "GET" ]]; then
+        send_response 405 "text/plain; charset=utf-8" $'Method Not Allowed\n' "Allow: GET" || true
+        return 0
+    fi
+
+    # Generated now, after the request arrived: never older than the request.
+    body="$(generate_all_metrics)" || rc=$?
+    if ((rc != 0 && rc != EXIT_DEGRADED)); then
+        log "ERROR: generating the metrics failed (status ${rc})"
+        send_response 500 "text/plain; charset=utf-8" $'Internal Server Error\n' || true
+        return 0
+    fi
+    send_response 200 "text/plain; version=0.0.4; charset=utf-8" "${body}"$'\n' || true
+    return 0
+}
+
+# Let the nc of the connection being served finish the response (it quits on EOF
+# of its stdin, then the peer's FIN) and stop it if it does not within
+# SERVE_CLOSE_TIMEOUT.
+finish_connection() {
+    local slot="$_SRV_CUR" fd deadline=$((SECONDS + SERVE_CLOSE_TIMEOUT))
+    fd="${_L_W[slot]}"
+    if [[ -n "$fd" ]]; then
+        exec {fd}>&-
+        _L_W[slot]=""
+    fi
+    fd="${_L_R[slot]}"
+    if [[ -n "$fd" ]]; then
+        while IFS= read -r -t "$SERVE_CLOSE_TIMEOUT" -n 65536 -u "$fd" _; do
+            ((SECONDS < deadline)) || break
+        done
+    fi
+    stop_listener "$slot"
+}
+
+# Exit trap of the server: stop our nc processes and remove the private directory.
+srv_cleanup() {
+    log "Shutting down metrics server..."
+    stop_listener 0
+    stop_listener 1
+    if [[ -n "$_SRV_SLEEP" ]]; then
+        exec {_SRV_SLEEP}<&-
+        _SRV_SLEEP=""
+    fi
+    if [[ -n "$_SRV_DIR" ]]; then
+        rm -rf -- "$_SRV_DIR"
+        _SRV_DIR=""
+    fi
+}
+
+# Run the server on BIND:PORT until stopped (SIGTERM/SIGINT end it cleanly with
+# status 0). Returns EXIT_FAILED when it cannot run: no usable netcat, no private
+# temp directory, or the port cannot be bound after SERVE_START_ATTEMPTS tries.
+serve_metrics() {
+    local port="$1" bind="$2"
+    local failures=0 delay_ms="$SERVE_RETRY_MS" err="" first="" rrc=0 url_host="" cur=0
+
+    _SRV_PORT="$port"
+    _SRV_BIND="$bind"
+
+    if ! detect_nc; then
+        log "ERROR: a netcat (nc) is required for the HTTP server; install netcat-openbsd"
+        return "$EXIT_FAILED"
+    fi
+    build_nc_command "$bind" "$port" || return "$EXIT_FAILED"
+
+    if ! _SRV_DIR="$(mktemp -d)"; then
+        log "ERROR: cannot create a temporary directory for the server"
+        return "$EXIT_FAILED"
+    fi
+    _L_FIFO=("${_SRV_DIR}/to_nc.0" "${_SRV_DIR}/to_nc.1")
+    _L_ERR=("${_SRV_DIR}/nc.err.0" "${_SRV_DIR}/nc.err.1")
+    if ! mkfifo "${_L_FIFO[0]}" "${_L_FIFO[1]}" "${_SRV_DIR}/sleep" || ! exec {_SRV_SLEEP}<>"${_SRV_DIR}/sleep"; then
+        log "ERROR: cannot create the server's FIFOs in ${_SRV_DIR}"
+        rm -rf -- "$_SRV_DIR"
+        _SRV_DIR=""
+        return "$EXIT_FAILED"
+    fi
+
+    trap 'exit 0' HUP INT TERM
+    trap srv_cleanup EXIT
+
+    # Come up, or say why not: a taken port and a failed bind are retried a few
+    # times (the previous instance may still be closing its socket), then fatal.
+    while :; do
+        if port_in_use "$port" "$bind"; then
+            err="something is already listening on ${bind}:${port}"
+        elif start_listener 0 && wait_listener_bound 0; then
+            break
+        else
+            err="$(listener_error 0)"
+            err="${err:-the netcat did not bind}"
+            stop_listener 0
+        fi
+        failures=$((failures + 1))
+        if ((failures >= SERVE_START_ATTEMPTS)); then
+            log "ERROR: cannot listen on ${bind}:${port}: ${err}"
+            return "$EXIT_FAILED"
+        fi
+        log "WARN: cannot listen on ${bind}:${port} (${err}); retrying"
+        srv_sleep "$((delay_ms / 1000)).$(printf '%03d' $((delay_ms % 1000)))"
+        delay_ms=$((delay_ms * 2))
+    done
+
+    url_host="$bind"
+    if is_wildcard_bind "$bind"; then
+        url_host="<this host>"
+    elif [[ "$bind" == *:* ]]; then
+        url_host="[${bind}]"
+    fi
+    log "Metrics server listening on http://${url_host}:${port}/metrics (netcat: ${_SRV_NC_VARIANT}; GET / and GET /metrics; one connection at a time)"
+    if ! is_loopback_bind "$bind"; then
+        log "WARN: ${bind} is not a loopback address: the metrics are served without authentication or TLS to anything that can reach ${bind}:${port}"
+    fi
+    log "Stop with SIGTERM or Ctrl+C"
+
+    failures=0
+    delay_ms="$SERVE_RETRY_MS"
+    _SRV_CUR=0
+    while :; do
+        cur="$_SRV_CUR"
+        if [[ -z "${_L_PID[cur]}" ]] && ! start_listener "$cur"; then
+            err="could not start ${_SRV_NC_BIN}"
+            rrc=1
+        else
+            rrc=0
+            first=""
+            IFS= read -r -t "$SERVE_IDLE_ROTATE" -n 8192 -u "${_L_R[cur]}" first || rrc=$?
+            err=""
+        fi
+
+        if ((rrc == 0)); then
+            # A client is connected to this nc, which no longer listens: arm the
+            # other slot before the metrics are generated, so the port is never
+            # left without a listener while a request is answered. If that fails
+            # it is noticed (and counted) when the slot becomes the current one.
+            start_listener "$((1 - cur))" || true
+            handle_connection "$first" || log "WARN: request handling failed"
+            finish_connection
+            _SRV_CUR=$((1 - cur))
+            failures=0
+            delay_ms="$SERVE_RETRY_MS"
+        elif ((rrc > 128)); then
+            # Idle: recycle the listener. This also drops a client that connected
+            # and never sent anything, which would otherwise hold the only
+            # connection for ever.
+            stop_listener "$cur"
+        else
+            # nc ended without a request: it failed (it said so on stderr), or a
+            # client connected and left without sending.
+            err="${err:-$(listener_error "$cur")}"
+            stop_listener "$cur"
+            if [[ -n "$err" ]]; then
+                failures=$((failures + 1))
+                if ((failures >= SERVE_START_ATTEMPTS)); then
+                    log "ERROR: the listener on ${bind}:${port} keeps failing: ${err}"
+                    return "$EXIT_FAILED"
+                fi
+                log "WARN: the listener on ${bind}:${port} failed (${err}); restarting"
+                srv_sleep "$((delay_ms / 1000)).$(printf '%03d' $((delay_ms % 1000)))"
+                delay_ms=$((delay_ms * 2))
+            else
+                srv_sleep 0.05
+            fi
+        fi
     done
 }
 
@@ -625,13 +1437,36 @@ Export LyreBirdAudio metrics in Prometheus format.
 Options:
   -h, --help          Show this help message
   -v, --version       Show version
-  --serve PORT        Start HTTP server on PORT (default: 9100)
-  --file PATH         Write metrics to file (for node_exporter textfile)
+  --serve [PORT]      Serve the metrics over HTTP on PORT (default: 9100); the
+                      same as the "serve" command with --port
+  serve               Serve over HTTP; combine with --port and --bind
+  --port PORT         Port for the HTTP server (default: 9100)
+  --bind ADDR         Address the HTTP server listens on: an IPv4/IPv6 literal
+                      or "localhost" (default: 127.0.0.1). The server has no
+                      authentication or TLS; bind a non-loopback address only
+                      on a network you trust
+  --file PATH         Write metrics to file (for node_exporter textfile); the file
+                      is replaced atomically and the previous one is kept if
+                      anything fails
   --once              Output metrics once and exit (default)
+
+The HTTP server answers GET / and GET /metrics (200), any other path with 404 and
+any other method with 405, one connection at a time. It needs netcat (OpenBSD
+nc, ncat, traditional/GNU nc or BusyBox nc). SIGTERM or SIGINT stops it cleanly.
+
+Exit status:
+  0  every collector completed (the server: stopped by a signal)
+  1  command-line error
+  2  nothing could be delivered: --file could not publish (the previous file
+     is kept), or the HTTP server cannot run (no usable netcat, port in use)
+  3  the output was delivered, but at least one collector failed
+     (lyrebird_scrape_success is 0; the failing collector is named in
+     lyrebird_collector_success and on stderr)
 
 Examples:
   ${SCRIPT_NAME}                        # Output to stdout
-  ${SCRIPT_NAME} --serve 9100           # Start HTTP server
+  ${SCRIPT_NAME} --serve 9100           # Start HTTP server on 127.0.0.1:9100
+  ${SCRIPT_NAME} serve --port 9100 --bind 0.0.0.0   # Same, on all interfaces
   ${SCRIPT_NAME} --file /tmp/lyrebird.prom  # Write to file
 
 Integration:
@@ -648,7 +1483,10 @@ EOF
 main() {
     local mode="once"
     local port="9100"
+    local bind="127.0.0.1"
+    local server_option_given=0
     local output_file=""
+    local gen_rc=0
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -667,6 +1505,28 @@ main() {
                     shift
                 fi
                 shift
+                ;;
+            serve)
+                mode="serve"
+                shift
+                ;;
+            --port)
+                if [[ -z "${2:-}" ]]; then
+                    log "ERROR: --port requires a port number"
+                    exit 1
+                fi
+                port="$2"
+                server_option_given=1
+                shift 2
+                ;;
+            --bind)
+                if [[ -z "${2:-}" ]]; then
+                    log "ERROR: --bind requires an address"
+                    exit 1
+                fi
+                bind="$2"
+                server_option_given=1
+                shift 2
                 ;;
             --file)
                 mode="file"
@@ -691,27 +1551,41 @@ main() {
         esac
     done
 
+    if [[ "$mode" != "serve" ]] && ((server_option_given)); then
+        log "ERROR: --port and --bind apply to the HTTP server only (use serve or --serve)"
+        exit 1
+    fi
+
     case "$mode" in
         serve)
-            serve_metrics "$port"
+            if [[ "$bind" == "localhost" ]]; then
+                bind="127.0.0.1"
+            fi
+            if ! valid_port "$port"; then
+                log "ERROR: invalid port '${port}' (need 1-65535)"
+                exit 1
+            fi
+            if ! valid_bind "$bind"; then
+                log "ERROR: invalid --bind address '${bind}' (need an IPv4 or IPv6 literal, or localhost)"
+                exit 1
+            fi
+            gen_rc=0
+            serve_metrics "$port" "$bind" || gen_rc=$?
+            return "$gen_rc"
             ;;
         file)
             if [[ -z "$output_file" ]]; then
                 log "ERROR: Output file path required"
                 exit 1
             fi
-            # Only replace the published file on a successful, complete
-            # generation; on failure keep the previous file and drop the partial
-            # temp rather than orphaning a `.tmp` (and never crash the cron).
-            if generate_all_metrics >"${output_file}.tmp"; then
-                mv "${output_file}.tmp" "$output_file"
-            else
-                log "ERROR: metric generation failed; leaving previous ${output_file} in place"
-                rm -f "${output_file}.tmp" 2>/dev/null || true
-            fi
+            gen_rc=0
+            publish_metrics_file "$output_file" || gen_rc=$?
+            return "$gen_rc"
             ;;
         once | *)
-            generate_all_metrics
+            gen_rc=0
+            generate_all_metrics || gen_rc=$?
+            return "$gen_rc"
             ;;
     esac
 }
