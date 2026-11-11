@@ -8,7 +8,12 @@
 #   - the generated mediamtx.yml is accepted and MediaMTX stays up;
 #   - no MoQ listener is started (MediaMTX >= 1.19.0 enables one by default);
 #   - probe_stream_ready sees a published stream as ready, and as not ready
-#     after the publisher stops.
+#     after the publisher stops;
+#   - the lifecycle (tests/lifecycle_e2e.bash): idempotent start, reconcile,
+#     stop, refusal by another owner;
+#   - the start outcome (tests/outcome_e2e.bash): policy exit codes, status.json,
+#     hot-plug through the monitor, a MediaMTX that is gone, and the inbound byte
+#     counter (inboundBytes or bytesReceived) read from the real API.
 
 load scratch_tmpdir
 
@@ -148,5 +153,31 @@ require_netns() {
         [[ "$out" == *"E2E: DONE"* ]]
         chmod -R u+rwx "$TEST_SCRATCH/e2e"
         rm -rf "$TEST_SCRATCH/e2e"
+    done
+}
+
+@test "start reports what publishes: policy exit codes and status.json, hot-plug through the monitor, a MediaMTX that is gone, and the inbound byte counter, against each real MediaMTX [LB-03, LB-07, D4, D5]" {
+    require_live
+    require_netns
+    command -v jq >/dev/null || skip "jq not installed"
+    local bin out rc
+    for bin in $LYREBIRD_TEST_MEDIAMTX_BINS; do
+        echo "# $("$bin" --version 2>/dev/null | head -n 1)" >&3
+        mkdir -p "$TEST_SCRATCH/outcome-e2e"
+        rc=0
+        out="$("${NETNS_CMD[@]}" env PATH="$PATH" PROJECT_ROOT="$PROJECT_ROOT" BIN="$bin" \
+            WORK="$TEST_SCRATCH/outcome-e2e" OWNER="$(id -u):$(id -g)" \
+            bash "$PROJECT_ROOT/tests/outcome_e2e.bash" 2>&1 3>&-)" || rc=$?
+        if [[ $rc -eq 77 ]]; then
+            skip "$(grep E2E-SKIP <<<"$out")"
+        fi
+        if [[ $rc -ne 0 ]]; then
+            echo "$out"
+            false
+        fi
+        sed 's/^/# /' <<<"$out" >&3
+        [[ "$out" == *"E2E: DONE"* ]]
+        chmod -R u+rwx "$TEST_SCRATCH/outcome-e2e"
+        rm -rf "$TEST_SCRATCH/outcome-e2e"
     done
 }
