@@ -13,8 +13,15 @@
       "title": "start is not idempotent: cleanup runs before the running check",
       "severity": "P1",
       "phase": 3,
-      "status": "open",
-      "tests": []
+      "status": "fixed",
+      "tests": [
+        "a repeated start on a healthy node changes nothing: same PIDs, no signal, no cleanup, no wait, no restart marker [LB-01]",
+        "a leftover cleanup marker does not make start tear down a MediaMTX this manager owns [LB-01]",
+        "start on a healthy node starts a missing stream and leaves the running one alone; a dead wrapper is reconciled by the next start [LB-01]",
+        "when the recorded MediaMTX is dead, start cleans up what is stale and launches a new one [LB-01]",
+        "a recorded PID that now belongs to an unrelated process is not signalled: the stale record is dropped and MediaMTX is started [LB-01, X-26]",
+        "start is idempotent against a real MediaMTX and real FFmpeg, a dead wrapper is reconciled, stop leaves nothing and another owner is refused [LB-01, LB-02, LB-10]"
+      ]
     },
     {
       "id": "LB-02",
@@ -22,7 +29,15 @@
       "severity": "P1",
       "phase": 3,
       "status": "open",
-      "tests": []
+      "tests": [
+        "help documents exit code 8 and the idempotent start [LB-02, LB-01]",
+        "start is refused with exit 8 while mediamtx.service is active, touching nothing [LB-02]",
+        "start is refused with exit 8, and signals nothing, when a MediaMTX this manager did not start runs on its configuration [LB-02]",
+        "the refusal names the unit that runs the other MediaMTX when systemd says it is active [LB-02]",
+        "restart is refused with exit 8 before anything is stopped or marked while mediamtx.service owns MediaMTX [LB-02]",
+        "start is idempotent against a real MediaMTX and real FFmpeg, a dead wrapper is reconciled, stop leaves nothing and another owner is refused [LB-01, LB-02, LB-10]"
+      ],
+      "note": "manager side fixed and verified (E_OWNERSHIP=8, never signals a process it did not start); config/mediamtx-audio.service still declares Wants/PartOf=mediamtx.service until the unit template phase"
     },
     {
       "id": "LB-03",
@@ -105,8 +120,50 @@
       "title": "process cleanup by name/pattern can kill unrelated processes",
       "severity": "P2",
       "phase": 3,
-      "status": "open",
-      "tests": []
+      "status": "fixed",
+      "tests": [
+        "terminate_process_group does not signal a process whose start time is not the recorded one [LB-10]",
+        "terminate_process_group stops a wrapper that ignores SIGINT well before its timeout and leaves no child behind [LB-10]",
+        "no pkill, killall, pidof or pgrep -f/-x pattern is left in the script's commands [LB-10, D11]",
+        "stop_mediamtx stops only the processes this manager started; another installation's processes and an FFmpeg reader survive [LB-10]",
+        "cleanup_stale_processes stops only what this manager started [LB-10]",
+        "force_stop_mediamtx kills only what this manager started; the other installation's processes survive [LB-10]",
+        "a PID file that names another installation's process does not make stop, cleanup or force-stop signal it [LB-10, X-26]",
+        "is_restart_scenario ignores other installations' MediaMTX and FFmpeg processes [LB-10]",
+        "verify_cleanup_complete counts this installation's leftovers, not another installation's FFmpeg [LB-10]",
+        "count_wrapper_processes counts the wrappers of this wrapper directory only [LB-10]",
+        "is_managed_mediamtx_pid accepts only the exact binary and config path [LB-10 installer]",
+        "find_managed_mediamtx_pids lists only the exact-identity process among look-alikes [LB-10 installer]",
+        "find_managed_mediamtx_pids lists nothing when only look-alikes run [LB-10 installer]",
+        "the managed process is still recognised after an update replaced its binary [LB-10 installer]",
+        "signal_managed_pid does not signal a process whose start time differs, as after PID reuse [LB-10 installer]",
+        "proc_alive tells the recorded process from a reused PID [LB-10 installer]",
+        "proc_alive counts a zombie as gone, so a stop does not wait on a process whose parent never reaps it [LB-10 installer]",
+        "detect_management_mode reports none while only look-alikes run [LB-10 installer]",
+        "detect_management_mode reports manual for the exact-identity process among look-alikes [LB-10 installer]",
+        "detect_management_mode reports stream-manager when the manager's PID file names the verified process [LB-10 installer]",
+        "detect_management_mode ignores a PID file that names a look-alike [LB-10 installer]",
+        "detect_management_mode takes systemd unit state first [LB-10 installer]",
+        "stop_mediamtx (manual) signals only the exact-identity process and no name-based tool runs [LB-10 installer]",
+        "stop_mediamtx sends SIGKILL to the exact-identity process that ignores SIGTERM, after a bounded wait [LB-10 installer]",
+        "stop_mediamtx (stream-manager) stops through the manager and leaves FFmpeg and look-alikes alone [LB-10 installer]",
+        "stop_mediamtx (stream-manager) falls back to the verified process only, never to FFmpeg, when the manager's stop fails [LB-10 installer]",
+        "stop_mediamtx (stream-manager) without a stream manager script stops only the verified process [LB-10 installer]",
+        "stop_mediamtx (systemd) stops through systemctl and signals nothing when the unit owns the process [LB-10 installer]",
+        "stop_mediamtx (systemd) goes on when systemctl reports a failure but the unit is no longer active [LB-10 installer]",
+        "stop_mediamtx with nothing running returns at once and signals nothing [LB-10 installer]",
+        "stop_mediamtx (stream-manager-service) stops the stream manager unit through systemctl [LB-10 installer]",
+        "stop_mediamtx fails without signalling anything when systemd cannot stop an active unit [LB-10 installer]",
+        "start_mediamtx and execute_rollback restart through the owner and signal nothing [LB-10 installer]",
+        "verify_service_started does not accept a look-alike named mediamtx as the installed MediaMTX [LB-10 installer]",
+        "verify_service_started accepts the exact-identity process [LB-10 installer]",
+        "verify_service_started follows the stream manager unit's state [LB-10 installer]",
+        "update_mediamtx leaves the installed binary alone and stops when MediaMTX cannot be stopped [LB-10 installer]",
+        "uninstall_mediamtx removes nothing and stops when MediaMTX cannot be stopped [LB-10 installer]",
+        "show_status says so when a non-root run cannot identify a MediaMTX started outside systemd [LB-10 installer]",
+        "install_mediamtx.sh has no name- or pattern-based process control [LB-10 installer]",
+        "start is idempotent against a real MediaMTX and real FFmpeg, a dead wrapper is reconciled, stop leaves nothing and another owner is refused [LB-01, LB-02, LB-10]"
+      ]
     },
     {
       "id": "LB-11",
@@ -680,16 +737,32 @@
       "title": "FFmpeg logs deleted on every start",
       "severity": "P3",
       "phase": 3,
-      "status": "open",
-      "tests": []
+      "status": "fixed",
+      "tests": [
+        "help documents FFMPEG_LOG_KEEP and that no command deletes the logs [X-25]",
+        "rotate_ffmpeg_log keeps the logs of the last FFMPEG_LOG_KEEP runs and removes older ones [X-25]",
+        "rotate_ffmpeg_log removes archives beyond a lowered limit, skips an empty log and discards the old run at limit 0 [X-25]",
+        "FFMPEG_LOG_KEEP falls back to 3 when it is not a number and is capped at 20 [X-25]",
+        "cleanup_stale_processes keeps the FFmpeg logs of the run it cleans up [X-25]",
+        "stop_mediamtx keeps the FFmpeg logs of the run it stops [X-25]",
+        "force_stop_mediamtx keeps the FFmpeg logs [X-25]",
+        "starting a stream rotates the log of its previous run instead of deleting it [X-25]"
+      ]
     },
     {
       "id": "X-26",
       "title": "read_pid_safe comm allowlist deletes live PID files",
       "severity": "P3",
       "phase": 3,
-      "status": "open",
-      "tests": []
+      "status": "fixed",
+      "tests": [
+        "read_pid_safe keeps the PID file of a live process whose binary is not mediamtx, bash or ffmpeg [X-26]",
+        "read_pid_safe drops the PID file and the start-time record of a dead process [X-26]",
+        "read_pid_safe treats a PID with another start time as recycled and does not signal the process now using it [X-26]",
+        "read_pid_safe accepts a PID file written without a start-time record (older versions) while the process lives [X-26]",
+        "write_pid_atomic keeps the PID file a plain PID and records the start time beside it [X-26, D11]",
+        "an unreadable /proc entry (a run without root) is 'unknown', not 'dead': the PID file is kept and nothing is signalled [X-26]"
+      ]
     },
     {
       "id": "X-27",
