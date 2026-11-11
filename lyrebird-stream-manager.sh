@@ -1071,6 +1071,10 @@ terminate_process_group() {
 #     place with "<pid> <starttime>" (starttime = field 22 of /proc/<pid>/stat).
 #     The record is informational: it is what a refused process shows the
 #     operator. It is never used to decide whether the lock is held.
+#   - A flock belongs to an open file description, which a child inherits. A
+#     long-lived child that inherits the descriptor would keep the lock held
+#     after this process exits, so every such child is started through
+#     spawn_detached.
 
 # Print the start time (clock ticks since boot, field 22 of /proc/<pid>/stat)
 # of a process. PID plus start time identify one process for the life of the
@@ -1299,6 +1303,34 @@ acquire_config_lock() {
     fi
     CONFIG_LOCK_FD=${LOCK_OPENED_FD}
     return 0
+}
+
+# Run a long-lived child (MediaMTX, a per-stream wrapper) without any of this
+# shell's file descriptors above stderr: a child that inherited a lock
+# descriptor would keep the lock held after this process exited. The same goes
+# for a lock descriptor inherited from a parent, e.g. the monitor lock that
+# `flock FILE -c ...` leaves open in everything it starts.
+#
+# Use it as a background command; it replaces the forked subshell with the
+# command, so $! is the PID of the command itself:
+#   spawn_detached nohup setsid some-command args >>log 2>&1 &
+# Called in the foreground it would replace this very process, so it refuses.
+spawn_detached() {
+    if [[ "${BASHPID}" == "$$" ]]; then
+        log ERROR "spawn_detached must run as a background command"
+        return 1
+    fi
+    local entry fd
+    for entry in /proc/self/fd/*; do
+        fd="${entry##*/}"
+        [[ "$fd" =~ ^[0-9]+$ ]] || continue
+        # 0-2 are the child's stdio; 255 is bash's own script descriptor, which
+        # is close-on-exec
+        if [[ $fd -gt 2 && $fd -ne 255 ]]; then
+            exec {fd}>&- || true
+        fi
+    done
+    exec "$@"
 }
 
 # Check if running as root
@@ -4107,9 +4139,9 @@ WRAPPER_LOGIC
     # Start wrapper with process group using setsid if available
     log DEBUG "Starting multiplex wrapper script: $wrapper_script"
     if command_exists setsid; then
-        nohup setsid bash "$wrapper_script" >/dev/null 2>&1 &
+        spawn_detached nohup setsid bash "$wrapper_script" >/dev/null 2>&1 &
     else
-        nohup bash "$wrapper_script" >/dev/null 2>&1 &
+        spawn_detached nohup bash "$wrapper_script" >/dev/null 2>&1 &
     fi
 
     local wrapper_pid=$!
@@ -4531,9 +4563,9 @@ WRAPPER_LOGIC
     # Start wrapper with process group using setsid if available
     log DEBUG "Starting wrapper script: $wrapper_script"
     if command_exists setsid; then
-        nohup setsid bash "$wrapper_script" >/dev/null 2>&1 &
+        spawn_detached nohup setsid bash "$wrapper_script" >/dev/null 2>&1 &
     else
-        nohup bash "$wrapper_script" >/dev/null 2>&1 &
+        spawn_detached nohup bash "$wrapper_script" >/dev/null 2>&1 &
     fi
     local pid=$!
 
@@ -4885,9 +4917,9 @@ start_mediamtx() {
 
     # Start MediaMTX with process group
     if command_exists setsid; then
-        nohup setsid "${MEDIAMTX_BIN}" "${CONFIG_FILE}" >>"${MEDIAMTX_LOG_FILE}" 2>&1 &
+        spawn_detached nohup setsid "${MEDIAMTX_BIN}" "${CONFIG_FILE}" >>"${MEDIAMTX_LOG_FILE}" 2>&1 &
     else
-        nohup "${MEDIAMTX_BIN}" "${CONFIG_FILE}" >>"${MEDIAMTX_LOG_FILE}" 2>&1 &
+        spawn_detached nohup "${MEDIAMTX_BIN}" "${CONFIG_FILE}" >>"${MEDIAMTX_LOG_FILE}" 2>&1 &
     fi
     local pid=$!
 

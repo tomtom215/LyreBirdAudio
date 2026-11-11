@@ -726,3 +726,190 @@ _force_stop_fixture() {
     [[ "$(_record "$LK/cfg/.config.lock")" =~ ^[0-9]+\ [0-9]+\ *$ ]]
     _wait_gone "$HOLDER_PID"
 }
+
+# ---------------------------------------------------------------------------
+# No long-lived child holds a lock descriptor (X-02)
+# ---------------------------------------------------------------------------
+
+# Descriptors of process $1 that refer to file $2 (the lock file)
+_fds_on() {
+    local pid="$1" target="$2" fd out=""
+    for fd in /proc/"$pid"/fd/*; do
+        [[ "$fd" -ef "$target" ]] && out+="${fd##*/} "
+    done
+    printf '%s' "$out"
+}
+
+@test "spawn_detached starts the command itself with no descriptor above stderr, even an inherited one [X-02]" {
+    run bash "$ROLE" eval '
+        acquire_lock 1
+        acquire_config_lock 1
+        # a descriptor inherited from a parent, like the monitor lock of `flock FILE -c`
+        exec {inherited}<>"$LB_IDLE_FIFO"
+        spawn_detached nohup setsid sleep 30 >/dev/null 2>&1 &
+        child=$!
+        sleep 0.3
+        printf "comm=%s\n" "$(cat /proc/$child/comm)"
+        printf "fds=%s\n" "$(ls /proc/$child/fd | tr "\n" " ")"
+        kill "$child"'
+    [ "$status" -eq 0 ]
+    # $! is the command's own PID (the subshell was replaced by it) ...
+    [[ "$output" == *"comm=sleep"* ]]
+    # ... and only stdin, stdout and stderr are open in it
+    [[ "$output" == *"fds=0 1 2 "* ]]
+}
+
+@test "spawn_detached refuses to run in the foreground, where it would replace the manager itself [X-02]" {
+    run bash "$ROLE" eval 'rc=0; spawn_detached true || rc=$?; echo "still running rc=$rc"'
+    [[ "$output" == *"still running rc=1" ]]
+}
+
+@test "every nohup launch in the script goes through spawn_detached [X-02]" {
+    run bash -c 'grep -nE "(^|[^_[:alnum:]])nohup " "$1" | grep -vE "spawn_detached nohup|^[0-9]+:[[:space:]]*#"' _ "$PROJECT_ROOT/lyrebird-stream-manager.sh"
+    # what is printed is a launch that bypasses the helper: there must be none
+    [ -z "$output" ]
+}
+
+# A MediaMTX stand-in the real start_mediamtx can launch. It names itself
+# "mediamtx" (the process-identity check accepts that comm) and, unlike a
+# background bash script, dies on SIGINT, which is how stop_mediamtx asks.
+_write_mediamtx_stub() {
+    mkdir -p "$LK/stub"
+    cat >"$LK/stub/mediamtx" <<'STUB_EOF'
+#!/bin/bash
+[[ "${1:-}" == --version ]] && { echo v1.21.1; exit 0; }
+exec python3 -I -c 'import ctypes, signal, time
+ctypes.CDLL(None).prctl(15, b"mediamtx", 0, 0, 0)
+signal.signal(signal.SIGINT, signal.SIG_DFL)
+time.sleep(300)'
+STUB_EOF
+    chmod +x "$LK/stub/mediamtx"
+    export MEDIAMTX_BINARY="$LK/stub/mediamtx"
+}
+
+# Hardware-only seams: no USB device and no stream publishing. Everything else
+# (the lock, the config generation, the launch itself) is the real function.
+_SEAMS='
+detect_audio_devices() { echo "testmic:1"; }
+wait_for_usb_stabilization() { return 0; }
+start_all_ffmpeg_streams() { :; }
+validate_stream() { return 0; }
+check_audio_device() { return 0; }
+'
+
+# The generated wrapper checks /dev/snd/pcmC<N>D0c, which a machine without
+# sound hardware (CI) does not have, and drives a real ffmpeg. For the tests of
+# the wrapper launch sites only, `bash` on PATH is a shim that runs the wrapper
+# the manager generated with those two hardware dependencies pointed at stand-
+# ins (an existing path, and a stub ffmpeg that just waits). The launch itself,
+# the wrapper text and the lock are the real ones.
+_use_wrapper_hardware_stand_ins() {
+    mkdir -p "$LK/wrapbin"
+    cat >"$LK/wrapbin/bash" <<'SHIM_EOF'
+#!/bin/bash
+if [[ "${1:-}" == "$LB_DIR/ff/"*.sh ]]; then
+    script="$1"
+    shift
+    sed -e 's#/dev/snd/pcmC${card_num}D0c#/dev/null#' \
+        -e 's#/dev/snd/pcmC${CARD_NUM}D0c#/dev/null#' \
+        -e 's#export PATH="/usr/local/sbin#export PATH="'"$LB_DIR"'/bin:/usr/local/sbin#' \
+        "$script" >"${script%.sh}.standin"
+    exec /bin/bash "${script%.sh}.standin" "$@"
+fi
+exec /bin/bash "$@"
+SHIM_EOF
+    printf '#!/bin/bash\nexec sleep 600\n' >"$LK/bin/ffmpeg"
+    chmod +x "$LK/wrapbin/bash" "$LK/bin/ffmpeg"
+    export PATH="$LK/wrapbin:$PATH"
+}
+
+# PIDs of every descendant of $1
+_descendants() {
+    local parent="$1" pid ppid
+    while read -r pid ppid; do
+        if [[ "$ppid" == "$parent" ]]; then
+            printf '%s\n' "$pid"
+            _descendants "$pid"
+        fi
+    done < <(ps -eo pid=,ppid=)
+}
+
+# The launcher runs CODE (a real start_* function), reports the child's PID
+# through LB_READY, then keeps holding the lock until LB_STOP appears.
+# Sets CHILD_PID and LAUNCHER_PID.
+_start_launcher() {
+    local code="$1" pidfile="$2"
+    rm -f "$LB_READY" "$LB_STOP"
+    _role_bg bash eval "$_SEAMS
+$code
+read -r child <\"$pidfile\"
+printf '%s\n' \"\$child\" >\"\$LB_READY\"
+until [[ -e \"\$LB_STOP\" ]]; do idle 0.05; done"
+    LAUNCHER_PID="${BG_PIDS[${#BG_PIDS[@]} - 1]}"
+    _wait_nonempty "$LB_READY" 30
+    CHILD_PID="$(<"$LB_READY")"
+    [[ "$CHILD_PID" =~ ^[0-9]+$ ]]
+    EXTRA_PIDS+=("$CHILD_PID")
+}
+
+# The child is running, holds no lock file, and the lock is free once the
+# launcher has gone (the old code left it held by the child)
+_assert_child_holds_no_lock() {
+    local w
+    _witness "$MEDIAMTX_LOCK_FILE"
+    w=$WITNESS_FD
+    kill -0 "$CHILD_PID"
+    local pid
+    for pid in "$CHILD_PID" $(_descendants "$CHILD_PID"); do
+        EXTRA_PIDS+=("$pid")
+        [ "$(_fds_on "$pid" "$MEDIAMTX_LOCK_FILE")" = "" ]
+        [ "$(_fds_on "$pid" "$LK/cfg/.config.lock")" = "" ]
+    done
+
+    # the launcher itself still holds the lock, so the test means something
+    run _role bash try 1
+    [[ "$output" == *"rc=1"* ]]
+
+    : >"$LB_STOP"
+    _wait_gone "$LAUNCHER_PID"
+    kill -0 "$CHILD_PID"
+    run _role bash try 3
+    [[ "$output" == *"rc=0"* ]]
+    # and no unlink/re-create cycle happened on the way
+    _same_file "$w" "$MEDIAMTX_LOCK_FILE"
+}
+
+@test "the MediaMTX child holds no lock descriptor, so the lock is free once the launcher exits [X-02]" {
+    _write_mediamtx_stub
+    _start_launcher 'start_mediamtx >/dev/null || exit 9' "$MEDIAMTX_PID_FILE"
+    _assert_child_holds_no_lock
+}
+
+@test "a multiplex wrapper and its ffmpeg hold no lock descriptor, so the lock is free once the launcher exits [X-02]" {
+    _use_wrapper_hardware_stand_ins
+    _start_launcher 'acquire_lock 5 && start_ffmpeg_multiplex_stream testmic:1 testmic:2 >/dev/null || exit 9' "$LK/ff/all_mics.pid"
+    _assert_child_holds_no_lock
+}
+
+@test "a per-stream wrapper and its ffmpeg hold no lock descriptor, so the lock is free once the launcher exits [X-02]" {
+    _use_wrapper_hardware_stand_ins
+    export STREAM_STARTUP_DELAY=0
+    _start_launcher 'acquire_lock 5 && start_ffmpeg_stream testmic 1 testmic >/dev/null || exit 9' "$LK/ff/testmic.pid"
+    _assert_child_holds_no_lock
+}
+
+@test "stop after start in one process does not wait for a lock its own child kept alive [X-02]" {
+    _write_mediamtx_stub
+    run bash "$ROLE" eval "$_SEAMS"'
+        start_mediamtx >/dev/null || exit 9
+        mtx=$(<"$MEDIAMTX_PID_FILE")
+        rc=0
+        stop_mediamtx || rc=$?
+        alive=no
+        kill -0 "$mtx" 2>/dev/null && alive=yes
+        printf "stop rc=%s mediamtx-alive=%s\n" "$rc" "$alive"'
+    [[ "$output" == *"stop rc=0 mediamtx-alive=no"* ]]
+    # The old code waited out 5 s for the lock its own child kept alive and
+    # then went ahead without it
+    ! grep -q 'Could not acquire lock\|Failed to acquire lock\|Refusing to stop' "$MEDIAMTX_LOG_FILE" || false
+}
