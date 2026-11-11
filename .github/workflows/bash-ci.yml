@@ -576,8 +576,9 @@ jobs:
 
       - name: Install bats
         run: |
+          # jq and python3-yaml: tests/test_ci_config.bats reads the workflows
           sudo apt-get update -qq
-          sudo apt-get install -y -qq bats
+          sudo apt-get install -y -qq bats jq python3-yaml
 
       - name: Run bats test suite
         run: |
@@ -597,11 +598,26 @@ jobs:
 
   # ===========================================================================
   # Job 7b: Live tests against real MediaMTX releases (checksum-pinned)
+  #
+  # One job per version, in parallel, so a failure names its version in the
+  # job list ("Live MediaMTX v1.19.0") instead of hiding in one long run.
+  # Every version here needs a sha256 pin in tests/fetch_mediamtx.sh and vice
+  # versa (tests/test_ci_config.bats checks both).
   # ===========================================================================
   live-mediamtx:
-    name: Live MediaMTX Tests
+    name: Live MediaMTX ${{ matrix.version }}
     runs-on: ubuntu-latest
     needs: discover-scripts
+    strategy:
+      fail-fast: false
+      matrix:
+        version:
+          - v1.15.0
+          - v1.18.0
+          - v1.19.0
+          - v1.21.1
+          - v1.21.2
+          - v1.21.3
     steps:
       - name: Checkout code
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
@@ -611,11 +627,48 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq bats ffmpeg jq curl
 
-      - name: Run live tests (MediaMTX 1.15.0, 1.18.0, 1.19.0, 1.21.1)
+      - name: Run live tests for one MediaMTX version
+        env:
+          MEDIAMTX_VERSION: ${{ matrix.version }}
         run: |
           export TMPDIR="${RUNNER_TEMP:-/tmp}"
-          LYREBIRD_TEST_MEDIAMTX_BINS="$(tests/fetch_mediamtx.sh "$RUNNER_TEMP/mediamtx")"
+          LYREBIRD_TEST_MEDIAMTX_BINS="$(tests/fetch_mediamtx.sh "$RUNNER_TEMP/mediamtx" "$MEDIAMTX_VERSION")"
           export LYREBIRD_TEST_MEDIAMTX_BINS
+          tests/check_tmp_leaks.sh --print-output-on-failure --timing \
+            tests/test_mediamtx_live.bats tests/test_soak_live.bats tests/test_soak_observer.bats
+
+  # ===========================================================================
+  # Job 7c: Canary against the newest upstream MediaMTX release
+  #
+  # ADVISORY, NON-BLOCKING: `continue-on-error`, and deliberately not in the
+  # summary job's needs. It resolves the newest stable upstream release at run
+  # time, verifies the tarball against the checksums.sha256 published with
+  # that release, and runs the same live tests, so a release that breaks the
+  # generated config shows up here before it is pinned above. It does not run
+  # for tag pushes (release validation).
+  # ===========================================================================
+  live-mediamtx-canary:
+    name: Live MediaMTX newest upstream (advisory, non-blocking)
+    runs-on: ubuntu-latest
+    needs: discover-scripts
+    continue-on-error: true
+    if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq bats ffmpeg jq curl
+
+      - name: Run live tests against the newest upstream release
+        run: |
+          export TMPDIR="${RUNNER_TEMP:-/tmp}"
+          LYREBIRD_TEST_MEDIAMTX_BINS="$(tests/fetch_mediamtx.sh "$RUNNER_TEMP/mediamtx" latest)"
+          export LYREBIRD_TEST_MEDIAMTX_BINS
+          version="$(basename "$(dirname "$LYREBIRD_TEST_MEDIAMTX_BINS")")"
+          echo "Canary (advisory): MediaMTX ${version}, newest upstream release" >> "$GITHUB_STEP_SUMMARY"
           tests/check_tmp_leaks.sh --print-output-on-failure --timing \
             tests/test_mediamtx_live.bats tests/test_soak_live.bats tests/test_soak_observer.bats
 

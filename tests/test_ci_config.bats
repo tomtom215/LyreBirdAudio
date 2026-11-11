@@ -541,6 +541,105 @@ check_installer() {
 }
 
 # ---------------------------------------------------------------------------
+# Live MediaMTX: one blocking job per pinned version, plus an advisory canary.
+# ---------------------------------------------------------------------------
+
+# pinned_versions: the versions tests/fetch_mediamtx.sh holds a sha256 for.
+pinned_versions() {
+    sed -nE 's/^[[:space:]]+\["(v[0-9]+\.[0-9]+\.[0-9]+)"\]=[0-9a-f]{64}$/\1/p' "$FETCH" | sort -V
+}
+
+@test "every version in the live matrix has a sha256 pin in fetch_mediamtx.sh, and every pin is in the matrix" {
+    load_wf bash-ci
+    local matrix pins v
+    matrix="$(jq -r '.jobs["live-mediamtx"].strategy.matrix.version[]' <<<"$WF" | sort -V)"
+    pins="$(pinned_versions)"
+    [ -n "$matrix" ]
+    for v in $matrix; do
+        grep -qE "^[[:space:]]+\[\"$v\"\]=[0-9a-f]{64}\$" "$FETCH" || {
+            echo "matrix version $v has no sha256 pin in fetch_mediamtx.sh"
+            return 1
+        }
+    done
+    [ "$matrix" = "$pins" ] || {
+        printf 'matrix:\n%s\npins:\n%s\n' "$matrix" "$pins"
+        return 1
+    }
+}
+
+@test "the live matrix runs v1.21.2 and v1.21.3, each version as its own job that fails on its own" {
+    load_wf bash-ci
+    run jq -e '
+        .jobs["live-mediamtx"] as $j
+        | ($j.strategy.matrix.version | index("v1.21.2") != null and index("v1.21.3") != null)
+        and ($j.strategy["fail-fast"] == false)
+        and ($j.name | contains("${{ matrix.version }}"))
+        and ($j["continue-on-error"] != true)' <<<"$WF"
+    [ "$status" -eq 0 ]
+}
+
+@test "bash-ci live step fetches exactly the matrix version and fails when its tests fail" {
+    load_wf bash-ci
+    mkdir -p "$TEST_SCRATCH/repo/tests" "$TEST_SCRATCH/runner"
+    cat >"$TEST_SCRATCH/repo/tests/fetch_mediamtx.sh" <<'SH'
+#!/bin/bash
+echo "fetch $*" >>"$FAKE_LOG"
+echo "$1/$2/mediamtx"
+SH
+    cat >"$TEST_SCRATCH/repo/tests/check_tmp_leaks.sh" <<'SH'
+#!/bin/bash
+echo "tests bins=$LYREBIRD_TEST_MEDIAMTX_BINS args=$*" >>"$FAKE_LOG"
+exit "${FAKE_TEST_STATUS:-0}"
+SH
+    chmod +x "$TEST_SCRATCH"/repo/tests/*.sh
+    cd "$TEST_SCRATCH/repo"
+    run_step live-mediamtx "Run live tests for one MediaMTX version" \
+        MEDIAMTX_VERSION=v1.21.3 RUNNER_TEMP="$TEST_SCRATCH/runner" FAKE_LOG="$TEST_SCRATCH/log"
+    [ "$status" -eq 0 ]
+    grep -qxF "fetch $TEST_SCRATCH/runner/mediamtx v1.21.3" "$TEST_SCRATCH/log"
+    grep -qF "bins=$TEST_SCRATCH/runner/mediamtx/v1.21.3/mediamtx " "$TEST_SCRATCH/log"
+    grep -qF 'tests/test_mediamtx_live.bats tests/test_soak_live.bats tests/test_soak_observer.bats' "$TEST_SCRATCH/log"
+
+    run_step live-mediamtx "Run live tests for one MediaMTX version" \
+        MEDIAMTX_VERSION=v1.19.0 RUNNER_TEMP="$TEST_SCRATCH/runner" FAKE_LOG="$TEST_SCRATCH/log" FAKE_TEST_STATUS=1
+    [ "$status" -ne 0 ]
+}
+
+@test "the canary is advisory: continue-on-error, labelled non-blocking, outside the summary, skipped for tags" {
+    load_wf bash-ci
+    run jq -e '
+        .jobs["live-mediamtx-canary"] as $c
+        | ($c["continue-on-error"] == true)
+        and ($c.name | test("advisory") and test("non-blocking"))
+        and (.jobs.summary.needs | index("live-mediamtx-canary") == null)
+        and ($c["if"] | contains("startsWith(github.ref, '"'"'refs/tags/'"'"')"))
+        and ([.jobs | to_entries[] | select(.value["continue-on-error"] == true) | .key] == ["live-mediamtx-canary"])' <<<"$WF"
+    [ "$status" -eq 0 ]
+}
+
+@test "the canary resolves and verifies the newest upstream release and runs the same live tests" {
+    load_wf bash-ci
+    mkdir -p "$TEST_SCRATCH/repo/tests" "$TEST_SCRATCH/runner"
+    cat >"$TEST_SCRATCH/repo/tests/fetch_mediamtx.sh" <<'SH'
+#!/bin/bash
+echo "fetch $*" >>"$FAKE_LOG"
+echo "$1/v9.9.9/mediamtx"
+SH
+    cat >"$TEST_SCRATCH/repo/tests/check_tmp_leaks.sh" <<'SH'
+#!/bin/bash
+echo "tests bins=$LYREBIRD_TEST_MEDIAMTX_BINS args=$*" >>"$FAKE_LOG"
+SH
+    chmod +x "$TEST_SCRATCH"/repo/tests/*.sh
+    cd "$TEST_SCRATCH/repo"
+    run_step live-mediamtx-canary "Run live tests against the newest upstream release" \
+        RUNNER_TEMP="$TEST_SCRATCH/runner" FAKE_LOG="$TEST_SCRATCH/log" GITHUB_STEP_SUMMARY="$TEST_SCRATCH/summary.md"
+    [ "$status" -eq 0 ]
+    grep -qxF "fetch $TEST_SCRATCH/runner/mediamtx latest" "$TEST_SCRATCH/log"
+    grep -qF 'tests/test_mediamtx_live.bats tests/test_soak_live.bats tests/test_soak_observer.bats' "$TEST_SCRATCH/log"
+    grep -qF 'MediaMTX v9.9.9' "$TEST_SCRATCH/summary.md"
+}
+
+# ---------------------------------------------------------------------------
 # Required checks: the summary job gates on every job, and the format and
 # style linters block.
 # ---------------------------------------------------------------------------
