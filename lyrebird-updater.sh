@@ -2228,6 +2228,18 @@ transaction_handoff() {
     transaction_reset_state
 }
 
+# The transaction's stash may have been created without its hash being recorded
+# yet: the updater was stopped (SIGTERM, SIGINT, or killed and recovered later)
+# between `git stash push` and the next line. The stash message was written to
+# the journal before the push, so the entry can still be found by it.
+adopt_transaction_stash() {
+    local found
+    if [[ -z "${TRANSACTION_STATE[stash_hash]}" && -n "${TRANSACTION_STATE[stash_message]}" ]]; then
+        found="$(git stash list --format='%H %gs' 2>/dev/null | awk -v m="${TRANSACTION_STATE[stash_message]}" 'index($0, m) {print $1; exit}')" || found=""
+        TRANSACTION_STATE[stash_hash]="$found"
+    fi
+}
+
 # After a checkout, confirm the files on disk are the target's. git can report
 # success after a write error on a single file (it prints "unable to write
 # file X", leaves X truncated and exits 0), so for every file the switch added
@@ -2436,6 +2448,7 @@ transaction_rollback() {
     fi
 
     # Restore stashed changes if any -- only onto the original version again
+    adopt_transaction_stash
     if [[ -n "${TRANSACTION_STATE[stash_hash]}" ]]; then
         log_debug "Restoring saved changes: ${TRANSACTION_STATE[stash_hash]}"
 
@@ -2620,7 +2633,7 @@ recover_handoff() {
 # the transaction was; git decides how far it got. Returns 0 when nothing was
 # pending or it was rolled back, E_ROLLBACK_FAILED / E_BAD_STATE when not.
 recover_interrupted_transaction() {
-    local rc=0 key found=""
+    local rc=0 key
     journal_load || rc=$?
     if [[ $rc -eq 1 ]]; then
         return 0
@@ -2651,12 +2664,7 @@ recover_interrupted_transaction() {
     if [[ "$(git rev-parse HEAD 2>/dev/null || true)" != "${JOURNAL[original_head]:-}" ]]; then
         TRANSACTION_STATE[head_changed]=true
     fi
-    # killed between creating the stash and recording it: find it by its message
-    if [[ -z "${TRANSACTION_STATE[stash_hash]}" && -n "${TRANSACTION_STATE[stash_message]}" ]]; then
-        found="$(git stash list --format='%H %gs' 2>/dev/null | awk -v m="${TRANSACTION_STATE[stash_message]}" 'index($0, m) {print $1; exit}')" || found=""
-        TRANSACTION_STATE[stash_hash]="$found"
-    fi
-
+    # (a stash created but not recorded before the kill is found by its message in transaction_rollback)
     if transaction_rollback "interrupted run recovered at phase ${JOURNAL[phase]}"; then
         log_success "The interrupted ${JOURNAL[kind]:-update} was rolled back."
         return 0

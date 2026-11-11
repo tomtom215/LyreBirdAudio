@@ -358,6 +358,33 @@ _updater_vars() {
     git -C "$REPO" stash show -p 'stash@{0}' | grep -q "config LOCAL EDIT"
 }
 
+@test "SIGTERM right after the local changes were saved restores them and leaves the version alone" {
+    updater_checkout v1.1.0
+    echo "precious edit" >>"$REPO/config.txt"
+    updater_inject stash-push after TERM
+    updater_stdin 3 v1.2.0 y
+    updater_run
+    [ "$status" -eq 9 ]
+    [ "$(updater_head)" = "v1.1.0" ]
+    grep -qx "precious edit" "$REPO/config.txt"
+    [ -z "$(git -C "$REPO" stash list)" ]
+    [ ! -e "$REPO/.git/lyrebird-updater/transaction" ]
+}
+
+@test "SIGINT just before the saved changes are restored rolls the update back and restores them" {
+    updater_checkout v1.1.0
+    echo "precious edit" >>"$REPO/config.txt"
+    updater_inject stash-pop before INT
+    updater_stdin 3 v1.2.0 y
+    updater_run
+    [ "$status" -eq 9 ]
+    [ "$(updater_head)" = "v1.1.0" ]
+    grep -qx "precious edit" "$REPO/config.txt"
+    [ ! -e "$REPO/added-in-1.2.0.txt" ]
+    [ -z "$(git -C "$REPO" stash list)" ]
+    grep -q 'interrupted by SIGINT' "$REPO/.git/lyrebird-updater/history.log"
+}
+
 @test "a checkout that reports success after a write error is caught and rolled back" {
     updater_checkout v1.1.0
     updater_make_big_tag
