@@ -145,12 +145,14 @@ _age() { touch -d "${2:-45 days ago}" "$1"; }
     echo data >"$ST_TEMP/lyrebird-stuck.tmp"
     echo data >"$ST_BUF/stuck.opus"
     echo data >"$ST_BUF/audio_000.opus"
+    _age "$ST_BUF/stuck.opus" "2 hours ago"          # idle: not an open segment
+    _age "$ST_BUF/audio_000.opus" "2 hours ago"
 
     run storage_run cmd_emergency
     [ "$status" -eq 3 ]
     [[ "$output" == *"Cannot delete rotated log"*"stuck.log.1.gz"* ]]
     [[ "$output" == *"Cannot delete temp"*"lyrebird-stuck.tmp"* ]]
-    [[ "$output" == *"Cannot clear buffer directory"* ]]
+    [[ "$output" == *"Cannot delete emergency buffer file"*"stuck.opus"* ]]
     [ -f "$ST_LOGS/stuck.log.1.gz" ]
     [ -f "$ST_BUF/stuck.opus" ]
 }

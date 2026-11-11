@@ -624,13 +624,13 @@ emergency_cleanup() {
         fi
     fi
 
-    # Delete rotated logs, temp files, and buffer contents.
+    # Delete rotated logs and temp files.
     # These must honour DRY_RUN (a "preview" must not delete anything), and the
     # *.gz sweep must be tightly scoped: MEDIAMTX_LOG_DIR is typically /var/log,
     # so a bare `find "$MEDIAMTX_LOG_DIR" -name '*.gz' -delete` would wipe every
     # rotated SYSTEM log (syslog, auth.log, journal exports) during an incident.
     if [[ "$DRY_RUN" == "true" ]]; then
-        log_info "[DRY RUN] Would delete rotated LyreBird/MediaMTX logs, LyreBird temp files, and buffer contents"
+        log_info "[DRY RUN] Would delete rotated LyreBird/MediaMTX logs and LyreBird temp files"
     else
         _sweep_reset
         if [[ -d "$LOG_DIR" ]]; then
@@ -641,14 +641,21 @@ emergency_cleanup() {
         # Clear LyreBird temp files
         _sweep "temp" < <(find "$TEMP_DIR" -maxdepth 1 -name "lyrebird-*" -type f -print0 2>/dev/null)
         log_info "Emergency: Deleted $SWEEP_DELETED rotated log/temp file(s)$(_failed_suffix "$SWEEP_FAILED")"
+    fi
 
-        # Clear buffer directory (with safety validation)
-        if [[ -d "$BUFFER_DIR" ]] && validate_safe_path "$BUFFER_DIR"; then
-            local err
-            if ! err=$(rm -rf -- "${BUFFER_DIR:?}"/* 2>&1); then
-                ((++DELETE_FAILURES))
-                log_error "Cannot clear buffer directory ${BUFFER_DIR}: ${err:-rm failed}"
-            fi
+    # Clear the segment ring buffer (with safety validation): its files, never
+    # its directories. The recorder creates "$BUFFER_DIR/<stream>" once, when the
+    # stream starts, and FFmpeg's segment muxer cannot recreate it: with the
+    # directory gone the tee drops its recording leg at the next segment
+    # ("Failed to open segment ... No such file or directory, continuing with
+    # 1/2 slaves"), so local recording silently stopped until that stream was
+    # restarted. Files written in the last ACTIVE_SEGMENT_SECONDS are the open
+    # segment and are left alone like everywhere else.
+    if [[ -d "$BUFFER_DIR" ]] && validate_safe_path "$BUFFER_DIR"; then
+        _evict_oldest_first "$BUFFER_DIR" 0 "emergency buffer file"
+        log_info "Emergency: Deleted $EVICT_DELETED buffer file(s)$(_failed_suffix "$EVICT_FAILED")"
+        if ((EVICT_PROTECTED > 0)); then
+            log_info "Emergency: Left $EVICT_PROTECTED buffer file(s) written in the last ${ACTIVE_SEGMENT_SECONDS}s alone (active streams)"
         fi
     fi
     return 0
