@@ -243,6 +243,30 @@ readonly LOG_FILE="${MEDIAMTX_LOG_FILE:-/var/log/lyrebird-stream-manager.log}"
 readonly MEDIAMTX_LOG_FILE="${MEDIAMTX_LOG_FILE:-/var/log/mediamtx.out}"
 readonly MEDIAMTX_BIN="${MEDIAMTX_BINARY:-/usr/local/bin/mediamtx}"
 readonly MEDIAMTX_HOST="${MEDIAMTX_HOST:-localhost}"
+
+# MediaMTX listener ports (D15, X-19). An invalid value is an error and never a
+# silent fallback to the default: a manager that publishes to the wrong port
+# looks like a healthy node that records nothing.
+_mediamtx_port_env() {
+    local name="$1" default="$2" value
+    value="${!name:-}"
+    if [[ -z "$value" ]]; then
+        printf '%s' "$default"
+        return 0
+    fi
+    if [[ "$value" =~ ^[0-9]{1,5}$ ]] && ((10#$value >= 1 && 10#$value <= 65535)); then
+        printf '%s' "$((10#$value))"
+        return 0
+    fi
+    printf '[ERROR] %s must be an integer from 1 to 65535 (got: %q)\n' "$name" "$value" >&2
+    return 1
+}
+MEDIAMTX_RTSP_PORT="$(_mediamtx_port_env MEDIAMTX_RTSP_PORT 8554)" || exit "${E_CONFIG_ERROR}"
+readonly MEDIAMTX_RTSP_PORT
+MEDIAMTX_API_PORT="$(_mediamtx_port_env MEDIAMTX_API_PORT 9997)" || exit "${E_CONFIG_ERROR}"
+readonly MEDIAMTX_API_PORT
+MEDIAMTX_METRICS_PORT="$(_mediamtx_port_env MEDIAMTX_METRICS_PORT 9998)" || exit "${E_CONFIG_ERROR}"
+readonly MEDIAMTX_METRICS_PORT
 # Note: These are NOT readonly to allow command-line option overrides
 STREAM_MODE="${STREAM_MODE:-individual}"
 MULTIPLEX_STREAM_NAME="${MULTIPLEX_STREAM_NAME:-all_mics}"
@@ -1723,12 +1747,27 @@ check_network_connectivity() {
     return 0
 }
 
+# RTSP base URL every publisher and reader of this node uses:
+# rtsp://MEDIAMTX_HOST:MEDIAMTX_RTSP_PORT
+mediamtx_rtsp_base() {
+    printf 'rtsp://%s:%s' "${MEDIAMTX_HOST}" "${MEDIAMTX_RTSP_PORT}"
+}
+
+# URL a publisher or reader of stream path $1 connects to
+rtsp_publish_url() {
+    printf '%s/%s' "$(mediamtx_rtsp_base)" "$1"
+}
+
+# Root URL of the MediaMTX control API: http://MEDIAMTX_HOST:MEDIAMTX_API_PORT
+mediamtx_api_root() {
+    printf 'http://%s:%s' "${MEDIAMTX_HOST}" "${MEDIAMTX_API_PORT}"
+}
+
 # Detect MediaMTX API version and return appropriate base URL
 # Tries v3, v2, v1 in order if auto-detection is enabled
 detect_mediamtx_api_version() {
-    local host="${MEDIAMTX_HOST:-localhost}"
-    local port="${MEDIAMTX_API_PORT:-9997}"
-    local base_url="http://${host}:${port}"
+    local base_url
+    base_url="$(mediamtx_api_root)"
 
     # If version is explicitly set, use it
     if [[ "${MEDIAMTX_API_VERSION}" != "auto" ]]; then
@@ -3336,7 +3375,8 @@ wait_for_mediamtx_ready() {
         if command_exists curl; then
             # v1.4.2: Try multiple API versions for compatibility
             for api_version in v3 v2 v1 ""; do
-                local test_url="http://${MEDIAMTX_HOST}:9997/${api_version:+$api_version/}paths/list"
+                local test_url
+                test_url="$(mediamtx_api_root)/${api_version:+$api_version/}paths/list"
                 if curl -s --max-time 2 "$test_url" >/dev/null 2>&1; then
                     log INFO "MediaMTX API is ready after ${elapsed} seconds (API: ${api_version:-legacy})"
                     return 0
@@ -3777,6 +3817,7 @@ LOG_FILE="$LOG_FILE"
 WRAPPER_PID_FILE="$pid_file"
 CLEANUP_MARKER="$CLEANUP_MARKER"
 MEDIAMTX_HOST="$MEDIAMTX_HOST"
+MEDIAMTX_RTSP_PORT="$MEDIAMTX_RTSP_PORT"
 
 # Restart configuration
 RESTART_COUNT=0
@@ -3951,7 +3992,7 @@ run_ffmpeg() {
     ffmpeg_cmd+=(
         -f rtsp
         -rtsp_transport tcp
-        "rtsp://${MEDIAMTX_HOST}:8554/${STREAM_PATH}"
+        "rtsp://${MEDIAMTX_HOST}:${MEDIAMTX_RTSP_PORT}/${STREAM_PATH}"
     )
     
     # Log the complete command for debugging
@@ -4238,6 +4279,7 @@ LOG_FILE="$LOG_FILE"
 WRAPPER_PID_FILE="$pid_file"
 CLEANUP_MARKER="$CLEANUP_MARKER"
 MEDIAMTX_HOST="$MEDIAMTX_HOST"
+MEDIAMTX_RTSP_PORT="$MEDIAMTX_RTSP_PORT"
 
 # Parent process tracking - use main script PID, not immediate parent
 MAIN_SCRIPT_PID="$$"
@@ -4381,7 +4423,7 @@ run_ffmpeg() {
         ffmpeg_cmd+=(
             -f tee
             -map 0:a
-            "[f=rtsp:rtsp_transport=tcp]rtsp://${MEDIAMTX_HOST}:8554/${STREAM_PATH}|[f=segment:segment_time=${AUDIO_RECORDING_SEGMENT_TIME}:segment_wrap=${AUDIO_RECORDING_SEGMENTS}:strftime=0]${AUDIO_RECORDING_PATH}/${STREAM_PATH}/audio_%03d.${CODEC}"
+            "[f=rtsp:rtsp_transport=tcp]rtsp://${MEDIAMTX_HOST}:${MEDIAMTX_RTSP_PORT}/${STREAM_PATH}|[f=segment:segment_time=${AUDIO_RECORDING_SEGMENT_TIME}:segment_wrap=${AUDIO_RECORDING_SEGMENTS}:strftime=0]${AUDIO_RECORDING_PATH}/${STREAM_PATH}/audio_%03d.${CODEC}"
         )
         log_message "Local recording enabled: ${AUDIO_RECORDING_PATH}/${STREAM_PATH} (${AUDIO_RECORDING_SEGMENTS} x ${AUDIO_RECORDING_SEGMENT_TIME}s segments)"
     else
@@ -4390,7 +4432,7 @@ run_ffmpeg() {
         ffmpeg_cmd+=(
             -f rtsp
             -rtsp_transport tcp
-            "rtsp://${MEDIAMTX_HOST}:8554/${STREAM_PATH}"
+            "rtsp://${MEDIAMTX_HOST}:${MEDIAMTX_RTSP_PORT}/${STREAM_PATH}"
         )
     fi
     
@@ -4757,20 +4799,20 @@ generate_mediamtx_config() {
     local _config_cleanup_needed=true
     trap 'if [[ "${_config_cleanup_needed:-}" == "true" ]]; then rm -f "$tmp_config" 2>/dev/null; release_config_lock_unsafe; fi' RETURN
 
-    cat >"$tmp_config" <<'EOF'
+    cat >"$tmp_config" <<EOF
 # MediaMTX Configuration - Audio Streams
 logLevel: info
 readTimeout: 30s
 writeTimeout: 30s
 
 api: yes
-apiAddress: :9997
+apiAddress: :${MEDIAMTX_API_PORT}
 
 metrics: yes
-metricsAddress: :9998
+metricsAddress: :${MEDIAMTX_METRICS_PORT}
 
 rtsp: yes
-rtspAddress: :8554
+rtspAddress: :${MEDIAMTX_RTSP_PORT}
 rtspTransports: [tcp, udp]
 
 rtmp: no
@@ -4894,14 +4936,14 @@ start_mediamtx() {
 
     # Check ports if lsof is available
     if command_exists lsof; then
-        for port in 8554 9997 9998; do
+        for port in "${MEDIAMTX_RTSP_PORT}" "${MEDIAMTX_API_PORT}" "${MEDIAMTX_METRICS_PORT}"; do
             if lsof -i ":$port" >/dev/null 2>&1; then
                 log ERROR "Port $port is already in use"
                 return 1
             fi
         done
     elif command_exists ss; then
-        for port in 8554 9997 9998; do
+        for port in "${MEDIAMTX_RTSP_PORT}" "${MEDIAMTX_API_PORT}" "${MEDIAMTX_METRICS_PORT}"; do
             if ss -tuln | grep -q ":$port "; then
                 log ERROR "Port $port appears to be in use"
                 return 1
@@ -4975,9 +5017,9 @@ start_mediamtx() {
         # In multiplex mode, validate the single multiplexed stream
         local stream_path="${MULTIPLEX_STREAM_NAME}"
         if validate_stream "$stream_path"; then
-            echo -e "${GREEN}[OK]${NC} rtsp://${MEDIAMTX_HOST}:8554/${stream_path} (multiplexed from ${#devices[@]} devices)"
+            echo -e "${GREEN}[OK]${NC} rtsp://${MEDIAMTX_HOST}:${MEDIAMTX_RTSP_PORT}/${stream_path} (multiplexed from ${#devices[@]} devices)"
         else
-            echo -e "${RED}[FAIL]${NC} rtsp://${MEDIAMTX_HOST}:8554/${stream_path} (failed)"
+            echo -e "${RED}[FAIL]${NC} rtsp://${MEDIAMTX_HOST}:${MEDIAMTX_RTSP_PORT}/${stream_path} (failed)"
         fi
     else
         # In individual mode, validate each device's stream
@@ -4987,9 +5029,9 @@ start_mediamtx() {
             stream_path="$(generate_stream_path "$device_name" "$card_num")"
 
             if validate_stream "$stream_path"; then
-                echo -e "${GREEN}[OK]${NC} rtsp://${MEDIAMTX_HOST}:8554/${stream_path}"
+                echo -e "${GREEN}[OK]${NC} rtsp://${MEDIAMTX_HOST}:${MEDIAMTX_RTSP_PORT}/${stream_path}"
             else
-                echo -e "${RED}[FAIL]${NC} rtsp://${MEDIAMTX_HOST}:8554/${stream_path} (failed)"
+                echo -e "${RED}[FAIL]${NC} rtsp://${MEDIAMTX_HOST}:${MEDIAMTX_RTSP_PORT}/${stream_path} (failed)"
             fi
         done
     fi
@@ -5136,7 +5178,7 @@ show_status() {
     if [[ "$is_multiplex_mode" == "true" ]]; then
         # Multiplex mode is active
         echo "Multiplex stream (combining ${#devices[@]} devices):"
-        echo "  Stream: rtsp://${MEDIAMTX_HOST}:8554/${MULTIPLEX_STREAM_NAME}"
+        echo "  Stream: rtsp://${MEDIAMTX_HOST}:${MEDIAMTX_RTSP_PORT}/${MULTIPLEX_STREAM_NAME}"
 
         local multiplex_pid
         multiplex_pid="$(read_pid_safe "$multiplex_pid_file")"
@@ -5169,7 +5211,7 @@ show_status() {
                 stream_path="$(generate_stream_path "$device_name" "$card_num")"
 
                 echo "  - $device_name (card $card_num)"
-                echo "    Stream: rtsp://${MEDIAMTX_HOST}:8554/$stream_path"
+                echo "    Stream: rtsp://${MEDIAMTX_HOST}:${MEDIAMTX_RTSP_PORT}/$stream_path"
 
                 local pid_file="${FFMPEG_PID_DIR}/${stream_path}.pid"
                 if [[ -f "$pid_file" ]]; then
@@ -5416,7 +5458,7 @@ Multiplex Mode Usage:
         # Or use default filter (amix)
         sudo ./lyrebird-stream-manager.sh -m multiplex start
         Mixes all microphones into a single audio stream
-        Output: rtsp://localhost:8554/${MULTIPLEX_STREAM_NAME}
+        Output: rtsp://localhost:${MEDIAMTX_RTSP_PORT}/${MULTIPLEX_STREAM_NAME}
 
     Multiplex mode - Separate channels (amerge):
         sudo ./lyrebird-stream-manager.sh -m multiplex -f amerge start
@@ -5425,7 +5467,7 @@ Multiplex Mode Usage:
 
     Custom stream name:
         sudo ./lyrebird-stream-manager.sh -m multiplex -f amix -n studio start
-        Output: rtsp://localhost:8554/studio
+        Output: rtsp://localhost:${MEDIAMTX_RTSP_PORT}/studio
 
 
 Resource Monitoring:
