@@ -147,6 +147,10 @@ readonly EXIT_DELETE_FAILED=3
 # Deletions that failed in this run; every delete goes through safe_delete.
 DELETE_FAILURES=0
 
+# Most files one emergency run evicts, so a single run stays short; the next
+# monitor run continues.
+readonly EMERGENCY_MAX_DELETE=100
+
 # ============================================================================
 # Safety Validation
 # ============================================================================
@@ -351,6 +355,44 @@ _report_delete_failures() {
     return 0
 }
 
+# Regular files under $1 that match the find arguments after it, oldest first,
+# as NUL-terminated "<mtime> <path>" records. Equal mtimes are ordered by path
+# in byte order (LC_ALL=C), so the same tree is always evicted in the same
+# order whatever the locale. NUL-terminated because a name may contain a
+# newline: the old newline-separated pipeline turned the tail of such a name
+# into a separate "path", which was then deleted relative to the current
+# directory.
+_list_oldest_first() {
+    local root="$1"
+    shift
+    find "$root" -type f "$@" -printf '%T@ %p\0' 2>/dev/null | LC_ALL=C sort -z -k1,1n -k2
+}
+
+# Delete the oldest files under $1, at most $2 attempts (0 = no limit), logging
+# each as $3 and passing the remaining arguments to find. Totals land in
+# EVICT_DELETED / EVICT_FAILED / EVICT_FREED (bytes).
+_evict_oldest_first() {
+    local root="$1" max="$2" desc="$3" rec file size
+    shift 3
+    EVICT_DELETED=0
+    EVICT_FAILED=0
+    EVICT_FREED=0
+    while IFS= read -r -d '' rec; do
+        file="${rec#* }"
+        size=$(stat -c%s -- "$file" 2>/dev/null || echo 0)
+        if safe_delete "$file" "$desc"; then
+            ((++EVICT_DELETED))
+            EVICT_FREED=$((EVICT_FREED + size))
+        else
+            ((++EVICT_FAILED))
+        fi
+        if ((max > 0 && EVICT_DELETED + EVICT_FAILED >= max)); then
+            break
+        fi
+    done < <(_list_oldest_first "$root" "$@")
+    return 0
+}
+
 # ============================================================================
 # Cleanup Functions
 # ============================================================================
@@ -510,20 +552,8 @@ emergency_cleanup() {
     # Delete oldest recordings first
     if [[ -d "$RECORDING_DIR" ]]; then
         log_info "Emergency: Removing oldest recordings..."
-        local deleted=0
-        local failed=0
-        local max_delete=100
-
-        while IFS= read -r file; do
-            if safe_delete "$file" "emergency recording"; then
-                ((++deleted))
-            else
-                ((++failed))
-            fi
-            [[ $((deleted + failed)) -ge $max_delete ]] && break
-        done < <(find "$RECORDING_DIR" -type f "${RECORDING_NAME_TEST[@]}" -printf '%T+ %p\n' 2>/dev/null | sort | head -n "$max_delete" | cut -d' ' -f2-)
-
-        log_info "Emergency: Deleted $deleted oldest recording(s)$(_failed_suffix "$failed")"
+        _evict_oldest_first "$RECORDING_DIR" "$EMERGENCY_MAX_DELETE" "emergency recording" "${RECORDING_NAME_TEST[@]}"
+        log_info "Emergency: Deleted $EVICT_DELETED oldest recording(s)$(_failed_suffix "$EVICT_FAILED")"
     fi
 
     # Delete rotated logs, temp files, and buffer contents.
