@@ -3673,11 +3673,33 @@ monitor_streams() {
     fi
 }
 
-# The `monitor` command's stream reconcile, followed by a refresh of the status
-# file (which samples the streams for a few seconds)
+# The `monitor` command's stream reconcile, under the lifecycle lock (LB-05).
+# A start, stop, restart or force-stop in progress holds the lock; the monitor
+# waits for it at most MONITOR_LOCK_TIMEOUT seconds, then logs that it is busy and
+# skips its cycle with exit 0, touching nothing. The lock covers only what can
+# change the stack (monitor_streams); it is released before the status is
+# refreshed, which samples the streams for a few seconds. Long probes (resource
+# checks, any signal or level probe) belong before this call, not inside it: a
+# stop that waits for the lock gives up after STOP_LOCK_TIMEOUT.
 monitor_cycle() {
-    local rc=0
+    local rc=0 lock_rc=0
+    if ! { [[ ${MAIN_LOCK_FD} -gt 2 ]] && [[ "/proc/self/fd/${MAIN_LOCK_FD}" -ef "${LOCK_FILE}" ]]; }; then
+        mkdir -p "$(dirname "${LOCK_FILE}")" 2>/dev/null || true
+        lock_open_and_acquire "${LOCK_FILE}" "${MONITOR_LOCK_TIMEOUT}" || lock_rc=$?
+        case "$lock_rc" in
+            0) MAIN_LOCK_FD=${LOCK_OPENED_FD} ;;
+            1)
+                log INFO "Monitor: a lifecycle command (start, stop, restart or force-stop) is in progress, busy, skipping this cycle ($(lock_describe_holder "${LOCK_FILE}"))"
+                return 0
+                ;;
+            *)
+                log ERROR "Monitor: cannot open the lock file ${LOCK_FILE}"
+                return "${E_LOCK_FAILED}"
+                ;;
+        esac
+    fi
     monitor_streams || rc=$?
+    release_lock
     status_refresh monitor
     return "$rc"
 }
