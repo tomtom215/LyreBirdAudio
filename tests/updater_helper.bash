@@ -170,7 +170,9 @@ updater_inject_clear() {
 }
 
 # updater_stdin LINES...: what the next updater_run sees on stdin. A leading
-# "y" answers the root/sudo prompt when the suite runs as root.
+# "y" answers the root/sudo prompt when the suite runs as root. Called with no
+# arguments on purpose (just the root answer).
+# shellcheck disable=SC2119,SC2120
 updater_stdin() {
     local line
     UPDATER_INPUT=""
@@ -197,6 +199,7 @@ updater_run() {
 # updater is started through `env --default-signal` where coreutils has it.
 UPDATER_SIGNAL_ARGS=()
 if env --default-signal=INT,TERM true 2>/dev/null; then
+    # shellcheck disable=SC2054  # one env option whose value is a comma-separated signal list
     UPDATER_SIGNAL_ARGS=(--default-signal=INT,TERM)
 fi
 
@@ -232,6 +235,7 @@ updater_make_diverged_dev() {
 # predates the self-update hand-over: it knows no --post-update-* option.
 updater_make_old_updater_tag() {
     git -C "$WORK" checkout -q v1.0.0
+    # shellcheck disable=SC2016  # the $1 is meant literally: it is the old updater's own code
     printf '#!/bin/bash\n# an old updater: no hand-over options\necho "old updater: unknown option: $1" >&2\nexit 1\n' >"$WORK/lyrebird-updater.sh"
     echo "config v0.9.0" >"$WORK/config.txt"
     git -C "$WORK" commit -qam "v0.9.0 (old updater)"
