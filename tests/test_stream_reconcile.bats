@@ -131,3 +131,200 @@ teardown() {
     [ ! -e "$MEDIAMTX_CLEANUP_MARKER" ]
     pid_running "$(mediamtx_pid)"
 }
+
+# ---------------------------------------------------------------------------
+# D5: the monitor reconciles 0 -> 1 -> N devices
+# ---------------------------------------------------------------------------
+
+# One monitor cycle (the real monitor_cycle: reconcile, then refresh the status)
+monitor_once() {
+    stage 'monitor_cycle'
+}
+
+@test "the monitor reconciles 0 -> 1 -> N: a node that started empty gets a stream for each device that appears, nothing running is restarted [LB-07, D5]" {
+    stage 'COMMAND=start; start_mediamtx'
+    [ "$status" -eq 0 ]
+    local mtx
+    mtx="$(mediamtx_pid)"
+
+    # still no device: the monitor waits
+    monitor_once
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"waiting for devices"* ]]
+    jq -e '.command == "monitor" and .overall == "waiting_for_devices" and .streams == []' "$LYREBIRD_STATE_DIR/status.json"
+    [ ! -e "$ST/ff/mic1.pid" ]
+
+    # 0 -> 1
+    device_add mic1 31
+    monitor_once
+    [ "$status" -eq 0 ]
+    pid_running "$(stream_pid mic1)"
+    jq -e '.command == "monitor" and .overall == "ok" and (.streams | length) == 1 and .streams[0].path == "mic1" and .streams[0].path_ready == true and .streams[0].bytes_flowing == true' "$LYREBIRD_STATE_DIR/status.json"
+    local w1
+    w1="$(stream_pid mic1)"
+
+    # 1 -> N
+    device_add mic2 32
+    monitor_once
+    [ "$status" -eq 0 ]
+    pid_running "$(stream_pid mic2)"
+    jq -e '.overall == "ok" and (.streams | length) == 2 and ([.streams[].path_ready] | all)' "$LYREBIRD_STATE_DIR/status.json"
+    # the running MediaMTX and the first stream were left alone throughout
+    [ "$(mediamtx_pid)" = "$mtx" ]
+    [ "$(stream_pid mic1)" = "$w1" ]
+}
+
+@test "a device that is unplugged is not restarted, and comes back when it is plugged in again [D5]" {
+    device_add mic1 31
+    device_add mic2 32
+    stage 'COMMAND=start; start_mediamtx'
+    [ "$status" -eq 0 ]
+    local w1 w2
+    w1="$(stream_pid mic1)"
+    w2="$(stream_pid mic2)"
+
+    # mic1 is unplugged: its wrapper ends (as the generated wrapper does when its
+    # device node is gone) and the monitor has nothing to restart for it
+    device_remove 31
+    kill -TERM "$w1"
+    wait_until '! pid_running '"$w1" 10
+    monitor_once
+    [ "$status" -eq 0 ]
+    [ ! -e "$ST/ff/mic1.pid" ]
+    [ "$(stream_pid mic2)" = "$w2" ]
+    jq -e '(.streams | length) == 1 and .streams[0].path == "mic2" and .overall == "ok"' "$LYREBIRD_STATE_DIR/status.json"
+
+    # plugged in again
+    device_add mic1 31
+    monitor_once
+    [ "$status" -eq 0 ]
+    pid_running "$(stream_pid mic1)"
+    [ "$(stream_pid mic1)" != "$w1" ]
+    [ "$(stream_pid mic2)" = "$w2" ]
+    jq -e '(.streams | length) == 2 and .overall == "ok"' "$LYREBIRD_STATE_DIR/status.json"
+}
+
+@test "in multiplex mode the monitor starts the stream again with the new device when one is added, and leaves it alone otherwise [D5]" {
+    export STREAM_MODE=multiplex
+    device_add mic1 31
+    stage 'COMMAND=start; start_mediamtx'
+    [ "$status" -eq 0 ]
+    local w
+    w="$(stream_pid all_mics)"
+    jq -e '.streams[0].device == "mic1"' "$LYREBIRD_STATE_DIR/status.json"
+
+    # nothing changed: nothing restarts
+    monitor_once
+    [ "$status" -eq 0 ]
+    [ "$(stream_pid all_mics)" = "$w" ]
+
+    # a second microphone: the running wrapper captured one, so it is replaced
+    device_add mic2 32
+    monitor_once
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"the set of devices changed - restarting"* ]]
+    pid_running "$(stream_pid all_mics)"
+    [ "$(stream_pid all_mics)" != "$w" ]
+    jq -e '.streams[0].device == "mic1,mic2" and .streams[0].card == "31,32" and .overall == "ok"' "$LYREBIRD_STATE_DIR/status.json"
+
+    # and then it is stable again
+    w="$(stream_pid all_mics)"
+    monitor_once
+    [ "$(stream_pid all_mics)" = "$w" ]
+}
+
+@test "with no device the monitor exits 0 (waiting), or 6 when empty start is disabled [D5]" {
+    mediamtx_stub_up
+    stage 'monitor_streams'
+    [ "$status" -eq 0 ]
+    LYREBIRD_ALLOW_EMPTY_START=false stage 'monitor_streams'
+    [ "$status" -eq 6 ]
+}
+
+# ---------------------------------------------------------------------------
+# D5: a MediaMTX that is gone comes back when the node is meant to run
+# ---------------------------------------------------------------------------
+
+@test "MediaMTX killed while the node is meant to run: the monitor starts it again, its stream publishes again [LB-07, D5]" {
+    device_add mic1 31
+    stage 'COMMAND=start; start_mediamtx'
+    [ "$status" -eq 0 ]
+    local mtx w
+    mtx="$(mediamtx_pid)"
+    w="$(stream_pid mic1)"
+    kill -KILL "$mtx"
+    wait_until '! pid_running '"$mtx" 10
+
+    monitor_once
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"MediaMTX is not running although the node is meant to run"* ]]
+    [[ "$output" == *"MediaMTX was started again"* ]]
+    pid_running "$(mediamtx_pid)"
+    [ "$(mediamtx_pid)" != "$mtx" ]
+    pid_running "$(stream_pid mic1)"
+    [ "$(stream_pid mic1)" != "$w" ]
+    jq -e '.command == "monitor" and .overall == "ok" and .mediamtx.running == true and .streams[0].path_ready == true' "$LYREBIRD_STATE_DIR/status.json"
+    # one restart is charged to the budget
+    [ "$(wc -l <"$CRON_RESTART_STATE_DIR/_mediamtx.restarts")" -eq 1 ]
+}
+
+@test "a crash loop is bounded: the monitor starts MediaMTX again only CRON_RESTART_MAX_PER_HOUR times an hour [D5]" {
+    export CRON_RESTART_MAX_PER_HOUR=2
+    stage 'COMMAND=start; start_mediamtx'
+    [ "$status" -eq 0 ]
+    local i mtx
+    for i in 1 2; do
+        mtx="$(mediamtx_pid)"
+        kill -KILL "$mtx"
+        wait_until '! pid_running '"$mtx" 10
+        monitor_once
+        [ "$status" -eq 0 ]
+        pid_running "$(mediamtx_pid)"
+    done
+    # the third time the budget is used up: nothing is started, the monitor says so
+    mtx="$(mediamtx_pid)"
+    kill -KILL "$mtx"
+    wait_until '! pid_running '"$mtx" 10
+    monitor_once
+    [ "$status" -eq 7 ]
+    [[ "$output" == *"restart budget (2/hour) is used up; not starting it"* ]]
+    [ ! -e "$MEDIAMTX_PID_FILE" ]
+    ! pid_running "$mtx"
+    jq -e '.overall == "failed" and .mediamtx.running == false' "$LYREBIRD_STATE_DIR/status.json"
+}
+
+@test "an intentionally stopped node is not resurrected, and neither is one that was never started [D5]" {
+    stage 'COMMAND=start; start_mediamtx'
+    [ "$status" -eq 0 ]
+    stage 'COMMAND=stop; stop_mediamtx'
+    [ "$status" -eq 0 ]
+    monitor_once
+    [ "$status" -eq 7 ]
+    [[ "$output" == *"MediaMTX is not running - skipping stream health check"* ]]
+    [ ! -e "$MEDIAMTX_PID_FILE" ]
+    [ -z "$(stage_processes)" ]
+    jq -e '.overall == "stopped"' "$LYREBIRD_STATE_DIR/status.json"
+    # never started (no marker at all)
+    rm -f "$LYREBIRD_STATE_DIR/desired-running"
+    monitor_once
+    [ "$status" -eq 7 ]
+    [ -z "$(stage_processes)" ]
+}
+
+@test "a restart that fails is reported (exit 7), charged to the budget, and leaves nothing half-started [D5]" {
+    device_add mic1 31
+    bad_card 31
+    export LYREBIRD_START_POLICY=strict
+    mediamtx_stub_up
+    : >"$LYREBIRD_STATE_DIR/desired-running"
+    local mtx
+    mtx="$(mediamtx_pid)"
+    kill -KILL "$mtx"
+    wait_until '! pid_running '"$mtx" 10
+    monitor_once
+    [ "$status" -eq 7 ]
+    [[ "$output" == *"Starting MediaMTX again failed (exit 9)"* ]]
+    wait_until '[ -z "$(stage_processes)" ]' 5
+    [ -s "$LYREBIRD_STATE_DIR/desired-running" ]
+    [ "$(wc -l <"$CRON_RESTART_STATE_DIR/_mediamtx.restarts")" -eq 1 ]
+}

@@ -3307,6 +3307,80 @@ deep_stream_unhealthy() {
     deep_health_note "$stream_path" "$verdict"
 }
 
+# The multiplex wrapper captures the devices it was started with. A signature of
+# that set ("name:card," sorted) is kept next to its PID file so that the monitor
+# can tell when a device has been added.
+multiplex_devices_signature() {
+    printf '%s\n' "$@" | LC_ALL=C sort | tr '\n' ','
+}
+
+# Launch the multiplex stream and, when that started a new wrapper (not when one
+# was already running), record the set of devices it was given
+start_multiplex_stream() {
+    local multiplex_path was_running=false
+    multiplex_path="$(multiplex_stream_path)"
+    if stream_wrapper_alive "$multiplex_path"; then
+        was_running=true
+    fi
+    start_ffmpeg_multiplex_stream "$@" || return $?
+    if [[ "$was_running" != "true" ]]; then
+        multiplex_devices_signature "$@" >"${FFMPEG_PID_DIR}/${multiplex_path}.devices" 2>/dev/null || true
+    fi
+    return 0
+}
+
+# Succeeds when the running multiplex stream $1 was started with another set of
+# devices than DEVICES (the rest of the arguments). A stream with no record (one
+# started before the record existed) is never reported as changed.
+multiplex_set_changed() {
+    local multiplex_path="$1" recorded=""
+    shift
+    [[ -f "${FFMPEG_PID_DIR}/${multiplex_path}.devices" ]] || return 1
+    recorded="$(cat "${FFMPEG_PID_DIR}/${multiplex_path}.devices" 2>/dev/null)" || return 1
+    [[ "$recorded" != "$(multiplex_devices_signature "$@")" ]]
+}
+
+# MediaMTX is not running. When the node is not meant to be running (it was
+# stopped on purpose, or never started) there is nothing to do. When it is (a
+# start was run and no stop since: DESIRED_MARKER) the idempotent start is run
+# again, under the lifecycle lock the caller holds, bounded by the cron restart
+# budget so that a crash loop cannot storm (D5).
+monitor_mediamtx_absent() {
+    local restarts rc=0 errexit_was_on=false
+    if ! desired_present; then
+        log WARN "MediaMTX is not running - skipping stream health check"
+        log INFO "Run 'start' command to start MediaMTX and streams"
+        return "${E_MEDIAMTX_DOWN}"
+    fi
+    restarts="$(_cron_restart_count _mediamtx)"
+    if ((restarts >= CRON_RESTART_MAX_PER_HOUR)); then
+        log WARN "MediaMTX is not running although the node is meant to run, and its restart budget (${CRON_RESTART_MAX_PER_HOUR}/hour) is used up; not starting it"
+        return "${E_MEDIAMTX_DOWN}"
+    fi
+    _record_cron_restart _mediamtx
+    log WARN "MediaMTX is not running although the node is meant to run (${DESIRED_MARKER}); starting it again (${restarts}/${CRON_RESTART_MAX_PER_HOUR} restarts this hour before this one)"
+    # In a subshell, so that a start that exits (a refusal, a configuration
+    # error) does not end the monitor; errexit stays on inside it
+    if [[ $- == *e* ]]; then
+        errexit_was_on=true
+    fi
+    set +e
+    (
+        set -e
+        start_mediamtx
+    )
+    rc=$?
+    if [[ "$errexit_was_on" == "true" ]]; then
+        set -e
+    fi
+    if ((rc == 0)); then
+        log INFO "MediaMTX was started again"
+        return 0
+    fi
+    log ERROR "Starting MediaMTX again failed (exit ${rc})"
+    return "${E_MEDIAMTX_DOWN}"
+}
+
 # Stream health monitoring with automatic restart
 monitor_streams() {
     log INFO "Checking stream health..."
@@ -3316,9 +3390,8 @@ monitor_streams() {
     mediamtx_pid="$(read_pid_safe "${PID_FILE}")"
 
     if [[ -z "$mediamtx_pid" ]] || ! kill -0 "$mediamtx_pid" 2>/dev/null; then
-        log WARN "MediaMTX is not running - skipping stream health check"
-        log INFO "Run 'start' command to start MediaMTX and streams"
-        return "${E_MEDIAMTX_DOWN}"
+        monitor_mediamtx_absent
+        return $?
     fi
 
     # Restart decisions are made per-stream by should_restart_stream: interactive
@@ -3335,6 +3408,12 @@ monitor_streams() {
     readarray -t devices < <(detect_audio_devices)
 
     if [[ ${#devices[@]} -eq 0 ]]; then
+        # A node without devices is waiting for them (D5): a stream is started
+        # for each one that appears, by the checks below on a later cycle
+        if allow_empty_start; then
+            log INFO "No USB audio devices detected; waiting for devices"
+            return 0
+        fi
         log WARN "No USB audio devices detected"
         return "${E_USB_NO_DEVICES}"
     fi
@@ -3361,7 +3440,7 @@ monitor_streams() {
         if [[ ! -f "$pid_file" ]]; then
             if should_restart_stream "$stream_path"; then
                 log WARN "Multiplex stream $stream_path has no PID file - restarting"
-                if start_ffmpeg_multiplex_stream "${devices[@]}"; then
+                if start_multiplex_stream "${devices[@]}"; then
                     ((streams_restarted++)) || true
                     log INFO "Successfully restarted multiplex stream $stream_path"
                 else
@@ -3380,7 +3459,7 @@ monitor_streams() {
             if [[ -z "$pid" ]]; then
                 if should_restart_stream "$stream_path"; then
                     log WARN "Multiplex stream $stream_path PID is invalid - restarting"
-                    if start_ffmpeg_multiplex_stream "${devices[@]}"; then
+                    if start_multiplex_stream "${devices[@]}"; then
                         ((streams_restarted++)) || true
                         log INFO "Successfully restarted multiplex stream $stream_path"
                     else
@@ -3395,7 +3474,7 @@ monitor_streams() {
                 if should_restart_stream "$stream_path"; then
                     log WARN "Multiplex stream $stream_path PID $pid is stale - restarting"
                     rm -f "$pid_file"
-                    if start_ffmpeg_multiplex_stream "${devices[@]}"; then
+                    if start_multiplex_stream "${devices[@]}"; then
                         ((streams_restarted++)) || true
                         log INFO "Successfully restarted multiplex stream $stream_path"
                     else
@@ -3413,7 +3492,7 @@ monitor_streams() {
                     log WARN "Multiplex stream $stream_path wrapper is alive but path is not ready - restarting"
                     terminate_process_group "$pid" 5 || true
                     rm -f "$pid_file"
-                    if start_ffmpeg_multiplex_stream "${devices[@]}"; then
+                    if start_multiplex_stream "${devices[@]}"; then
                         ((streams_restarted++)) || true
                         log INFO "Successfully restarted multiplex stream $stream_path"
                     else
@@ -3423,6 +3502,25 @@ monitor_streams() {
                 else
                     ((streams_failed++)) || true
                     log WARN "Multiplex stream $stream_path is not ready (restart budget exhausted)"
+                fi
+            elif multiplex_set_changed "$stream_path" "${devices[@]}"; then
+                # A device appeared (a vanished one ends the wrapper itself): the
+                # wrapper captures the devices it was started with, so the stream
+                # is started again to include the new one
+                if should_restart_stream "$stream_path"; then
+                    log WARN "Multiplex stream $stream_path: the set of devices changed - restarting"
+                    terminate_process_group "$pid" 5 || true
+                    rm -f "$pid_file"
+                    if start_multiplex_stream "${devices[@]}"; then
+                        ((streams_restarted++)) || true
+                        log INFO "Successfully restarted multiplex stream $stream_path"
+                    else
+                        ((streams_failed++)) || true
+                        log ERROR "Failed to restart multiplex stream $stream_path"
+                    fi
+                else
+                    ((streams_failed++)) || true
+                    log WARN "Multiplex stream $stream_path: the set of devices changed (restart budget exhausted)"
                 fi
             else
                 ((streams_healthy++)) || true
@@ -3573,6 +3671,15 @@ monitor_streams() {
         # All healthy
         return 0
     fi
+}
+
+# The `monitor` command's stream reconcile, followed by a refresh of the status
+# file (which samples the streams for a few seconds)
+monitor_cycle() {
+    local rc=0
+    monitor_streams || rc=$?
+    status_refresh monitor
+    return "$rc"
 }
 
 # Enhanced stream validation
@@ -6163,7 +6270,7 @@ start_streams_and_report() {
             was_running=true
         fi
         # Start single multiplex stream with all devices
-        if start_ffmpeg_multiplex_stream "${devices[@]}"; then
+        if start_multiplex_stream "${devices[@]}"; then
             unset 'STREAM_LAST_ERROR[$multiplex_path]'
             if [[ "$was_running" != "true" ]]; then
                 run_track_stream "$multiplex_path"
@@ -7110,7 +7217,7 @@ main() {
             fi
             # Non-critical resource issues are logged but we continue
             # Then check and restart streams (returns error codes for failures)
-            monitor_streams
+            monitor_cycle
             exit_code=$?
             # Log exit code for debugging
             if [[ $exit_code -ne 0 ]]; then
