@@ -639,7 +639,8 @@
       "severity": "P2",
       "phase": 4,
       "status": "open",
-      "tests": []
+      "tests": [],
+      "note": "YAML key side fixed (canonical name, quoted scalar, newline injection tested on real MediaMTX: see the [LB-04] live tests); the systemd Environment= quoting is in the unit phase"
     },
     {
       "id": "X-12",
