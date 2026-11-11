@@ -22,11 +22,15 @@
 #   # Hourly monitoring
 #   0 * * * * /usr/local/bin/lyrebird-storage.sh monitor
 #
-# Version: 1.1.0 - Broken-clock retention guard + inode-exhaustion detection
+# Exit status: 0 success, 1 usage error, 3 finished but at least one deletion
+# failed (permission, immutable file, read-only filesystem; see the ERROR lines).
+#
+# Version: 1.2.0 - Every recording codec covered, empty/active segment handling,
+#                  failed deletions surfaced, deterministic emergency eviction
 
 set -euo pipefail
 
-readonly VERSION="1.1.0"
+readonly VERSION="1.2.0"
 SCRIPT_NAME="$(basename "${BASH_SOURCE[0]}")"
 readonly SCRIPT_NAME
 
@@ -85,6 +89,46 @@ _clock_floor=$(_coerce_uint "${LYREBIRD_CLOCK_SANE_EPOCH:-1735689600}" 173568960
 readonly CLOCK_SANE_EPOCH="$_clock_floor"
 unset _clock_floor
 
+# Recording file extensions: the ONE list that retention, emergency eviction and
+# `status` all use. lyrebird-stream-manager.sh records through FFmpeg's segment
+# muxer to `audio_%03d.${CODEC}`, so the extension IS the CODEC value and FFmpeg
+# picks the container from it: opus -> .opus (Ogg Opus), aac -> .aac (ADTS),
+# mp3 -> .mp3 (verified with ffmpeg 6.1.1). Any other CODEC is encoded with
+# libopus under its own name, which only produces a recording where that
+# container accepts Opus (ogg); the other names still leave empty or truncated
+# files behind when the muxer refuses the stream (flac, m4a, adts, wav).
+# adts/m4a are the other names FFmpeg gives AAC. wav/flac cover recordings from
+# other tools and earlier releases. tests/test_storage_codecs.bats fails when the
+# manager gains a CODEC that is missing here.
+readonly RECORDING_EXTENSIONS=(opus ogg aac adts m4a mp3 flac wav)
+
+# find(1) test matching RECORDING_EXTENSIONS, built once from the list above.
+RECORDING_NAME_TEST=()
+for _ext in "${RECORDING_EXTENSIONS[@]}"; do
+    if ((${#RECORDING_NAME_TEST[@]} > 0)); then
+        RECORDING_NAME_TEST+=(-o)
+    fi
+    RECORDING_NAME_TEST+=(-name "*.${_ext}")
+done
+RECORDING_NAME_TEST=(\( "${RECORDING_NAME_TEST[@]}" \))
+readonly RECORDING_NAME_TEST
+unset _ext
+
+# How long a file may sit unmodified and still count as part of a stream that is
+# recording right now. Emergency eviction never touches such a file, and an
+# empty segment younger than this is a segment being opened, not debris.
+# Measured with ffmpeg 6.1.1 (the manager's tee + segment muxer): the segment in
+# progress is a 0-byte file whose mtime stays at its creation time until the
+# first 256 KiB chunk is flushed (16 s at 128 kb/s; 350 s at 6 kb/s, the lowest
+# useful audio rate), then the mtime advances once per chunk. 900 s is well
+# above that; a hard-killed FFmpeg leaves the in-progress segment at 0 bytes (or
+# cut at a 256 KiB boundary, which still decodes), so such debris ages past this
+# window and is removed. Floor 60 s so 0 cannot disable the protection.
+_active_window=$(_coerce_uint "${LYREBIRD_ACTIVE_SEGMENT_SECONDS:-900}" 900)
+((_active_window < 60)) && _active_window=60
+readonly ACTIVE_SEGMENT_SECONDS="$_active_window"
+unset _active_window
+
 # Disk thresholds (percentage) - validate bounds 0-100
 _disk_warning=$(_coerce_uint "${DISK_WARNING_PERCENT:-80}" 80)
 _disk_critical=$(_coerce_uint "${DISK_CRITICAL_PERCENT:-90}" 90)
@@ -113,6 +157,18 @@ unset _max_log_size
 
 # Dry run mode (set to true to see what would be deleted)
 DRY_RUN="${DRY_RUN:-false}"
+
+# Exit status of a run that finished but could not delete at least one file
+# (permission, immutable bit, read-only filesystem, ...). 1 stays "usage error";
+# 2 is lyrebird-common's E_PERMISSION, which this is not specific to.
+readonly EXIT_DELETE_FAILED=3
+
+# Deletions that failed in this run; every delete goes through safe_delete.
+DELETE_FAILURES=0
+
+# Most files one emergency run evicts, so a single run stays short; the next
+# monitor run continues.
+readonly EMERGENCY_MAX_DELETE=100
 
 # ============================================================================
 # Safety Validation
@@ -231,7 +287,7 @@ get_free_space_mb() {
 get_dir_size() {
     local path="$1"
     if [[ -d "$path" ]]; then
-        du -sb "$path" 2>/dev/null | cut -f1
+        du -sbD "$path" 2>/dev/null | cut -f1
     else
         echo "0"
     fi
@@ -244,17 +300,142 @@ count_files() {
     find "$path" -maxdepth 1 -name "$pattern" -type f 2>/dev/null | wc -l
 }
 
-# Safe delete with dry run support
+# Safe delete with dry run support. Returns 0 when the file is gone (or, in a dry
+# run, would be) and 1 when rm refused; a refusal is logged with rm's reason and
+# counted in DELETE_FAILURES so the run's exit status reports it. Under
+# `set -e` an unhandled rm failure used to abort the whole run mid-cleanup, so
+# nothing after the first stuck file was cleaned and no summary was logged.
+# Files only: there is no -r, so a path swapped for a directory between the
+# listing and the removal fails instead of taking a tree with it.
 safe_delete() {
     local path="$1"
     local desc="${2:-file}"
+    local err
 
     if [[ "$DRY_RUN" == "true" ]]; then
         log_info "[DRY RUN] Would delete ${desc}: $path"
-    else
-        log_debug "Deleting ${desc}: $path"
-        rm -rf -- "$path"
+        return 0
     fi
+
+    log_debug "Deleting ${desc}: $path"
+    if err=$(rm -f -- "$path" 2>&1); then
+        return 0
+    fi
+    # Already gone (another run, or the recorder reusing the slot): done.
+    if [[ ! -e "$path" && ! -L "$path" ]]; then
+        return 0
+    fi
+    ((++DELETE_FAILURES))
+    log_error "Cannot delete ${desc} ${path}: ${err:-rm failed}"
+    return 1
+}
+
+# Totals of the current _sweep calls; _sweep_reset starts a new tally.
+SWEEP_DELETED=0
+SWEEP_FAILED=0
+SWEEP_FREED=0
+
+_sweep_reset() {
+    SWEEP_DELETED=0
+    SWEEP_FAILED=0
+    SWEEP_FREED=0
+}
+
+# Delete every NUL-separated path read from stdin through safe_delete, adding to
+# the SWEEP_* totals. A failure is counted and the sweep carries on.
+_sweep() {
+    local desc="$1" file size
+    while IFS= read -r -d '' file; do
+        size=$(stat -c%s -- "$file" 2>/dev/null || echo 0)
+        if safe_delete "$file" "$desc"; then
+            ((++SWEEP_DELETED))
+            SWEEP_FREED=$((SWEEP_FREED + size))
+        else
+            ((++SWEEP_FAILED))
+        fi
+    done
+    return 0
+}
+
+# "; N deletion(s) FAILED" when N > 0, nothing otherwise (for summary lines).
+_failed_suffix() {
+    if (($1 > 0)); then
+        printf '; %d deletion(s) FAILED' "$1"
+    fi
+}
+
+# End-of-command verdict: the run's exit status is EXIT_DELETE_FAILED when any
+# deletion failed, 0 otherwise.
+_report_delete_failures() {
+    if ((DELETE_FAILURES > 0)); then
+        log_error "Run finished with ${DELETE_FAILURES} failed deletion(s); the files named in the errors above are still on disk"
+        return "$EXIT_DELETE_FAILED"
+    fi
+    return 0
+}
+
+# True when mtime $1 (epoch seconds) lies within ACTIVE_SEGMENT_SECONDS of now $2
+# (either side: a file dated in the future by more than the window cannot be an
+# active write, it was stamped by a clock that has since been corrected).
+_recently_modified() {
+    local age=$(($2 - $1))
+    if ((age < 0)); then
+        age=$((-age))
+    fi
+    ((age <= ACTIVE_SEGMENT_SECONDS))
+}
+
+# Regular files under $1 that match the find arguments after it, oldest first,
+# as NUL-terminated "<mtime> <path>" records. A symlink given as $1 itself is
+# followed (-H): /var/lib/.../recordings -> /mnt/usb is a normal setup, and
+# without -H find sees only the link and reports nothing, so retention and
+# eviction silently did nothing. Symlinks found INSIDE the tree are never
+# followed (-type f excludes them), so nothing outside the configured directory
+# can be reached through one. Equal mtimes are ordered by path
+# in byte order (LC_ALL=C), so the same tree is always evicted in the same
+# order whatever the locale. NUL-terminated because a name may contain a
+# newline: the old newline-separated pipeline turned the tail of such a name
+# into a separate "path", which was then deleted relative to the current
+# directory.
+_list_oldest_first() {
+    local root="$1"
+    shift
+    find -H "$root" -type f "$@" -printf '%T@ %p\0' 2>/dev/null | LC_ALL=C sort -z -k1,1n -k2
+}
+
+# Delete the oldest files under $1, at most $2 attempts (0 = no limit), logging
+# each as $3 and passing the remaining arguments to find. A file modified within
+# ACTIVE_SEGMENT_SECONDS is never touched: it belongs to a stream that is
+# recording now, and deleting the open segment would lose its audio and free
+# nothing until FFmpeg closes it. Totals land in EVICT_DELETED / EVICT_FAILED /
+# EVICT_FREED (bytes) / EVICT_PROTECTED.
+_evict_oldest_first() {
+    local root="$1" max="$2" desc="$3" rec file size mtime now
+    shift 3
+    EVICT_DELETED=0
+    EVICT_FAILED=0
+    EVICT_FREED=0
+    EVICT_PROTECTED=0
+    now=$(date +%s)
+    while IFS= read -r -d '' rec; do
+        mtime="${rec%% *}"
+        file="${rec#* }"
+        if _recently_modified "${mtime%%.*}" "$now"; then
+            ((++EVICT_PROTECTED))
+            continue
+        fi
+        size=$(stat -c%s -- "$file" 2>/dev/null || echo 0)
+        if safe_delete "$file" "$desc"; then
+            ((++EVICT_DELETED))
+            EVICT_FREED=$((EVICT_FREED + size))
+        else
+            ((++EVICT_FAILED))
+        fi
+        if ((max > 0 && EVICT_DELETED + EVICT_FAILED >= max)); then
+            break
+        fi
+    done < <(_list_oldest_first "$root" "$@")
+    return 0
 }
 
 # ============================================================================
@@ -282,23 +463,45 @@ cleanup_recordings() {
     local count=0
     local freed_bytes=0
     local kept_broken_clock=0
+    local failed=0
+    local empty_removed=0
+    local file mtime size
+
+    # Empty segments no stream has touched for ACTIVE_SEGMENT_SECONDS are debris
+    # (crash, ENOSPC, a muxer that refused the stream), not recordings: remove
+    # them now instead of letting them sit for the whole retention period. A
+    # younger empty file is a segment being opened (FFmpeg keeps the segment in
+    # progress at 0 bytes until its first flush). Same clock rule as below: a
+    # pre-CLOCK_SANE_EPOCH mtime has no known age, so it is kept.
+    while IFS= read -r -d '' file; do
+        mtime=$(stat -c%Y -- "$file" 2>/dev/null || echo 0)
+        if [[ "$mtime" -lt "$CLOCK_SANE_EPOCH" ]] || _recently_modified "$mtime" "$now_epoch"; then
+            continue
+        fi
+        if safe_delete "$file" "empty recording segment"; then
+            ((++empty_removed))
+        else
+            ((++failed))
+        fi
+    done < <(find -H "$RECORDING_DIR" -type f "${RECORDING_NAME_TEST[@]}" -empty -print0 2>/dev/null)
 
     # Find and delete old recording files
     while IFS= read -r -d '' file; do
         # A pre-CLOCK_SANE_EPOCH mtime means the file was written while the
         # clock was broken; its real age is unknown and it may be minutes old.
-        local mtime
         mtime=$(stat -c%Y "$file" 2>/dev/null || echo 0)
         if [[ "$mtime" -lt "$CLOCK_SANE_EPOCH" ]]; then
             ((++kept_broken_clock))
             continue
         fi
-        local size
         size=$(stat -c%s "$file" 2>/dev/null || echo 0)
-        safe_delete "$file" "recording"
-        ((++count))
-        freed_bytes=$((freed_bytes + size))
-    done < <(find "$RECORDING_DIR" -type f \( -name "*.wav" -o -name "*.mp3" -o -name "*.flac" -o -name "*.opus" -o -name "*.ogg" \) -mtime "+${RECORDING_RETENTION_DAYS}" -print0 2>/dev/null)
+        if safe_delete "$file" "recording"; then
+            ((++count))
+            freed_bytes=$((freed_bytes + size))
+        else
+            ((++failed))
+        fi
+    done < <(find -H "$RECORDING_DIR" -type f "${RECORDING_NAME_TEST[@]}" -mtime "+${RECORDING_RETENTION_DAYS}" -print0 2>/dev/null)
 
     if [[ $kept_broken_clock -gt 0 ]]; then
         log_warn "Kept $kept_broken_clock recording(s) with pre-${CLOCK_SANE_EPOCH} mtimes (written before NTP sync; real age unknown)"
@@ -309,71 +512,48 @@ cleanup_recordings() {
     # itself, and if the recorder does not recreate it on the next write, every
     # subsequent recording silently fails — permanent data loss on an
     # unattended box.
-    find "$RECORDING_DIR" -mindepth 1 -type d -empty -delete 2>/dev/null || true
+    find -H "$RECORDING_DIR" -mindepth 1 -type d -empty -delete 2>/dev/null || true
 
-    log_info "Cleaned $count recording file(s), freed $(format_bytes $freed_bytes)"
+    if [[ $empty_removed -gt 0 ]]; then
+        log_info "Removed $empty_removed empty recording segment(s) idle for over ${ACTIVE_SEGMENT_SECONDS}s"
+    fi
+    log_info "Cleaned $count recording file(s), freed $(format_bytes $freed_bytes)$(_failed_suffix "$failed")"
 }
 
 # Clean old log files
 cleanup_logs() {
     log_info "Cleaning logs older than ${LOG_RETENTION_DAYS} days"
 
-    local count=0
-    local freed_bytes=0
+    _sweep_reset
 
     # Clean LyreBird logs
     if [[ -d "$LOG_DIR" ]]; then
-        while IFS= read -r -d '' file; do
-            local size
-            size=$(stat -c%s "$file" 2>/dev/null || echo 0)
-            safe_delete "$file" "log"
-            ((++count))
-            freed_bytes=$((freed_bytes + size))
-        done < <(find "$LOG_DIR" -type f -name "*.log*" -mtime "+${LOG_RETENTION_DAYS}" -print0 2>/dev/null)
+        _sweep "log" < <(find "$LOG_DIR" -type f -name "*.log*" -mtime "+${LOG_RETENTION_DAYS}" -print0 2>/dev/null)
     fi
 
     # Clean rotated MediaMTX logs
     if [[ -d "$MEDIAMTX_LOG_DIR" ]]; then
-        while IFS= read -r -d '' file; do
-            local size
-            size=$(stat -c%s "$file" 2>/dev/null || echo 0)
-            safe_delete "$file" "mediamtx log"
-            ((++count))
-            freed_bytes=$((freed_bytes + size))
-        done < <(find "$MEDIAMTX_LOG_DIR" -type f -name "mediamtx*.out.*" -mtime "+${LOG_RETENTION_DAYS}" -print0 2>/dev/null)
+        _sweep "mediamtx log" < <(find "$MEDIAMTX_LOG_DIR" -type f -name "mediamtx*.out.*" -mtime "+${LOG_RETENTION_DAYS}" -print0 2>/dev/null)
     fi
 
-    log_info "Cleaned $count log file(s), freed $(format_bytes $freed_bytes)"
+    log_info "Cleaned $SWEEP_DELETED log file(s), freed $(format_bytes "$SWEEP_FREED")$(_failed_suffix "$SWEEP_FAILED")"
 }
 
 # Clean temporary files
 cleanup_temp() {
     log_info "Cleaning temp files older than ${TEMP_RETENTION_HOURS} hours"
 
-    local count=0
-    local freed_bytes=0
+    _sweep_reset
 
     # Clean LyreBird temp files in /tmp
-    while IFS= read -r -d '' file; do
-        local size
-        size=$(stat -c%s "$file" 2>/dev/null || echo 0)
-        safe_delete "$file" "temp"
-        ((++count))
-        freed_bytes=$((freed_bytes + size))
-    done < <(find "$TEMP_DIR" -maxdepth 1 -type f -name "lyrebird-*" -mmin "+$((TEMP_RETENTION_HOURS * 60))" -print0 2>/dev/null)
+    _sweep "temp" < <(find "$TEMP_DIR" -maxdepth 1 -type f -name "lyrebird-*" -mmin "+$((TEMP_RETENTION_HOURS * 60))" -print0 2>/dev/null)
 
     # Clean memory buffer directory if present
     if [[ -d "$BUFFER_DIR" ]]; then
-        while IFS= read -r -d '' file; do
-            local size
-            size=$(stat -c%s "$file" 2>/dev/null || echo 0)
-            safe_delete "$file" "buffer"
-            ((++count))
-            freed_bytes=$((freed_bytes + size))
-        done < <(find "$BUFFER_DIR" -type f -mmin "+$((TEMP_RETENTION_HOURS * 60))" -print0 2>/dev/null)
+        _sweep "buffer" < <(find -H "$BUFFER_DIR" -type f -mmin "+$((TEMP_RETENTION_HOURS * 60))" -print0 2>/dev/null)
     fi
 
-    log_info "Cleaned $count temp file(s), freed $(format_bytes $freed_bytes)"
+    log_info "Cleaned $SWEEP_DELETED temp file(s), freed $(format_bytes "$SWEEP_FREED")$(_failed_suffix "$SWEEP_FAILED")"
 }
 
 # Truncate oversized log files
@@ -438,37 +618,56 @@ emergency_cleanup() {
     # Delete oldest recordings first
     if [[ -d "$RECORDING_DIR" ]]; then
         log_info "Emergency: Removing oldest recordings..."
-        local deleted=0
-        local max_delete=100
-
-        while IFS= read -r file; do
-            safe_delete "$file" "emergency recording"
-            ((++deleted))
-            [[ $deleted -ge $max_delete ]] && break
-        done < <(find "$RECORDING_DIR" -type f \( -name "*.wav" -o -name "*.mp3" -o -name "*.flac" -o -name "*.opus" -o -name "*.ogg" \) -printf '%T+ %p\n' 2>/dev/null | sort | head -n "$max_delete" | cut -d' ' -f2-)
-
-        log_info "Emergency: Deleted $deleted oldest recording(s)"
+        # 1. Empty segments (debris of a crash, ENOSPC or a muxer that refused the
+        #    stream): they hold no audio and cost an inode each.
+        _evict_oldest_first "$RECORDING_DIR" "$EMERGENCY_MAX_DELETE" "emergency empty segment" "${RECORDING_NAME_TEST[@]}" -empty
+        local empty_deleted=$EVICT_DELETED empty_failed=$EVICT_FAILED protected=$EVICT_PROTECTED
+        # 2. Then the oldest recordings that hold audio, truncated ones included
+        #    (a killed FFmpeg leaves a decodable prefix).
+        _evict_oldest_first "$RECORDING_DIR" "$EMERGENCY_MAX_DELETE" "emergency recording" "${RECORDING_NAME_TEST[@]}" ! -empty
+        protected=$((protected + EVICT_PROTECTED))
+        log_info "Emergency: Deleted $empty_deleted empty segment(s)$(_failed_suffix "$empty_failed")"
+        log_info "Emergency: Deleted $EVICT_DELETED oldest recording(s)$(_failed_suffix "$EVICT_FAILED")"
+        if ((protected > 0)); then
+            log_info "Emergency: Left $protected file(s) written in the last ${ACTIVE_SEGMENT_SECONDS}s alone (active streams)"
+        fi
     fi
 
-    # Delete rotated logs, temp files, and buffer contents.
+    # Delete rotated logs and temp files.
     # These must honour DRY_RUN (a "preview" must not delete anything), and the
     # *.gz sweep must be tightly scoped: MEDIAMTX_LOG_DIR is typically /var/log,
     # so a bare `find "$MEDIAMTX_LOG_DIR" -name '*.gz' -delete` would wipe every
     # rotated SYSTEM log (syslog, auth.log, journal exports) during an incident.
     if [[ "$DRY_RUN" == "true" ]]; then
-        log_info "[DRY RUN] Would delete rotated LyreBird/MediaMTX logs, LyreBird temp files, and buffer contents"
+        log_info "[DRY RUN] Would delete rotated LyreBird/MediaMTX logs and LyreBird temp files"
     else
-        [[ -d "$LOG_DIR" ]] && find "$LOG_DIR" -maxdepth 1 -name "*.gz" -delete 2>/dev/null || true
-        find "$MEDIAMTX_LOG_DIR" -maxdepth 1 -name "mediamtx*.out*.gz" -delete 2>/dev/null || true
+        _sweep_reset
+        if [[ -d "$LOG_DIR" ]]; then
+            _sweep "rotated log" < <(find "$LOG_DIR" -maxdepth 1 -type f -name "*.gz" -print0 2>/dev/null)
+        fi
+        _sweep "rotated mediamtx log" < <(find "$MEDIAMTX_LOG_DIR" -maxdepth 1 -type f -name "mediamtx*.out*.gz" -print0 2>/dev/null)
 
         # Clear LyreBird temp files
-        find "$TEMP_DIR" -maxdepth 1 -name "lyrebird-*" -type f -delete 2>/dev/null || true
+        _sweep "temp" < <(find "$TEMP_DIR" -maxdepth 1 -name "lyrebird-*" -type f -print0 2>/dev/null)
+        log_info "Emergency: Deleted $SWEEP_DELETED rotated log/temp file(s)$(_failed_suffix "$SWEEP_FAILED")"
+    fi
 
-        # Clear buffer directory (with safety validation)
-        if [[ -d "$BUFFER_DIR" ]] && validate_safe_path "$BUFFER_DIR"; then
-            rm -rf "${BUFFER_DIR:?}"/* 2>/dev/null || true
+    # Clear the segment ring buffer (with safety validation): its files, never
+    # its directories. The recorder creates "$BUFFER_DIR/<stream>" once, when the
+    # stream starts, and FFmpeg's segment muxer cannot recreate it: with the
+    # directory gone the tee drops its recording leg at the next segment
+    # ("Failed to open segment ... No such file or directory, continuing with
+    # 1/2 slaves"), so local recording silently stopped until that stream was
+    # restarted. Files written in the last ACTIVE_SEGMENT_SECONDS are the open
+    # segment and are left alone like everywhere else.
+    if [[ -d "$BUFFER_DIR" ]] && validate_safe_path "$BUFFER_DIR"; then
+        _evict_oldest_first "$BUFFER_DIR" 0 "emergency buffer file"
+        log_info "Emergency: Deleted $EVICT_DELETED buffer file(s)$(_failed_suffix "$EVICT_FAILED")"
+        if ((EVICT_PROTECTED > 0)); then
+            log_info "Emergency: Left $EVICT_PROTECTED buffer file(s) written in the last ${ACTIVE_SEGMENT_SECONDS}s alone (active streams)"
         fi
     fi
+    return 0
 }
 
 # ============================================================================
@@ -507,11 +706,15 @@ cmd_status() {
     if [[ -d "$RECORDING_DIR" ]]; then
         local rec_size
         rec_size=$(get_dir_size "$RECORDING_DIR")
-        local rec_count
-        rec_count=$(find "$RECORDING_DIR" -type f 2>/dev/null | wc -l)
+        local rec_count empty_count
+        # `|| true`: find exits 1 on an unreadable subdirectory, which under
+        # pipefail would abort `status` before it printed anything.
+        rec_count=$({ find -H "$RECORDING_DIR" -type f "${RECORDING_NAME_TEST[@]}" ! -empty 2>/dev/null || true; } | wc -l)
+        empty_count=$({ find -H "$RECORDING_DIR" -type f "${RECORDING_NAME_TEST[@]}" -empty 2>/dev/null || true; } | wc -l)
         printf "  Path: %s\n" "$RECORDING_DIR"
         printf "  Size: %s\n" "$(format_bytes "$rec_size")"
         printf "  Files: %d\n" "$rec_count"
+        printf "  Empty segments: %d\n" "$empty_count"
         printf "  Retention: %d days\n" "$RECORDING_RETENTION_DAYS"
     else
         echo "  No recording directory"
@@ -550,12 +753,13 @@ cmd_cleanup() {
     cleanup_temp
     truncate_large_logs
 
+    _report_delete_failures || return "$EXIT_DELETE_FAILED"
     log_info "Cleanup completed"
 }
 
 # Monitor and cleanup if needed
 cmd_monitor() {
-    local usage free_mb
+    local usage free_mb rc=0
     usage=$(get_disk_usage "/")
     free_mb=$(get_free_space_mb "/")
 
@@ -565,8 +769,8 @@ cmd_monitor() {
     # the safe, retention-based cleanup (which deletes solely by age).
     if [[ ! "$usage" =~ ^[0-9]+$ ]] || [[ ! "$free_mb" =~ ^[0-9]+$ ]]; then
         log_error "Could not determine disk usage for / (df unparseable: usage='${usage}', free='${free_mb}'MB); running standard cleanup only"
-        cmd_cleanup
-        return 0
+        cmd_cleanup || rc=$?
+        return "$rc"
     fi
 
     # Inode pressure counts as disk pressure: many small recordings exhaust
@@ -583,17 +787,19 @@ cmd_monitor() {
         || [[ $free_mb -lt $MIN_FREE_SPACE_MB ]]; then
         log_error "EMERGENCY: Disk ${usage}% full, inodes ${iusage}% used, ${free_mb}MB free"
         emergency_cleanup
-        cmd_cleanup
+        cmd_cleanup || rc=$?
     elif [[ $usage -ge $DISK_CRITICAL_PERCENT ]] || [[ $iusage -ge $DISK_CRITICAL_PERCENT ]]; then
         log_warn "CRITICAL: Disk ${usage}% full, inodes ${iusage}% used"
-        cmd_cleanup
+        cmd_cleanup || rc=$?
     elif [[ $usage -ge $DISK_WARNING_PERCENT ]] || [[ $iusage -ge $DISK_WARNING_PERCENT ]]; then
         log_warn "WARNING: Disk ${usage}% full, inodes ${iusage}% used"
         cleanup_temp
         truncate_large_logs
+        _report_delete_failures || rc=$?
     else
         log_debug "Disk usage OK: ${usage}%"
     fi
+    return "$rc"
 }
 
 # Run emergency cleanup
@@ -634,6 +840,18 @@ Environment Variables:
   MIN_FREE_SPACE_MB          Minimum free space (default: 500)
   LYREBIRD_RECORDING_DIR     Recording directory path
   LYREBIRD_LOG_DIR           Log directory path
+  LYREBIRD_ACTIVE_SEGMENT_SECONDS
+                             A file written this recently belongs to a stream that
+                             is recording now: emergency cleanup never deletes it,
+                             and an empty segment younger than this is not removed
+                             (default: 900, minimum: 60)
+
+Recordings are files ending in: ${RECORDING_EXTENSIONS[*]}
+
+Exit status:
+  0  success
+  1  usage error
+  3  finished, but at least one deletion failed (see the ERROR lines)
 
 Examples:
   ${SCRIPT_NAME} status

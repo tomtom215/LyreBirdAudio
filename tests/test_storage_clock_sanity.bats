@@ -32,13 +32,20 @@ _run_cleanup() {
 
 @test "recordings with broken-clock (1970) mtimes are KEPT by age-based cleanup" {
     # Written while the clock was unsynced: mtime says 1970, real age is minutes.
+    # Both an empty file and one holding audio (an empty file is also debris the
+    # retention run removes once idle; the 1970 mtime has to keep it too).
     touch -d @1000000 "$CS_TMP/rec/fresh-but-1970.wav"
-    # A control file with a sane, genuinely expired mtime.
+    echo audio >"$CS_TMP/rec/fresh-but-1970-with-audio.wav"
+    touch -d @1000000 "$CS_TMP/rec/fresh-but-1970-with-audio.wav"
+    # A control file with a sane, genuinely expired mtime. It holds audio so that
+    # it is removed by the age rule, not as an idle empty segment.
+    echo audio >"$CS_TMP/rec/genuinely-old.wav"
     touch -d "45 days ago" "$CS_TMP/rec/genuinely-old.wav"
 
     run _run_cleanup
     [ "$status" -eq 0 ]
     [ -f "$CS_TMP/rec/fresh-but-1970.wav" ]        # broken-clock file survives
+    [ -f "$CS_TMP/rec/fresh-but-1970-with-audio.wav" ]
     [ ! -f "$CS_TMP/rec/genuinely-old.wav" ]       # real retention still works
     [[ "$output" == *"pre-"*"mtimes"* ]]           # and it says so
 }
@@ -73,7 +80,11 @@ EOF
 }
 
 @test "retention keeps files younger than the retention window (control)" {
-    touch "$CS_TMP/rec/today.wav"
+    # Both files hold audio: an idle zero-byte segment is debris and is removed
+    # by retention whatever its age (tests/test_storage_segments.bats), which is
+    # not what this control is about.
+    echo audio >"$CS_TMP/rec/today.wav"
+    echo audio >"$CS_TMP/rec/recent.wav"
     touch -d "5 days ago" "$CS_TMP/rec/recent.wav"
 
     run _run_cleanup
