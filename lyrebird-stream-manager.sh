@@ -3698,7 +3698,22 @@ monitor_cycle() {
                 ;;
         esac
     fi
-    monitor_streams || rc=$?
+    # monitor_streams keeps errexit on, as it has always had (a `||` here would
+    # switch it off inside the whole function, including the start it may run),
+    # and runs in a subshell so that its status can be taken without that
+    local errexit_was_on=false
+    if [[ $- == *e* ]]; then
+        errexit_was_on=true
+    fi
+    set +e
+    (
+        set -e
+        monitor_streams
+    )
+    rc=$?
+    if [[ "$errexit_was_on" == "true" ]]; then
+        set -e
+    fi
     release_lock
     status_refresh monitor
     return "$rc"
@@ -5422,11 +5437,13 @@ start_all_ffmpeg_streams() {
     # Log summary with details about failures
     if [[ ${#failed_streams[@]} -gt 0 ]]; then
         log WARN "Started $success_count/${#devices[@]} FFmpeg streams. Failed: ${failed_streams[*]}"
-        # What a failed stream means for the start is the caller's decision
-        # (the start policy), not a silent "best effort"
-        return 1
+    else
+        log INFO "Successfully started all $success_count/${#devices[@]} FFmpeg streams"
     fi
-    log INFO "Successfully started all $success_count/${#devices[@]} FFmpeg streams"
+
+    # What a failed stream means for the start is not decided here: every failure
+    # is recorded in STREAM_LAST_ERROR and start_streams_and_report applies the
+    # start policy to what is actually publishing
     return 0
 }
 
@@ -6304,7 +6321,7 @@ start_streams_and_report() {
     else
         log INFO "Individual stream mode - starting separate streams"
         # Pass the stable device list to start function
-        start_all_ffmpeg_streams "${devices[@]}" || true
+        start_all_ffmpeg_streams "${devices[@]}"
     fi
 
     # What counts is what is publishing: wait for each stream that was launched

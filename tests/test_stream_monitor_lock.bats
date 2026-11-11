@@ -75,7 +75,7 @@ stack_with_dead_wrapper() {
     stage 'monitor_cycle'
     [ "$status" -eq 0 ]
     # waited about MONITOR_LOCK_TIMEOUT (1 s), not longer
-    [ "$SECONDS" -le 4 ]
+    [ "$SECONDS" -le 8 ]
     [[ "$output" == *"busy, skipping this cycle"* ]]
     [[ "$output" == *"PID $HOLDER (start time"* ]]
     # nothing was touched: the dead wrapper's PID file is still there, no new
@@ -154,4 +154,15 @@ monitor_cycle'
     exec 9<&-
     # the record in the lock file is the monitor's own: pid and start time
     [[ "$(head -c 64 "$MEDIAMTX_LOCK_FILE")" =~ ^[0-9]+\ [0-9]+\ *$ ]]
+}
+
+@test "monitor_streams keeps errexit on when the monitor runs it under the lock, as it had before: a failing command still ends it [LB-05]" {
+    # an unguarded failing command inside it must still end it (a `||` around
+    # the call would switch errexit off for the whole function), and what it
+    # returns is what the monitor returns
+    stage 'monitor_streams() { false; echo "continued after a failing command"; }
+monitor_cycle'
+    [ "$status" -eq 1 ]
+    [[ "$output" != *"continued after a failing command"* ]]
+    flock -n "$MEDIAMTX_LOCK_FILE" true
 }

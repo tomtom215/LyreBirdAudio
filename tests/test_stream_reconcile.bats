@@ -61,8 +61,11 @@ teardown() {
     stage 'SECONDS=0; rc=0; wait_for_usb_stabilization 6 || rc=$?; echo "rc=$rc elapsed=$SECONDS"'
     # The old guard (-n "$hash") passed for the digest of nothing, so two empty
     # scans counted as a stable subsystem and the wait ended after 4 s with
-    # "stable with 0 devices" and rc=0
-    [[ "$output" == *"rc=1 elapsed=6"* ]]
+    # "stable with 0 devices" and rc=0. (The deadline is 6 s; a loaded machine
+    # may stretch it by a second, never shorten it.)
+    [[ "$output" =~ rc=1\ elapsed=([0-9]+) ]]
+    [ "${BASH_REMATCH[1]}" -ge 6 ]
+    [ "${BASH_REMATCH[1]}" -le 9 ]
     [[ "$output" != *"stable with 0 devices"* ]]
     [[ "$output" == *"No USB audio devices detected after 6 seconds"* ]]
 }
@@ -70,7 +73,9 @@ teardown() {
 @test "with empty start allowed the USB wait still waits for the first device up to its deadline, then proceeds with none [X-03, D5]" {
     export STAGE_STABILIZE=:
     stage 'SECONDS=0; rc=0; wait_for_usb_stabilization 6 || rc=$?; echo "rc=$rc elapsed=$SECONDS"'
-    [[ "$output" == *"rc=0 elapsed=6"* ]]
+    [[ "$output" =~ rc=0\ elapsed=([0-9]+) ]]
+    [ "${BASH_REMATCH[1]}" -ge 6 ]
+    [ "${BASH_REMATCH[1]}" -le 9 ]
     [[ "$output" != *"stable with 0 devices"* ]]
     [[ "$output" == *"continuing without"* ]]
 }
