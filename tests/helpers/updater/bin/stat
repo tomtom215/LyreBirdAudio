@@ -1,0 +1,10 @@
+#!/bin/bash
+# The updater refuses a repository whose .git/config is owned by root (the
+# normal state of a throw-away fixture when the suite itself runs as root).
+# With UPDATER_FAKE_OWNER set this wrapper reports that user as the owner of
+# the repository's config file; every other stat call is passed through.
+if [[ -n "${UPDATER_FAKE_OWNER:-}" && "${1:-}" == "-c" && "${2:-}" == "%U" && "${3:-}" == */config && "${3:-}" == *git* ]]; then
+    echo "$UPDATER_FAKE_OWNER"
+    exit 0
+fi
+exec /usr/bin/stat "$@"

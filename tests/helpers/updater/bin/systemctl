@@ -1,0 +1,30 @@
+#!/bin/bash
+# Minimal stateful stand-in for systemctl, for the updater tests. The service
+# is "running" while the file named by FAKE_SVC_STATE holds "running".
+# Every call is appended to FAKE_SVC_LOG. FAKE_SVC_FAIL_START (any value) makes
+# `start` fail, as a service that crashes on its new version would.
+state="${FAKE_SVC_STATE:?FAKE_SVC_STATE not set}"
+echo "systemctl $*" >>"${FAKE_SVC_LOG:-/dev/null}"
+# options like --quiet are not interesting
+args=()
+for a in "$@"; do
+    [[ "$a" == --* ]] || args+=("$a")
+done
+case "${args[0]:-}" in
+    is-active)
+        [[ "$(cat "$state" 2>/dev/null)" == running ]]
+        ;;
+    is-enabled) exit 0 ;;
+    stop | kill)
+        echo stopped >"$state"
+        ;;
+    start | restart)
+        if [[ -n "${FAKE_SVC_FAIL_START:-}" ]]; then
+            echo "Job for ${args[1]:-unit} failed." >&2
+            exit 1
+        fi
+        echo running >"$state"
+        ;;
+    daemon-reload) exit 0 ;;
+    *) exit 0 ;;
+esac

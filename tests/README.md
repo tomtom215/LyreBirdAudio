@@ -15,6 +15,7 @@ Unit tests for LyreBirdAudio using the [Bats](https://github.com/bats-core/bats-
 | lyrebird-metrics.sh | test_lyrebird_metrics.bats | 39 | 55% |
 | lyrebird-storage.sh | test_lyrebird_storage.bats | 59 | 65% |
 | lyrebird-updater.sh | test_lyrebird_updater.bats | 58 | 75% |
+| lyrebird-updater.sh, real git repositories with injected failures | test_lyrebird_updater_failures.bats, test_lyrebird_updater_history.bats, test_lyrebird_updater_rollback.bats | 55 + 12 + 19 | not estimated (real script vs. local bare origin; see `tests/updater_helper.bash`) |
 | install_mediamtx.sh | test_install_mediamtx.bats | 66 | 70% |
 | lyrebird-mic-check.sh | test_lyrebird_mic_check.bats | 45 | 70% |
 | lyrebird-stream-manager.sh vs. MediaMTX versions | test_mediamtx_config_versions.bats, test_mediamtx_live.bats | 4 + 1 live | not estimated |
@@ -117,6 +118,9 @@ bats tests/ --filter "validation"
 | `test_lyrebird_metrics.bats` | Tests for Prometheus metrics export (collectors, formatting) |
 | `test_lyrebird_storage.bats` | Tests for storage management (cleanup, retention, disk usage) |
 | `test_lyrebird_updater.bats` | Tests for update system (git operations, transactions, service detection, backups) |
+| `test_lyrebird_updater_failures.bats` | The updater against real git repositories (a local bare origin plus a clone) with injected failures: SIGKILL/SIGTERM/SIGINT at chosen points of an update, DNS failure, a black-holed origin, a full disk (real ENOSPC on a size-limited tmpfs in a private mount namespace, skipped where that is not permitted), stash conflicts, divergent branches, file modes |
+| `test_lyrebird_updater_history.bats` | The update history log and `--history` |
+| `test_lyrebird_updater_rollback.bats` | `--rollback [VERSION]`, including with the service installed (stateful systemctl stand-in) |
 | `test_install_mediamtx.bats` | Tests for MediaMTX installer (version comparison, platform detection, validation) |
 | `test_lyrebird_mic_check.bats` | Tests for mic check utility (device detection, capability testing, config generation) |
 | `test_storage_suite_safety.bats` | Guards `test_lyrebird_storage.bats` itself: its setup must point the storage script at private temp dirs, never at real recordings, logs or `/tmp` |

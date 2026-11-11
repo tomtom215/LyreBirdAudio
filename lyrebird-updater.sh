@@ -7,9 +7,21 @@
 # Copyright: Tom F and LyreBirdAudio contributors
 # License: Apache 2.0
 #
-# Version: 1.6.1
+# Version: 1.7.0
 #
-# NEW in v1.6.0:
+# NEW in v1.7.0:
+#   - --rollback [VERSION]: back to the previous version (or a tag/commit already
+#     in the clone) with the update's own transaction, no network needed
+#   - --history: past updates, failures and rollbacks (local append-only log)
+#   - Crash-safe updates: a journal in the git directory; an update killed halfway
+#     is undone (or, after a self-update hand-over, completed) by the next run
+#   - The automatic rollback now returns to the original commit (it was a no-op
+#     for tag installs) and never discards uncommitted work
+#   - The lock moved out of the working tree; saved changes that conflict with the
+#     new version stay in the stash instead of leaving conflict markers
+#   - Bounded network access (no hang on a dead uplink); --list exits 4 offline
+#
+# v1.6.0:
 #   - Automatic post-update migrations for breaking changes
 #   - Handles script renames (mediamtx-stream-manager.sh -> lyrebird-stream-manager.sh)
 #   - Updates systemd services, cron jobs, and /usr/local/bin installations
@@ -53,12 +65,22 @@ fi
 
 # Strict error handling and security
 export LC_ALL=C # Ensure consistent sorting and string handling
-umask 077       # Secure file creation (owner-only by default)
+# The updater's own files (lock, journal, history, backups) are owner-only, but
+# the files git writes into the working tree must get the modes the operator's
+# umask gives every other file in the repository. Under umask 077 an update used
+# to leave the files it rewrote 0600/0700 and the rest 0644: ORIGINAL_UMASK is
+# applied to those operations (git_worktree, set_script_permissions).
+ORIGINAL_UMASK="$(umask)"
+umask 077 # Secure file creation (owner-only by default)
 
 set -o errexit  # Exit on any command failure
 set -o pipefail # Catch errors in pipes
 set -o nounset  # Exit if uninitialized variable is used
 set -o errtrace # Inherit ERR trap in functions
+
+# USER is only used in "to fix: sudo chown" hints, but unset (cron, systemd,
+# some containers) it crashed the updater under nounset instead of printing them
+: "${USER:=$(id -un 2>/dev/null || echo user)}"
 
 # Source shared library if available (backward compatible)
 # Provides: colors, logging, command_exists, compute_hash, exit codes
@@ -77,8 +99,45 @@ SCRIPT_NAME="$(basename "${BASH_SOURCE[0]}")"
 readonly SCRIPT_NAME
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly SCRIPT_DIR
-readonly VERSION="1.6.1"
-readonly LOCKFILE="${SCRIPT_DIR}/.lyrebird-updater.lock"
+readonly VERSION="1.7.0"
+
+# Updater state: the lock, the update history and the transaction journal live
+# in a directory INSIDE the git directory, never in the working tree. A lock in
+# the working tree is an untracked file: every run then reported "local
+# modifications", `git stash -u` removed the lock for the whole checkout, and
+# a stash created by one process could not be restored by the re-exec'd one
+# (it collided with the new process's own lock). LYREBIRD_UPDATER_STATE_DIR
+# overrides the location (used by the test suite).
+_updater_git_dir() {
+    local dot_git="${SCRIPT_DIR}/.git" line gitdir
+    if [[ -d "$dot_git" ]]; then
+        printf '%s' "$dot_git"
+    elif [[ -f "$dot_git" ]] && IFS= read -r line <"$dot_git" && [[ "$line" == "gitdir: "* ]]; then
+        # Linked worktree or submodule: ".git" is a file naming the real directory
+        gitdir="${line#gitdir: }"
+        [[ "$gitdir" == /* ]] || gitdir="${SCRIPT_DIR}/${gitdir}"
+        printf '%s' "$gitdir"
+    else
+        return 1
+    fi
+}
+if [[ -n "${LYREBIRD_UPDATER_STATE_DIR:-}" ]]; then
+    UPDATER_STATE_DIR="$LYREBIRD_UPDATER_STATE_DIR"
+elif _updater_state_git_dir="$(_updater_git_dir)"; then
+    UPDATER_STATE_DIR="${_updater_state_git_dir}/lyrebird-updater"
+else
+    # Not a git repository: check_git_repository reports that; the directory
+    # only has to exist for the lock until then.
+    UPDATER_STATE_DIR="${SCRIPT_DIR}/.lyrebird-updater"
+fi
+unset _updater_state_git_dir
+readonly UPDATER_STATE_DIR
+readonly LOCKFILE="${UPDATER_STATE_DIR}/lock"
+readonly HISTORY_FILE="${UPDATER_STATE_DIR}/history.log"
+readonly JOURNAL_FILE="${UPDATER_STATE_DIR}/transaction"
+readonly GIT_CONFIG_SAVED_FILE="${UPDATER_STATE_DIR}/core.fileMode.saved"
+# Where updaters before 1.7.0 kept the lock (an untracked directory in the repo)
+readonly LEGACY_LOCKFILE="${SCRIPT_DIR}/.lyrebird-updater.lock"
 
 # Repository configuration
 readonly REPO_OWNER="tomtom215"
@@ -92,9 +151,12 @@ readonly E_PREREQUISITES=2
 readonly E_NOT_GIT_REPO=3
 readonly E_NO_REMOTE=4
 readonly E_PERMISSION=5
+readonly E_NOT_FOUND=6 # requested/previous version is not available locally
 readonly E_LOCKED=7
 readonly E_BAD_STATE=8
 readonly E_USER_ABORT=9
+readonly E_RESTORE_CONFLICT=10 # switch done, but your saved changes could not be re-applied (kept in the stash)
+readonly E_ROLLBACK_FAILED=11  # the automatic rollback could not restore everything; see the messages
 
 # Version requirements
 readonly MIN_GIT_MAJOR=2
@@ -102,27 +164,55 @@ readonly MIN_GIT_MINOR=0
 readonly MIN_BASH_MAJOR=4
 readonly MIN_BASH_MINOR=0
 
-# Operation timeouts and retries
-readonly FETCH_TIMEOUT=30
-readonly FETCH_RETRIES=3
-readonly FETCH_RETRY_DELAY=2
-readonly LOCK_MAX_WAIT=30
+# Operation timeouts and retries. Slow or metered uplinks can raise these (and
+# the test suite lowers them) through LYREBIRD_FETCH_TIMEOUT, LYREBIRD_FETCH_RETRIES,
+# LYREBIRD_FETCH_RETRY_DELAY, LYREBIRD_REMOTE_PROBE_TIMEOUT and
+# LYREBIRD_UPDATER_LOCK_WAIT (whole seconds / counts, at least 1; anything else
+# falls back to the default).
+_updater_positive_int() {
+    local value="${1:-}" default="$2"
+    if [[ "$value" =~ ^[0-9]+$ ]] && ((10#$value >= 1)); then
+        printf '%s' "$((10#$value))"
+    else
+        printf '%s' "$default"
+    fi
+}
+FETCH_TIMEOUT="$(_updater_positive_int "${LYREBIRD_FETCH_TIMEOUT:-}" 30)"
+readonly FETCH_TIMEOUT
+FETCH_RETRIES="$(_updater_positive_int "${LYREBIRD_FETCH_RETRIES:-}" 3)"
+readonly FETCH_RETRIES
+FETCH_RETRY_DELAY="$(_updater_positive_int "${LYREBIRD_FETCH_RETRY_DELAY:-}" 2)"
+readonly FETCH_RETRY_DELAY
+REMOTE_PROBE_TIMEOUT="$(_updater_positive_int "${LYREBIRD_REMOTE_PROBE_TIMEOUT:-}" 10)"
+readonly REMOTE_PROBE_TIMEOUT
+LOCK_MAX_WAIT="$(_updater_positive_int "${LYREBIRD_UPDATER_LOCK_WAIT:-}" 30)"
+readonly LOCK_MAX_WAIT
 readonly TAG_LIST_LIMIT=20
+
+# Every absolute system path the updater touches (service unit, cron job,
+# /run marker, migration state, /usr/local/bin, /var/log) can be re-rooted
+# under LYREBIRD_UPDATER_SYSROOT. Unset (the normal case) it is empty and the
+# paths are the real ones. The test suite points it at a temp directory so a
+# full update can run without writing to the host.
+UPDATER_SYSROOT="${LYREBIRD_UPDATER_SYSROOT:-}"
+UPDATER_SYSROOT="${UPDATER_SYSROOT%/}"
+readonly UPDATER_SYSROOT
 
 # Service update configuration
 readonly SERVICE_NAME="mediamtx-audio"
-readonly SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
-readonly SERVICE_CRON_FILE="/etc/cron.d/mediamtx-monitor"
+readonly SERVICE_FILE="${UPDATER_SYSROOT}/etc/systemd/system/${SERVICE_NAME}.service"
+readonly SERVICE_CRON_FILE="${UPDATER_SYSROOT}/etc/cron.d/mediamtx-monitor"
 readonly SERVICE_SCRIPT="lyrebird-stream-manager.sh"
-readonly SERVICE_UPDATE_MARKER="/run/lyrebird-service-update.marker"
+readonly SERVICE_UPDATE_MARKER="${UPDATER_SYSROOT}/run/lyrebird-service-update.marker"
 readonly SERVICE_STOP_TIMEOUT=30
 readonly SERVICE_START_TIMEOUT=10
 
 # Migration configuration
-readonly MIGRATION_MARKER_DIR="/var/lib/lyrebird/migrations"
+readonly MIGRATION_MARKER_DIR="${UPDATER_SYSROOT}/var/lib/lyrebird/migrations"
 readonly OLD_STREAM_MANAGER="mediamtx-stream-manager.sh"
-readonly OLD_STREAM_MANAGER_LOG="/var/log/mediamtx-stream-manager.log"
-readonly NEW_STREAM_MANAGER_LOG="/var/log/lyrebird-stream-manager.log"
+readonly OLD_STREAM_MANAGER_LOG="${UPDATER_SYSROOT}/var/log/mediamtx-stream-manager.log"
+readonly NEW_STREAM_MANAGER_LOG="${UPDATER_SYSROOT}/var/log/lyrebird-stream-manager.log"
+readonly STREAM_MANAGER_BIN_DIR="${UPDATER_SYSROOT}/usr/local/bin"
 
 # Colors for output (using tput for portability)
 if command -v tput >/dev/null 2>&1 && [[ -t 1 ]]; then
@@ -173,7 +263,23 @@ declare -A TRANSACTION_STATE=(
     [original_ref]=""
     [original_head]=""
     [operation]=""
+    [target]=""
+    [target_head]=""
+    [head_changed]=false
+    [kind]=""
+    [original_label]=""
+    [stash_message]=""
+    [service_was_running]=false
+    [recovering]=false
+    [note]=""
+    [phase]=""
+    [started]=""
+    [pid]=""
 )
+
+# Exit status of a run that otherwise ended normally (E_RESTORE_CONFLICT when a
+# self-update could not re-apply the operator's saved changes)
+EXIT_STATUS="$E_SUCCESS"
 
 # Available versions array
 declare -a AVAILABLE_VERSIONS=()
@@ -227,21 +333,211 @@ log_step() {
 }
 
 ################################################################################
+# Durable State: update history and transaction journal
+################################################################################
+
+# Both live in UPDATER_STATE_DIR (inside the git directory), are written with
+# fsync, and are readable without network or git. The history log is
+# append-only (one line per finished update, rollback or recovery); the
+# journal exists only while a transaction is in flight, so a copy that is still
+# there at the next start means the updater was killed (SIGKILL, OOM, power).
+
+# Flush FILE or DIR to stable storage (coreutils >= 8.24 syncs just that path;
+# older systems fall back to a global sync)
+updater_fsync() {
+    if declare -F lyrebird_fsync_path >/dev/null 2>&1; then
+        lyrebird_fsync_path "$1"
+    else
+        sync -- "$1" 2>/dev/null || sync
+    fi
+}
+
+# Replace DEST with stdin atomically and durably: temp file in DEST's
+# directory, fsync, rename, fsync of the directory. lyrebird_atomic_write when
+# the shared library is loaded, an equivalent local copy otherwise (the updater
+# must keep working in a tree where the library is missing).
+# Usage: updater_atomic_write DEST [MODE] < content
+updater_atomic_write() {
+    local dest="$1" mode="${2:-0600}"
+    local dir base tmp
+    if declare -F lyrebird_atomic_write >/dev/null 2>&1; then
+        lyrebird_atomic_write "$dest" "$mode"
+        return
+    fi
+    dir="$(dirname -- "$dest")"
+    base="$(basename -- "$dest")"
+    tmp="$(mktemp "${dir}/.${base}.XXXXXX")" || return 1
+    if ! cat >"$tmp" \
+        || ! chmod "$mode" -- "$tmp" \
+        || ! updater_fsync "$tmp" \
+        || ! mv -f -- "$tmp" "$dest"; then
+        rm -f -- "$tmp"
+        return 1
+    fi
+    updater_fsync "$dir"
+}
+
+# One line of text: tabs and newlines would break the TSV history and the
+# key=value journal
+_updater_oneline() {
+    local value="$1"
+    value="${value//$'\t'/ }"
+    value="${value//$'\r'/ }"
+    printf '%s' "${value//$'\n'/ }"
+}
+
+# A history field: one line, and "-" when empty so that fields never collapse
+_updater_field() {
+    local value
+    value="$(_updater_oneline "$1")"
+    printf '%s' "${value:--}"
+}
+
+# Human label of a commit: its tag, else FALLBACK (a branch name), else the short hash
+commit_label() {
+    local commit="$1" fallback="${2:-}" tag=""
+    if [[ -z "$commit" ]]; then
+        printf '%s' "(none)"
+        return 0
+    fi
+    tag="$(git describe --tags --exact-match "$commit" 2>/dev/null)" || tag=""
+    tag="${tag%%$'\n'*}"
+    if [[ -n "$tag" ]]; then
+        printf '%s' "$tag"
+    elif [[ -n "$fallback" && "$fallback" != "HEAD" ]]; then
+        printf '%s' "$fallback"
+    else
+        git rev-parse --short "$commit" 2>/dev/null || printf '%s' "${commit:0:7}"
+    fi
+}
+
+# Append one record to the history log.
+#   ts  kind  result  from_commit  from_label  to_commit  to_label  note
+# kind: update | rollback | reset;  result: ok | failed | rolled-back | interrupted
+# Usage: history_record KIND RESULT FROM_COMMIT FROM_LABEL TO_COMMIT TO_LABEL [NOTE]
+history_record() {
+    local kind="$1" result="$2" from_commit="$3" from_label="$4" to_commit="$5" to_label="$6" note="${7:-}"
+    local ts line
+    ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    line="${ts}"$'\t'"$(_updater_field "$kind")"$'\t'"$(_updater_field "$result")"
+    line+=$'\t'"$(_updater_field "$from_commit")"$'\t'"$(_updater_field "$from_label")"
+    line+=$'\t'"$(_updater_field "$to_commit")"$'\t'"$(_updater_field "$to_label")"
+    line+=$'\t'"$(_updater_field "$note")"
+    # A power cut can leave the last line unterminated; start a new line so the
+    # next record is not glued to that fragment
+    if [[ -s "$HISTORY_FILE" && -n "$(tail -c 1 "$HISTORY_FILE" 2>/dev/null)" ]]; then
+        line=$'\n'"$line"
+    fi
+    if ! mkdir -p "$UPDATER_STATE_DIR" 2>/dev/null \
+        || ! printf '%s\n' "$line" >>"$HISTORY_FILE" 2>/dev/null; then
+        log_warn "Could not record this in the update history: $HISTORY_FILE"
+        return 1
+    fi
+    updater_fsync "$HISTORY_FILE" || true
+    updater_fsync "$UPDATER_STATE_DIR" || true
+    return 0
+}
+
+# The most recent record of a completed version change (an update, rollback or
+# reset that finished with result ok), as the raw TSV line; empty if none
+history_last_change() {
+    [[ -f "$HISTORY_FILE" ]] || return 0
+    awk -F'\t' '$3 == "ok" && ($2 == "update" || $2 == "rollback" || $2 == "reset") {line = $0} END {if (line != "") print line}' \
+        "$HISTORY_FILE" 2>/dev/null || true
+}
+
+# Journal of the transaction in flight (key=value, one per line)
+declare -A JOURNAL=()
+
+# Persist the in-memory transaction. Returns 1 when it could not be written.
+# Usage: journal_write [PHASE]
+journal_write() {
+    local key
+    if [[ -n "${1:-}" ]]; then
+        TRANSACTION_STATE[phase]="$1"
+    fi
+    mkdir -p "$UPDATER_STATE_DIR" 2>/dev/null || return 1
+    {
+        echo "version=1"
+        for key in kind operation target target_head original_ref original_head original_label \
+            stash_hash stash_message head_changed service_was_running phase started pid; do
+            printf '%s=%s\n' "$key" "$(_updater_oneline "${TRANSACTION_STATE[$key]:-}")"
+        done
+    } | updater_atomic_write "$JOURNAL_FILE" 0600
+}
+
+# Load the journal into JOURNAL. 0 = loaded, 1 = no journal, 2 = unreadable.
+journal_load() {
+    local key value
+    JOURNAL=()
+    [[ -e "$JOURNAL_FILE" ]] || return 1
+    while IFS='=' read -r key value || [[ -n "$key" ]]; do
+        if [[ "$key" =~ ^[a-z_]+$ ]]; then
+            JOURNAL["$key"]="$value"
+        fi
+    done <"$JOURNAL_FILE" 2>/dev/null || return 2
+    [[ "${JOURNAL[version]:-}" == "1" && -n "${JOURNAL[phase]:-}" && -n "${JOURNAL[kind]:-}" ]] || return 2
+    return 0
+}
+
+journal_clear() {
+    rm -f -- "$JOURNAL_FILE" 2>/dev/null || true
+    updater_fsync "$UPDATER_STATE_DIR" || true
+}
+
+# Describe the loaded JOURNAL in one line
+journal_summary() {
+    printf '%s to %s (started %s, interrupted at phase "%s")' \
+        "${JOURNAL[kind]:-update}" "${JOURNAL[target]:-?}" "${JOURNAL[started]:-?}" "${JOURNAL[phase]:-?}"
+}
+
+################################################################################
 # Lock File Management
 ################################################################################
 
-acquire_lock() {
-    local waited=0
+# True (0) while an updater older than 1.7.0 still holds its in-tree lock. A
+# lock left by a dead one is removed: as an untracked directory it would
+# otherwise show up as a local modification of the repository forever.
+legacy_lock_held() {
+    [[ -d "$LEGACY_LOCKFILE" ]] || return 1
+    local legacy_pid="" legacy_cmdline=""
+    if [[ -f "${LEGACY_LOCKFILE}/pid" ]]; then
+        legacy_pid="$(cat "${LEGACY_LOCKFILE}/pid" 2>/dev/null || true)"
+    fi
+    if [[ "$legacy_pid" =~ ^[0-9]+$ && "$legacy_pid" != "$$" ]] && kill -0 "$legacy_pid" 2>/dev/null; then
+        legacy_cmdline="$(tr '\0' ' ' <"/proc/${legacy_pid}/cmdline" 2>/dev/null || true)"
+        if [[ "$legacy_cmdline" == *"lyrebird-updater"* ]]; then
+            return 0
+        fi
+    fi
+    rm -rf "$LEGACY_LOCKFILE" 2>/dev/null || true
+    return 1
+}
 
-    # Verify SCRIPT_DIR is writable before attempting lock file operations
-    if [[ ! -w "$SCRIPT_DIR" ]]; then
-        log_error "Cannot write to script directory: $SCRIPT_DIR"
-        log_info "The lock file needs to be created in this directory"
+acquire_lock() {
+    local waited=0 pid_write_failures=0
+
+    # The lock lives in the updater state directory (inside the git directory)
+    if ! mkdir -p "$UPDATER_STATE_DIR" 2>/dev/null || [[ ! -w "$UPDATER_STATE_DIR" ]]; then
+        log_error "Cannot write to updater state directory: $UPDATER_STATE_DIR"
+        log_info "The lock file, update history and transaction journal are kept there"
         log_info "Permission denied or directory is read-only"
         return "$E_PERMISSION"
     fi
 
     while true; do
+        # An old updater (< 1.7.0) running at the same time holds the old lock
+        if legacy_lock_held; then
+            if [[ $waited -ge $LOCK_MAX_WAIT ]]; then
+                log_error "Another (older) updater instance is running: $LEGACY_LOCKFILE"
+                return "$E_LOCKED"
+            fi
+            [[ $waited -eq 0 ]] && log_info "Waiting for other instance to finish..."
+            sleep 1
+            ((waited++)) || true
+            continue
+        fi
+
         # ATOMIC OPERATION: mkdir fails if directory exists
         if mkdir "$LOCKFILE" 2>/dev/null; then
             # Write PID atomically using temp file + rename
@@ -251,8 +547,14 @@ acquire_lock() {
                 log_debug "Lock acquired (PID: $$)"
                 return 0
             else
-                # Failed to write PID - clean up and retry
+                # Failed to write PID - clean up and retry a few times. On a full or
+                # read-only disk it fails every time: say so instead of spinning.
                 rm -rf "$LOCKFILE" 2>/dev/null
+                pid_write_failures=$((pid_write_failures + 1))
+                if [[ $pid_write_failures -ge 5 ]]; then
+                    log_error "Cannot write the lock file in $UPDATER_STATE_DIR (disk full or read-only?)"
+                    return "$E_PERMISSION"
+                fi
                 sleep 0.1
                 continue
             fi
@@ -1057,11 +1359,11 @@ migration_stream_manager_rename() {
     fi
 
     # 2. Handle /usr/local/bin installation
-    local old_bin="/usr/local/bin/${OLD_STREAM_MANAGER}"
-    local new_bin="/usr/local/bin/${SERVICE_SCRIPT}"
+    local old_bin="${STREAM_MANAGER_BIN_DIR}/${OLD_STREAM_MANAGER}"
+    local new_bin="${STREAM_MANAGER_BIN_DIR}/${SERVICE_SCRIPT}"
 
     if [[ -f "$old_bin" ]] || [[ -L "$old_bin" ]]; then
-        log_info "  Removing old script from /usr/local/bin..."
+        log_info "  Removing old script from ${STREAM_MANAGER_BIN_DIR}..."
         if rm -f "$old_bin" 2>/dev/null; then
             log_success "  Removed $old_bin"
             ((changes_made++)) || true
@@ -1153,7 +1455,11 @@ cleanup() {
     # If we're in an active transaction and exiting with error, attempt rollback
     if [[ "${TRANSACTION_STATE[active]}" == "true" ]] && [[ $exit_code -ne 0 ]]; then
         log_error "Operation failed - attempting automatic rollback..."
-        transaction_rollback
+        if [[ -n "$INTERRUPT_SIGNAL" ]]; then
+            transaction_rollback "interrupted by ${INTERRUPT_SIGNAL}" || true
+        else
+            transaction_rollback "stopped with exit status ${exit_code}" || true
+        fi
     fi
 
     # Restore git configuration
@@ -1167,20 +1473,58 @@ cleanup() {
 }
 
 # Trap all exit conditions
-trap cleanup EXIT
-trap 'log_error "Script interrupted by user"; exit $E_USER_ABORT' INT TERM
+# SIGINT/SIGTERM end the run with E_USER_ABORT; EXIT then rolls back any open
+# transaction (cleanup). INTERRUPT_SIGNAL says why, for the history record.
+INTERRUPT_SIGNAL=""
+# shellcheck disable=SC2317  # Invoked through the INT/TERM traps
+on_interrupt_signal() {
+    INTERRUPT_SIGNAL="$1"
+    log_error "Script interrupted by user"
+    exit "$E_USER_ABORT"
+}
+install_signal_traps() {
+    trap cleanup EXIT
+    trap 'on_interrupt_signal SIGINT' INT
+    trap 'on_interrupt_signal SIGTERM' TERM
+}
+install_signal_traps
+
+# Run a git command that writes working-tree files with the operator's umask
+git_worktree() {
+    (
+        umask "$ORIGINAL_UMASK"
+        git "$@"
+    )
+}
 
 ################################################################################
 # Git Configuration Management
 ################################################################################
 
+# core.fileMode is switched off for the length of a run: the scripts are
+# tracked as 644 but made executable on disk, which git would otherwise report
+# as local modifications. The value it had is written to GIT_CONFIG_SAVED_FILE
+# BEFORE the change, so a run that is killed (or exec'd into the new updater,
+# which skips the EXIT trap) cannot leave "false" behind for good: whoever
+# starts next restores the saved value first.
 save_git_config() {
     log_debug "Saving git configuration..."
 
+    if [[ -f "$GIT_CONFIG_SAVED_FILE" ]]; then
+        log_warn "An earlier run ended before restoring core.fileMode; restoring it now"
+        restore_git_config
+    fi
+
     # Save core.fileMode setting
     local current_filemode
-    current_filemode=$(git config --local core.fileMode 2>/dev/null || echo "")
+    current_filemode="$(git config --local core.fileMode 2>/dev/null || true)"
     ORIGINAL_GIT_CONFIG["core.fileMode"]="$current_filemode"
+    ORIGINAL_GIT_CONFIG["saved"]="true"
+
+    if ! printf '%s\n' "${current_filemode:-<unset>}" | updater_atomic_write "$GIT_CONFIG_SAVED_FILE" 0600; then
+        log_warn "Could not record the current core.fileMode in $GIT_CONFIG_SAVED_FILE"
+        log_warn "If this run is killed, restore it by hand: git config --local core.fileMode ${current_filemode:-true}"
+    fi
 
     # Apply our temporary setting
     git config --local core.fileMode false 2>/dev/null || true
@@ -1192,12 +1536,30 @@ save_git_config() {
 restore_git_config() {
     log_debug "Restoring git configuration..."
 
+    # Only put back what was saved: by this run, or by an earlier one that died.
+    # (Run unconditionally, an early exit -- the lock is held, not a repository --
+    # deleted an operator's own core.fileMode.)
+    local value=""
+    if [[ "${ORIGINAL_GIT_CONFIG["saved"]:-}" == "true" ]]; then
+        value="${ORIGINAL_GIT_CONFIG["core.fileMode"]:-}"
+    elif [[ -f "$GIT_CONFIG_SAVED_FILE" ]]; then
+        IFS= read -r value <"$GIT_CONFIG_SAVED_FILE" || true
+        if [[ "$value" == "<unset>" ]]; then
+            value=""
+        fi
+    else
+        log_debug "core.fileMode was not changed; nothing to restore"
+        return 0
+    fi
+
     # Restore core.fileMode
-    if [[ -n "${ORIGINAL_GIT_CONFIG["core.fileMode"]:-}" ]]; then
-        git config --local core.fileMode "${ORIGINAL_GIT_CONFIG["core.fileMode"]}" 2>/dev/null || true
+    if [[ -n "$value" ]]; then
+        git config --local core.fileMode "$value" 2>/dev/null || true
     else
         git config --unset --local core.fileMode 2>/dev/null || true
     fi
+    rm -f -- "$GIT_CONFIG_SAVED_FILE" 2>/dev/null || true
+    ORIGINAL_GIT_CONFIG["saved"]="false"
 
     log_debug "Git config restored"
 }
@@ -1495,7 +1857,27 @@ validate_clean_state() {
 # Repository State Functions
 ################################################################################
 
+# Ask origin which branch its HEAD points to. Bounded: on a dead uplink
+# `git ls-remote` waits for ever, and this ran at the start of every command
+# (even --version and --help), so a node that had lost its network could not
+# be asked anything, nor rolled back.
+query_remote_default_branch() {
+    local out
+    if command -v timeout >/dev/null 2>&1; then
+        out="$(GIT_HTTP_LOW_SPEED_LIMIT=1000 GIT_HTTP_LOW_SPEED_TIME="$REMOTE_PROBE_TIMEOUT" \
+            timeout "$REMOTE_PROBE_TIMEOUT" git ls-remote --symref origin HEAD 2>/dev/null)" || return 1
+    else
+        out="$(GIT_HTTP_LOW_SPEED_LIMIT=1000 GIT_HTTP_LOW_SPEED_TIME="$REMOTE_PROBE_TIMEOUT" \
+            git ls-remote --symref origin HEAD 2>/dev/null)" || return 1
+    fi
+    awk '/^ref:/ {sub(/refs\/heads\//, "", $2); print $2; exit}' <<<"$out"
+}
+
+# Usage: get_default_branch [offline]
+# With "offline" the network is not asked at all: the answer comes from what is
+# already in the clone (the cached refs/remotes/origin/HEAD, then the branches).
 get_default_branch() {
+    local offline="${1:-}"
     log_debug "Detecting default branch..."
 
     # Special handling for git-flow: if both main and develop exist, develop is development branch
@@ -1522,12 +1904,21 @@ get_default_branch() {
     fi
 
     # Try to get remote HEAD (but only use if not in git-flow pattern)
-    if remote_head="$(git ls-remote --symref origin HEAD 2>/dev/null | awk '/^ref:/ {sub(/refs\/heads\//, "", $2); print $2; exit}')"; then
-        if [[ -n "$remote_head" ]]; then
+    if [[ "$offline" != "offline" ]]; then
+        if remote_head="$(query_remote_default_branch)" && [[ -n "$remote_head" ]]; then
             log_debug "Remote HEAD points to: $remote_head"
             echo "$remote_head"
             return 0
         fi
+    fi
+
+    # What the last successful fetch recorded (git remote set-head origin --auto)
+    remote_head="$(git symbolic-ref -q --short refs/remotes/origin/HEAD 2>/dev/null || true)"
+    remote_head="${remote_head#origin/}"
+    if [[ -n "$remote_head" ]]; then
+        log_debug "Cached remote HEAD points to: $remote_head"
+        echo "$remote_head"
+        return 0
     fi
 
     log_debug "Remote HEAD detection failed, checking local branches..."
@@ -1603,9 +1994,13 @@ check_local_changes() {
         return 0
     fi
 
-    # Check for any changes
-    if ! git diff-index --quiet HEAD 2>/dev/null \
-        || git ls-files --others --exclude-standard 2>/dev/null | grep -q .; then
+    # Check for any changes. `git status` (not the plumbing `git diff-index`)
+    # because it refreshes stale stat data first: after the updater's own chmod
+    # of the scripts every one of them looked modified to diff-index, so a
+    # pristine clone reported "local modifications" and offered to stash
+    # nothing. A failing status is treated as "dirty" (the safe answer).
+    local porcelain=""
+    if ! porcelain="$(git status --porcelain 2>/dev/null)" || [[ -n "$porcelain" ]]; then
         HAS_LOCAL_CHANGES=true
         log_debug "Local modifications detected"
     else
@@ -1663,6 +2058,9 @@ confirm_destructive_action() {
 
 transaction_begin() {
     local operation="$1"
+    local target="${2:-}"
+    local target_head="${3:-}"
+    local kind="${4:-update}"
 
     if [[ "${TRANSACTION_STATE[active]}" == "true" ]]; then
         log_error "Transaction already active: ${TRANSACTION_STATE[operation]}"
@@ -1673,7 +2071,18 @@ transaction_begin() {
 
     # Save current state
     TRANSACTION_STATE[active]=true
+    TRANSACTION_STATE[kind]="$kind"
     TRANSACTION_STATE[operation]="$operation"
+    TRANSACTION_STATE[target]="$target"
+    TRANSACTION_STATE[target_head]="$target_head"
+    TRANSACTION_STATE[head_changed]=false
+    TRANSACTION_STATE[stash_hash]=""
+    TRANSACTION_STATE[stash_message]=""
+    TRANSACTION_STATE[service_was_running]=false
+    TRANSACTION_STATE[recovering]=false
+    TRANSACTION_STATE[note]=""
+    TRANSACTION_STATE[started]="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    TRANSACTION_STATE[pid]="$$"
     TRANSACTION_STATE[original_head]="$(git rev-parse HEAD 2>/dev/null || echo "")"
 
     if ! git symbolic-ref -q HEAD >/dev/null 2>&1; then
@@ -1681,8 +2090,26 @@ transaction_begin() {
     else
         TRANSACTION_STATE[original_ref]="$(git rev-parse --abbrev-ref HEAD 2>/dev/null)"
     fi
+    TRANSACTION_STATE[original_label]="$(commit_label "${TRANSACTION_STATE[original_head]}" "${TRANSACTION_STATE[original_ref]}")"
+
+    # The journal is what lets the next run undo a half-finished update after
+    # a kill or a power cut. Do not start changing anything that could not be
+    # recovered.
+    if ! journal_write begin; then
+        log_error "Cannot write the transaction journal in $UPDATER_STATE_DIR (disk full or read-only?)"
+        log_info "Nothing has been changed."
+        transaction_reset_state
+        return "$E_GENERAL"
+    fi
 
     return 0
+}
+
+# Record how far the transaction has got. A journal that cannot be written
+# here only means a crash would be diagnosed from an earlier phase (recovery
+# also looks at git itself), so it is not fatal.
+transaction_phase() {
+    journal_write "$1" || log_debug "Could not write the transaction journal (phase $1)"
 }
 
 transaction_stash_changes() {
@@ -1700,22 +2127,73 @@ transaction_stash_changes() {
     local stash_message
     stash_message="lyrebird-tx-${TRANSACTION_STATE[operation]}-${stash_nonce}"
 
+    # Name the stash in the journal BEFORE creating it: if the updater is killed
+    # in between, the next run can still find the stash by its message.
+    TRANSACTION_STATE[stash_message]="$stash_message"
+    if ! journal_write stashing; then
+        log_error "Cannot write the transaction journal in $UPDATER_STATE_DIR (disk full or read-only?)"
+        return "$E_GENERAL"
+    fi
+
+    # `git stash push` exits 0 without creating anything when there is nothing
+    # to save, so refs/stash must be compared before and after: taking
+    # `stash@{0}` blindly would adopt (and later pop) a stash the operator made
+    # earlier.
+    local stash_before="" stash_after="" stash_hash=""
+    stash_before="$(git rev-parse --verify --quiet refs/stash 2>/dev/null || true)"
+
     if ! git stash push -u -m "$stash_message" >/dev/null 2>&1; then
         log_error "Failed to save your changes"
         return "$E_GENERAL"
     fi
 
-    # Verify stash was created and get its hash
-    local stash_hash
-    if ! stash_hash="$(git rev-parse 'stash@{0}' 2>/dev/null)"; then
-        log_error "Failed to save your changes (couldn't verify save)"
-        return "$E_GENERAL"
+    stash_after="$(git rev-parse --verify --quiet refs/stash 2>/dev/null || true)"
+    if [[ -z "$stash_after" || "$stash_after" == "$stash_before" ]]; then
+        log_debug "Nothing to stash (no stash entry was created)"
+        TRANSACTION_STATE[stash_hash]=""
+        transaction_phase stashed
+        return 0
     fi
+    stash_hash="$stash_after"
 
     TRANSACTION_STATE[stash_hash]="$stash_hash"
     log_debug "Transaction stash created: $stash_hash"
+    transaction_phase stashed
 
     return 0
+}
+
+# Forget the transaction (nothing left to roll back)
+transaction_reset_state() {
+    TRANSACTION_STATE[active]=false
+    TRANSACTION_STATE[kind]=""
+    TRANSACTION_STATE[stash_hash]=""
+    TRANSACTION_STATE[stash_message]=""
+    TRANSACTION_STATE[original_ref]=""
+    TRANSACTION_STATE[original_head]=""
+    TRANSACTION_STATE[original_label]=""
+    TRANSACTION_STATE[operation]=""
+    TRANSACTION_STATE[target]=""
+    TRANSACTION_STATE[target_head]=""
+    TRANSACTION_STATE[head_changed]=false
+    TRANSACTION_STATE[service_was_running]=false
+    TRANSACTION_STATE[recovering]=false
+    TRANSACTION_STATE[note]=""
+    TRANSACTION_STATE[phase]=""
+    TRANSACTION_STATE[started]=""
+    TRANSACTION_STATE[pid]=""
+}
+
+# Label for the version the transaction was asked to go to
+_transaction_target_label() {
+    local target="${TRANSACTION_STATE[target]}" head="$1"
+    if [[ -n "$target" ]] \
+        && { git show-ref --verify --quiet "refs/tags/${target}" 2>/dev/null \
+            || git show-ref --verify --quiet "refs/heads/${target}" 2>/dev/null; }; then
+        printf '%s' "$target"
+    else
+        commit_label "$head" ""
+    fi
 }
 
 transaction_commit() {
@@ -1726,57 +2204,266 @@ transaction_commit() {
 
     log_debug "Transaction commit: ${TRANSACTION_STATE[operation]}"
 
-    # Clear transaction state
-    TRANSACTION_STATE[active]=false
-    TRANSACTION_STATE[stash_hash]=""
-    TRANSACTION_STATE[original_ref]=""
-    TRANSACTION_STATE[original_head]=""
-    TRANSACTION_STATE[operation]=""
+    local to_head to_label
+    to_head="$(git rev-parse HEAD 2>/dev/null || true)"
+    to_label="$(_transaction_target_label "$to_head")"
+
+    # The journal goes first: a kill between the two steps then loses one
+    # history line instead of rolling back an update that had completed
+    journal_clear
+    history_record "${TRANSACTION_STATE[kind]}" ok \
+        "${TRANSACTION_STATE[original_head]}" "${TRANSACTION_STATE[original_label]}" \
+        "$to_head" "$to_label" "${TRANSACTION_STATE[note]}" || true
+
+    transaction_reset_state
 
     return 0
 }
 
+# Hand the first half of a self-update to the re-exec'd updater. The journal
+# (phase "handoff") stays: the new process completes the restore and records
+# the result, or -- if it is killed -- the next run does.
+transaction_handoff() {
+    journal_write handoff || log_warn "Could not update the transaction journal before restarting"
+    transaction_reset_state
+}
+
+# The transaction's stash may have been created without its hash being recorded
+# yet: the updater was stopped (SIGTERM, SIGINT, or killed and recovered later)
+# between `git stash push` and the next line. The stash message was written to
+# the journal before the push, so the entry can still be found by it.
+adopt_transaction_stash() {
+    local found
+    if [[ -z "${TRANSACTION_STATE[stash_hash]}" && -n "${TRANSACTION_STATE[stash_message]}" ]]; then
+        found="$(git stash list --format='%H %gs' 2>/dev/null | awk -v m="${TRANSACTION_STATE[stash_message]}" 'index($0, m) {print $1; exit}')" || found=""
+        TRANSACTION_STATE[stash_hash]="$found"
+    fi
+}
+
+# After a checkout, confirm the files on disk are the target's. git can report
+# success after a write error on a single file (it prints "unable to write
+# file X", leaves X truncated and exits 0), so for every file the switch added
+# or changed the content on disk is compared with the blob in the target tree.
+# Prints the offending paths and returns 1 on any difference.
+verify_checkout_integrity() {
+    local from_head="$1" to_head="$2"
+    local path expected actual bad=0
+    while IFS= read -r -d '' path; do
+        if [[ -L "$path" ]]; then
+            continue # symlinks carry no content of their own to compare
+        fi
+        expected="$(git rev-parse --verify --quiet "${to_head}:${path}" 2>/dev/null || true)"
+        if [[ ! -f "$path" ]]; then
+            log_error "Missing after checkout: $path"
+            bad=1
+            continue
+        fi
+        actual="$(git hash-object -- "$path" 2>/dev/null || true)"
+        if [[ -z "$expected" || "$actual" != "$expected" ]]; then
+            log_error "Differs from the target version after checkout: $path"
+            bad=1
+        fi
+    done < <(git diff --name-only -z --diff-filter=AM "$from_head" "$to_head" 2>/dev/null || true)
+    [[ "$bad" -eq 0 ]]
+}
+
+# Print the stash reference (stash@{n}) of the stash commit HASH, if it is still in the list
+find_stash_ref() {
+    local hash="$1"
+    git stash list --format="%gd %H" 2>/dev/null | awk -v h="$hash" '$2 == h {print $1; exit}' || true
+}
+
+# Tell the operator where their changes are and how to get them back
+report_kept_stash() {
+    local ref="$1"
+    log_warn "Your saved changes could not be re-applied to this version and were NOT lost:"
+    log_info "  They are kept in:   $ref"
+    log_info "  To look at them:    git stash show -p $ref"
+    log_info "  To re-apply:        git stash apply $ref   (resolve any conflicts, then: git stash drop $ref)"
+}
+
+# After a failed `git stash pop` the working tree holds conflict markers and
+# possibly part of the stash. Called only when the tree was clean before the
+# pop, so everything modified or untracked now came from the failed pop:
+# discard it and leave the clean version the operator switched to.
+abandon_failed_stash_apply() {
+    local ref="$1"
+    local path
+    git_worktree reset --hard HEAD >/dev/null 2>&1 || true
+    # Untracked files stored in the stash (its third parent) that the failed
+    # apply may already have restored. A path that is tracked in HEAD is the
+    # version's own file (the stash held an untracked file of the same name): keep it.
+    if git rev-parse --verify --quiet "${ref}^3" >/dev/null 2>&1; then
+        while IFS= read -r -d '' path; do
+            [[ -e "$path" || -L "$path" ]] || continue
+            if git ls-files --error-unmatch -- "$path" >/dev/null 2>&1; then
+                continue
+            fi
+            rm -f -- "$path" 2>/dev/null || true
+        done < <(git ls-tree -r -z --name-only "${ref}^3" 2>/dev/null || true)
+    fi
+}
+
+# Re-apply the transaction stash HASH onto the working tree.
+#   0                   restored; the stash entry is dropped
+#   1                   the stash entry is gone, nothing to restore
+#   E_RESTORE_CONFLICT  conflicts: the working tree is left clean (the version
+#                       that was switched to) and the changes stay in the stash
+# `git stash pop` on conflicts leaves markers in tracked files and exits
+# non-zero; the old code then reported success, so the markers could end up in
+# a script the service runs.
+restore_saved_changes() {
+    local hash="$1" ref clean_before=false
+    ref="$(find_stash_ref "$hash")"
+    if [[ -z "$ref" ]]; then
+        log_warn "Could not find your saved changes (stash $hash)"
+        return 1
+    fi
+
+    if [[ -z "$(git status --porcelain 2>/dev/null || echo unknown)" ]]; then
+        clean_before=true
+    fi
+
+    if git_worktree stash pop "$ref" >/dev/null 2>&1; then
+        return 0
+    fi
+
+    if [[ "$clean_before" == "true" ]]; then
+        abandon_failed_stash_apply "$ref"
+    else
+        log_warn "The working tree was not clean, so the partial result is left in place for you to inspect"
+    fi
+    report_kept_stash "$ref"
+    return "$E_RESTORE_CONFLICT"
+}
+
+# Delete files the failed switch added to the working tree: present in the
+# target version, absent from the original one, and untracked once HEAD is
+# back. (`git checkout` of the original version does not remove them.)
+remove_target_leftovers() {
+    local orig_head="${TRANSACTION_STATE[original_head]}"
+    local target_head="${TRANSACTION_STATE[target_head]}"
+    local leftover
+    [[ -n "$target_head" && "$target_head" != "$orig_head" ]] || return 0
+    while IFS= read -r -d '' leftover; do
+        [[ -e "$leftover" || -L "$leftover" ]] || continue
+        if git ls-files --error-unmatch -- "$leftover" >/dev/null 2>&1; then
+            continue
+        fi
+        rm -f -- "$leftover" 2>/dev/null || true
+    done < <(git diff --name-only -z --diff-filter=A "$orig_head" "$target_head" 2>/dev/null || true)
+}
+
+# Put HEAD and the working tree back where the transaction started.
+# Returns 0 when they are there, 1 when they could not be restored.
+#
+# A forced checkout discards uncommitted changes, so it is only done when this
+# transaction actually moved HEAD (head_changed): by then the operator's
+# changes are in the transaction stash. Before that -- the operator declined to
+# stash, or the stash failed -- the tree still holds their work and is not
+# touched.
+#
+# When recovering from a crash (the updater was killed, then run again) the
+# working tree may also hold edits made after the crash, which cannot be told
+# from what the interrupted checkout left behind: anything uncommitted is first
+# saved in a recovery stash instead of being discarded.
+restore_original_head() {
+    local orig_ref="${TRANSACTION_STATE[original_ref]}"
+    local orig_head="${TRANSACTION_STATE[original_head]}"
+    local cur_head=""
+
+    # Empty repository: there is no commit to return to
+    [[ -n "$orig_head" ]] || return 0
+
+    cur_head="$(git rev-parse HEAD 2>/dev/null || true)"
+    if [[ "${TRANSACTION_STATE[head_changed]}" != "true" && "$cur_head" == "$orig_head" ]]; then
+        log_debug "HEAD never moved; leaving the working tree alone"
+        return 0
+    fi
+
+    if [[ "${TRANSACTION_STATE[recovering]}" == "true" ]] \
+        && [[ -n "$(git status --porcelain 2>/dev/null || echo unknown)" ]]; then
+        local safety_message safety_before safety_after
+        safety_message="lyrebird-recovery-$(date +%s)-$$"
+        safety_before="$(git rev-parse --verify --quiet refs/stash 2>/dev/null || true)"
+        if ! git stash push -u -m "$safety_message" >/dev/null 2>&1; then
+            log_error "The working tree has uncommitted differences and they could not be saved first"
+            return 1
+        fi
+        safety_after="$(git rev-parse --verify --quiet refs/stash 2>/dev/null || true)"
+        if [[ "$safety_after" != "$safety_before" ]]; then
+            log_warn "Uncommitted differences in the working tree were saved first, in the stash entry named: $safety_message"
+            log_info "They are what the interrupted update left behind, plus any edit made since;"
+            log_info "inspect with: git stash list   /   git stash show -p <entry>"
+        fi
+    fi
+
+    log_debug "Restoring original position: ${orig_ref} @ ${orig_head}"
+    # First delete what the failed switch added: on a full disk those partially
+    # written files occupy the space the restore needs.
+    remove_target_leftovers
+    if [[ "$orig_ref" != "HEAD" ]]; then
+        # Started on a branch: back on it, and back to where its tip was
+        # (fast_forward_branch_to_origin may have advanced the branch)
+        git_worktree checkout --force "$orig_ref" >/dev/null 2>&1 || return 1
+        if [[ "$(git rev-parse HEAD 2>/dev/null || true)" != "$orig_head" ]]; then
+            git_worktree reset --hard "$orig_head" >/dev/null 2>&1 || return 1
+        fi
+    else
+        # Started on a tag or commit (detached HEAD): `git checkout HEAD` would
+        # re-check-out the version we are trying to leave
+        git_worktree checkout --force --detach "$orig_head" >/dev/null 2>&1 || return 1
+    fi
+
+    [[ "$(git rev-parse HEAD 2>/dev/null || true)" == "$orig_head" ]]
+}
+
+# Usage: transaction_rollback [REASON] [quiet]
+# quiet: do not record the rollback in the history (the operator cancelled)
 transaction_rollback() {
+    local reason="${1:-failed}" quiet="${2:-}"
+
     if [[ "${TRANSACTION_STATE[active]}" != "true" ]]; then
         log_debug "No active transaction to rollback"
         return 0
     fi
 
-    log_warn "Rolling back: ${TRANSACTION_STATE[operation]}"
+    log_warn "Rolling back: ${TRANSACTION_STATE[operation]} (${reason})"
 
-    # Disable traps during rollback to prevent recursion
-    trap - EXIT INT TERM
+    # The rollback must run to completion: a second Ctrl-C or SIGTERM in the
+    # middle of it would leave the repository between the two versions.
+    trap - EXIT
+    trap '' INT TERM
 
-    # Attempt to return to original ref
-    if [[ -n "${TRANSACTION_STATE[original_ref]}" ]]; then
-        log_debug "Restoring original ref: ${TRANSACTION_STATE[original_ref]}"
-        if ! git checkout "${TRANSACTION_STATE[original_ref]}" --force >/dev/null 2>&1; then
-            log_error "Could not restore original ref"
-            # Try to at least get to original HEAD
-            if [[ -n "${TRANSACTION_STATE[original_head]}" ]]; then
-                git checkout "${TRANSACTION_STATE[original_head]}" --force >/dev/null 2>&1 || true
-            fi
-        fi
+    local rollback_ok=true
+    local head_restored=true
+
+    if ! restore_original_head; then
+        log_error "Could not restore the original version"
+        log_info "To return by hand: git checkout --force ${TRANSACTION_STATE[original_head]}"
+        rollback_ok=false
+        head_restored=false
+    else
+        set_script_permissions
     fi
 
-    # Restore stashed changes if any
+    # Restore stashed changes if any -- only onto the original version again
+    adopt_transaction_stash
     if [[ -n "${TRANSACTION_STATE[stash_hash]}" ]]; then
         log_debug "Restoring saved changes: ${TRANSACTION_STATE[stash_hash]}"
 
-        # Find stash ref from hash
         local stash_ref
-        stash_ref=$(git stash list --format="%gd %H" | grep "${TRANSACTION_STATE[stash_hash]}" | cut -d' ' -f1 || echo "")
+        stash_ref="$(find_stash_ref "${TRANSACTION_STATE[stash_hash]}")"
 
-        if [[ -n "$stash_ref" ]]; then
-            if git stash pop "$stash_ref" >/dev/null 2>&1; then
-                log_success "Your changes were restored"
-            else
-                log_warn "Could not restore your changes automatically"
-                log_info "Your changes are saved in: $stash_ref"
-                log_info "To restore: git stash pop $stash_ref"
-            fi
-        else
+        if [[ -z "$stash_ref" ]]; then
             log_warn "Could not find your saved changes"
+        elif [[ "$head_restored" != "true" ]]; then
+            log_warn "Your changes are saved in: $stash_ref"
+            log_info "Once the version is back: git stash pop $stash_ref"
+        elif restore_saved_changes "${TRANSACTION_STATE[stash_hash]}"; then
+            log_success "Your changes were restored"
+        else
+            TRANSACTION_STATE[note]="saved changes kept in the stash"
         fi
     fi
 
@@ -1799,22 +2486,237 @@ transaction_rollback() {
             cleanup_service_backups
         fi
         rm -f "$SERVICE_UPDATE_MARKER"
+    elif [[ "${TRANSACTION_STATE[service_was_running]}" == "true" ]] \
+        && [[ "${TRANSACTION_STATE[recovering]}" == "true" ]] \
+        && command -v systemctl >/dev/null 2>&1 \
+        && ! systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null; then
+        # recovering after the marker is gone (reboot): the service was running
+        # when the update began and is not now
+        log_info "Starting $SERVICE_NAME again (it was running when the update began)..."
+        systemctl start "$SERVICE_NAME" 2>/dev/null || log_warn "Could not start $SERVICE_NAME: systemctl status $SERVICE_NAME"
+    fi
+
+    # Record the outcome, then forget the transaction. The journal survives a
+    # rollback that could not finish, so the next run tries again.
+    local result="failed"
+    if [[ "${TRANSACTION_STATE[recovering]}" == "true" ]]; then
+        result="interrupted"
+    elif [[ "${TRANSACTION_STATE[head_changed]}" == "true" ]]; then
+        result="rolled-back"
+    fi
+    local note="$reason"
+    if [[ "$rollback_ok" != "true" ]]; then
+        note="$reason; rollback incomplete"
+    elif [[ -n "${TRANSACTION_STATE[note]}" ]]; then
+        note="$reason; ${TRANSACTION_STATE[note]}"
+    fi
+    if [[ "$rollback_ok" == "true" ]]; then
+        journal_clear
+    else
+        transaction_phase rollback-failed
+    fi
+    if [[ "$quiet" != "quiet" ]]; then
+        history_record "${TRANSACTION_STATE[kind]:-update}" "$result" \
+            "${TRANSACTION_STATE[original_head]}" "${TRANSACTION_STATE[original_label]}" \
+            "${TRANSACTION_STATE[target_head]}" "${TRANSACTION_STATE[target]}" "$note" || true
     fi
 
     # Clear transaction state
-    TRANSACTION_STATE[active]=false
-    TRANSACTION_STATE[stash_hash]=""
-    TRANSACTION_STATE[original_ref]=""
-    TRANSACTION_STATE[original_head]=""
-    TRANSACTION_STATE[operation]=""
+    transaction_reset_state
 
     # Restore traps (direct re-installation avoids eval of arbitrary strings)
-    trap cleanup EXIT
-    trap 'log_error "Script interrupted by user"; exit $E_USER_ABORT' INT TERM
+    install_signal_traps
 
-    log_warn "Rollback complete"
+    if [[ "$rollback_ok" == "true" ]]; then
+        log_warn "Rollback complete"
+        return 0
+    fi
+    log_error "Rollback incomplete: the repository may be between versions"
+    return 1
+}
 
+# Roll back and return CODE (the reason the transaction failed), or
+# E_ROLLBACK_FAILED when the rollback itself could not restore everything.
+# A third argument "quiet" keeps it out of the history (the operator cancelled).
+# Use as: transaction_abort "why" "$E_GENERAL" || return $?
+transaction_abort() {
+    local reason="$1" code="$2" quiet="${3:-}"
+    transaction_rollback "$reason" "$quiet" || return "$E_ROLLBACK_FAILED"
+    return "$code"
+}
+
+################################################################################
+# Recovery from an interrupted run, and the update history
+################################################################################
+
+# Read-only: say whether an earlier run left a transaction behind.
+# Returns 0 (and says so) when one is there, 1 when not.
+report_interrupted_transaction() {
+    local rc=0
+    journal_load || rc=$?
+    if [[ $rc -eq 1 ]]; then
+        return 1
+    fi
+    if [[ $rc -eq 2 ]]; then
+        log_warn "The transaction journal exists but cannot be read: $JOURNAL_FILE"
+        log_info "Check 'git status' and 'git stash list', then remove that file."
+        return 0
+    fi
+    log_warn "An earlier $(journal_summary) did not finish."
+    log_info "Run ${SCRIPT_NAME} without arguments to recover; nothing is changed until you do."
     return 0
+}
+
+# A self-update whose first half ran in the previous updater process: take the
+# transaction over from the journal so the service update that follows knows
+# which version it came from.
+handoff_load_journal() {
+    if journal_load && [[ "${JOURNAL[phase]}" == "handoff" ]]; then
+        TRANSACTION_STATE[original_head]="${JOURNAL[original_head]:-}"
+        return 0
+    fi
+    return 1
+}
+
+# Close the journal of a handed-over self-update and record the result.
+# Usage: handoff_finish [NOTE]
+handoff_finish() {
+    local note="${1:-}" to_head
+    to_head="$(git rev-parse HEAD 2>/dev/null || true)"
+    if journal_load && [[ "${JOURNAL[phase]}" == "handoff" ]]; then
+        journal_clear
+        history_record "${JOURNAL[kind]:-update}" ok "${JOURNAL[original_head]:-}" "${JOURNAL[original_label]:-(unknown)}" \
+            "$to_head" "${JOURNAL[target]:-$(commit_label "$to_head" "")}" "$note" || true
+    elif [[ ! -e "$JOURNAL_FILE" ]]; then
+        # started by an updater that kept no journal
+        history_record update ok "" "(unknown)" "$to_head" "$(commit_label "$to_head" "")" \
+            "self-update started by an older updater${note:+; $note}" || true
+    fi
+    TRANSACTION_STATE[original_head]=""
+}
+
+# The first half of a self-update ran and the new updater never finished it
+# (killed, or the machine lost power). The checkout was verified and the new
+# updater syntax-checked, so this rolls forward: re-apply the saved changes and
+# complete the service update.
+recover_handoff() {
+    local stash_hash="${JOURNAL[stash_hash]:-}" restore_status=0 note=""
+    local head
+    head="$(git rev-parse HEAD 2>/dev/null || true)"
+
+    if [[ -n "${JOURNAL[target_head]:-}" && "$head" != "${JOURNAL[target_head]}" ]]; then
+        log_warn "HEAD is no longer at the version that update switched to; leaving it where it is"
+    fi
+
+    if [[ -n "$stash_hash" ]] && [[ -n "$(find_stash_ref "$stash_hash")" ]]; then
+        log_step "Restoring your saved changes..."
+        restore_saved_changes "$stash_hash" || restore_status=$?
+        if [[ $restore_status -eq 0 ]]; then
+            log_success "Changes restored successfully"
+        elif [[ $restore_status -eq $E_RESTORE_CONFLICT ]]; then
+            note="saved changes kept in the stash"
+            EXIT_STATUS="$E_RESTORE_CONFLICT"
+        fi
+    fi
+
+    TRANSACTION_STATE[original_head]="${JOURNAL[original_head]:-}"
+    if check_pending_service_update; then
+        complete_pending_service_update || log_error "Service update completion failed; check: systemctl status $SERVICE_NAME"
+    fi
+
+    handoff_finish "completed after an interruption${note:+; $note}"
+    log_success "The interrupted self-update was completed."
+    return 0
+}
+
+# Undo an update that an earlier run left half done. The journal tells what
+# the transaction was; git decides how far it got. Returns 0 when nothing was
+# pending or it was rolled back, E_ROLLBACK_FAILED / E_BAD_STATE when not.
+recover_interrupted_transaction() {
+    local rc=0 key
+    journal_load || rc=$?
+    if [[ $rc -eq 1 ]]; then
+        return 0
+    fi
+    if [[ $rc -eq 2 ]]; then
+        log_error "The transaction journal exists but cannot be read: $JOURNAL_FILE"
+        log_info "Check 'git status' and 'git stash list', then remove that file to continue."
+        return "$E_BAD_STATE"
+    fi
+
+    echo
+    log_warn "An earlier $(journal_summary)."
+    log_info "The updater was stopped before it finished (killed, crashed or powered off)."
+
+    if [[ "${JOURNAL[phase]}" == "handoff" ]]; then
+        recover_handoff
+        return $?
+    fi
+
+    # Take the journal over as the active transaction and roll it back
+    for key in kind operation target target_head original_ref original_head original_label \
+        stash_hash stash_message head_changed service_was_running started pid; do
+        TRANSACTION_STATE[$key]="${JOURNAL[$key]:-}"
+    done
+    TRANSACTION_STATE[active]=true
+    TRANSACTION_STATE[recovering]=true
+    TRANSACTION_STATE[note]=""
+    if [[ "$(git rev-parse HEAD 2>/dev/null || true)" != "${JOURNAL[original_head]:-}" ]]; then
+        TRANSACTION_STATE[head_changed]=true
+    fi
+    # (a stash created but not recorded before the kill is found by its message in transaction_rollback)
+    if transaction_rollback "interrupted run recovered at phase ${JOURNAL[phase]}"; then
+        log_success "The interrupted ${JOURNAL[kind]:-update} was rolled back."
+        return 0
+    fi
+    log_error "Recovery could not finish; see the messages above."
+    return "$E_ROLLBACK_FAILED"
+}
+
+# Show the update history (the log is local: no network, no git needed)
+readonly HISTORY_SHOW_LIMIT=50
+show_history() {
+    local ts kind result from_commit from_label to_commit to_label note
+    local skipped=0 total=0
+
+    echo
+    echo "${BOLD}=== Update History ===${NC}"
+    echo "  Log: $HISTORY_FILE"
+    echo
+
+    if [[ ! -s "$HISTORY_FILE" ]]; then
+        echo "  No updates recorded yet."
+    else
+        total="$(wc -l <"$HISTORY_FILE" | tr -d '[:space:]')"
+        printf '  %-20s  %-8s  %-11s  %-22s  %-22s  %s\n' "WHEN (UTC)" "KIND" "RESULT" "FROM" "TO" "NOTE"
+        while IFS=$'\t' read -r ts kind result from_commit from_label to_commit to_label note || [[ -n "$ts" ]]; do
+            if [[ -z "$ts" || -z "$kind" || -z "$result" ]]; then
+                skipped=$((skipped + 1))
+                continue
+            fi
+            printf '  %-20s  %-8s  %-11s  %-22s  %-22s  %s\n' "${ts/T/ }" "$kind" "$result" \
+                "${from_label:-?} (${from_commit:0:7})" "${to_label:-?} (${to_commit:0:7})" "$note"
+        done < <(tail -n "$HISTORY_SHOW_LIMIT" "$HISTORY_FILE")
+        if [[ $total -gt $HISTORY_SHOW_LIMIT ]]; then
+            echo
+            echo "  (newest ${HISTORY_SHOW_LIMIT} of ${total} records; the full log is the file above)"
+        fi
+        if [[ $skipped -gt 0 ]]; then
+            echo "  ($skipped unreadable line(s) skipped)"
+        fi
+    fi
+
+    local rc=0
+    journal_load || rc=$?
+    if [[ $rc -eq 0 ]]; then
+        echo
+        echo "  ${YELLOW}Not finished:${NC} $(journal_summary)"
+        echo "  Run ${SCRIPT_NAME} without arguments to recover."
+    elif [[ $rc -eq 2 ]]; then
+        echo
+        echo "  ${YELLOW}Not finished:${NC} an update left an unreadable journal: $JOURNAL_FILE"
+    fi
+    echo
 }
 
 ################################################################################
@@ -1834,15 +2736,18 @@ fetch_updates_safe() {
             sleep "$FETCH_RETRY_DELAY"
         fi
 
-        # Try fetch with timeout if available
+        # Try fetch with timeout if available (the low-speed limits also bound a
+        # stalled http transfer where there is no timeout command)
         if command -v timeout >/dev/null 2>&1; then
-            if fetch_output=$(timeout "$FETCH_TIMEOUT" git fetch --all --tags --prune 2>&1); then
+            if fetch_output=$(GIT_HTTP_LOW_SPEED_LIMIT=1000 GIT_HTTP_LOW_SPEED_TIME="$FETCH_TIMEOUT" \
+                timeout "$FETCH_TIMEOUT" git fetch --all --tags --prune 2>&1); then
                 fetch_succeeded=true
                 break
             fi
         else
             # No timeout command, try without it
-            if fetch_output=$(git fetch --all --tags --prune 2>&1); then
+            if fetch_output=$(GIT_HTTP_LOW_SPEED_LIMIT=1000 GIT_HTTP_LOW_SPEED_TIME="$FETCH_TIMEOUT" \
+                git fetch --all --tags --prune 2>&1); then
                 fetch_succeeded=true
                 break
             fi
@@ -1855,12 +2760,17 @@ fetch_updates_safe() {
     if [[ "$fetch_succeeded" != "true" ]]; then
         log_error "Failed to fetch updates after $FETCH_RETRIES attempts"
         log_error "Please check your internet connection"
-        log_debug "Last error: $fetch_output"
+        # what git said (its first line: "Could not resolve host", "timed out", ...)
+        log_info "git said: ${fetch_output%%$'\n'*}"
         return "$E_NO_REMOTE"
     fi
 
-    # Update remote HEAD reference
-    git remote set-head origin --auto >/dev/null 2>&1 || true
+    # Update remote HEAD reference (this asks the remote again: bounded too)
+    if command -v timeout >/dev/null 2>&1; then
+        timeout "$FETCH_TIMEOUT" git remote set-head origin --auto >/dev/null 2>&1 || true
+    else
+        git remote set-head origin --auto >/dev/null 2>&1 || true
+    fi
 
     log_success "Updates fetched successfully"
     return 0
@@ -1907,11 +2817,22 @@ fast_forward_branch_to_origin() {
     git show-ref --verify --quiet "refs/heads/${target}" || return 0
     # No remote-tracking counterpart -> local-only branch, leave as-is.
     git show-ref --verify --quiet "refs/remotes/origin/${target}" || return 0
-    git merge --ff-only "origin/${target}" >/dev/null 2>&1
+    git_worktree merge --ff-only "origin/${target}" >/dev/null 2>&1
 }
 
+# True when the updater script at COMMIT can resume after a self-update re-exec
+# (it understands --post-update-restore / --post-update-complete). Releases
+# before 1.5 do not: re-exec'ing into one strands the stash and the service.
+updater_supports_handoff() {
+    local commit="$1" content
+    content="$(git show "${commit}:${SCRIPT_NAME}" 2>/dev/null)" || return 1
+    [[ "$content" == *"--post-update-restore"* && "$content" == *"--post-update-complete"* ]]
+}
+
+# Usage: switch_version_safe TARGET [KIND]   (KIND: update | rollback, for the journal and history)
 switch_version_safe() {
     local target_version="$1"
+    local kind="${2:-update}"
 
     if [[ -z "$target_version" ]]; then
         log_error "No version specified"
@@ -1940,7 +2861,9 @@ switch_version_safe() {
     fi
 
     # Begin transaction
-    if ! transaction_begin "switch to $target_version"; then
+    local target_head
+    target_head="$(git rev-parse --verify --quiet "${target_version}^{commit}" 2>/dev/null || true)"
+    if ! transaction_begin "switch to $target_version" "$target_version" "$target_head" "$kind"; then
         return "$E_GENERAL"
     fi
 
@@ -1963,13 +2886,11 @@ switch_version_safe() {
         echo
         if ! confirm_action "Save your changes temporarily? (recommended)"; then
             log_info "Operation cancelled"
-            transaction_rollback
-            return "$E_USER_ABORT"
+            transaction_abort "cancelled by the operator" "$E_USER_ABORT" quiet || return $?
         fi
 
         if ! transaction_stash_changes; then
-            transaction_rollback
-            return "$E_GENERAL"
+            transaction_abort "could not save local changes" "$E_GENERAL" || return $?
         fi
 
         log_success "Your changes have been saved and will be restored after the update"
@@ -1980,26 +2901,37 @@ switch_version_safe() {
     handle_systemd_service_update "$target_version" || service_update_result=$?
     if [[ $service_update_result -eq 0 ]]; then
         log_debug "Service update preparation successful"
+        if [[ "${SERVICE_STATE[installed]}" == "true" ]]; then
+            TRANSACTION_STATE[service_was_running]="${SERVICE_STATE[was_running]}"
+            transaction_phase service-prepared
+        fi
     else
         if [[ $service_update_result -eq $E_USER_ABORT ]]; then
             log_info "Operation cancelled by user during service update"
-            transaction_rollback
-            return "$E_USER_ABORT"
+            transaction_abort "cancelled during service update" "$E_USER_ABORT" quiet || return $?
         else
             log_error "Service update preparation failed"
-            transaction_rollback
-            return "$E_GENERAL"
+            transaction_abort "service update preparation failed" "$E_GENERAL" || return $?
         fi
     fi
 
     # Check if script itself will be modified (self-update)
     local script_will_change=false
     if ! git diff --quiet HEAD "$target_version" -- "$SCRIPT_NAME" 2>/dev/null; then
-        script_will_change=true
-        log_info "The updater script itself will be updated"
-        log_info "The process will restart automatically after the update"
-        echo
-        sleep 2
+        if updater_supports_handoff "${TRANSACTION_STATE[target_head]}"; then
+            script_will_change=true
+            log_info "The updater script itself will be updated"
+            log_info "The process will restart automatically after the update"
+            echo
+            sleep 2
+        else
+            # Re-exec'ing into an updater that does not know --post-update-* would
+            # strand the saved changes and the stopped service: finish here with
+            # the copy already loaded (git replaces the file; this process keeps
+            # reading the old one).
+            log_warn "The updater in $target_version is older and cannot resume an update"
+            log_info "Finishing this update with the current updater; start it again afterwards"
+        fi
     fi
 
     # Perform the checkout
@@ -2010,23 +2942,29 @@ switch_version_safe() {
     repo_root="$(git rev-parse --show-toplevel 2>/dev/null)"
     if [[ -z "$repo_root" ]]; then
         log_error "Could not determine repository root"
-        transaction_rollback
-        return "$E_GENERAL"
+        transaction_abort "repository root unknown" "$E_GENERAL" || return $?
     fi
 
     if [[ ! -w "$repo_root" ]]; then
         log_error "No write permission for working directory: $repo_root"
         log_info "To fix: sudo chown -R $USER:$USER $repo_root"
-        transaction_rollback
-        return "$E_PERMISSION"
+        transaction_abort "working directory not writable" "$E_PERMISSION" || return $?
+    fi
+
+    # From here on HEAD and the working tree may change: a rollback must put
+    # them back (and may then discard whatever the failed checkout left behind).
+    # This phase is written to the journal before git is allowed to touch the tree.
+    TRANSACTION_STATE[head_changed]=true
+    if ! journal_write checkout; then
+        log_error "Cannot write the transaction journal in $UPDATER_STATE_DIR (disk full or read-only?)"
+        transaction_abort "transaction journal not writable" "$E_GENERAL" || return $?
     fi
 
     local checkout_output
-    if ! checkout_output=$(git checkout "$target_version" 2>&1); then
+    if ! checkout_output=$(git_worktree checkout "$target_version" 2>&1); then
         log_error "Failed to switch to version: $target_version"
         echo "$checkout_output" >&2
-        transaction_rollback
-        return "$E_GENERAL"
+        transaction_abort "checkout failed" "$E_GENERAL" || return $?
     fi
 
     # Fast-forward a branch target to origin (a plain checkout lands on the stale
@@ -2035,8 +2973,7 @@ switch_version_safe() {
     if ! fast_forward_branch_to_origin "$target_version"; then
         log_error "Cannot fast-forward ${target_version} to origin/${target_version}: local history has diverged"
         log_info "To discard local commits and match the remote exactly, use the reset option in the menu."
-        transaction_rollback
-        return "$E_GENERAL"
+        transaction_abort "local branch has diverged from origin" "$E_GENERAL" || return $?
     fi
 
     # Verify we actually switched to the target
@@ -2048,10 +2985,15 @@ switch_version_safe() {
     if [[ "$new_head" != "$target_head" ]]; then
         log_error "Checkout completed but HEAD does not match target"
         log_error "This indicates a git state inconsistency"
-        transaction_rollback
-        return "$E_GENERAL"
+        transaction_abort "HEAD does not match the target after checkout" "$E_GENERAL" || return $?
     fi
 
+    if ! verify_checkout_integrity "${TRANSACTION_STATE[original_head]}" "$new_head"; then
+        log_error "The files on disk do not match version $target_version (disk full or a write error?)"
+        transaction_abort "files on disk differ from the target after checkout" "$E_GENERAL" || return $?
+    fi
+
+    transaction_phase checked-out
     log_success "Switched to version: $target_version"
 
     # Set executable permissions on known scripts
@@ -2077,8 +3019,7 @@ switch_version_safe() {
             if ! chmod +x "$script_path" 2>/dev/null; then
                 log_error "Failed to make new script executable: $script_path"
                 log_error "Self-update cannot proceed"
-                transaction_rollback
-                return "$E_PERMISSION"
+                transaction_abort "new updater is not executable" "$E_PERMISSION" || return $?
             fi
         fi
 
@@ -2092,8 +3033,7 @@ switch_version_safe() {
             bash -n "$script_path" 2>&1 | head -10 | sed 's/^/  /' >&2
             echo >&2
             log_error "Rolling back to previous version..."
-            transaction_rollback
-            return "$E_GENERAL"
+            transaction_abort "new updater has syntax errors" "$E_GENERAL" || return $?
         fi
         log_debug "Syntax validation passed [OK]"
 
@@ -2104,12 +3044,24 @@ switch_version_safe() {
         else
             restart_args=("--post-update-complete")
         fi
+        # --rollback is a command, not a menu session: the re-exec'd updater
+        # must finish it and exit, not open the interactive menu on stdin
+        if [[ "$kind" == "rollback" ]]; then
+            restart_args+=("--no-menu")
+        fi
 
-        # NOW safe to commit transaction (syntax validated)
-        transaction_commit
+        # NOW safe to hand the transaction over (syntax validated). The journal
+        # stays, phase "handoff", until the new process has restored the saved
+        # changes and recorded the result.
+        transaction_handoff
 
         # Service update marker remains for post-exec completion
         # No need to cleanup - new script will handle it
+
+        # exec skips the EXIT trap, so put core.fileMode back here; the new
+        # process saves and sets it again. (Left out, the new process saved the
+        # temporary "false" as the operator's own value and kept it for good.)
+        restore_git_config
 
         # Release our lock BEFORE exec. exec replaces the process (same PID) and
         # does NOT fire the EXIT trap, so the lock dir would survive. The re-exec'd
@@ -2134,8 +3086,7 @@ switch_version_safe() {
     # Complete service update (post-checkout)
     if ! post_checkout_service_update; then
         log_error "Service update failed after checkout"
-        transaction_rollback
-        return "$E_GENERAL"
+        transaction_abort "service update failed after checkout" "$E_GENERAL" || return $?
     fi
 
     # Remove service update marker on success
@@ -2145,36 +3096,23 @@ switch_version_safe() {
     run_post_update_migrations
 
     # Restore stashed changes (if not self-updating)
+    local restore_status=0
     if [[ -n "${TRANSACTION_STATE[stash_hash]}" ]]; then
         echo
         log_step "Restoring your saved changes..."
-
-        local stash_ref
-        stash_ref=$(git stash list --format="%gd %H" | grep "${TRANSACTION_STATE[stash_hash]}" | cut -d' ' -f1 || echo "")
-
-        if [[ -z "$stash_ref" ]]; then
-            log_warn "Could not find your saved changes"
+        restore_saved_changes "${TRANSACTION_STATE[stash_hash]}" || restore_status=$?
+        if [[ $restore_status -eq 0 ]]; then
+            log_success "Changes restored successfully"
+        elif [[ $restore_status -ne $E_RESTORE_CONFLICT ]]; then
             log_info "Your changes may have been lost (stash hash: ${TRANSACTION_STATE[stash_hash]})"
-        else
-            # Try to pop the stash
-            if git stash pop "$stash_ref" >/dev/null 2>&1; then
-                log_success "Changes restored successfully"
-            else
-                # Pop failed, try apply
-                if git stash apply "$stash_ref" >/dev/null 2>&1; then
-                    log_success "Changes restored (with manual stash cleanup needed)"
-                    log_info "To remove the stash: git stash drop $stash_ref"
-                else
-                    log_warn "Could not restore changes automatically (conflicts detected)"
-                    log_info "Your changes are saved in: $stash_ref"
-                    log_info "To restore manually: git stash pop $stash_ref"
-                    log_info "You may need to resolve conflicts first"
-                fi
-            fi
+            restore_status=0
         fi
     fi
 
     # Commit transaction
+    if [[ $restore_status -eq $E_RESTORE_CONFLICT ]]; then
+        TRANSACTION_STATE[note]="saved changes kept in the stash"
+    fi
     transaction_commit
 
     # Update state
@@ -2182,6 +3120,10 @@ switch_version_safe() {
     check_local_changes
 
     echo
+    if [[ $restore_status -eq $E_RESTORE_CONFLICT ]]; then
+        log_warn "Version switch complete, but your saved changes were NOT re-applied (see above)"
+        return "$E_RESTORE_CONFLICT"
+    fi
     log_success "Version switch complete!"
 
     return 0
@@ -2225,9 +3167,19 @@ reset_to_clean_state() {
 
     log_step "Resetting to clean state: $target"
 
+    # A reset changes the installed version like an update does: it goes into the
+    # history (and --rollback can return to where it started)
+    local from_head from_label reset_note=""
+    from_head="$(git rev-parse HEAD 2>/dev/null || true)"
+    from_label="$(commit_label "$from_head" "$(git symbolic-ref -q --short HEAD 2>/dev/null || true)")"
+    if [[ -n "$(git status --porcelain 2>/dev/null || true)" ]]; then
+        reset_note="uncommitted changes discarded"
+    fi
+
     # Perform reset
-    if ! git reset --hard "$target" >/dev/null 2>&1; then
+    if ! git_worktree reset --hard "$target" >/dev/null 2>&1; then
         log_error "Failed to reset to $target"
+        history_record reset failed "$from_head" "$from_label" "$from_head" "$target" "git reset failed" || true
         return "$E_GENERAL"
     fi
 
@@ -2237,6 +3189,7 @@ reset_to_clean_state() {
     fi
 
     log_success "Reset complete. Your changes are gone. Repository is clean."
+    history_record reset ok "$from_head" "$from_label" "$(git rev-parse HEAD 2>/dev/null || true)" "$target" "$reset_note" || true
 
     # Set script permissions
     set_script_permissions
@@ -2251,17 +3204,30 @@ reset_to_clean_state() {
 set_script_permissions() {
     log_debug "Setting executable permissions on scripts..."
 
-    local scripts=(
+    # The known scripts plus every shell script the repository tracks. git
+    # writes a changed file with the mode recorded in the repository (644 for
+    # most of the scripts) and core.fileMode is off while the updater runs, so
+    # after a switch or a rollback whatever is not marked here is no longer
+    # executable -- the diagnostics and mic-check scripts were not on the old
+    # list of five.
+    local -a scripts=(
         "install_mediamtx.sh"
         "lyrebird-orchestrator.sh"
         "lyrebird-updater.sh"
         "lyrebird-stream-manager.sh"
         "usb-audio-mapper.sh"
     )
+    local tracked script
+    while IFS= read -r -d '' tracked; do
+        scripts+=("$tracked")
+    done < <(git ls-files -z -- '*.sh' 2>/dev/null || true)
 
     for script in "${scripts[@]}"; do
         if [[ -f "$script" ]]; then
-            if ! chmod +x "$script" 2>/dev/null; then
+            if ! (
+                umask "$ORIGINAL_UMASK"
+                chmod +x "$script"
+            ) 2>/dev/null; then
                 log_warn "Could not set executable permission on $script (permission denied)"
                 log_debug "This may cause issues when running $script"
             fi
@@ -2269,6 +3235,85 @@ set_script_permissions() {
     done
 
     return 0
+}
+
+################################################################################
+# Rollback Command
+################################################################################
+
+# lyrebird-updater.sh --rollback [VERSION]
+# Goes back to a version that is already in this clone, as the same
+# transaction an update is (stash, service handling, migrations, journal,
+# history), and without any network access.
+#   no VERSION  the version the last completed update, rollback or reset left
+#   VERSION     a release tag, or a commit; a branch name is refused (a
+#               rollback is to an exact commit, not to "the latest of a branch")
+# Exit status: that of the switch (0, 1, 5, 8, 9, 10, 11), 6 when the version is
+# not in the clone.
+rollback_command() {
+    local requested="${1:-}"
+    local commit="" target="" label=""
+
+    if [[ -n "$requested" ]]; then
+        if [[ ! "$requested" =~ ^[a-zA-Z0-9._/-]+$ ]]; then
+            log_error "Invalid version: $requested"
+            return "$E_GENERAL"
+        fi
+        if git show-ref --verify --quiet "refs/tags/${requested}"; then
+            target="$requested"
+        elif git show-ref --verify --quiet "refs/heads/${requested}" \
+            || git show-ref --verify --quiet "refs/remotes/origin/${requested}"; then
+            log_error "'${requested}' is a branch. A rollback goes back to a release tag or to a commit."
+            log_info "To follow a branch, use option 3 of the menu."
+            return "$E_GENERAL"
+        fi
+        if ! commit="$(git rev-parse --verify --quiet "${requested}^{commit}" 2>/dev/null)"; then
+            log_error "Version '${requested}' is not available in this repository"
+            log_info "A rollback never uses the network. For a release that has not been fetched yet,"
+            log_info "run '${SCRIPT_NAME} --list' while online (or: git fetch --tags), then try again."
+            log_info "Releases in this clone: git tag -l 'v*'    What was installed: ${SCRIPT_NAME} --history"
+            return "$E_NOT_FOUND"
+        fi
+        [[ -n "$target" ]] || target="$commit"
+        label="$requested"
+    else
+        local line from_commit from_label to_commit
+        line="$(history_last_change)"
+        if [[ -z "$line" ]]; then
+            log_error "There is no previous version to go back to: no completed update is recorded."
+            log_info "Name the version instead: ${SCRIPT_NAME} --rollback v1.2.3"
+            log_info "What this node has had: ${SCRIPT_NAME} --history    Releases here: git tag -l 'v*'"
+            return "$E_NOT_FOUND"
+        fi
+        IFS=$'\t' read -r _ _ _ from_commit from_label to_commit _ <<<"$line"
+        if [[ "$from_commit" == "-" ]]; then
+            log_error "The last update did not record the version it came from (an older updater started it)."
+            log_info "Name the version instead: ${SCRIPT_NAME} --rollback v1.2.3"
+            return "$E_NOT_FOUND"
+        fi
+        if ! commit="$(git rev-parse --verify --quiet "${from_commit}^{commit}" 2>/dev/null)"; then
+            log_error "The previous version (${from_label}, ${from_commit:0:7}) is no longer in this clone."
+            log_info "Name another one: ${SCRIPT_NAME} --rollback VERSION    Releases here: git tag -l 'v*'"
+            return "$E_NOT_FOUND"
+        fi
+        if [[ "$(git rev-parse HEAD 2>/dev/null || true)" != "$to_commit" ]]; then
+            log_warn "This node is not at the version the last update recorded; going back to ${from_label} anyway."
+        fi
+        label="$from_label"
+        target="$commit"
+        # a release tag that still names that commit reads better in the output
+        if [[ "$from_label" != "-" ]] && [[ "$(git rev-parse --verify --quiet "refs/tags/${from_label}^{commit}" 2>/dev/null || true)" == "$commit" ]]; then
+            target="$from_label"
+        fi
+    fi
+
+    if [[ "$(git rev-parse HEAD 2>/dev/null || true)" == "$commit" ]]; then
+        log_info "Already on ${label} (${commit:0:7}); nothing to do."
+        return 0
+    fi
+
+    log_info "Rolling back to ${label} (${commit:0:7}); the network is not used."
+    switch_version_safe "$target" rollback
 }
 
 ################################################################################
@@ -2655,6 +3700,10 @@ USAGE:
   ${SCRIPT_NAME}              Interactive menu (described below)
   ${SCRIPT_NAME} --status     Show current version, branch and sync status (-s)
   ${SCRIPT_NAME} --list       Fetch and list available versions (-l)
+  ${SCRIPT_NAME} --history    Show past updates, failures and rollbacks (no network needed)
+  ${SCRIPT_NAME} --rollback [VERSION]
+                              Go back to the previous version, or to a release tag or
+                              commit already in this clone (no network needed)
   ${SCRIPT_NAME} --migrate    Run post-update migrations
   ${SCRIPT_NAME} --version    Print the updater version (-v)
   ${SCRIPT_NAME} --help       Show this help (-h)
@@ -2747,7 +3796,13 @@ Q: What happens to my systemd service?
 A: It's automatically stopped, updated, and restarted with your custom config
 
 Q: Can I undo an update?
-A: Yes, use option 3 to switch back to any previous version
+A: Yes. '${SCRIPT_NAME} --rollback' returns to the previous version, '--rollback v1.3.0'
+   to a release already in this clone; '--history' shows what was installed. Option 3
+   of the menu also switches to any version (it can fetch new ones first).
+
+Q: The updater was killed or the power failed in the middle of an update.
+A: Run '${SCRIPT_NAME}' again: it finds the unfinished update and undoes it (or, for a
+   self-update, completes it). Your uncommitted changes are never discarded.
 
 Q: What if something goes wrong?
 A: The script automatically tries to recover, including service restoration
@@ -2776,7 +3831,7 @@ main_menu() {
         get_current_version
         check_local_changes
 
-        clear
+        clear 2>/dev/null || true # exits 1 on TERM=dumb or without terminfo: not a reason to end the menu
         echo
         echo "${BOLD}+---------------------------------------------------------+${NC}"
         echo "${BOLD}|     LyreBirdAudio - Version Manager v${VERSION}      |${NC}"
@@ -2959,6 +4014,12 @@ main() {
         exit "$E_GENERAL"
     fi
 
+    # The history is a local file: readable with no network, no lock and no git
+    if [[ "${1:-}" == "--history" ]]; then
+        show_history
+        exit "$E_SUCCESS"
+    fi
+
     # A self-update re-exec resumes here with --post-update-* . At that point the
     # service is already stopped and only the completion/restore half remains.
     # Mark the run as resumed so check_prerequisites skips the interactive
@@ -2968,29 +4029,60 @@ main() {
         --post-update-complete | --post-update-restore) RESUMED_POST_UPDATE=true ;;
     esac
 
-    # Check prerequisites
-    if ! check_prerequisites; then
-        exit "$E_PREREQUISITES"
+    # Check prerequisites. The checks return the documented code themselves (2
+    # missing tool, 9 operator declined the root prompt); main() used to
+    # replace every one of them with a single code, so 5, 9 and 3-vs-5 never
+    # reached the caller.
+    local startup_status=0
+    check_prerequisites || startup_status=$?
+    if [[ $startup_status -ne 0 ]]; then
+        exit "$startup_status"
     fi
 
-    # Acquire lock
-    if ! acquire_lock; then
-        exit "$E_LOCKED"
+    # Acquire lock (7 held by another updater, 5 cannot be written)
+    acquire_lock || startup_status=$?
+    if [[ $startup_status -ne 0 ]]; then
+        exit "$startup_status"
     fi
 
-    # Validate git repository
-    if ! check_git_repository; then
-        exit "$E_NOT_GIT_REPO"
+    # Validate git repository (3 not a repository, 5 not writable or owned by root)
+    check_git_repository || startup_status=$?
+    if [[ $startup_status -ne 0 ]]; then
+        exit "$startup_status"
     fi
 
     # Save and configure git settings
     save_git_config
 
     # Detect default branch (CRITICAL: Must be done early and consistently used)
-    DEFAULT_BRANCH="$(get_default_branch)"
+    # Only the commands that fetch (the menu, --list) ask the remote; the rest
+    # must work with the network down.
+    local branch_probe=""
+    case "${1:-}" in
+        --version | -v | --help | -h | --status | -s | --migrate | --rollback | --post-update-complete | --post-update-restore)
+            branch_probe="offline"
+            ;;
+    esac
+    DEFAULT_BRANCH="$(get_default_branch "$branch_probe")"
     log_debug "Default branch: $DEFAULT_BRANCH"
 
+    # An update that an earlier run did not finish (killed, crashed, power cut):
+    # a run that changes things undoes it first; the read-only commands only say
+    # so. --post-update-* is the continuation of an update, not a new one.
+    case "${1:-}" in
+        "" | --rollback)
+            local recovery_status=0
+            recover_interrupted_transaction || recovery_status=$?
+            if [[ $recovery_status -ne 0 ]]; then
+                exit "$recovery_status"
+            fi
+            ;;
+        --post-update-complete | --post-update-restore) ;;
+        *) report_interrupted_transaction || true ;;
+    esac
+
     # Handle command line arguments
+    local post_update_no_menu=false
     if [[ $# -gt 0 ]]; then
         case "$1" in
             --post-update-restore)
@@ -3003,21 +4095,18 @@ main() {
                 log_success "Updater has been updated!"
                 log_step "Restoring your saved changes..."
 
-                local stash_hash="$2"
-                local stash_ref
-                stash_ref=$(git stash list --format="%gd %H" | grep "$stash_hash" | cut -d' ' -f1 || echo "")
-
-                if [[ -n "$stash_ref" ]]; then
-                    if git stash pop "$stash_ref" >/dev/null 2>&1; then
-                        log_success "Changes restored successfully"
-                    else
-                        log_warn "Could not restore changes automatically"
-                        log_info "Your changes are in: $stash_ref"
-                        log_info "To restore: git stash pop $stash_ref"
-                    fi
-                else
-                    log_warn "Could not find your saved changes"
+                local restore_status=0 handoff_note=""
+                [[ "${3:-}" == "--no-menu" ]] && post_update_no_menu=true
+                handoff_load_journal || true
+                restore_saved_changes "$2" || restore_status=$?
+                if [[ $restore_status -eq 0 ]]; then
+                    log_success "Changes restored successfully"
+                elif [[ $restore_status -eq $E_RESTORE_CONFLICT ]]; then
+                    EXIT_STATUS="$E_RESTORE_CONFLICT"
+                    handoff_note="saved changes kept in the stash"
                 fi
+                # an old updater's lock directory comes back with the stash
+                legacy_lock_held || true
 
                 # Check for pending service update
                 if check_pending_service_update; then
@@ -3026,15 +4115,21 @@ main() {
                         log_info "You may need to manually check the service status"
                     fi
                 fi
+                handoff_finish "$handoff_note"
 
+                if [[ "$post_update_no_menu" == "true" ]]; then
+                    exit "$EXIT_STATUS"
+                fi
                 echo
-                read -r -p "Press Enter to continue..."
+                read -r -p "Press Enter to continue..." || true
                 ;;
 
             --post-update-complete)
                 echo
                 log_success "Updater has been updated successfully!"
 
+                [[ "${2:-}" == "--no-menu" ]] && post_update_no_menu=true
+                handoff_load_journal || true
                 # Check for pending service update
                 if check_pending_service_update; then
                     if ! complete_pending_service_update; then
@@ -3042,9 +4137,13 @@ main() {
                         log_info "You may need to manually check the service status"
                     fi
                 fi
+                handoff_finish
 
+                if [[ "$post_update_no_menu" == "true" ]]; then
+                    exit "$EXIT_STATUS"
+                fi
                 echo
-                read -r -p "Press Enter to continue..."
+                read -r -p "Press Enter to continue..." || true
                 ;;
 
             --version | -v)
@@ -3063,9 +4162,14 @@ main() {
                 ;;
 
             --list | -l)
-                fetch_updates_safe || true
+                # Cached data is still listed, but the exit status says it is not fresh
+                local list_status="$E_SUCCESS"
+                fetch_updates_safe || list_status=$?
                 list_available_releases
-                exit "$E_SUCCESS"
+                if [[ $list_status -ne 0 ]]; then
+                    log_warn "The list above is from the last successful fetch: origin could not be reached."
+                fi
+                exit "$list_status"
                 ;;
 
             --migrate)
@@ -3074,6 +4178,16 @@ main() {
                 echo
                 run_post_update_migrations
                 exit "$E_SUCCESS"
+                ;;
+
+            --rollback)
+                if [[ $# -gt 2 ]]; then
+                    log_error "Usage: ${SCRIPT_NAME} --rollback [VERSION]"
+                    exit "$E_GENERAL"
+                fi
+                local rollback_status=0
+                rollback_command "${2:-}" || rollback_status=$?
+                exit "$rollback_status"
                 ;;
 
             *)
@@ -3104,7 +4218,7 @@ main() {
     # Run interactive menu
     main_menu
 
-    exit "$E_SUCCESS"
+    exit "$EXIT_STATUS"
 }
 
 # Run main function
