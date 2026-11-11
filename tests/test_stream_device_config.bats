@@ -175,7 +175,7 @@ _check_batch() {
     _conf 'DEVICE_A_FOO=1' 'DEFAULT_CODEC=aac' 'OTHER=1' 'DEVICE_A_CODEC = aac'
     run smq "$_DUMP"
     [ "${lines[0]}" = "rc=1 errors=4 warnings=0 settings=0" ]
-    grep -qF 'DEVICE_A_FOO: unknown setting (expected: DEVICE_<NAME>_<SETTING> with SETTING one of SAMPLE_RATE, CHANNELS, CODEC, BITRATE, THREAD_QUEUE)' "$STREAM_MANAGER_LOG_FILE"
+    grep -qF 'DEVICE_A_FOO: unknown setting (expected: DEVICE_<NAME>_<SETTING> with SETTING one of SAMPLE_RATE, CHANNELS, CODEC, BITRATE, THREAD_QUEUE, PCM)' "$STREAM_MANAGER_LOG_FILE"
     grep -qF 'DEFAULT_CODEC: defaults are read from the environment (the DEFAULT_CODEC variable), not from this file' "$STREAM_MANAGER_LOG_FILE"
     grep -qF 'OTHER: unknown key' "$STREAM_MANAGER_LOG_FILE"
     grep -qF "no spaces are allowed before the '='" "$STREAM_MANAGER_LOG_FILE"
@@ -407,9 +407,10 @@ sys.stdout.buffer.write(b"DEVICE_GOOD_CODEC=aac\n" + data + b"\nDEVICE_GOOD2_CHA
     # the documented examples, uncommented
     sed -i -E 's/^# (DEVICE_BLUE_YETI_[A-Z_]+=)/\1/' "$MEDIAMTX_DEVICE_CONFIG"
     run smq "$_DUMP"
-    [ "${lines[0]}" = "rc=0 errors=0 warnings=0 settings=4" ]
+    [ "${lines[0]}" = "rc=0 errors=0 warnings=0 settings=5" ]
     [ "${lines[1]}" = "DEVICE_BLUE_YETI_BITRATE=256k" ]
     [ "${lines[3]}" = "DEVICE_BLUE_YETI_CODEC=aac" ]
+    [ "${lines[4]}" = "DEVICE_BLUE_YETI_PCM=1" ]
     # and no example in the template names a codec that is not supported (X-28)
     ! grep -q 'pcm_s16le' "$MEDIAMTX_DEVICE_CONFIG"
 }
@@ -566,14 +567,14 @@ _start_live_mediamtx_standin() {
 @test "a monitor-triggered restart keeps the per-device settings from the config file [X-01]" {
     _conf 'DEVICE_MIC1_SAMPLE_RATE=96000' 'DEVICE_MIC1_CHANNELS=1' 'DEVICE_MIC1_CODEC=aac' 'DEVICE_MIC1_BITRATE=192k' 'DEVICE_MIC1_THREAD_QUEUE=4096'
     _start_live_mediamtx_standin
+    sd_fake_card 98 0c
     export DEEP_HEALTH_CHECK_ENABLED=false
     # The whole path is real: monitor_streams finds no PID file for the stream and
     # restarts it with start_ffmpeg_stream, which reads its settings. Nothing in
     # this process has called the loader before. Stood in for: the device list,
-    # the ALSA availability check (hardware), the wrapper process and the waits.
+    # the wrapper process and the waits (the card checks are real, over a fake ALSA tree).
     run smq "$SD_SPAWN_STUBS"'
         detect_audio_devices() { printf "mic1:98\n"; }
-        check_alsa_device_available() { return 0; }
         rc=0; monitor_streams || rc=$?
         echo "monitor rc=$rc"'
     [ "$status" -eq 0 ]
@@ -591,6 +592,8 @@ _start_live_mediamtx_standin() {
 @test "a monitor-triggered restart of the multiplex stream keeps the settings of its first device [X-01]" {
     _conf 'DEVICE_ALL_MICS_SAMPLE_RATE=44100' 'DEVICE_ALL_MICS_CHANNELS=1' 'DEVICE_ALL_MICS_BITRATE=64k'
     _start_live_mediamtx_standin
+    sd_fake_card 98 0c
+    sd_fake_card 99 0c
     export DEEP_HEALTH_CHECK_ENABLED=false STREAM_MODE=multiplex
     run smq "$SD_SPAWN_STUBS"'
         detect_audio_devices() { printf "mic1:98\nmic2:99\n"; }

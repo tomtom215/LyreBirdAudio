@@ -255,6 +255,10 @@ MULTIPLEX_FILTER_TYPE="${MULTIPLEX_FILTER_TYPE:-amix}"
 readonly RESTART_MARKER="${MEDIAMTX_RESTART_MARKER:-/run/mediamtx-audio.restart}"
 readonly CLEANUP_MARKER="${MEDIAMTX_CLEANUP_MARKER:-/run/mediamtx-audio.cleanup}"
 readonly CONFIG_LOCK_FILE="${CONFIG_DIR}/.config.lock"
+# Where ALSA lists its cards and where its device nodes live; tests point these at
+# fake trees
+readonly ASOUND_PROC_ROOT="${ASOUND_PROC_ROOT:-/proc/asound}"
+readonly DEV_SND_ROOT="${DEV_SND_ROOT:-/dev/snd}"
 
 # System limits
 SYSTEM_PID_MAX="$(cat /proc/sys/kernel/pid_max 2>/dev/null || echo 32768)"
@@ -2338,15 +2342,15 @@ mediamtx_get_status_summary() {
 # Check if ALSA device is available before attempting stream restart
 # Prevents restart loops when USB device is disconnected
 check_alsa_device_available() {
-    local card_num="$1"
+    local card_num="$1" pcm="${2:-}"
 
     if [[ "${USB_ALSA_CHECK_ENABLED}" != "true" ]]; then
         return 0
     fi
 
     # Check if card exists in ALSA
-    if [[ ! -d "/proc/asound/card${card_num}" ]]; then
-        log DEBUG "ALSA card ${card_num} not found in /proc/asound"
+    if [[ ! -d "${ASOUND_PROC_ROOT}/card${card_num}" ]]; then
+        log DEBUG "ALSA card ${card_num} not found in ${ASOUND_PROC_ROOT}"
         return 1
     fi
 
@@ -2358,9 +2362,13 @@ check_alsa_device_available() {
         fi
     fi
 
-    # Additional check: verify the device node exists
-    local device_path="/dev/snd/pcmC${card_num}D0c"
-    if [[ ! -e "$device_path" ]]; then
+    # Additional check: verify the capture device node exists (the card's first
+    # capture PCM unless one was given)
+    if [[ -z "$pcm" ]]; then
+        pcm="$(alsa_capture_pcms "$card_num" | head -n 1)"
+    fi
+    local device_path="${DEV_SND_ROOT}/pcmC${card_num}D${pcm:-0}c"
+    if [[ -z "$pcm" ]] || [[ ! -e "$device_path" ]]; then
         log DEBUG "Device node $device_path does not exist"
         return 1
     fi
@@ -2374,6 +2382,7 @@ check_alsa_device_available() {
 check_audio_level() {
     local card_num="$1"
     local stream_name="${2:-unknown}"
+    local pcm="${3:-}"
 
     if [[ "${AUDIO_LEVEL_CHECK_ENABLED}" != "true" ]]; then
         return 0
@@ -2385,7 +2394,14 @@ check_audio_level() {
         return 0
     fi
 
-    local audio_device="plughw:${card_num},0"
+    if [[ -z "$pcm" ]]; then
+        pcm="$(alsa_capture_pcms "$card_num" | head -n 1)"
+    fi
+    if [[ -z "$pcm" ]]; then
+        log DEBUG "Card ${card_num} has no capture PCM; no audio level check for $stream_name"
+        return 2
+    fi
+    local audio_device="plughw:${card_num},${pcm}"
     local sample_duration="${AUDIO_LEVEL_SAMPLE_DURATION}"
     local silence_threshold="${AUDIO_SILENCE_THRESHOLD_DB}"
 
@@ -3374,7 +3390,7 @@ wait_for_mediamtx_ready() {
 #
 # <NAME> is the stream path or the device name made upper-case with every run of
 # other characters turned into "_" (see get_device_config); <SETTING> is one of
-# SAMPLE_RATE, CHANNELS, CODEC, BITRATE, THREAD_QUEUE. Blank lines and lines that
+# SAMPLE_RATE, CHANNELS, CODEC, BITRATE, THREAD_QUEUE, PCM. Blank lines and lines that
 # start with "#" are ignored; a value may be bare, 'single-quoted' or
 # "double-quoted" and is taken literally: nothing in the file is expanded, run or
 # sourced. The file used to be `source`d, so a line such as `exit 0` ended the
@@ -3392,7 +3408,7 @@ readonly DEVICE_CONFIG_MAX_REPORTED=50
 # A file with this many problems is garbage: the parse stops there (each problem
 # costs a few processes, 100000 of them would take minutes)
 readonly DEVICE_CONFIG_MAX_PROBLEMS=100
-readonly DEVICE_SETTING_NAMES="SAMPLE_RATE, CHANNELS, CODEC, BITRATE, THREAD_QUEUE"
+readonly DEVICE_SETTING_NAMES="SAMPLE_RATE, CHANNELS, CODEC, BITRATE, THREAD_QUEUE, PCM"
 readonly SUPPORTED_CODECS="opus aac mp3"
 readonly SUPPORTED_SAMPLE_RATES="8000 11025 12000 16000 22050 24000 32000 44100 48000 88200 96000 176400 192000 352800 384000 705600 768000"
 # What a setting falls back to when its value (in the file or in the DEFAULT_*
@@ -3467,6 +3483,13 @@ device_setting_check() {
             [[ "$value" =~ ^[0-9]{1,7}$ ]] || return 1
             n=$((10#$value))
             ((n >= 1 && n <= 1048576)) || return 1
+            DS_VALUE="$n"
+            ;;
+        PCM)
+            DS_EXPECTED="the number of a capture PCM of the card, a whole number from 0 to 255"
+            [[ "$value" =~ ^[0-9]{1,3}$ ]] || return 1
+            n=$((10#$value))
+            ((n <= 255)) || return 1
             DS_VALUE="$n"
             ;;
         *)
@@ -3569,7 +3592,7 @@ parse_device_config() {
         rest="${BASH_REMATCH[2]}"
 
         ukey="${key^^}"
-        if [[ ! "$ukey" =~ ^DEVICE_([A-Z0-9_]+)_(SAMPLE_RATE|CHANNELS|CODEC|BITRATE|THREAD_QUEUE)$ ]]; then
+        if [[ ! "$ukey" =~ ^DEVICE_([A-Z0-9_]+)_(SAMPLE_RATE|CHANNELS|CODEC|BITRATE|THREAD_QUEUE|PCM)$ ]]; then
             if [[ "$ukey" == DEFAULT_* ]]; then
                 _dc_problem error "$file" "$lineno" "$key" "defaults are read from the environment (the ${ukey} variable), not from this file" "a DEVICE_<NAME>_<SETTING> key"
             elif [[ "$ukey" == DEVICE_* ]]; then
@@ -3742,6 +3765,8 @@ save_device_config() {
 #   CODEC         opus, aac or mp3
 #   BITRATE       1k to 9999k, for example 128k
 #   THREAD_QUEUE  1 to 1048576
+#   PCM           the capture PCM of the card to record from (0 to 255); the
+#                 default is the first capture PCM the card has, usually 0
 #
 # Universal defaults (the DEFAULT_* environment variables, not this file):
 # - Sample Rate: 48000 Hz
@@ -3755,6 +3780,7 @@ save_device_config() {
 # DEVICE_BLUE_YETI_CHANNELS=1
 # DEVICE_BLUE_YETI_CODEC=aac
 # DEVICE_BLUE_YETI_BITRATE=256k
+# DEVICE_BLUE_YETI_PCM=1
 EOF
 
     mv -f "$tmp_config" "${DEVICE_CONFIG_FILE}"
@@ -4035,11 +4061,78 @@ detect_audio_devices() {
     fi
 }
 
-# Check audio device availability
-check_audio_device() {
-    local card_num="$1"
+# The capture PCMs of an ALSA card, as device numbers, ascending, one per line:
+# the N of every <ASOUND_PROC_ROOT>/card<CARD>/pcm<N>c directory. A card's
+# capture stream is not always device 0 (a USB interface may put capture on 1, or
+# have a playback PCM 0 and no capture there), which the code used to assume.
+# Where /proc/asound has no PCM directories at all the capture device nodes
+# <DEV_SND_ROOT>/pcmC<CARD>D<N>c are used. Prints nothing for a card that cannot
+# capture (a playback-only card, or one that is not there).
+# Usage: alsa_capture_pcms CARD
+alsa_capture_pcms() {
+    local card="$1" dir idx
+    local -a found=()
+    [[ "$card" =~ ^[0-9]+$ ]] || return 0
+    for dir in "${ASOUND_PROC_ROOT}/card${card}"/pcm[0-9]*c; do
+        [[ -d "$dir" ]] || continue
+        idx="${dir##*/pcm}"
+        idx="${idx%c}"
+        if [[ "$idx" =~ ^[0-9]+$ ]]; then
+            found+=("$((10#$idx))")
+        fi
+    done
+    if ((${#found[@]} == 0)); then
+        for dir in "${DEV_SND_ROOT}/pcmC${card}D"[0-9]*c; do
+            [[ -e "$dir" ]] || continue
+            idx="${dir##*/pcmC${card}D}"
+            idx="${idx%c}"
+            if [[ "$idx" =~ ^[0-9]+$ ]]; then
+                found+=("$((10#$idx))")
+            fi
+        done
+    fi
+    if ((${#found[@]} > 0)); then
+        printf '%s\n' "${found[@]}" | sort -n
+    fi
+    return 0
+}
 
-    if [[ ! -e "/dev/snd/pcmC${card_num}D0c" ]]; then
+# Choose the capture PCM of CARD for one stream and put it in STREAM_PCM: the
+# DEVICE_<NAME>_PCM setting when it names a capture PCM of the card, otherwise the
+# first capture PCM the card has. A setting that names a PCM the card does not
+# capture on is an error in the log and the first capture PCM is used. Returns 1,
+# with a warning that says the card is left out, when the card has no capture PCM.
+# Usage: resolve_capture_pcm CARD DEVICE_NAME [STREAM_PATH]
+resolve_capture_pcm() {
+    local card="$1" device_name="$2" stream_path="${3:-}" configured
+    local -a pcms=()
+    STREAM_PCM=""
+    mapfile -t pcms < <(alsa_capture_pcms "$card")
+    if ((${#pcms[@]} == 0)); then
+        log WARN "Card ${card} (${device_name}) has no capture PCM (a playback-only card?); it is not used for streaming"
+        return 1
+    fi
+    configured="$(get_device_config "$device_name" "PCM" "" "$stream_path")"
+    if [[ -n "$configured" ]]; then
+        if [[ " ${pcms[*]} " == *" ${configured} "* ]]; then
+            STREAM_PCM="$configured"
+            return 0
+        fi
+        log ERROR "PCM ${configured} set for ${stream_path:-$device_name} is not a capture PCM of card ${card} (capture PCMs: ${pcms[*]}); using ${pcms[0]}"
+    fi
+    STREAM_PCM="${pcms[0]}"
+    return 0
+}
+
+# Check audio device availability. PCM is the capture PCM to check (default: the
+# card's first capture PCM).
+check_audio_device() {
+    local card_num="$1" pcm="${2:-}"
+
+    if [[ -z "$pcm" ]]; then
+        pcm="$(alsa_capture_pcms "$card_num" | head -n 1)"
+    fi
+    if [[ -z "$pcm" ]] || [[ ! -e "${DEV_SND_ROOT}/pcmC${card_num}D${pcm}c" ]]; then
         return 1
     fi
 
@@ -4142,6 +4235,7 @@ start_ffmpeg_multiplex_stream() {
     # Build device array and validate all devices
     local -a valid_devices=()
     local -a card_numbers=()
+    local -a pcm_numbers=()
     local -a device_names=()
 
     for device_info in "${devices[@]}"; do
@@ -4152,13 +4246,19 @@ start_ffmpeg_multiplex_stream() {
             continue
         fi
 
-        if ! check_audio_device "$card_num"; then
-            log WARN "Audio device card ${card_num} is not accessible, skipping"
+        # Each device has its own capture PCM (and its own DEVICE_<NAME>_PCM)
+        if ! resolve_capture_pcm "$card_num" "$device_name" "$(generate_stream_path "$device_name" "$card_num")"; then
+            continue
+        fi
+
+        if ! check_audio_device "$card_num" "$STREAM_PCM"; then
+            log WARN "Audio device card ${card_num} (capture PCM ${STREAM_PCM}) is not accessible, skipping"
             continue
         fi
 
         valid_devices+=("$device_info")
         card_numbers+=("$card_num")
+        pcm_numbers+=("$STREAM_PCM")
         device_names+=("$device_name")
     done
 
@@ -4224,7 +4324,9 @@ FFMPEG_LOG_MAX_SIZE=$FFMPEG_LOG_MAX_SIZE
 
 # Device arrays (initialized empty, populated below)
 declare -a CARD_NUMBERS=()
+declare -a PCM_NUMBERS=()
 declare -a DEVICE_NAMES=()
+DEV_SND_ROOT="$DEV_SND_ROOT"
 
 FFMPEG_PID=""
 MAIN_SCRIPT_PID="$$"
@@ -4234,6 +4336,7 @@ EOF
     for i in "${!card_numbers[@]}"; do
         cat >>"$wrapper_script" <<EOF
 CARD_NUMBERS+=("${card_numbers[$i]}")
+PCM_NUMBERS+=("${pcm_numbers[$i]}")
 DEVICE_NAMES+=("${device_names[$i]}")
 EOF
     done
@@ -4320,7 +4423,7 @@ run_ffmpeg() {
     # Add input for each device
     for i in "${!CARD_NUMBERS[@]}"; do
         local card_num="${CARD_NUMBERS[$i]}"
-        local audio_device="plughw:${card_num},0"
+        local audio_device="plughw:${card_num},${PCM_NUMBERS[$i]}"
         
         log_message "Adding input $((i+1))/${NUM_DEVICES}: ${DEVICE_NAMES[$i]} (card ${card_num})"
         
@@ -4428,9 +4531,9 @@ run_ffmpeg() {
 }
 
 check_devices_exist() {
-    for card_num in "${CARD_NUMBERS[@]}"; do
-        if [[ ! -e "/dev/snd/pcmC${card_num}D0c" ]]; then
-            log_message "Device card ${card_num} no longer exists"
+    for i in "${!CARD_NUMBERS[@]}"; do
+        if [[ ! -e "${DEV_SND_ROOT}/pcmC${CARD_NUMBERS[$i]}D${PCM_NUMBERS[$i]}c" ]]; then
+            log_message "Device card ${CARD_NUMBERS[$i]} (capture PCM ${PCM_NUMBERS[$i]}) no longer exists"
             return 1
         fi
     done
@@ -4625,8 +4728,12 @@ start_ffmpeg_stream() {
         fi
     fi
 
-    if ! check_audio_device "$card_num"; then
-        log ERROR "Audio device card ${card_num} is not accessible"
+    if ! resolve_capture_pcm "$card_num" "$device_name" "$stream_path"; then
+        return 1
+    fi
+    local pcm_num="$STREAM_PCM"
+    if ! check_audio_device "$card_num" "$pcm_num"; then
+        log ERROR "Audio device card ${card_num} (capture PCM ${pcm_num}) is not accessible"
         return 1
     fi
 
@@ -4660,6 +4767,8 @@ WRAPPER_START
 # Stream Configuration
 STREAM_PATH="$stream_path"
 CARD_NUM="$card_num"
+PCM_NUM="$pcm_num"
+DEV_SND_ROOT="$DEV_SND_ROOT"
 SAMPLE_RATE="$sample_rate"
 CHANNELS="$channels"
 BITRATE="$bitrate"
@@ -4761,7 +4870,7 @@ trap cleanup_wrapper EXIT INT TERM
 
 # Run FFmpeg with proper quoting
 run_ffmpeg() {
-    local audio_device="plughw:${CARD_NUM},0"
+    local audio_device="plughw:${CARD_NUM},${PCM_NUM}"
 
     log_message "Starting FFmpeg with device: $audio_device"
 
@@ -4866,7 +4975,7 @@ run_ffmpeg() {
 }
 
 check_device_exists() {
-    [[ -e "/dev/snd/pcmC${CARD_NUM}D0c" ]]
+    [[ -e "${DEV_SND_ROOT}/pcmC${CARD_NUM}D${PCM_NUM}c" ]]
 }
 
 # Check if parent is still alive

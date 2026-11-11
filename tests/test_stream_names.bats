@@ -220,6 +220,7 @@ teardown() {
 # ---------------------------------------------------------------------------
 
 @test "the multiplex wrapper, its PID file and its stream path use the canonical name [LB-04]" {
+    sd_fake_card 1 0c
     run sm "$SD_SPAWN_STUBS"'
         MULTIPLEX_STREAM_NAME="Studio Mix"; STREAM_MODE=multiplex
         resolve_multiplex_stream_name
@@ -324,6 +325,8 @@ teardown() {
 # multiplex start (wrapper process stood in for), the real generator, a real
 # MediaMTX and a real publisher to the path the wrapper publishes to.
 _write_live_script() {
+    # The multiplex start looks at a card: a fake one with a capture PCM
+    sd_fake_card 98 0c
     cat >"$SD/live_names.sh" <<'LIVE'
 #!/bin/bash
 bin="$1"; shift
@@ -339,7 +342,6 @@ spawn_detached() {
     command sleep 30
 }
 validate_stream() { return 0; }
-check_audio_device() { return 0; }
 for raw in "$@"; do
     rm -f "$MEDIAMTX_FFMPEG_DIR"/*
     STREAM_MODE=multiplex
@@ -349,7 +351,7 @@ for raw in "$@"; do
         continue
     fi
     resolve_multiplex_stream_name 2>/dev/null
-    start_ffmpeg_multiplex_stream "usb-audio-fake:1" >/dev/null 2>&1
+    start_ffmpeg_multiplex_stream "usb-audio-fake:98" >/dev/null 2>&1
     pidf="$(ls "$MEDIAMTX_FFMPEG_DIR"/*.pid 2>/dev/null | head -n 1)"
     pubpath="$(basename "${pidf:-/none.pid}" .pid)"
     generate_mediamtx_config >/dev/null 2>&1

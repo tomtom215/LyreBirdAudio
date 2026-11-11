@@ -146,6 +146,41 @@ capture-PCM helpers, the multiplex graph) and, for the writer only,
   the manager no longer does that, so the test now calls `load_device_config`
   (`MEDIAMTX_DEVICE_CONFIG`). The assertion (96000 is honoured) is unchanged.
 
+## LB-24: the capture PCM is not always 0
+
+- **What changed.** `check_audio_device`, `check_alsa_device_available`, `check_audio_level`, the
+  individual wrapper (`plughw:CARD,PCM` input and its "device still exists" check) and the
+  multiplex wrapper (one PCM per input device) no longer assume ALSA PCM device 0. New
+  functions: `alsa_capture_pcms CARD` (the N of every `/proc/asound/card<CARD>/pcm<N>c`
+  directory, ascending; if there is none, the `pcmC<CARD>D<N>c` device nodes) and
+  `resolve_capture_pcm CARD DEVICE_NAME [STREAM_PATH]` (sets `STREAM_PCM`).
+  `check_audio_device`, `check_alsa_device_available` and `check_audio_level` take the PCM as an
+  optional last argument and default to the card's first capture PCM.
+- **New setting `DEVICE_<NAME>_PCM`** (0 to 255), same lookup order as the other settings
+  (friendly stream name, then device name). It must name a capture PCM of the card; if it does
+  not, an ERROR is logged (`PCM 0 set for three is not a capture PCM of card 3 (capture PCMs: 1);
+  using 1`) and the first capture PCM is used. In multiplex mode each input device has its own
+  `DEVICE_<NAME>_PCM` (looked up by the device's own stream path, as in individual mode); the
+  other multiplex settings still come from the first device and the multiplex stream name.
+  Document it in the README settings list and next to the `lyrebird-mic-check.sh` example.
+- **Cards that cannot capture** (a playback-only USB speaker or DAC) are left out with one WARN,
+  `Card N (<device>) has no capture PCM (a playback-only card?); it is not used for streaming`:
+  `start_ffmpeg_stream` returns 1 (the start summary counts it among the failed streams; the
+  lifecycle/D4 work should treat it as "skipped", not as a failed stream) and the multiplex
+  start leaves the card out of the mix.
+- **New environment variables for tests**, defaults unchanged: `ASOUND_PROC_ROOT`
+  (`/proc/asound`) and `DEV_SND_ROOT` (`/dev/snd`). `detect_audio_devices`,
+  `generate_stream_path` and the `controlC` check in `start_all_ffmpeg_streams` still read the
+  real paths directly (other workers' functions); only the capture checks use the roots.
+  The wrappers carry `DEV_SND_ROOT` and `PCM_NUM` (multiplex: `PCM_NUMBERS`, parallel to
+  `CARD_NUMBERS`) as variables.
+- **Needs hardware (not verified here).** The tests run over fake `/proc/asound` and `/dev/snd`
+  trees and a stand-in for `arecord -l`; nothing shows how a real USB card lays out its PCMs
+  (capture on device 0 or 1, several capture PCMs), that `plughw:CARD,PCM` opens the intended
+  stream, or what a second open of a busy capture device does. `arecord -l` is still only
+  checked per card. The template written by `save_device_config` mentions the setting
+  (`# DEVICE_BLUE_YETI_PCM=1`).
+
 ## lyrebird-mic-check.sh: the writer (D3)
 
 - `generate_config` now writes quoted values (`DEVICE_BLUE_YETI_SAMPLE_RATE="48000"`,
@@ -166,6 +201,12 @@ capture-PCM helpers, the multiplex graph) and, for the writer only,
 
 ## New defects found while verifying (not fixed here)
 
+- The generated wrappers refer to `MAX_RESTART_DELAY` and `INITIAL_RESTART_DELAY` but never
+  define them (the manager's copies are `readonly`, not exported): under the wrapper's own
+  `set -euo pipefail` the first back-off computation after an FFmpeg failure aborts the
+  wrapper with `MAX_RESTART_DELAY: unbound variable`. Reproduced by running a generated
+  wrapper for real: it logged `Failed to start FFmpeg` and ended with exit code 1 instead of
+  waiting and retrying (fixed in the wrapper commit, see below).
 - The cron line written by `install` (`.../lyrebird-stream-manager.sh monitor`) does not
   carry `STREAM_MODE`, `MULTIPLEX_STREAM_NAME` or `MULTIPLEX_FILTER_TYPE`, so the cron
   `monitor` always runs in individual mode: on a multiplex node it finds no per-device PID

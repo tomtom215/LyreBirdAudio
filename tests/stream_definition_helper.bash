@@ -19,7 +19,7 @@ sd_setup() {
     scratch_setup
     PROJECT_ROOT="$(cd "$(dirname "$BATS_TEST_FILENAME")/.." && pwd)"
     SD="$TEST_SCRATCH/sd"
-    mkdir -p "$SD/cfg" "$SD/ff" "$SD/bin" "$SD/rec"
+    mkdir -p "$SD/cfg" "$SD/ff" "$SD/bin" "$SD/rec" "$SD/asound" "$SD/dev-snd"
     SD_PIDS_FILE="$SD/stand-in.pids"
     : >"$SD_PIDS_FILE"
 
@@ -43,10 +43,12 @@ sd_setup() {
     export MEM_SAMPLE_FILE="$SD/mem-samples"
     export AUDIO_RECORDING_PATH="$SD/rec"
     export LOCK_ACQUISITION_TIMEOUT=2 STOP_LOCK_TIMEOUT=1
+    # Fake ALSA: the card directories and the device nodes the script looks at
+    export ASOUND_PROC_ROOT="$SD/asound" DEV_SND_ROOT="$SD/dev-snd"
     # Not inherited from the environment of the test run
     unset STREAM_MODE MULTIPLEX_STREAM_NAME MULTIPLEX_FILTER_TYPE MULTIPLEX_NAME_EXPLICIT \
         DEFAULT_SAMPLE_RATE DEFAULT_CHANNELS DEFAULT_CODEC DEFAULT_BITRATE DEFAULT_THREAD_QUEUE \
-        AUDIO_LOCAL_RECORDING ASOUND_PROC_ROOT DEV_SND_ROOT
+        AUDIO_LOCAL_RECORDING
 
     # Nothing of the host may be touched: process lookups and port probes are
     # PATH shims that only record the call
@@ -54,8 +56,36 @@ sd_setup() {
     for tool in pkill pgrep lsof ss; do
         printf '#!/bin/bash\nprintf "%%s\\n" "$*" >>"%s/%s.calls"\nexit 1\n' "$SD" "$tool" >"$SD/bin/$tool"
     done
+    # Stands in for alsa-utils' `arecord -l`: lists every fake card that has a
+    # capture PCM, in the format the script greps ("card N: ...")
+    printf '%s\n' '#!/bin/bash' \
+        'for d in "$ASOUND_PROC_ROOT"/card[0-9]*; do' \
+        '    [[ -d "$d" ]] || continue' \
+        '    n="${d##*/card}"' \
+        '    for p in "$d"/pcm[0-9]*c; do' \
+        '        [[ -d "$p" ]] || continue' \
+        '        i="${p##*/pcm}"' \
+        '        echo "card ${n}: Fake [Fake USB Audio], device ${i%c}: USB Audio [USB Audio]"' \
+        '    done' \
+        'done' >"$SD/bin/arecord"
     chmod +x "$SD/bin/"*
     export PATH="$SD/bin:$PATH"
+}
+
+# A fake ALSA card: sd_fake_card N SPEC... where each SPEC is <device><c|p>, for
+# example `0c 0p 1c` = capture and playback on device 0, capture on device 1. The
+# card gets its /proc/asound directory (with a usbid, so it counts as USB audio)
+# and a device node for every PCM and for its control device.
+sd_fake_card() {
+    local card="$1" spec
+    shift
+    mkdir -p "$ASOUND_PROC_ROOT/card${card}"
+    echo "0d8c:0014" >"$ASOUND_PROC_ROOT/card${card}/usbid"
+    : >"$DEV_SND_ROOT/controlC${card}"
+    for spec in "$@"; do
+        mkdir -p "$ASOUND_PROC_ROOT/card${card}/pcm${spec}"
+        : >"$DEV_SND_ROOT/pcmC${card}D${spec}"
+    done
 }
 
 sd_teardown() {
@@ -83,8 +113,8 @@ smq() {
 # Code to put in front of a test's snippet when it runs start_ffmpeg_stream or
 # start_ffmpeg_multiplex_stream. Stands in for: the wrapper process (spawn_detached
 # only records the command and idles; the wrapper is written but never run), the
-# waits (sleep), the RTSP validation that needs a running MediaMTX (validate_stream)
-# and the hardware check (check_audio_device).
+# waits (sleep) and the RTSP validation that needs a running MediaMTX
+# (validate_stream). The card checks are real, over the fake ALSA tree (sd_fake_card).
 SD_SPAWN_STUBS='
 sleep() { :; }
 spawn_detached() {
@@ -95,7 +125,6 @@ spawn_detached() {
     command sleep 30
 }
 validate_stream() { return 0; }
-check_audio_device() { return 0; }
 '
 
 # A line count of FILE matching PATTERN (fixed string), 0 when there is none
