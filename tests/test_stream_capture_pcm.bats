@@ -152,6 +152,26 @@ teardown() {
     [ "${lines[5]}" = "card 3 pcm 0: 1" ]
 }
 
+@test "an arecord -l that is still writing when the card's line has been read does not make the card look absent (pipefail) [LB-24, new defect]" {
+    # `arecord -l | grep -q "card N:"` under the script's pipefail: grep -q exits at the
+    # first match, arecord's next write is a SIGPIPE, the pipeline's status is 141 and the
+    # card is "not listed". Stood in for: arecord, which writes the line of card 3 at once
+    # and the lines of two more cards 0.3 s later.
+    sd_fake_card 3 0p 1c
+    printf '%s\n' '#!/bin/bash' \
+        'echo "card 3: Fake [Fake USB Audio], device 1: USB Audio [USB Audio]"' \
+        'sleep 0.3' \
+        'echo "card 4: Other [Other USB Audio], device 0: USB Audio [USB Audio]"' \
+        'echo "card 5: Third [Third USB Audio], device 0: USB Audio [USB Audio]"' >"$SD/bin/arecord"
+    chmod +x "$SD/bin/arecord"
+    run smq '
+        rc=0; check_audio_device 3 || rc=$?; echo "check_audio_device: $rc"
+        rc=0; check_alsa_device_available 3 || rc=$?; echo "check_alsa_device_available: $rc"'
+    [ "$status" -eq 0 ]
+    [ "${lines[0]}" = "check_audio_device: 0" ]
+    [ "${lines[1]}" = "check_alsa_device_available: 0" ]
+}
+
 @test "check_audio_device refuses a capture PCM whose device node has gone [LB-24]" {
     sd_fake_card 3 0p 1c
     rm -f "$DEV_SND_ROOT/pcmC3D1c"

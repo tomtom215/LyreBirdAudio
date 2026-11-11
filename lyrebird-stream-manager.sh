@@ -2356,7 +2356,9 @@ check_alsa_device_available() {
 
     # Check if device is accessible
     if command_exists arecord; then
-        if ! arecord -l 2>/dev/null | grep -q "card ${card_num}:"; then
+        local listing
+        listing="$(arecord -l 2>/dev/null || true)"
+        if [[ "$listing" != *"card ${card_num}:"* ]]; then
             log DEBUG "ALSA card ${card_num} not listed by arecord"
             return 1
         fi
@@ -2365,7 +2367,7 @@ check_alsa_device_available() {
     # Additional check: verify the capture device node exists (the card's first
     # capture PCM unless one was given)
     if [[ -z "$pcm" ]]; then
-        pcm="$(alsa_capture_pcms "$card_num" | head -n 1)"
+        pcm="$(first_capture_pcm "$card_num")"
     fi
     local device_path="${DEV_SND_ROOT}/pcmC${card_num}D${pcm:-0}c"
     if [[ -z "$pcm" ]] || [[ ! -e "$device_path" ]]; then
@@ -2395,7 +2397,7 @@ check_audio_level() {
     fi
 
     if [[ -z "$pcm" ]]; then
-        pcm="$(alsa_capture_pcms "$card_num" | head -n 1)"
+        pcm="$(first_capture_pcm "$card_num")"
     fi
     if [[ -z "$pcm" ]]; then
         log DEBUG "Card ${card_num} has no capture PCM; no audio level check for $stream_name"
@@ -4097,6 +4099,16 @@ alsa_capture_pcms() {
     return 0
 }
 
+# The first capture PCM of CARD (nothing printed if it has none). Read into an array
+# rather than piped into head: under pipefail, `producer | head -n 1` fails when the
+# producer is still writing as head exits.
+# Usage: first_capture_pcm CARD
+first_capture_pcm() {
+    local -a pcms=()
+    mapfile -t pcms < <(alsa_capture_pcms "$1")
+    printf '%s' "${pcms[0]-}"
+}
+
 # Choose the capture PCM of CARD for one stream and put it in STREAM_PCM: the
 # DEVICE_<NAME>_PCM setting when it names a capture PCM of the card, otherwise the
 # first capture PCM the card has. A setting that names a PCM the card does not
@@ -4130,14 +4142,18 @@ check_audio_device() {
     local card_num="$1" pcm="${2:-}"
 
     if [[ -z "$pcm" ]]; then
-        pcm="$(alsa_capture_pcms "$card_num" | head -n 1)"
+        pcm="$(first_capture_pcm "$card_num")"
     fi
     if [[ -z "$pcm" ]] || [[ ! -e "${DEV_SND_ROOT}/pcmC${card_num}D${pcm}c" ]]; then
         return 1
     fi
 
-    # Use a simple existence check instead of opening the device
-    if arecord -l 2>/dev/null | grep -q "card ${card_num}:"; then
+    # Use a simple existence check instead of opening the device. (The listing is
+    # captured before it is searched: `arecord -l | grep -q` fails under pipefail
+    # when arecord is still writing as grep exits at the first match.)
+    local listing
+    listing="$(arecord -l 2>/dev/null || true)"
+    if [[ "$listing" == *"card ${card_num}:"* ]]; then
         return 0
     fi
 

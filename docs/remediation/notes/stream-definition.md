@@ -213,6 +213,15 @@ capture-PCM helpers, the multiplex graph) and, for the writer only,
   real paths directly (other workers' functions); only the capture checks use the roots.
   The wrappers carry `DEV_SND_ROOT` and `PCM_NUM` (multiplex: `PCM_NUMBERS`, parallel to
   `CARD_NUMBERS`) as variables.
+- **New defect fixed with it: `arecord -l | grep -q` under `pipefail`.** `check_audio_device` and
+  `check_alsa_device_available` looked for the card with `arecord -l 2>/dev/null | grep -q "card N:"`.
+  Under the script's `set -o pipefail` that fails whenever `arecord` is still writing after `grep -q`
+  has exited at the first match (SIGPIPE, status 141): the card then looks "not listed" and its
+  stream is not started or restarted (reproduced with an `arecord` that prints the card's line and
+  more lines 0.3 s later; whether a real `arecord` can trigger it was not tested: its output to a pipe is
+  stdio-buffered, so it is probably rare, but it is a load-dependent false negative). The listing is captured first and
+  searched afterwards. The same trap in new code was avoided: the first capture PCM is read into an
+  array (`first_capture_pcm`), not piped into `head -n 1`.
 - **Needs hardware (not verified here).** The tests run over fake `/proc/asound` and `/dev/snd`
   trees and a stand-in for `arecord -l`; nothing shows how a real USB card lays out its PCMs
   (capture on device 0 or 1, several capture PCMs), that `plughw:CARD,PCM` opens the intended
