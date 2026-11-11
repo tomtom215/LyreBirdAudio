@@ -14,7 +14,7 @@
 # Tags in the fixture history:
 #   v1.0.0  base                                   (scripts tracked 644, mapper 755)
 #   v1.1.0  stream manager and config.txt change
-#   v1.2.0  stream manager and diagnostics change
+#   v1.2.0  stream manager and diagnostics change, adds added-in-1.2.0.txt
 #   v1.3.0  the updater itself changes             (forces the self-update re-exec)
 
 UPDATER_HELPER_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -68,6 +68,8 @@ updater_template_build() {
 
         printf '#!/bin/bash\necho lyrebird-stream-manager v1.2.0\n' >"$work/lyrebird-stream-manager.sh"
         printf '#!/bin/bash\necho lyrebird-diagnostics v1.2.0\n' >"$work/lyrebird-diagnostics.sh"
+        printf 'added in v1.2.0\n' >"$work/added-in-1.2.0.txt"
+        git -C "$work" add added-in-1.2.0.txt
         git -C "$work" commit -qam "v1.2.0"
         git -C "$work" tag v1.2.0
 
@@ -158,4 +160,56 @@ updater_head() {
 
 updater_mode() {
     stat -c '%a' "$REPO/$1"
+}
+
+# updater_make_diverged_dev: origin has a branch "dev" and the node's local dev
+# has a commit origin does not (so a switch to dev cannot fast-forward).
+updater_make_diverged_dev() {
+    git -C "$WORK" checkout -q -b dev
+    echo "dev 1" >"$WORK/dev.txt"
+    git -C "$WORK" add dev.txt
+    git -C "$WORK" commit -qm "dev 1"
+    git -C "$WORK" push -q origin dev 2>/dev/null
+    git -C "$REPO" fetch -q origin
+    git -C "$REPO" checkout -q -b dev origin/dev 2>/dev/null
+    echo "local only" >"$REPO/local-only.txt"
+    git -C "$REPO" add local-only.txt
+    git -C "$REPO" commit -qm "local commit on dev"
+    echo "dev 2" >>"$WORK/dev.txt"
+    git -C "$WORK" commit -qam "dev 2"
+    git -C "$WORK" push -q origin dev 2>/dev/null
+    git -C "$REPO" fetch -q origin
+}
+
+# updater_make_big_tag: origin gets v1.4.0, whose checkout writes a small file
+# (aa-first.txt) and then a 900 KB one (big.bin); the node fetches it.
+updater_make_big_tag() {
+    echo "first" >"$WORK/aa-first.txt"
+    head -c 900000 /dev/urandom >"$WORK/big.bin"
+    git -C "$WORK" add aa-first.txt big.bin
+    git -C "$WORK" commit -qm "v1.4.0 (big)"
+    git -C "$WORK" tag v1.4.0
+    git -C "$WORK" push -q origin main --tags 2>/dev/null
+    git -C "$REPO" fetch -q origin --tags
+}
+
+# updater_unshare_cmd: set UNSHARE_CMD to a command that runs its argument in a
+# private mount namespace (so a size-limited tmpfs can be mounted and vanishes
+# with the process). Returns 1 where that is not permitted.
+updater_unshare_cmd() {
+    local candidate
+    for candidate in "unshare -m" "unshare -Urm"; do
+        # shellcheck disable=SC2206
+        UNSHARE_CMD=($candidate)
+        if "${UNSHARE_CMD[@]}" true 2>/dev/null; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+# updater_git_clean: no content changes in the node's working tree (file modes
+# are ignored, as they are by the updater).
+updater_git_clean() {
+    [ -z "$(git -C "$REPO" -c core.fileMode=false status --porcelain)" ]
 }

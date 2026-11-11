@@ -202,3 +202,187 @@ _updater_vars() {
     git -C "$REPO" stash list | grep -q operator-stash
     [ ! -e "$REPO/operator-notes.txt" ]
 }
+
+# ============================================================================
+# Rollback returns to where the operator was and never discards their work
+# ============================================================================
+
+@test "a failed switch from a tag goes back to that tag, not the version it was leaving" {
+    updater_checkout v1.1.0
+    # git completes the checkout, then reports failure (what a write error half way through looks like)
+    updater_inject checkout after FAIL
+    updater_stdin 3 v1.2.0
+    updater_run
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"Rollback complete"* ]]
+    [ "$(updater_head)" = "v1.1.0" ]
+    grep -q 'lyrebird-stream-manager v1.1.0' "$REPO/lyrebird-stream-manager.sh"
+    grep -q 'lyrebird-diagnostics v1.0.0' "$REPO/lyrebird-diagnostics.sh"
+    updater_git_clean
+}
+
+@test "a rollback removes the files the failed switch had already added" {
+    updater_checkout v1.1.0
+    updater_inject checkout after FAIL
+    updater_stdin 3 v1.2.0
+    updater_run
+    [ "$status" -eq 1 ]
+    [ "$(updater_head)" = "v1.1.0" ]
+    [ ! -e "$REPO/added-in-1.2.0.txt" ]
+    updater_git_clean
+}
+
+@test "SIGTERM during a switch rolls back to the original tag and exits 9" {
+    updater_checkout v1.1.0
+    updater_inject checkout after TERM
+    updater_stdin 3 v1.2.0
+    updater_run
+    [ "$status" -eq 9 ]
+    [[ "$output" == *"interrupted"* ]]
+    [ "$(updater_head)" = "v1.1.0" ]
+    [ ! -e "$REPO/added-in-1.2.0.txt" ]
+    updater_git_clean
+}
+
+@test "SIGINT during a switch rolls back to the original tag and exits 9" {
+    updater_checkout v1.1.0
+    updater_inject checkout after INT
+    updater_stdin 3 v1.2.0
+    updater_run
+    [ "$status" -eq 9 ]
+    [ "$(updater_head)" = "v1.1.0" ]
+    updater_git_clean
+}
+
+@test "a rollback of a branch update puts the branch tip back where it was" {
+    updater_checkout main
+    local tip
+    tip="$(git -C "$REPO" rev-parse main)"
+    echo "newer" >"$WORK/newer.txt"
+    git -C "$WORK" add newer.txt
+    git -C "$WORK" commit -qm "newer on main"
+    git -C "$WORK" push -q origin main 2>/dev/null
+    git -C "$REPO" fetch -q origin
+    # the fast-forward happens, then git reports failure
+    updater_inject merge after FAIL
+    updater_stdin 3 main
+    updater_run
+    [ "$status" -eq 1 ]
+    [ "$(git -C "$REPO" symbolic-ref --short HEAD)" = "main" ]
+    [ "$(git -C "$REPO" rev-parse main)" = "$tip" ]
+    [ ! -e "$REPO/newer.txt" ]
+}
+
+@test "declining to save local changes keeps them" {
+    updater_checkout v1.1.0
+    echo "precious edit" >>"$REPO/config.txt"
+    updater_stdin 3 v1.2.0 n
+    updater_run
+    [ "$status" -eq 9 ]
+    [[ "$output" == *"Operation cancelled"* ]]
+    grep -qx "precious edit" "$REPO/config.txt"
+    [ "$(updater_head)" = "v1.1.0" ]
+    [ -z "$(git -C "$REPO" stash list)" ]
+}
+
+@test "a failed stash keeps local changes in the working tree" {
+    updater_checkout v1.1.0
+    echo "precious edit" >>"$REPO/config.txt"
+    updater_inject stash-push before FAIL
+    updater_stdin 3 v1.2.0 y
+    updater_run
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"Failed to save your changes"* ]]
+    grep -qx "precious edit" "$REPO/config.txt"
+    [ "$(updater_head)" = "v1.1.0" ]
+}
+
+@test "a divergent local branch is refused, the original tag restored and the local commit kept" {
+    updater_checkout v1.1.0
+    updater_make_diverged_dev
+    local local_tip
+    local_tip="$(git -C "$REPO" rev-parse dev)"
+    updater_checkout v1.1.0
+    updater_stdin 3 dev
+    updater_run
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"local history has diverged"* ]]
+    [ "$(updater_head)" = "v1.1.0" ]
+    [ "$(git -C "$REPO" rev-parse dev)" = "$local_tip" ]
+    [ ! -e "$REPO/local-only.txt" ]
+    updater_git_clean
+}
+
+@test "a checkout that reports success after a write error is caught and rolled back" {
+    updater_checkout v1.1.0
+    updater_make_big_tag
+    echo "precious edit" >>"$REPO/config.txt"
+    # RLIMIT_FSIZE: git prints "unable to write file big.bin", leaves it truncated and exits 0
+    updater_stdin 3 v1.4.0 y
+    run env PATH="$SHIMS:$PATH" bash -c 'trap "" XFSZ; ulimit -f 200; exec bash "$1"' _ \
+        "$REPO/lyrebird-updater.sh" <<<"${UPDATER_INPUT%$'\n'}"
+    unset UPDATER_INPUT
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"do not match version v1.4.0"* ]]
+    [[ "$output" == *"Rollback complete"* ]]
+    [ "$(updater_head)" = "v1.1.0" ]
+    [ ! -e "$REPO/big.bin" ]
+    [ ! -e "$REPO/aa-first.txt" ]
+    grep -qx "precious edit" "$REPO/config.txt"
+    [ -z "$(git -C "$REPO" stash list)" ]
+}
+
+@test "disk full while checking out: rolled back to the original version with the local edit intact (real ENOSPC)" {
+    updater_unshare_cmd || skip "mount namespaces are not permitted here"
+    updater_checkout v1.1.0
+    updater_make_big_tag
+    export SMALL="$NODE/small"
+    mkdir -p "$SMALL"
+    updater_stdin 3 v1.4.0 y
+    export INPUT="$UPDATER_INPUT"
+    run "${UNSHARE_CMD[@]}" bash -c '
+        mount -t tmpfs -o size=3m tmpfs "$SMALL" || exit 99
+        cp -a "$REPO" "$SMALL/repo"
+        cd "$SMALL/repo" || exit 98
+        git fetch -q origin --tags
+        git checkout -q v1.1.0
+        echo "precious edit" >>config.txt
+        free_kb="$(df -k --output=avail . | tail -1)"
+        dd if=/dev/zero of="$SMALL/filler" bs=1k count=$((free_kb - 300)) 2>/dev/null
+        printf "%s" "$INPUT" | env PATH="$SHIMS:$PATH" bash ./lyrebird-updater.sh >"$SMALL/out.txt" 2>&1
+        echo "RC=$?"
+        echo "HEAD=$(git describe --tags --exact-match 2>/dev/null)"
+        echo "DIRTY=$(git -c core.fileMode=false status --porcelain | wc -l)"
+        echo "EDIT=$(grep -c "precious edit" config.txt)"
+        echo "BIG=$([ -e big.bin ] && echo present || echo absent)"
+        echo "FIRST=$([ -e aa-first.txt ] && echo present || echo absent)"
+        echo "STASH=$(git stash list | wc -l)"
+        cat "$SMALL/out.txt"
+    '
+    [[ "$output" == *"unable to write file"* ]] || [[ "$output" == *"Failed to switch to version"* ]]
+    [[ "$output" == *"RC=1"* ]]
+    [[ "$output" == *"HEAD=v1.1.0"* ]]
+    [[ "$output" == *"DIRTY=1"* ]] # only the operator's config.txt edit
+    [[ "$output" == *"EDIT=1"* ]]
+    [[ "$output" == *"BIG=absent"* ]]
+    [[ "$output" == *"FIRST=absent"* ]]
+    [[ "$output" == *"STASH=0"* ]]
+}
+
+@test "when the rollback itself fails it says so, exits 11 and names the manual command" {
+    updater_checkout v1.1.0
+    updater_make_diverged_dev
+    updater_checkout v1.1.0
+    local original
+    original="$(git -C "$REPO" rev-parse HEAD)"
+    echo "precious edit" >>"$REPO/config.txt"
+    updater_inject checkout-force before FAIL
+    updater_stdin 3 dev y
+    updater_run
+    [ "$status" -eq 11 ]
+    [[ "$output" == *"Could not restore the original version"* ]]
+    [[ "$output" == *"git checkout --force $original"* ]]
+    [[ "$output" == *"Rollback incomplete"* ]]
+    # the operator's edit is safe in the stash, not lost
+    git -C "$REPO" stash list | grep -q lyrebird-tx
+}

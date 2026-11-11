@@ -126,9 +126,11 @@ readonly E_PREREQUISITES=2
 readonly E_NOT_GIT_REPO=3
 readonly E_NO_REMOTE=4
 readonly E_PERMISSION=5
+readonly E_NOT_FOUND=6 # requested/previous version is not available locally
 readonly E_LOCKED=7
 readonly E_BAD_STATE=8
 readonly E_USER_ABORT=9
+readonly E_ROLLBACK_FAILED=11 # the automatic rollback could not restore everything; see the messages
 
 # Version requirements
 readonly MIN_GIT_MAJOR=2
@@ -232,6 +234,9 @@ declare -A TRANSACTION_STATE=(
     [original_ref]=""
     [original_head]=""
     [operation]=""
+    [target]=""
+    [target_head]=""
+    [head_changed]=false
 )
 
 # Available versions array
@@ -1243,7 +1248,7 @@ cleanup() {
     # If we're in an active transaction and exiting with error, attempt rollback
     if [[ "${TRANSACTION_STATE[active]}" == "true" ]] && [[ $exit_code -ne 0 ]]; then
         log_error "Operation failed - attempting automatic rollback..."
-        transaction_rollback
+        transaction_rollback "stopped with exit status ${exit_code}" || true
     fi
 
     # Restore git configuration
@@ -1757,6 +1762,8 @@ confirm_destructive_action() {
 
 transaction_begin() {
     local operation="$1"
+    local target="${2:-}"
+    local target_head="${3:-}"
 
     if [[ "${TRANSACTION_STATE[active]}" == "true" ]]; then
         log_error "Transaction already active: ${TRANSACTION_STATE[operation]}"
@@ -1768,6 +1775,10 @@ transaction_begin() {
     # Save current state
     TRANSACTION_STATE[active]=true
     TRANSACTION_STATE[operation]="$operation"
+    TRANSACTION_STATE[target]="$target"
+    TRANSACTION_STATE[target_head]="$target_head"
+    TRANSACTION_STATE[head_changed]=false
+    TRANSACTION_STATE[stash_hash]=""
     TRANSACTION_STATE[original_head]="$(git rev-parse HEAD 2>/dev/null || echo "")"
 
     if ! git symbolic-ref -q HEAD >/dev/null 2>&1; then
@@ -1820,6 +1831,18 @@ transaction_stash_changes() {
     return 0
 }
 
+# Forget the transaction (nothing left to roll back)
+transaction_reset_state() {
+    TRANSACTION_STATE[active]=false
+    TRANSACTION_STATE[stash_hash]=""
+    TRANSACTION_STATE[original_ref]=""
+    TRANSACTION_STATE[original_head]=""
+    TRANSACTION_STATE[operation]=""
+    TRANSACTION_STATE[target]=""
+    TRANSACTION_STATE[target_head]=""
+    TRANSACTION_STATE[head_changed]=false
+}
+
 transaction_commit() {
     if [[ "${TRANSACTION_STATE[active]}" != "true" ]]; then
         log_error "No active transaction"
@@ -1828,57 +1851,148 @@ transaction_commit() {
 
     log_debug "Transaction commit: ${TRANSACTION_STATE[operation]}"
 
-    # Clear transaction state
-    TRANSACTION_STATE[active]=false
-    TRANSACTION_STATE[stash_hash]=""
-    TRANSACTION_STATE[original_ref]=""
-    TRANSACTION_STATE[original_head]=""
-    TRANSACTION_STATE[operation]=""
+    transaction_reset_state
 
     return 0
 }
 
+# After a checkout, confirm the files on disk are the target's. git can report
+# success after a write error on a single file (it prints "unable to write
+# file X", leaves X truncated and exits 0), so for every file the switch added
+# or changed the content on disk is compared with the blob in the target tree.
+# Prints the offending paths and returns 1 on any difference.
+verify_checkout_integrity() {
+    local from_head="$1" to_head="$2"
+    local path expected actual bad=0
+    while IFS= read -r -d '' path; do
+        if [[ -L "$path" ]]; then
+            continue # symlinks carry no content of their own to compare
+        fi
+        expected="$(git rev-parse --verify --quiet "${to_head}:${path}" 2>/dev/null || true)"
+        if [[ ! -f "$path" ]]; then
+            log_error "Missing after checkout: $path"
+            bad=1
+            continue
+        fi
+        actual="$(git hash-object -- "$path" 2>/dev/null || true)"
+        if [[ -z "$expected" || "$actual" != "$expected" ]]; then
+            log_error "Differs from the target version after checkout: $path"
+            bad=1
+        fi
+    done < <(git diff --name-only -z --diff-filter=AM "$from_head" "$to_head" 2>/dev/null || true)
+    [[ "$bad" -eq 0 ]]
+}
+
+# Print the stash reference (stash@{n}) of the stash commit HASH, if it is still in the list
+find_stash_ref() {
+    local hash="$1"
+    git stash list --format="%gd %H" 2>/dev/null | awk -v h="$hash" '$2 == h {print $1; exit}' || true
+}
+
+# Delete files the failed switch added to the working tree: present in the
+# target version, absent from the original one, and untracked once HEAD is
+# back. (`git checkout` of the original version does not remove them.)
+remove_target_leftovers() {
+    local orig_head="${TRANSACTION_STATE[original_head]}"
+    local target_head="${TRANSACTION_STATE[target_head]}"
+    local leftover
+    [[ -n "$target_head" && "$target_head" != "$orig_head" ]] || return 0
+    while IFS= read -r -d '' leftover; do
+        [[ -e "$leftover" || -L "$leftover" ]] || continue
+        if git ls-files --error-unmatch -- "$leftover" >/dev/null 2>&1; then
+            continue
+        fi
+        rm -f -- "$leftover" 2>/dev/null || true
+    done < <(git diff --name-only -z --diff-filter=A "$orig_head" "$target_head" 2>/dev/null || true)
+}
+
+# Put HEAD and the working tree back where the transaction started.
+# Returns 0 when they are there, 1 when they could not be restored.
+#
+# A forced checkout discards uncommitted changes, so it is only done when this
+# transaction actually moved HEAD (head_changed): by then the operator's
+# changes are in the transaction stash. Before that -- the operator declined to
+# stash, or the stash failed -- the tree still holds their work and is not
+# touched.
+restore_original_head() {
+    local orig_ref="${TRANSACTION_STATE[original_ref]}"
+    local orig_head="${TRANSACTION_STATE[original_head]}"
+    local cur_head=""
+
+    # Empty repository: there is no commit to return to
+    [[ -n "$orig_head" ]] || return 0
+
+    cur_head="$(git rev-parse HEAD 2>/dev/null || true)"
+    if [[ "${TRANSACTION_STATE[head_changed]}" != "true" && "$cur_head" == "$orig_head" ]]; then
+        log_debug "HEAD never moved; leaving the working tree alone"
+        return 0
+    fi
+
+    log_debug "Restoring original position: ${orig_ref} @ ${orig_head}"
+    # First delete what the failed switch added: on a full disk those partially
+    # written files occupy the space the restore needs.
+    remove_target_leftovers
+    if [[ "$orig_ref" != "HEAD" ]]; then
+        # Started on a branch: back on it, and back to where its tip was
+        # (fast_forward_branch_to_origin may have advanced the branch)
+        git checkout --force "$orig_ref" >/dev/null 2>&1 || return 1
+        if [[ "$(git rev-parse HEAD 2>/dev/null || true)" != "$orig_head" ]]; then
+            git reset --hard "$orig_head" >/dev/null 2>&1 || return 1
+        fi
+    else
+        # Started on a tag or commit (detached HEAD): `git checkout HEAD` would
+        # re-check-out the version we are trying to leave
+        git checkout --force --detach "$orig_head" >/dev/null 2>&1 || return 1
+    fi
+
+    [[ "$(git rev-parse HEAD 2>/dev/null || true)" == "$orig_head" ]]
+}
+
 transaction_rollback() {
+    local reason="${1:-failed}"
+
     if [[ "${TRANSACTION_STATE[active]}" != "true" ]]; then
         log_debug "No active transaction to rollback"
         return 0
     fi
 
-    log_warn "Rolling back: ${TRANSACTION_STATE[operation]}"
+    log_warn "Rolling back: ${TRANSACTION_STATE[operation]} (${reason})"
 
-    # Disable traps during rollback to prevent recursion
-    trap - EXIT INT TERM
+    # The rollback must run to completion: a second Ctrl-C or SIGTERM in the
+    # middle of it would leave the repository between the two versions.
+    trap - EXIT
+    trap '' INT TERM
 
-    # Attempt to return to original ref
-    if [[ -n "${TRANSACTION_STATE[original_ref]}" ]]; then
-        log_debug "Restoring original ref: ${TRANSACTION_STATE[original_ref]}"
-        if ! git checkout "${TRANSACTION_STATE[original_ref]}" --force >/dev/null 2>&1; then
-            log_error "Could not restore original ref"
-            # Try to at least get to original HEAD
-            if [[ -n "${TRANSACTION_STATE[original_head]}" ]]; then
-                git checkout "${TRANSACTION_STATE[original_head]}" --force >/dev/null 2>&1 || true
-            fi
-        fi
+    local rollback_ok=true
+    local head_restored=true
+
+    if ! restore_original_head; then
+        log_error "Could not restore the original version"
+        log_info "To return by hand: git checkout --force ${TRANSACTION_STATE[original_head]}"
+        rollback_ok=false
+        head_restored=false
+    else
+        set_script_permissions
     fi
 
-    # Restore stashed changes if any
+    # Restore stashed changes if any -- only onto the original version again
     if [[ -n "${TRANSACTION_STATE[stash_hash]}" ]]; then
         log_debug "Restoring saved changes: ${TRANSACTION_STATE[stash_hash]}"
 
-        # Find stash ref from hash
         local stash_ref
-        stash_ref=$(git stash list --format="%gd %H" | grep "${TRANSACTION_STATE[stash_hash]}" | cut -d' ' -f1 || echo "")
+        stash_ref="$(find_stash_ref "${TRANSACTION_STATE[stash_hash]}")"
 
-        if [[ -n "$stash_ref" ]]; then
-            if git stash pop "$stash_ref" >/dev/null 2>&1; then
-                log_success "Your changes were restored"
-            else
-                log_warn "Could not restore your changes automatically"
-                log_info "Your changes are saved in: $stash_ref"
-                log_info "To restore: git stash pop $stash_ref"
-            fi
-        else
+        if [[ -z "$stash_ref" ]]; then
             log_warn "Could not find your saved changes"
+        elif [[ "$head_restored" != "true" ]]; then
+            log_warn "Your changes are saved in: $stash_ref"
+            log_info "Once the version is back: git stash pop $stash_ref"
+        elif git stash pop "$stash_ref" >/dev/null 2>&1; then
+            log_success "Your changes were restored"
+        else
+            log_warn "Could not restore your changes automatically"
+            log_info "Your changes are saved in: $stash_ref"
+            log_info "To restore: git stash pop $stash_ref"
         fi
     fi
 
@@ -1904,19 +2018,27 @@ transaction_rollback() {
     fi
 
     # Clear transaction state
-    TRANSACTION_STATE[active]=false
-    TRANSACTION_STATE[stash_hash]=""
-    TRANSACTION_STATE[original_ref]=""
-    TRANSACTION_STATE[original_head]=""
-    TRANSACTION_STATE[operation]=""
+    transaction_reset_state
 
     # Restore traps (direct re-installation avoids eval of arbitrary strings)
     trap cleanup EXIT
     trap 'log_error "Script interrupted by user"; exit $E_USER_ABORT' INT TERM
 
-    log_warn "Rollback complete"
+    if [[ "$rollback_ok" == "true" ]]; then
+        log_warn "Rollback complete"
+        return 0
+    fi
+    log_error "Rollback incomplete: the repository may be between versions"
+    return 1
+}
 
-    return 0
+# Roll back and return CODE (the reason the transaction failed), or
+# E_ROLLBACK_FAILED when the rollback itself could not restore everything.
+# Use as: transaction_abort "why" "$E_GENERAL" || return $?
+transaction_abort() {
+    local reason="$1" code="$2"
+    transaction_rollback "$reason" || return "$E_ROLLBACK_FAILED"
+    return "$code"
 }
 
 ################################################################################
@@ -2042,7 +2164,9 @@ switch_version_safe() {
     fi
 
     # Begin transaction
-    if ! transaction_begin "switch to $target_version"; then
+    local target_head
+    target_head="$(git rev-parse --verify --quiet "${target_version}^{commit}" 2>/dev/null || true)"
+    if ! transaction_begin "switch to $target_version" "$target_version" "$target_head"; then
         return "$E_GENERAL"
     fi
 
@@ -2065,13 +2189,11 @@ switch_version_safe() {
         echo
         if ! confirm_action "Save your changes temporarily? (recommended)"; then
             log_info "Operation cancelled"
-            transaction_rollback
-            return "$E_USER_ABORT"
+            transaction_abort "cancelled by the operator" "$E_USER_ABORT" || return $?
         fi
 
         if ! transaction_stash_changes; then
-            transaction_rollback
-            return "$E_GENERAL"
+            transaction_abort "could not save local changes" "$E_GENERAL" || return $?
         fi
 
         log_success "Your changes have been saved and will be restored after the update"
@@ -2085,12 +2207,10 @@ switch_version_safe() {
     else
         if [[ $service_update_result -eq $E_USER_ABORT ]]; then
             log_info "Operation cancelled by user during service update"
-            transaction_rollback
-            return "$E_USER_ABORT"
+            transaction_abort "cancelled during service update" "$E_USER_ABORT" || return $?
         else
             log_error "Service update preparation failed"
-            transaction_rollback
-            return "$E_GENERAL"
+            transaction_abort "service update preparation failed" "$E_GENERAL" || return $?
         fi
     fi
 
@@ -2112,23 +2232,24 @@ switch_version_safe() {
     repo_root="$(git rev-parse --show-toplevel 2>/dev/null)"
     if [[ -z "$repo_root" ]]; then
         log_error "Could not determine repository root"
-        transaction_rollback
-        return "$E_GENERAL"
+        transaction_abort "repository root unknown" "$E_GENERAL" || return $?
     fi
 
     if [[ ! -w "$repo_root" ]]; then
         log_error "No write permission for working directory: $repo_root"
         log_info "To fix: sudo chown -R $USER:$USER $repo_root"
-        transaction_rollback
-        return "$E_PERMISSION"
+        transaction_abort "working directory not writable" "$E_PERMISSION" || return $?
     fi
+
+    # From here on HEAD and the working tree may change: a rollback must put
+    # them back (and may then discard whatever the failed checkout left behind)
+    TRANSACTION_STATE[head_changed]=true
 
     local checkout_output
     if ! checkout_output=$(git checkout "$target_version" 2>&1); then
         log_error "Failed to switch to version: $target_version"
         echo "$checkout_output" >&2
-        transaction_rollback
-        return "$E_GENERAL"
+        transaction_abort "checkout failed" "$E_GENERAL" || return $?
     fi
 
     # Fast-forward a branch target to origin (a plain checkout lands on the stale
@@ -2137,8 +2258,7 @@ switch_version_safe() {
     if ! fast_forward_branch_to_origin "$target_version"; then
         log_error "Cannot fast-forward ${target_version} to origin/${target_version}: local history has diverged"
         log_info "To discard local commits and match the remote exactly, use the reset option in the menu."
-        transaction_rollback
-        return "$E_GENERAL"
+        transaction_abort "local branch has diverged from origin" "$E_GENERAL" || return $?
     fi
 
     # Verify we actually switched to the target
@@ -2150,8 +2270,12 @@ switch_version_safe() {
     if [[ "$new_head" != "$target_head" ]]; then
         log_error "Checkout completed but HEAD does not match target"
         log_error "This indicates a git state inconsistency"
-        transaction_rollback
-        return "$E_GENERAL"
+        transaction_abort "HEAD does not match the target after checkout" "$E_GENERAL" || return $?
+    fi
+
+    if ! verify_checkout_integrity "${TRANSACTION_STATE[original_head]}" "$new_head"; then
+        log_error "The files on disk do not match version $target_version (disk full or a write error?)"
+        transaction_abort "files on disk differ from the target after checkout" "$E_GENERAL" || return $?
     fi
 
     log_success "Switched to version: $target_version"
@@ -2179,8 +2303,7 @@ switch_version_safe() {
             if ! chmod +x "$script_path" 2>/dev/null; then
                 log_error "Failed to make new script executable: $script_path"
                 log_error "Self-update cannot proceed"
-                transaction_rollback
-                return "$E_PERMISSION"
+                transaction_abort "new updater is not executable" "$E_PERMISSION" || return $?
             fi
         fi
 
@@ -2194,8 +2317,7 @@ switch_version_safe() {
             bash -n "$script_path" 2>&1 | head -10 | sed 's/^/  /' >&2
             echo >&2
             log_error "Rolling back to previous version..."
-            transaction_rollback
-            return "$E_GENERAL"
+            transaction_abort "new updater has syntax errors" "$E_GENERAL" || return $?
         fi
         log_debug "Syntax validation passed [OK]"
 
@@ -2236,8 +2358,7 @@ switch_version_safe() {
     # Complete service update (post-checkout)
     if ! post_checkout_service_update; then
         log_error "Service update failed after checkout"
-        transaction_rollback
-        return "$E_GENERAL"
+        transaction_abort "service update failed after checkout" "$E_GENERAL" || return $?
     fi
 
     # Remove service update marker on success
