@@ -251,7 +251,7 @@ teardown() {
 }
 
 @test "a hostile name cannot add a YAML key to the generated config [LB-04]" {
-    export RAW=$'x:\n    runOnInit: touch '"$SD"$'/MARK\n  evil'
+    export RAW=$'x:\n    runOnInit: touch MARK\n  evil'
     run sm '
         MULTIPLEX_STREAM_NAME="$RAW"; STREAM_MODE=multiplex
         resolve_multiplex_stream_name
