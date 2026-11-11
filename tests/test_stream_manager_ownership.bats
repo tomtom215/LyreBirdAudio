@@ -786,3 +786,25 @@ make_logs() {
     # the new run writes a fresh log
     ! grep -q 'previous run' "$FF/all_mics.log" || false
 }
+# ---------------------------------------------------------------------------
+# Refused restart: no marker (found by the lock work)
+# ---------------------------------------------------------------------------
+
+@test "a restart refused by the lock leaves no restart marker and stops nothing [new defect]" {
+    use_seams
+    our_mediamtx_up
+    our_wrapper_up mic1
+    # another lifecycle command holds the lock until the test ends
+    bash -c 'exec 8<>"$MEDIAMTX_LOCK_FILE"; flock -x 8; : >"$OW/holder.ready"; exec sleep 60' 3>&- &
+    EXTRA_PIDS+=("$!")
+    wait_until '[[ -e "$OW/holder.ready" ]]'
+    LOCK_ACQUISITION_TIMEOUT=1 run_mgr eval 'COMMAND=restart; trap cleanup EXIT; restart_mediamtx'
+    [ "$status" -eq 5 ]
+    [[ "$output" == *"Refusing to restart: another lifecycle command holds the lock"* ]]
+    # The old code marked the restart before it asked for the lock, so the next
+    # start treated the node as being in a restart for 60 seconds
+    [ ! -e "$MEDIAMTX_RESTART_MARKER" ]
+    [ ! -e "$MEDIAMTX_CLEANUP_MARKER" ]
+    assert_alive mtx w_mic1
+    [ -z "$(decoy_signals)" ]
+}

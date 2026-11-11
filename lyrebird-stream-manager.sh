@@ -5649,7 +5649,18 @@ force_stop_mediamtx() {
 }
 
 # Restart MediaMTX
+#
+# The lifecycle lock is taken first and kept across the stop and the start. A
+# restart that cannot get it is refused before anything is written: it used to
+# mark the restart first, so a refused restart left the restart marker behind
+# and the next start treated the node as being in a restart for 60 seconds.
 restart_mediamtx() {
+    if ! acquire_lock; then
+        log ERROR "Refusing to restart: another lifecycle command holds the lock (${LOCK_FILE})"
+        SKIP_CLEANUP=true
+        return "${E_LOCK_FAILED}"
+    fi
+
     mark_restart
     stop_mediamtx
     sleep "$MEDIUM_SLEEP"
