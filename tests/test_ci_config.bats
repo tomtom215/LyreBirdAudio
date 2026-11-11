@@ -164,3 +164,133 @@ fetch_from_fixture() {
     [ "$status" -eq 2 ]
     [[ "$output" == *"no pin for v9.9.9"* ]]
 }
+
+# ---------------------------------------------------------------------------
+# Workflows. The YAML is loaded into JSON (python3 + PyYAML, else ruby) and
+# asserted with jq. GitHub's own `on:` key is parsed as boolean true by YAML
+# 1.1 loaders; it is mapped back to "on".
+# ---------------------------------------------------------------------------
+
+# wf_json FILE: the workflow as one line of JSON.
+wf_json() {
+    if python3 -I -c 'import yaml' 2>/dev/null; then
+        python3 -I -c '
+import json, sys, yaml
+d = yaml.safe_load(sys.stdin)
+if True in d:
+    d["on"] = d.pop(True)
+print(json.dumps(d))' <"$1"
+    elif command -v ruby >/dev/null && ruby -ryaml -rjson -e 'exit' 2>/dev/null; then
+        ruby -ryaml -rjson -e '
+d = YAML.safe_load(STDIN.read)
+d["on"] = d.delete(true) if d.key?(true)
+puts JSON.generate(d)' <"$1"
+    else
+        return 3
+    fi
+}
+
+# require_yaml: the workflow checks need jq and a YAML loader. Skip when one is
+# missing on a developer machine, but never in CI, where a skip would hide the
+# checks.
+require_yaml() {
+    local why=""
+    if ! command -v jq >/dev/null; then
+        why="jq not installed"
+    elif ! wf_json "$ROOT/.github/workflows/bash-ci.yml" >/dev/null 2>&1; then
+        why="needs python3 with PyYAML, or ruby"
+    fi
+    [[ -z "$why" ]] && return 0
+    if [[ -n "${CI:-}" ]]; then
+        echo "CI checks cannot run: $why" >&2
+        return 1
+    fi
+    skip "$why"
+}
+
+# load_wf NAME: put the JSON of .github/workflows/NAME.yml in $WF.
+load_wf() {
+    require_yaml
+    WF="$(wf_json "$ROOT/.github/workflows/$1.yml")"
+}
+
+# step_script JOB STEP: print the run: script of the step named STEP in JOB of
+# $WF (exactly one such step must exist).
+step_script() {
+    jq -e --arg j "$1" --arg s "$2" '[.jobs[$j].steps[] | select(.name == $s)] | length == 1' <<<"$WF" >/dev/null || {
+        echo "no single step '$2' in job '$1'" >&2
+        return 1
+    }
+    jq -er --arg j "$1" --arg s "$2" '.jobs[$j].steps[] | select(.name == $s) | .run' <<<"$WF"
+}
+
+# step_env JOB STEP: NAME=value lines for the workflow-, job- and step-level
+# env of the step; values that use a ${{ }} expression are left out (the test
+# supplies those).
+step_env() {
+    jq -r --arg j "$1" --arg s "$2" '
+        ([.env, .jobs[$j].env, (.jobs[$j].steps[] | select(.name == $s) | .env)] | map(. // {}) | add)
+        | to_entries[] | select((.value | tostring | contains("${{")) | not)
+        | "\(.key)=\(.value)"' <<<"$WF"
+}
+
+# run_step JOB STEP [NAME=value...]: run the step's real script the way the
+# runner does (bash --noprofile --norc -eo pipefail), with its static env plus
+# the given variables, in the current directory.
+run_step() {
+    local job="$1" step="$2"
+    shift 2
+    local -a envs
+    step_script "$job" "$step" >"$TEST_SCRATCH/step.sh"
+    mapfile -t envs < <(step_env "$job" "$step")
+    run env "${envs[@]}" "$@" bash --noprofile --norc -eo pipefail "$TEST_SCRATCH/step.sh"
+}
+
+@test "bash-ci runs on pull requests and pushes to main/master, weekly, on demand and when called" {
+    load_wf bash-ci
+    run jq -e '
+        (.on | has("pull_request") and has("push") and has("schedule")
+            and has("workflow_dispatch") and has("workflow_call"))
+        and (.on.pull_request.branches == ["main", "master"])
+        and (.on.push.branches == ["main", "master"])
+        and (.on.schedule | length >= 1)' <<<"$WF"
+    [ "$status" -eq 0 ]
+}
+
+@test "bash-ci has no path filter on any trigger" {
+    load_wf bash-ci
+    run jq -e '[.on | .. | objects | keys[] | select(. == "paths" or . == "paths-ignore")] | length == 0' <<<"$WF"
+    [ "$status" -eq 0 ]
+}
+
+@test "bash-ci cancels superseded pull request runs only, never a run on main or a tag" {
+    load_wf bash-ci
+    run jq -er '.concurrency."cancel-in-progress"' <<<"$WF"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"github.event_name == 'pull_request'"* ]]
+}
+
+@test "bash-ci runs its steps with bash -eo pipefail and a read-only token" {
+    load_wf bash-ci
+    run jq -e '.defaults.run.shell == "bash" and .permissions == {"contents": "read"}' <<<"$WF"
+    [ "$status" -eq 0 ]
+}
+
+@test "bash-ci ShellCheck report step survives a script with findings under pipefail" {
+    load_wf bash-ci
+    mkdir "$TEST_SCRATCH/repo" "$TEST_SCRATCH/bin"
+    : >"$TEST_SCRATCH/repo/a.sh"
+    # A shellcheck that reports findings the way the real one does: JSON on
+    # stdout and exit status 1.
+    cat >"$TEST_SCRATCH/bin/shellcheck" <<'SH'
+#!/bin/bash
+echo '[{"level":"warning","code":2086},{"level":"info","code":2016},{"level":"error","code":1072}]'
+exit 1
+SH
+    chmod +x "$TEST_SCRATCH/bin/shellcheck"
+    cd "$TEST_SCRATCH/repo"
+    run_step shellcheck "ShellCheck Summary Report" \
+        PATH="$TEST_SCRATCH/bin:$PATH" GITHUB_STEP_SUMMARY="$TEST_SCRATCH/summary.md"
+    [ "$status" -eq 0 ]
+    grep -qF '| FAIL ./a.sh | 1 | 1 | 1 |' "$TEST_SCRATCH/summary.md"
+}

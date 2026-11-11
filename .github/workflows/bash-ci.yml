@@ -1,5 +1,9 @@
 # LyreBirdAudio - Bash CI Pipeline
-# Runs comprehensive shell script validation on PRs targeting main branch
+# Runs the full validation on every pull request to main/master and on every
+# push to main/master, with no path filter: scripts, tests, workflows,
+# configuration and documentation changes are all checked. It also runs weekly
+# and on demand, and release.yml calls it (workflow_call) so a release is
+# validated by exactly the checks a pull request passes.
 #
 # Tools included (all free, open source, no API/subscription required):
 #   - bash -n: Built-in syntax validation
@@ -17,18 +21,35 @@ on:
     branches:
       - main
       - master
-    paths:
-      # Only run when shell scripts change
-      - '**.sh'
-      - '.github/workflows/bash-ci.yml'
+
+  push:
+    branches:
+      - main
+      - master
+
+  # Weekly, so a changed runner image or a new upstream MediaMTX release is
+  # noticed even when nobody pushes. Scheduled runs use the default branch.
+  schedule:
+    - cron: '23 4 * * 1'
 
   # Allow manual trigger for testing
   workflow_dispatch:
 
-# Cancel in-progress runs for the same PR
+  # Reused by release.yml to validate a tagged commit
+  workflow_call:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+# Cancel superseded runs of the same pull request only. A run on main (or a
+# tag) always finishes, so every merged commit keeps its verdict.
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   # Shellcheck version (check https://github.com/koalaman/shellcheck/releases)
@@ -176,9 +197,11 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
           while IFS= read -r script; do
-            errors=$(shellcheck --severity=error --format=json "$script" 2>/dev/null | jq 'length' || echo 0)
-            warnings=$(shellcheck --severity=warning --format=json "$script" 2>/dev/null | jq '[.[] | select(.level == "warning")] | length' || echo 0)
-            notes=$(shellcheck --format=json "$script" 2>/dev/null | jq '[.[] | select(.level == "info" or .level == "style")] | length' || echo 0)
+            # The tool exits 1 when it finds anything, which is not an error here
+            report=$(shellcheck --format=json "$script" 2>/dev/null || true)
+            errors=$(jq '[.[] | select(.level == "error")] | length' <<<"${report:-[]}")
+            warnings=$(jq '[.[] | select(.level == "warning")] | length' <<<"${report:-[]}")
+            notes=$(jq '[.[] | select(.level == "info" or .level == "style")] | length' <<<"${report:-[]}")
 
             if [[ "$errors" == "0" && "$warnings" == "0" ]]; then
               status="PASS"
