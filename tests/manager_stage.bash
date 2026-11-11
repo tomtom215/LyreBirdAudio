@@ -19,7 +19,8 @@
 #              counter) while it runs, and exits at once for a card listed in
 #              $ST/bad-cards, as an FFmpeg that cannot open its capture device does.
 #              $ST/api-shape selects the field names it writes: old (1.15: ready,
-#              bytesReceived), new (>=1.18: both generations) or newonly.
+#              bytesReceived), new (>=1.18: both generations), newonly, or silent
+#              (an FFmpeg that runs but never reaches MediaMTX: no path appears).
 #
 # Usage: in setup() call scratch_setup, then stage_setup; in teardown()
 # stage_teardown, then scratch_teardown. Needs PROJECT_ROOT.
@@ -126,11 +127,14 @@ n=0
 while :; do
     n=$((n + 1500))
     case "$shape" in
+        silent) body="" ;;
         old) body="{\"name\":\"$name\",\"ready\":true,\"bytesReceived\":$n,\"bytesSent\":0}" ;;
         newonly) body="{\"name\":\"$name\",\"available\":true,\"online\":true,\"inboundBytes\":$n}" ;;
         *) body="{\"name\":\"$name\",\"ready\":true,\"available\":true,\"online\":true,\"inboundBytes\":$n,\"bytesReceived\":$n}" ;;
     esac
-    printf '%s' "$body" >"$API/$name.json.tmp" && mv -f "$API/$name.json.tmp" "$API/$name.json"
+    if [[ -n "$body" ]]; then
+        printf '%s' "$body" >"$API/$name.json.tmp" && mv -f "$API/$name.json.tmp" "$API/$name.json"
+    fi
     sleep 0.2
 done
 FFMPEG_EOF
@@ -194,7 +198,7 @@ device_add() {
     : >"$HW/dev-snd/controlC$2"
 }
 device_remove() {
-    rm -f "$HW/$2" "$HW/dev-snd/controlC$1" "$HW/$1"
+    rm -f "$HW/$1" "$HW/dev-snd/controlC$1"
 }
 
 # card_unavailable CARD / card_available CARD: the card stays detected but ALSA
@@ -251,6 +255,21 @@ mediamtx_stub_up() {
         sleep 0.05
     done
     bash -c 'source "$PROJECT_ROOT/lyrebird-stream-manager.sh"; write_pid_atomic "$1" "$MEDIAMTX_PID_FILE"' _ "$pid"
+}
+
+# stage_processes: the PID of every running process whose command line names
+# this installation's private directory (MediaMTX, wrappers, FFmpeg), one per line
+stage_processes() {
+    local dir pid
+    for dir in /proc/[0-9]*; do
+        pid="${dir#/proc/}"
+        [[ "$pid" != "$$" ]] || continue
+        if tr '\0' ' ' 2>/dev/null <"$dir/cmdline" | grep -qF -- "$ST/"; then
+            if pid_running "$pid"; then
+                echo "$pid"
+            fi
+        fi
+    done
 }
 
 # The PID recorded for a stream wrapper / for MediaMTX

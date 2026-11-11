@@ -223,6 +223,7 @@ readonly E_LOCK_FAILED=5
 readonly E_USB_NO_DEVICES=6
 readonly E_MEDIAMTX_DOWN=7
 readonly E_OWNERSHIP=8
+readonly E_STREAMS_FAILED=9
 readonly E_MONITOR_DEGRADED=10
 
 # Configurable paths with environment variable defaults
@@ -313,6 +314,10 @@ readonly RESTART_STABILIZATION_DELAY
 # How long stop and force-stop wait for the lifecycle lock before refusing
 STOP_LOCK_TIMEOUT=$(_uint_or "${STOP_LOCK_TIMEOUT:-}" 5)
 readonly STOP_LOCK_TIMEOUT
+
+# How long the monitor waits for the lifecycle lock before it skips its cycle
+MONITOR_LOCK_TIMEOUT=$(_uint_or "${MONITOR_LOCK_TIMEOUT:-}" 5)
+readonly MONITOR_LOCK_TIMEOUT
 
 # Start outcome, status file and desired state (D4, D5). LYREBIRD_START_POLICY
 # (degraded|strict) and LYREBIRD_ALLOW_EMPTY_START are read where they are used
@@ -484,6 +489,9 @@ declare -g SKIP_CLEANUP=false
 # MediaMTX or a stream wrapper, cleared when the start succeeds or has taken
 # them down again. cleanup() acts on it (see there).
 declare -g RUN_DIRTY=false
+# Set once a start has been accepted, cleared when it has recorded its outcome:
+# a start that fails before it did gets the failure recorded by cleanup()
+declare -g STATUS_PENDING=false
 declare -g RUN_STARTED_MEDIAMTX=""
 declare -ga RUN_STARTED_STREAMS=()
 
@@ -575,6 +583,12 @@ cleanup() {
         if rollback_failed_start; then
             rm -f "${CLEANUP_MARKER}"
         fi
+    fi
+
+    # A start that was accepted and failed before it recorded its outcome
+    if [[ $exit_code -ne 0 ]] && [[ "${STATUS_PENDING}" == "true" ]]; then
+        status_collect_live
+        status_publish "${COMMAND:-start}"
     fi
 
     # Always release locks on exit
@@ -5243,12 +5257,18 @@ start_all_ffmpeg_streams() {
             continue
         fi
 
-        if ! device_node_exists "$card_num"; then
-            continue
-        fi
-
         local stream_path
         stream_path="$(generate_stream_path "$device_name" "$card_num")"
+
+        # A detected card whose control node is missing cannot be captured. It
+        # was skipped without a word and then counted as started (X-27): it is
+        # reported, here and in the status file, as a stream that failed.
+        if ! device_node_exists "$card_num"; then
+            STREAM_LAST_ERROR[$stream_path]="device node /dev/snd/controlC${card_num} does not exist"
+            failed_streams+=("$stream_path")
+            log WARN "Not starting $device_name (card $card_num): ${STREAM_LAST_ERROR[$stream_path]}"
+            continue
+        fi
 
         # Progress feedback for manual starts
         echo "Starting stream ${device_idx}/${#devices[@]}: ${stream_path}..."
@@ -5259,11 +5279,13 @@ start_all_ffmpeg_streams() {
         fi
         if start_ffmpeg_stream "$device_name" "$card_num" "$stream_path"; then
             ((success_count++)) || true
+            unset 'STREAM_LAST_ERROR[$stream_path]'
             if [[ "$was_running" != "true" ]]; then
                 run_track_stream "$stream_path"
             fi
         else
             failed_streams+=("$stream_path")
+            STREAM_LAST_ERROR[$stream_path]="the stream could not be started (see ${FFMPEG_PID_DIR}/${stream_path}.log and ${LOG_FILE})"
             log ERROR "Failed to start stream for $device_name (card $card_num)"
         fi
     done
@@ -5271,11 +5293,11 @@ start_all_ffmpeg_streams() {
     # Log summary with details about failures
     if [[ ${#failed_streams[@]} -gt 0 ]]; then
         log WARN "Started $success_count/${#devices[@]} FFmpeg streams. Failed: ${failed_streams[*]}"
-    else
-        log INFO "Successfully started all $success_count/${#devices[@]} FFmpeg streams"
+        # What a failed stream means for the start is the caller's decision
+        # (the start policy), not a silent "best effort"
+        return 1
     fi
-
-    # Always return 0 for best-effort behavior
+    log INFO "Successfully started all $success_count/${#devices[@]} FFmpeg streams"
     return 0
 }
 
@@ -5772,6 +5794,24 @@ stream_outcome_probe() {
     done
 }
 
+# Wait until MediaMTX reports the path ready, for at most
+# STREAM_VALIDATION_ATTEMPTS x STREAM_VALIDATION_DELAY seconds (one look when
+# that is 0). start_ffmpeg_stream's own validation can pass on a running FFmpeg
+# before the publish has reached MediaMTX; what start reports is the path.
+wait_path_ready() {
+    local stream_path="$1" limit=$((STREAM_VALIDATION_ATTEMPTS * STREAM_VALIDATION_DELAY)) waited=0 info rc
+    while true; do
+        rc=0
+        info="$(mediamtx_path_info "$stream_path")" || rc=$?
+        if [[ $rc -eq 0 ]] && mediamtx_json_path_ready "$info"; then
+            return 0
+        fi
+        ((waited < limit)) || return 1
+        sleep 1
+        ((waited++)) || true
+    done
+}
+
 # stream_outcome_collect DEVICES...: expect, then probe
 stream_outcome_collect() {
     stream_outcome_expect "$@"
@@ -5880,6 +5920,7 @@ state_file_write() {
 
 # Record the current OUTCOME_* facts of command $1 in STATUS_FILE
 status_publish() {
+    STATUS_PENDING=false
     state_file_write "${STATUS_FILE}" "$(status_document "$1")" \
         || log DEBUG "Could not write the status file ${STATUS_FILE}"
     return 0
@@ -5958,6 +5999,7 @@ start_mediamtx() {
     # Accepted: from here on the node is meant to be running (the monitor brings
     # MediaMTX back if it goes away; stop and force-stop clear this)
     desired_write
+    STATUS_PENDING=true
 
     # Handle deferred cleanup from previous termination
     handle_deferred_cleanup
@@ -6090,6 +6132,7 @@ start_mediamtx() {
 # already running is left alone: the per-stream start checks its wrapper.
 start_streams_and_report() {
     local devices=("$@")
+    local policy path total=0 ready=0 note=""
 
     if [[ ${#devices[@]} -eq 0 ]]; then
         # No device: MediaMTX is up and waits for them (D5); the monitor starts
@@ -6108,67 +6151,105 @@ start_streams_and_report() {
         status_publish start
         return 0
     fi
+    policy="$(start_policy)"
 
     # Start streams based on mode
     if [[ "${STREAM_MODE}" == "multiplex" ]]; then
-        log INFO "Multiplex mode - starting single multiplexed stream to ${MULTIPLEX_STREAM_NAME}"
-        echo "Starting multiplexed stream (${#devices[@]} devices): ${MULTIPLEX_STREAM_NAME}..."
-        # Start single multiplex stream with all devices
         local multiplex_path was_running=false
         multiplex_path="$(multiplex_stream_path)"
+        log INFO "Multiplex mode - starting single multiplexed stream to ${multiplex_path}"
+        echo "Starting multiplexed stream (${#devices[@]} devices): ${multiplex_path}..."
         if stream_wrapper_alive "$multiplex_path"; then
             was_running=true
         fi
+        # Start single multiplex stream with all devices
         if start_ffmpeg_multiplex_stream "${devices[@]}"; then
+            unset 'STREAM_LAST_ERROR[$multiplex_path]'
             if [[ "$was_running" != "true" ]]; then
                 run_track_stream "$multiplex_path"
             fi
         else
+            STREAM_LAST_ERROR[$multiplex_path]="the multiplex stream could not be started (see ${FFMPEG_PID_DIR}/${multiplex_path}.log and ${LOG_FILE})"
             log ERROR "Failed to start multiplex stream"
-            stop_mediamtx
-            return 1
         fi
     else
         log INFO "Individual stream mode - starting separate streams"
         # Pass the stable device list to start function
-        start_all_ffmpeg_streams "${devices[@]}"
+        start_all_ffmpeg_streams "${devices[@]}" || true
     fi
+
+    # What counts is what is publishing: wait for each stream that was launched
+    # to show up in MediaMTX, then establish the facts
+    stream_outcome_expect "${devices[@]}"
+    for path in ${OUTCOME_PATHS[@]+"${OUTCOME_PATHS[@]}"}; do
+        if [[ -z "${STREAM_LAST_ERROR[$path]:-}" ]]; then
+            wait_path_ready "$path" || true
+        fi
+    done
+    stream_outcome_probe
 
     # Display stream status based on mode
     echo
     echo -e "${GREEN}=== Available RTSP Streams ===${NC}"
-
-    if [[ "${STREAM_MODE}" == "multiplex" ]]; then
-        # In multiplex mode, validate the single multiplexed stream
-        local stream_path="${MULTIPLEX_STREAM_NAME}"
-        if validate_stream "$stream_path"; then
-            echo -e "${GREEN}[OK]${NC} rtsp://${MEDIAMTX_HOST}:8554/${stream_path} (multiplexed from ${#devices[@]} devices)"
-        else
-            echo -e "${RED}[FAIL]${NC} rtsp://${MEDIAMTX_HOST}:8554/${stream_path} (failed)"
+    for path in ${OUTCOME_PATHS[@]+"${OUTCOME_PATHS[@]}"}; do
+        total=$((total + 1))
+        note=""
+        if [[ "$(effective_stream_mode)" == "multiplex" ]]; then
+            note=" (multiplexed from ${#devices[@]} devices)"
         fi
-    else
-        # In individual mode, validate each device's stream
-        for device_info in "${devices[@]}"; do
-            IFS=':' read -r device_name card_num <<<"$device_info"
-            local stream_path
-            stream_path="$(generate_stream_path "$device_name" "$card_num")"
+        if [[ "${OUTCOME_READY[$path]}" == "true" ]]; then
+            ready=$((ready + 1))
+            echo -e "${GREEN}[OK]${NC} rtsp://${MEDIAMTX_HOST}:8554/${path}${note}"
+        else
+            echo -e "${RED}[FAIL]${NC} rtsp://${MEDIAMTX_HOST}:8554/${path}${note} (failed: ${OUTCOME_ERROR[$path]})"
+        fi
+    done
+    echo
 
-            if validate_stream "$stream_path"; then
-                echo -e "${GREEN}[OK]${NC} rtsp://${MEDIAMTX_HOST}:8554/${stream_path}"
-            else
-                echo -e "${RED}[FAIL]${NC} rtsp://${MEDIAMTX_HOST}:8554/${stream_path} (failed)"
-            fi
-        done
+    # The policy decides whether this is a start (D4)
+    local satisfied=true
+    if [[ "$policy" == "strict" ]]; then
+        ((ready == total)) || satisfied=false
+    elif ((total > 0)); then
+        ((ready > 0)) || satisfied=false
     fi
 
-    echo
-    # Everything this run launched is accounted for
-    RUN_STARTED_STREAMS=()
-    RUN_STARTED_MEDIAMTX=""
-    RUN_DIRTY=false
+    if [[ "$satisfied" == "true" ]]; then
+        if ((ready < total)); then
+            log WARN "Started in degraded mode: ${ready} of ${total} streams are publishing (policy ${policy})"
+            for path in ${OUTCOME_PATHS[@]+"${OUTCOME_PATHS[@]}"}; do
+                if [[ "${OUTCOME_READY[$path]}" != "true" ]]; then
+                    log WARN "  ${path}: ${OUTCOME_ERROR[$path]}"
+                fi
+            done
+        else
+            log INFO "All ${total} streams are publishing"
+        fi
+        # Everything this run launched is accounted for
+        RUN_STARTED_STREAMS=()
+        RUN_STARTED_MEDIAMTX=""
+        RUN_DIRTY=false
+        status_publish start
+        return 0
+    fi
+
+    log ERROR "Start failed: ${ready} of ${total} streams are publishing (policy ${policy})"
+    for path in ${OUTCOME_PATHS[@]+"${OUTCOME_PATHS[@]}"}; do
+        if [[ "${OUTCOME_READY[$path]}" == "true" ]]; then
+            STREAM_LAST_ERROR[$path]="was publishing; stopped again because the start failed under policy '${policy}'"
+        else
+            STREAM_LAST_ERROR[$path]="${OUTCOME_ERROR[$path]}"
+            log ERROR "  ${path}: ${OUTCOME_ERROR[$path]}"
+        fi
+    done
+    # No half-running stack: take down what THIS run started. A stack that was
+    # already running before it is left alone.
+    if ! rollback_failed_start; then
+        log ERROR "Not everything this run started could be stopped"
+    fi
     stream_outcome_collect "${devices[@]}"
     status_publish start
-    return 0
+    return "${E_STREAMS_FAILED}"
 }
 
 # Stop MediaMTX without requiring lock
@@ -6735,13 +6816,37 @@ Environment Variables:
     MULTIPLEX_FILTER_TYPE    Multiplex audio filter type [default: amix]
                              - amix: Mix all audio sources into one output
                              - amerge: Merge sources keeping channels separate
+    LYREBIRD_START_POLICY    What start requires [default: degraded]
+                             - degraded: at least one stream is publishing
+                             - strict: the stream of every detected device is
+                             A start that does not meet it exits 9 and stops
+                             what that run started. Any other value: exit 4.
+    LYREBIRD_ALLOW_EMPTY_START
+                             true (default): with no USB audio device start
+                             brings MediaMTX up anyway, reports
+                             waiting_for_devices and exits 0; the monitor starts
+                             a stream for each device that appears. false: exit 6
+                             and MediaMTX is not started.
+    LYREBIRD_STATUS_FILE     Machine-readable status [default: ${STATUS_FILE}]
+    LYREBIRD_STATE_DIR       Directory of the status file and of the
+                             desired-running marker [default: ${RUN_STATE_DIR}]
+    LYREBIRD_FLOW_SAMPLE_SECONDS
+                             Seconds between the two samples of a stream's
+                             inbound byte counter (bytes_flowing) [default: 3;
+                             0 skips the sample]
+    MONITOR_LOCK_TIMEOUT     Seconds the monitor waits for a running
+                             start/stop/restart before it skips its cycle
+                             [default: ${MONITOR_LOCK_TIMEOUT}]
 
 Commands:
-    start       Start MediaMTX and FFmpeg streams. Safe to repeat: when this
-                manager's own MediaMTX is running it is left alone (same PIDs,
-                no outage) and only streams that are missing are started.
-                Refused with exit 8 while another MediaMTX owns the node
-                (mediamtx.service, or a MediaMTX this manager did not start).
+    start       Start MediaMTX and FFmpeg streams. Exit status: 0 when the start
+                policy is met (see LYREBIRD_START_POLICY), 9 when it is not.
+                Safe to repeat: when this manager's own MediaMTX is running it
+                is left alone (same PIDs, no outage) and only streams that are
+                missing are started. Refused with exit 8 while another MediaMTX
+                owns the node (mediamtx.service, or a MediaMTX this manager did
+                not start). A start that fails stops what that run started and
+                never touches a stack that was already running.
     stop        Stop MediaMTX and FFmpeg streams. Only processes this manager
                 started are signalled (PID files + process start time).
     force-stop  SIGKILL, at once, the processes this manager started (emergency
@@ -6754,11 +6859,24 @@ Commands:
                 --yes it only prints those processes and why, signals nothing
                 and exits 1.
     restart     Restart everything
-    status      Show current status
+    status      Show current status: MediaMTX, every stream's path/bytes state
+                and the overall state (ok, degraded, failed,
+                waiting_for_devices, stopped). Also refreshes the status file.
+    status --json
+                The same, as one JSON document on stdout (schema_version,
+                timestamp, overall, policy, mediamtx {running, pid}, streams[]
+                with device, path, configured, process_alive, path_ready,
+                bytes_flowing, last_error). Computed live; exit 0.
     config      Show device configuration
-    monitor     Check resource usage and stream health
-                Exit codes: 0=healthy, 2=critical resources, 3=MediaMTX down,
-                            7=no devices, 10=streams degraded
+    monitor     Check resource usage and stream health; starts the stream of a
+                device that appeared or whose wrapper died, and restarts a
+                MediaMTX that is gone while the node is meant to be running
+                (bounded by CRON_RESTART_MAX_PER_HOUR). Skips its cycle (exit 0)
+                while a start/stop/restart/force-stop is in progress.
+                Exit codes: 0=healthy (or waiting for devices, or skipped),
+                            2=critical resources, 6=no devices (only with
+                            LYREBIRD_ALLOW_EMPTY_START=false), 7=MediaMTX not
+                            running, 10=streams degraded
     install     Create systemd service
     help        Show this help
 
@@ -6799,21 +6917,30 @@ Resource Monitoring:
     
     Conservative restart policy:
     - Exit 2 (Critical resource failure): Triggers full service restart
-    - Exit 7 (MediaMTX down): Logged, no restart (may recover)
+    - Exit 7 (MediaMTX down): Logged; the monitor itself restarts MediaMTX when
+      the node is meant to be running (start was run and stop was not)
     - Exit 6 (No USB devices): Logged, no restart (transient state)
     - Exit 10 (Stream degraded): Logged, no restart (fixed on next cycle)
 
 Exit Codes:
-    0  - Success
-    1  - General error
+    0  - Success. start: the start policy is met (also: no device and empty
+         start allowed). monitor: healthy, waiting for devices, or skipped
+         because a lifecycle command was running.
+    1  - General error (also: force-stop --kill-all without --yes, a command
+         that could not stop what it had to)
     2  - Critical resource state (TRIGGERS RESTART in cron)
     3  - Missing dependencies
-    4  - Configuration error
-    5  - Lock acquisition failed
-    6  - No USB devices found (logged only)
-    7  - MediaMTX not running (logged only)
+    4  - Configuration error (an invalid LYREBIRD_* setting, no MediaMTX config)
+    5  - Lock acquisition failed (another lifecycle command holds the lock;
+         nothing was changed)
+    6  - No USB devices found (start or monitor with
+         LYREBIRD_ALLOW_EMPTY_START=false)
+    7  - MediaMTX not running (monitor; start: MediaMTX did not come up is 1)
     8  - Another MediaMTX owns the node (start/restart refused, nothing changed)
+    9  - Streams failed: start did not meet LYREBIRD_START_POLICY; everything
+         that run started was stopped, a stack that was running is untouched
     10 - Stream monitoring degraded (logged only)
+    128+N - Terminated by signal N (130 SIGINT, 143 SIGTERM)
 
 FFmpeg logs:
     The log of each stream's previous run is kept as <stream>.log.prev.1 ...
@@ -6911,6 +7038,7 @@ parse_arguments() {
 #   6 = No USB devices found (E_USB_NO_DEVICES)
 #   7 = MediaMTX not running (E_MEDIAMTX_DOWN)
 #   8 = Another MediaMTX owns the node; start/restart refused (E_OWNERSHIP)
+#   9 = Streams failed: the start policy was not met (E_STREAMS_FAILED)
 #   10 = Stream monitoring degraded (E_MONITOR_DEGRADED)
 #
 # Side Effects:
