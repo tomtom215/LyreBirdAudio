@@ -85,6 +85,31 @@ _clock_floor=$(_coerce_uint "${LYREBIRD_CLOCK_SANE_EPOCH:-1735689600}" 173568960
 readonly CLOCK_SANE_EPOCH="$_clock_floor"
 unset _clock_floor
 
+# Recording file extensions: the ONE list that retention, emergency eviction and
+# `status` all use. lyrebird-stream-manager.sh records through FFmpeg's segment
+# muxer to `audio_%03d.${CODEC}`, so the extension IS the CODEC value and FFmpeg
+# picks the container from it: opus -> .opus (Ogg Opus), aac -> .aac (ADTS),
+# mp3 -> .mp3 (verified with ffmpeg 6.1.1). Any other CODEC is encoded with
+# libopus under its own name, which only produces a recording where that
+# container accepts Opus (ogg); the other names still leave empty or truncated
+# files behind when the muxer refuses the stream (flac, m4a, adts, wav).
+# adts/m4a are the other names FFmpeg gives AAC. wav/flac cover recordings from
+# other tools and earlier releases. tests/test_storage_codecs.bats fails when the
+# manager gains a CODEC that is missing here.
+readonly RECORDING_EXTENSIONS=(opus ogg aac adts m4a mp3 flac wav)
+
+# find(1) test matching RECORDING_EXTENSIONS, built once from the list above.
+RECORDING_NAME_TEST=()
+for _ext in "${RECORDING_EXTENSIONS[@]}"; do
+    if ((${#RECORDING_NAME_TEST[@]} > 0)); then
+        RECORDING_NAME_TEST+=(-o)
+    fi
+    RECORDING_NAME_TEST+=(-name "*.${_ext}")
+done
+RECORDING_NAME_TEST=(\( "${RECORDING_NAME_TEST[@]}" \))
+readonly RECORDING_NAME_TEST
+unset _ext
+
 # Disk thresholds (percentage) - validate bounds 0-100
 _disk_warning=$(_coerce_uint "${DISK_WARNING_PERCENT:-80}" 80)
 _disk_critical=$(_coerce_uint "${DISK_CRITICAL_PERCENT:-90}" 90)
@@ -298,7 +323,7 @@ cleanup_recordings() {
         safe_delete "$file" "recording"
         ((++count))
         freed_bytes=$((freed_bytes + size))
-    done < <(find "$RECORDING_DIR" -type f \( -name "*.wav" -o -name "*.mp3" -o -name "*.flac" -o -name "*.opus" -o -name "*.ogg" \) -mtime "+${RECORDING_RETENTION_DAYS}" -print0 2>/dev/null)
+    done < <(find "$RECORDING_DIR" -type f "${RECORDING_NAME_TEST[@]}" -mtime "+${RECORDING_RETENTION_DAYS}" -print0 2>/dev/null)
 
     if [[ $kept_broken_clock -gt 0 ]]; then
         log_warn "Kept $kept_broken_clock recording(s) with pre-${CLOCK_SANE_EPOCH} mtimes (written before NTP sync; real age unknown)"
@@ -445,7 +470,7 @@ emergency_cleanup() {
             safe_delete "$file" "emergency recording"
             ((++deleted))
             [[ $deleted -ge $max_delete ]] && break
-        done < <(find "$RECORDING_DIR" -type f \( -name "*.wav" -o -name "*.mp3" -o -name "*.flac" -o -name "*.opus" -o -name "*.ogg" \) -printf '%T+ %p\n' 2>/dev/null | sort | head -n "$max_delete" | cut -d' ' -f2-)
+        done < <(find "$RECORDING_DIR" -type f "${RECORDING_NAME_TEST[@]}" -printf '%T+ %p\n' 2>/dev/null | sort | head -n "$max_delete" | cut -d' ' -f2-)
 
         log_info "Emergency: Deleted $deleted oldest recording(s)"
     fi
