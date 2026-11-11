@@ -659,6 +659,18 @@ _force_stop_fixture() {
     [[ "$output" == *"stop rc=0"* ]]
 }
 
+@test "a start that cannot get the lock leaves no cleanup marker behind [LB-05]" {
+    _start_holder bash
+    # What main() does: a cleanup trap on exit, then start_mediamtx
+    run bash "$ROLE" eval 'COMMAND=start; trap cleanup EXIT; start_mediamtx'
+    [ "$status" -eq 5 ]
+    [[ "$output" == *"Failed to acquire lock"* ]]
+    # A marker would make the NEXT start run cleanup_stale_processes and kill
+    # the healthy stack that holds the lock
+    [ ! -e "$MEDIAMTX_CLEANUP_MARKER" ]
+    _stop_holder
+}
+
 @test "the log lock file is never truncated by log() [D2]" {
     run bash "$ROLE" eval '
         printf SENTINEL >"${LOG_FILE}.lock"

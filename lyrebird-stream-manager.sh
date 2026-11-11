@@ -4813,6 +4813,10 @@ is_mediamtx_running() {
 # Start MediaMTX with single device detection
 start_mediamtx() {
     if ! acquire_lock; then
+        # Nothing was started or stopped, so there is nothing to clean up: an
+        # exit marker here would make the NEXT start tear down the healthy
+        # stack that holds the lock.
+        SKIP_CLEANUP=true
         error_exit "Failed to acquire lock" "${E_LOCK_FAILED}"
     fi
 
