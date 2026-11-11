@@ -282,6 +282,31 @@ run_step() {
     [[ "$output" == *"github.event_name == 'pull_request'"* ]]
 }
 
+@test "no workflow interpolates an expression into a run script, and every run script parses" {
+    require_yaml
+    local f json n=0 i script
+    for f in "$ROOT"/.github/workflows/*.yml; do
+        json="$(wf_json "$f")"
+        run jq -r '[.jobs[] | .steps[]? | select(.run != null) | select(.run | contains("${{")) | .name] | .[]' <<<"$json"
+        [ -z "$output" ] || {
+            echo "$f puts an expression in a run script (pass it through env: instead): $output"
+            return 1
+        }
+        # Every run script is valid bash.
+        for i in $(jq -r '[.jobs[] | .steps[]? | select(.run != null)] | keys[]' <<<"$json"); do
+            script="$TEST_SCRATCH/run-script.sh"
+            jq -r --argjson i "$i" '[.jobs[] | .steps[]? | select(.run != null)][$i].run' <<<"$json" >"$script"
+            bash -n "$script" || {
+                echo "$f: run script #$i does not parse"
+                return 1
+            }
+            n=$((n + 1))
+        done
+    done
+    # The loop must not pass by finding nothing.
+    [ "$n" -ge 20 ]
+}
+
 @test "bash-ci runs its steps with bash -eo pipefail and a read-only token" {
     load_wf bash-ci
     run jq -e '.defaults.run.shell == "bash" and .permissions == {"contents": "read"}' <<<"$WF"

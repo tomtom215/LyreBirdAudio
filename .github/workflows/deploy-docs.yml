@@ -59,4 +59,6 @@ jobs:
         uses: actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e # v4.0.5
 
       - name: Print deployment URL
-        run: echo "Docs deployed to ${{ steps.deploy.outputs.page_url }}"
+        env:
+          PAGE_URL: ${{ steps.deploy.outputs.page_url }}
+        run: echo "Docs deployed to ${PAGE_URL}"
