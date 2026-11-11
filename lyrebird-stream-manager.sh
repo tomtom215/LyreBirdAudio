@@ -222,6 +222,7 @@ readonly E_CONFIG_ERROR=4
 readonly E_LOCK_FAILED=5
 readonly E_USB_NO_DEVICES=6
 readonly E_MEDIAMTX_DOWN=7
+readonly E_OWNERSHIP=8
 readonly E_MONITOR_DEGRADED=10
 
 # Configurable paths with environment variable defaults
@@ -616,10 +617,18 @@ handle_deferred_cleanup() {
             log WARN "Cleanup marker is ${marker_age}s old, might be stale"
         fi
 
-        cleanup_stale_processes
+        # The marker says an earlier run did not finish; it is no proof that
+        # anything is stale. A MediaMTX that is running and provably this
+        # manager's is kept (start then starts whatever stream is missing);
+        # anything else is cleaned up by identity.
+        if owned_mediamtx_pid >/dev/null; then
+            log INFO "MediaMTX is running and owned by this manager; keeping it"
+        else
+            cleanup_stale_processes
 
-        # Verify cleanup completeness
-        verify_cleanup_complete
+            # Verify cleanup completeness
+            verify_cleanup_complete
+        fi
 
         rm -f "${CLEANUP_MARKER}"
     fi
@@ -1145,6 +1154,46 @@ owned_mediamtx_pid() {
     is_managed_mediamtx_pid "$pid" || rc=$?
     [[ $rc -eq 0 ]] || return 1
     printf '%s' "$pid"
+}
+
+# Print the systemd service a process runs in (from its cgroup), if any
+proc_systemd_unit() {
+    local line="" unit=""
+    while IFS= read -r line; do
+        if [[ "$line" =~ /([^/]+\.service)(/|$) ]]; then
+            unit="${BASH_REMATCH[1]}"
+        fi
+    done 2>/dev/null <"/proc/${1}/cgroup" || true
+    printf '%s' "$unit"
+}
+
+# Succeeds, printing why, when a MediaMTX that this script did not start owns
+# (or is about to clash with) the one it is about to start: the standalone
+# mediamtx.service (D1), or any process that runs the configured binary on the
+# configured configuration file without being the process recorded in
+# PID_FILE. The caller refuses to start (E_OWNERSHIP) and touches nothing.
+foreign_mediamtx_owner() {
+    local owned="" dir pid unit=""
+    owned="$(owned_mediamtx_pid)" || owned=""
+
+    if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet mediamtx.service 2>/dev/null; then
+        printf 'mediamtx.service is active and owns MediaMTX (stop it first, for example: systemctl stop mediamtx.service)'
+        return 0
+    fi
+
+    for dir in /proc/[0-9]*; do
+        pid="${dir#/proc/}"
+        [[ "$pid" == "$owned" ]] && continue
+        is_managed_mediamtx_pid "$pid" || continue
+        unit="$(proc_systemd_unit "$pid")"
+        if [[ -n "$unit" ]] && command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet "$unit" 2>/dev/null; then
+            printf 'unit %s is active and runs MediaMTX (PID %s) on %s' "$unit" "$pid" "${CONFIG_FILE}"
+        else
+            printf 'MediaMTX (PID %s) is already running on %s but was not started by this script' "$pid" "${CONFIG_FILE}"
+        fi
+        return 0
+    done
+    return 1
 }
 
 # Number of running stream wrappers of this installation
@@ -5314,6 +5363,18 @@ is_mediamtx_running() {
 }
 
 # Start MediaMTX with single device detection
+#
+# One owner (D1): the MediaMTX this manager runs is the one it started and
+# recorded in PID_FILE. A MediaMTX that someone else started (the standalone
+# mediamtx.service, another unit, a manual run on the same configuration) is
+# not replaced, stopped or signalled: the start is refused with E_OWNERSHIP and
+# nothing is touched.
+#
+# Idempotent (LB-01): when that MediaMTX is running, `start` changes nothing
+# that works. It does not clean up, wait for the USB subsystem, regenerate the
+# configuration or restart anything; it only starts the streams that are
+# missing. Cleanup runs only when the recorded ownership is not provably intact
+# (the PID is dead, was reused, or is not MediaMTX) or on a restart.
 start_mediamtx() {
     if ! acquire_lock; then
         # Nothing was started or stopped, so there is nothing to clean up: an
@@ -5323,8 +5384,29 @@ start_mediamtx() {
         error_exit "Failed to acquire lock" "${E_LOCK_FAILED}"
     fi
 
+    local foreign_owner=""
+    if foreign_owner="$(foreign_mediamtx_owner)"; then
+        # Nothing was started or stopped: no exit marker, for the same reason
+        SKIP_CLEANUP=true
+        log ERROR "Refusing to start: ${foreign_owner}"
+        error_exit "This manager runs only the MediaMTX it started itself and never signals another; nothing was changed. Stop the other MediaMTX first, or remove it with: ${SCRIPT_NAME} force-stop --kill-all" "${E_OWNERSHIP}"
+    fi
+
     # Handle deferred cleanup from previous termination
     handle_deferred_cleanup
+
+    local owned_pid=""
+    if owned_pid="$(owned_mediamtx_pid)"; then
+        log INFO "MediaMTX is already running (PID: ${owned_pid}) and owned by this manager; leaving it and its streams alone"
+        local running_devices=()
+        readarray -t running_devices < <(detect_audio_devices)
+        if [[ ${#running_devices[@]} -eq 0 ]]; then
+            log WARN "No USB audio devices detected; no stream to start"
+            return 0
+        fi
+        start_streams_and_report "${running_devices[@]}"
+        return $?
+    fi
 
     if is_restart_scenario; then
         log INFO "Detected restart scenario, cleaning up"
@@ -5401,19 +5483,33 @@ start_mediamtx() {
         return 1
     fi
 
-    if ! wait_for_mediamtx_ready "$pid"; then
-        terminate_process_group "$pid" 5
-        log ERROR "MediaMTX failed to become ready"
-        return 1
-    fi
-
+    # Record the process (and its start time) before the readiness wait, not
+    # after it: a start that is interrupted while waiting would otherwise leave
+    # a running MediaMTX that no PID file names, which this manager (which only
+    # signals what it can prove it started) could not take over again
     if ! write_pid_atomic "$pid" "${PID_FILE}"; then
         log ERROR "Failed to write PID file"
         terminate_process_group "$pid" 5
         return 1
     fi
 
+    if ! wait_for_mediamtx_ready "$pid"; then
+        terminate_process_group "$pid" 5
+        pid_file_remove "${PID_FILE}"
+        log ERROR "MediaMTX failed to become ready"
+        return 1
+    fi
+
     log INFO "MediaMTX started successfully (PID: $pid)"
+
+    start_streams_and_report "${devices[@]}"
+}
+
+# Start the streams of DEVICES (one per device, or the single multiplexed
+# stream) that are not running yet, and print their RTSP URLs. A stream that is
+# already running is left alone: the per-stream start checks its wrapper.
+start_streams_and_report() {
+    local devices=("$@")
 
     # Start streams based on mode
     if [[ "${STREAM_MODE}" == "multiplex" ]]; then
@@ -5654,11 +5750,19 @@ force_stop_mediamtx() {
 # restart that cannot get it is refused before anything is written: it used to
 # mark the restart first, so a refused restart left the restart marker behind
 # and the next start treated the node as being in a restart for 60 seconds.
+# Nothing is changed either when another unit owns MediaMTX (E_OWNERSHIP).
 restart_mediamtx() {
     if ! acquire_lock; then
         log ERROR "Refusing to restart: another lifecycle command holds the lock (${LOCK_FILE})"
         SKIP_CLEANUP=true
         return "${E_LOCK_FAILED}"
+    fi
+
+    local foreign_owner=""
+    if foreign_owner="$(foreign_mediamtx_owner)"; then
+        SKIP_CLEANUP=true
+        log ERROR "Refusing to restart: ${foreign_owner}"
+        return "${E_OWNERSHIP}"
     fi
 
     mark_restart
@@ -5962,7 +6066,11 @@ Environment Variables:
                              - amerge: Merge sources keeping channels separate
 
 Commands:
-    start       Start MediaMTX and FFmpeg streams
+    start       Start MediaMTX and FFmpeg streams. Safe to repeat: when this
+                manager's own MediaMTX is running it is left alone (same PIDs,
+                no outage) and only streams that are missing are started.
+                Refused with exit 8 while another MediaMTX owns the node
+                (mediamtx.service, or a MediaMTX this manager did not start).
     stop        Stop MediaMTX and FFmpeg streams. Only processes this manager
                 started are signalled (PID files + process start time).
     force-stop  SIGKILL, at once, the processes this manager started (emergency
@@ -6033,6 +6141,7 @@ Exit Codes:
     5  - Lock acquisition failed
     6  - No USB devices found (logged only)
     7  - MediaMTX not running (logged only)
+    8  - Another MediaMTX owns the node (start/restart refused, nothing changed)
     10 - Stream monitoring degraded (logged only)
 
 FFmpeg logs:
@@ -6130,6 +6239,7 @@ parse_arguments() {
 #   5 = Lock acquisition failed (E_LOCK_FAILED)
 #   6 = No USB devices found (E_USB_NO_DEVICES)
 #   7 = MediaMTX not running (E_MEDIAMTX_DOWN)
+#   8 = Another MediaMTX owns the node; start/restart refused (E_OWNERSHIP)
 #   10 = Stream monitoring degraded (E_MONITOR_DEGRADED)
 #
 # Side Effects:

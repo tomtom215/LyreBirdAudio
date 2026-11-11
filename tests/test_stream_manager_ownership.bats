@@ -680,6 +680,288 @@ WRAP_EOF
 }
 
 # ---------------------------------------------------------------------------
+# LB-02 / D1: one owner
+# ---------------------------------------------------------------------------
+
+@test "help documents exit code 8 and the idempotent start [LB-02, LB-01]" {
+    run_mgr show_help
+    [[ "$output" == *"8  - Another MediaMTX owns the node"* ]]
+    [[ "$output" == *"Safe to repeat"* ]]
+}
+
+@test "start is refused with exit 8 while mediamtx.service is active, touching nothing [LB-02]" {
+    use_seams
+    decoy_unit_active mediamtx
+    printf 'sentinel: configuration of the other owner\n' >"$CFG"
+    local before
+    before="$(<"$CFG")"
+    run_mgr eval 'COMMAND=start; trap cleanup EXIT; start_mediamtx'
+    [ "$status" -eq 8 ]
+    [[ "$output" == *"Refusing to start: mediamtx.service is active and owns MediaMTX"* ]]
+    # nothing was written, started, stopped or marked
+    [ "$(<"$CFG")" = "$before" ]
+    [ ! -e "$MEDIAMTX_PID_FILE" ]
+    [ ! -e "$MEDIAMTX_CLEANUP_MARKER" ]
+    [ ! -e "$MEDIAMTX_RESTART_MARKER" ]
+    [ ! -s "$SEAM_LOG" ]
+    [ -z "$(decoy_signals)" ]
+    # the lifecycle lock was released
+    run_mgr acquire_lock 1
+    [ "$status" -eq 0 ]
+}
+
+@test "start is refused with exit 8, and signals nothing, when a MediaMTX this manager did not start runs on its configuration [LB-02]" {
+    use_seams
+    # the process of another unit: our binary on our configuration, but not in our PID file
+    decoy_spawn alien "$MEDIAMTX_BINARY" "$CFG"
+    run_mgr eval 'COMMAND=start; trap cleanup EXIT; start_mediamtx'
+    [ "$status" -eq 8 ]
+    [[ "$output" == *"Refusing to start: MediaMTX (PID $(decoy_pid alien)) is already running on $CFG but was not started by this script"* ]]
+    assert_alive alien
+    [ -z "$(decoy_signals)" ]
+    [ ! -e "$MEDIAMTX_PID_FILE" ]
+    [ ! -e "$MEDIAMTX_CLEANUP_MARKER" ]
+}
+
+@test "the refusal names the unit that runs the other MediaMTX when systemd says it is active [LB-02]" {
+    decoy_spawn alien "$MEDIAMTX_BINARY" "$CFG"
+    # a unit this script knows nothing about, found through the process's cgroup
+    run_mgr eval '
+        proc_systemd_unit() { printf "audio-bridge.service"; }
+        foreign_mediamtx_owner; echo " rc=$?"'
+    [[ "$output" == *"MediaMTX (PID $(decoy_pid alien)) is already running"* ]]
+    decoy_unit_active audio-bridge
+    run_mgr eval '
+        proc_systemd_unit() { printf "audio-bridge.service"; }
+        foreign_mediamtx_owner; echo " rc=$?"'
+    [[ "$output" == *"unit audio-bridge.service is active and runs MediaMTX (PID $(decoy_pid alien))"* ]]
+    [[ "$output" == *"rc=0" ]]
+}
+
+@test "restart is refused with exit 8 before anything is stopped or marked while mediamtx.service owns MediaMTX [LB-02]" {
+    use_seams
+    decoy_unit_active mediamtx
+    our_mediamtx_up
+    our_wrapper_up mic1
+    run_mgr eval 'COMMAND=restart; trap cleanup EXIT; restart_mediamtx'
+    [ "$status" -eq 8 ]
+    [[ "$output" == *"Refusing to restart: mediamtx.service is active"* ]]
+    assert_alive mtx w_mic1
+    [ -z "$(decoy_signals)" ]
+    [ ! -e "$MEDIAMTX_RESTART_MARKER" ]
+    [ ! -e "$MEDIAMTX_CLEANUP_MARKER" ]
+}
+
+# ---------------------------------------------------------------------------
+# Refused restart: no marker (found by the lock work)
+# ---------------------------------------------------------------------------
+
+@test "a restart refused by the lock leaves no restart marker and stops nothing [new defect]" {
+    use_seams
+    our_mediamtx_up
+    our_wrapper_up mic1
+    # another lifecycle command holds the lock until the test ends
+    bash -c 'exec 8<>"$MEDIAMTX_LOCK_FILE"; flock -x 8; : >"$OW/holder.ready"; exec sleep 60' 3>&- &
+    EXTRA_PIDS+=("$!")
+    wait_until '[[ -e "$OW/holder.ready" ]]'
+    LOCK_ACQUISITION_TIMEOUT=1 run_mgr eval 'COMMAND=restart; trap cleanup EXIT; restart_mediamtx'
+    [ "$status" -eq 5 ]
+    [[ "$output" == *"Refusing to restart: another lifecycle command holds the lock"* ]]
+    # The old code marked the restart before it asked for the lock, so the next
+    # start treated the node as being in a restart for 60 seconds
+    [ ! -e "$MEDIAMTX_RESTART_MARKER" ]
+    [ ! -e "$MEDIAMTX_CLEANUP_MARKER" ]
+    assert_alive mtx w_mic1
+    [ -z "$(decoy_signals)" ]
+}
+
+# ---------------------------------------------------------------------------
+# LB-01: an idempotent start
+# ---------------------------------------------------------------------------
+
+@test "a repeated start on a healthy node changes nothing: same PIDs, no signal, no cleanup, no wait, no restart marker [LB-01]" {
+    use_seams
+    our_mediamtx_up
+    our_wrapper_up mic1
+    our_wrapper_up mic2
+    other_installation_up
+    local before_mtx before_w1 before_w2 cfg_before
+    before_mtx="$(decoy_pid mtx):$(decoy_starttime "$(decoy_pid mtx)")"
+    before_w1="$(decoy_pid w_mic1):$(decoy_starttime "$(decoy_pid w_mic1)")"
+    before_w2="$(decoy_pid w_mic2):$(decoy_starttime "$(decoy_pid w_mic2)")"
+    cfg_before="$(cksum <"$CFG")"
+    DEVICES="mic1:31 mic2:32"
+    local round
+    for round in 1 2 3; do
+        run_mgr eval 'COMMAND=start; trap cleanup EXIT; start_mediamtx'
+        [ "$status" -eq 0 ] || {
+            echo "round $round: $output"
+            return 1
+        }
+        [[ "$output" == *"MediaMTX is already running (PID: $(decoy_pid mtx)) and owned by this manager"* ]]
+        [ "$(decoy_pid mtx):$(decoy_starttime "$(decoy_pid mtx)")" = "$before_mtx" ]
+        [ "$(decoy_pid w_mic1):$(decoy_starttime "$(decoy_pid w_mic1)")" = "$before_w1" ]
+        [ "$(decoy_pid w_mic2):$(decoy_starttime "$(decoy_pid w_mic2)")" = "$before_w2" ]
+    done
+    assert_alive mtx w_mic1 w_mic2 X_mtx X_wrapper X_reader
+    # no signal at all, not even to our own processes
+    [ -z "$(decoy_signals)" ]
+    # the old code went through cleanup_stale_processes and a USB wait every time
+    [ ! -s "$SEAM_LOG" ]
+    [ ! -e "$MEDIAMTX_RESTART_MARKER" ]
+    [ ! -e "$MEDIAMTX_CLEANUP_MARKER" ]
+    # the configuration was not regenerated either
+    [ "$(cksum <"$CFG")" = "$cfg_before" ]
+    [ -f "$MEDIAMTX_PID_FILE" ]
+    [ -f "$FF/mic1.pid" ]
+}
+
+@test "a leftover cleanup marker does not make start tear down a MediaMTX this manager owns [LB-01]" {
+    use_seams
+    our_mediamtx_up
+    our_wrapper_up mic1
+    # an earlier command exited abnormally and left the marker
+    : >"$MEDIAMTX_CLEANUP_MARKER"
+    run_mgr eval 'COMMAND=start; trap cleanup EXIT; start_mediamtx'
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"MediaMTX is running and owned by this manager; keeping it"* ]]
+    assert_alive mtx w_mic1
+    [ -z "$(decoy_signals)" ]
+    [ ! -e "$MEDIAMTX_CLEANUP_MARKER" ]
+}
+
+@test "start on a healthy node starts a missing stream and leaves the running one alone; a dead wrapper is reconciled by the next start [LB-01]" {
+    use_seams
+    use_wrapper_stand_ins
+    export STREAM_MODE=multiplex
+    DEVICES="mic1:31"
+    our_mediamtx_up
+    local mtx_before
+    mtx_before="$(decoy_pid mtx):$(decoy_starttime "$(decoy_pid mtx)")"
+
+    # No wrapper yet: the first start launches it
+    run_mgr eval 'COMMAND=start; trap cleanup EXIT; start_mediamtx'
+    [ "$status" -eq 0 ]
+    [ -f "$FF/all_mics.pid" ]
+    local w1
+    w1="$(<"$FF/all_mics.pid")"
+    EXTRA_PIDS+=("$w1")
+    [ -d "/proc/$w1" ]
+    [ "$(decoy_pid mtx):$(decoy_starttime "$(decoy_pid mtx)")" = "$mtx_before" ]
+
+    # A second start leaves that wrapper (and its FFmpeg) alone
+    run_mgr eval 'COMMAND=start; trap cleanup EXIT; start_mediamtx'
+    [ "$status" -eq 0 ]
+    [ "$(<"$FF/all_mics.pid")" = "$w1" ]
+
+    # The wrapper dies (killed from outside, its FFmpeg with it): the next start
+    # brings the stream back and still leaves MediaMTX alone
+    local ff_child
+    ff_child="$(ps -o pid= --ppid "$w1" | head -n1 | tr -d ' ')"
+    EXTRA_PIDS+=("$ff_child")
+    builtin kill -KILL "$w1"
+    [ -z "$ff_child" ] || builtin kill -KILL "$ff_child"
+    wait_gone "$w1"
+    run_mgr eval 'COMMAND=start; trap cleanup EXIT; start_mediamtx'
+    [ "$status" -eq 0 ]
+    local w2
+    w2="$(<"$FF/all_mics.pid")"
+    EXTRA_PIDS+=("$w2")
+    [ "$w2" != "$w1" ]
+    [ -d "/proc/$w2" ]
+    [ "$(decoy_pid mtx):$(decoy_starttime "$(decoy_pid mtx)")" = "$mtx_before" ]
+    assert_alive mtx
+    # the manager signalled nothing (the kills above are the test's own)
+    [ -z "$(decoy_signals)" ]
+}
+
+@test "when the recorded MediaMTX is dead, start cleans up what is stale and launches a new one [LB-01]" {
+    use_seams
+    use_mediamtx_launch_stub
+    our_mediamtx_up
+    our_wrapper_up mic1
+    other_installation_up
+    local old_mtx
+    old_mtx="$(decoy_pid mtx)"
+    # MediaMTX dies; its wrapper is still up (publishing to nothing)
+    builtin kill -KILL "$old_mtx"
+    wait_gone "$old_mtx"
+    run_mgr eval 'COMMAND=start; trap cleanup EXIT; start_mediamtx'
+    [ "$status" -eq 0 ]
+    local new_mtx
+    new_mtx="$(<"$MEDIAMTX_PID_FILE")"
+    EXTRA_PIDS+=("$new_mtx")
+    [ "$new_mtx" != "$old_mtx" ]
+    [ -d "/proc/$new_mtx" ]
+    # the stale generation's wrapper was stopped, by identity, and nothing else was
+    assert_dead w_mic1
+    assert_alive X_mtx X_wrapper X_reader
+    assert_signals_only_to w_mic1
+    # the new process is recorded with its start time
+    [ "$(<"$MEDIAMTX_PID_FILE.id")" = "$new_mtx $(decoy_starttime "$new_mtx")" ]
+    # and the USB settling wait ran, as for any fresh start
+    grep -q '^stabilize' "$SEAM_LOG"
+}
+
+@test "a recorded PID that now belongs to an unrelated process is not signalled: the stale record is dropped and MediaMTX is started [LB-01, X-26]" {
+    use_seams
+    use_mediamtx_launch_stub
+    # The PID file names a process that is alive but is not the MediaMTX that
+    # was recorded (its start time differs)
+    decoy_hold_script "$OW/other/mediamtx.yml"
+    decoy_bash_copy "$OW/other/bin/exporter"
+    decoy_spawn recycled "$OW/other/bin/exporter" "$OW/other/mediamtx.yml"
+    echo "$(decoy_pid recycled)" >"$MEDIAMTX_PID_FILE"
+    echo "$(decoy_pid recycled) $(($(decoy_starttime "$(decoy_pid recycled)") - 100))" >"$MEDIAMTX_PID_FILE.id"
+    run_mgr eval 'COMMAND=start; trap cleanup EXIT; start_mediamtx'
+    [ "$status" -eq 0 ]
+    local new_mtx
+    new_mtx="$(<"$MEDIAMTX_PID_FILE")"
+    EXTRA_PIDS+=("$new_mtx")
+    [ "$new_mtx" != "$(decoy_pid recycled)" ]
+    assert_alive recycled
+    [ -z "$(decoy_signals)" ]
+}
+
+@test "MediaMTX is recorded in the PID file, with its start time, before the readiness wait begins [D1]" {
+    use_seams
+    use_mediamtx_launch_stub
+    # The readiness probe (curl) notes whether the PID file already exists
+    cat >"$OW/shim/curl" <<'CURL_EOF'
+#!/bin/bash
+if [[ -f "$MEDIAMTX_PID_FILE" && -f "$MEDIAMTX_PID_FILE.id" ]]; then
+    echo "recorded $(cat "$MEDIAMTX_PID_FILE")" >>"$OW/probe.log"
+else
+    echo "not recorded" >>"$OW/probe.log"
+fi
+exit 0
+CURL_EOF
+    run_mgr eval 'COMMAND=start; trap cleanup EXIT; start_mediamtx'
+    [ "$status" -eq 0 ]
+    EXTRA_PIDS+=("$(<"$MEDIAMTX_PID_FILE")")
+    # A start interrupted during the wait would otherwise leave a running
+    # MediaMTX that no PID file names, which the manager could not take over
+    [ "$(head -n1 "$OW/probe.log")" = "recorded $(<"$MEDIAMTX_PID_FILE")" ]
+}
+
+
+@test "a MediaMTX that never becomes ready is stopped and its PID file removed [D1]" {
+    use_seams
+    use_mediamtx_launch_stub
+    printf '#!/bin/bash\nexit 7\n' >"$OW/shim/curl"
+    # (the manager signals the process it launched itself, which is not a decoy)
+    MEDIAMTX_API_TIMEOUT=2 run_mgr_real eval 'COMMAND=start; trap cleanup EXIT; start_mediamtx'
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"MediaMTX failed to become ready"* ]]
+    [ ! -e "$MEDIAMTX_PID_FILE" ]
+    [ ! -e "$MEDIAMTX_PID_FILE.id" ]
+    # the process it launched is gone: nothing runs the configured binary any more
+    run_mgr_real eval 'for p in /proc/[0-9]*; do is_managed_mediamtx_pid "${p#/proc/}" && echo "left ${p#/proc/}"; done; echo scanned'
+    [[ "$output" == "scanned" ]]
+}
+
+
+# ---------------------------------------------------------------------------
 # X-25: FFmpeg logs are rotated, not deleted
 # ---------------------------------------------------------------------------
 
@@ -785,26 +1067,4 @@ make_logs() {
     [ "$(<"$FF/all_mics.log.prev.1")" = "previous run" ]
     # the new run writes a fresh log
     ! grep -q 'previous run' "$FF/all_mics.log" || false
-}
-# ---------------------------------------------------------------------------
-# Refused restart: no marker (found by the lock work)
-# ---------------------------------------------------------------------------
-
-@test "a restart refused by the lock leaves no restart marker and stops nothing [new defect]" {
-    use_seams
-    our_mediamtx_up
-    our_wrapper_up mic1
-    # another lifecycle command holds the lock until the test ends
-    bash -c 'exec 8<>"$MEDIAMTX_LOCK_FILE"; flock -x 8; : >"$OW/holder.ready"; exec sleep 60' 3>&- &
-    EXTRA_PIDS+=("$!")
-    wait_until '[[ -e "$OW/holder.ready" ]]'
-    LOCK_ACQUISITION_TIMEOUT=1 run_mgr eval 'COMMAND=restart; trap cleanup EXIT; restart_mediamtx'
-    [ "$status" -eq 5 ]
-    [[ "$output" == *"Refusing to restart: another lifecycle command holds the lock"* ]]
-    # The old code marked the restart before it asked for the lock, so the next
-    # start treated the node as being in a restart for 60 seconds
-    [ ! -e "$MEDIAMTX_RESTART_MARKER" ]
-    [ ! -e "$MEDIAMTX_CLEANUP_MARKER" ]
-    assert_alive mtx w_mic1
-    [ -z "$(decoy_signals)" ]
 }
