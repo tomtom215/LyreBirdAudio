@@ -69,7 +69,7 @@ jobs:
       script_count: ${{ steps.find-scripts.outputs.count }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
       - name: Find shell scripts
         id: find-scripts
@@ -92,7 +92,7 @@ jobs:
     needs: discover-scripts
     steps:
       - name: Checkout code
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
       - name: Validate bash syntax (bash -n)
         run: |
@@ -133,7 +133,7 @@ jobs:
     needs: discover-scripts
     steps:
       - name: Checkout code
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
       - name: Install ShellCheck
         run: |
@@ -221,7 +221,7 @@ jobs:
     needs: discover-scripts
     steps:
       - name: Checkout code
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
       - name: Install shfmt
         run: |
@@ -276,7 +276,7 @@ jobs:
     needs: discover-scripts
     steps:
       - name: Checkout code
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
       - name: Install bashate
         run: |
@@ -325,7 +325,7 @@ jobs:
     needs: discover-scripts
     steps:
       - name: Checkout code
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
       - name: Basic security checks
         id: security
@@ -511,7 +511,7 @@ jobs:
     needs: discover-scripts
     steps:
       - name: Checkout code
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
       - name: Install bats
         run: |
@@ -543,7 +543,7 @@ jobs:
     needs: discover-scripts
     steps:
       - name: Checkout code
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
       - name: Install dependencies
         run: |

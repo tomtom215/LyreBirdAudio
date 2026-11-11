@@ -1,0 +1,18 @@
+# Keeps the pinned CI dependencies current. Every Action is pinned to a full
+# commit SHA with a "# vX.Y.Z" comment; Dependabot proposes the bumps as pull
+# requests (it updates the SHA and the comment together), which then run the
+# whole CI.
+#
+# Not covered by Dependabot (pinned in .github/workflows/bash-ci.yml, bumped by
+# hand together with their sha256): ShellCheck, shfmt and actionlint, and the
+# MediaMTX releases pinned in tests/fetch_mediamtx.sh.
+
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    commit-message:
+      prefix: ci

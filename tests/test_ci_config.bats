@@ -296,6 +296,68 @@ SH
 }
 
 # ---------------------------------------------------------------------------
+# Supply chain: every Action is pinned to a commit, Dependabot keeps the pins
+# current.
+# ---------------------------------------------------------------------------
+
+# uses_lines: every `uses:` line of every workflow, as "file:line:text".
+uses_lines() {
+    grep -nE '^[[:space:]]*(-[[:space:]]+)?uses:' "$ROOT"/.github/workflows/*.yml
+}
+
+@test "every action is pinned to a full commit sha with a version comment" {
+    local line text target comment bad=0 n=0
+    while IFS= read -r line; do
+        text="${line#*:*:}"
+        if [[ ! "$text" =~ ^[[:space:]]*(-[[:space:]]+)?uses:[[:space:]]+([^[:space:]#]+)[[:space:]]*(#[[:space:]]*(.*))?$ ]]; then
+            echo "unparsable uses line: $line"
+            bad=1
+            continue
+        fi
+        target="${BASH_REMATCH[2]}"
+        comment="${BASH_REMATCH[4]}"
+        # A workflow in this repository is referenced by path and has no ref.
+        [[ "$target" == ./* ]] && continue
+        n=$((n + 1))
+        if [[ ! "$target" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._/-]+@[0-9a-f]{40}$ ]]; then
+            echo "not pinned to a 40-hex commit sha: $line"
+            bad=1
+        elif [[ ! "$comment" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "pin has no '# vX.Y.Z' comment: $line"
+            bad=1
+        fi
+    done < <(uses_lines)
+    # A broken pattern must not pass by matching nothing.
+    [ "$n" -ge 10 ] || {
+        echo "only $n pinned actions found"
+        return 1
+    }
+    [ "$bad" -eq 0 ]
+}
+
+@test "each action is pinned to one commit, under one version, in every workflow" {
+    local out
+    out="$(uses_lines | sed -E 's/^[^:]*:[0-9]+:[[:space:]]*(-[[:space:]]+)?uses:[[:space:]]+//' \
+        | grep -v '^\./' | sed -E 's/@([0-9a-f]+)[[:space:]]+#[[:space:]]*(.*)$/ \1 \2/' \
+        | sort -u | awk '{ n[$1]++; if (n[$1] > 1) print "action " $1 " is pinned more than once" }')"
+    [ -z "$out" ] || {
+        echo "$out"
+        return 1
+    }
+}
+
+@test "dependabot proposes weekly updates for the pinned GitHub Actions" {
+    require_yaml
+    local dep
+    dep="$(wf_json "$ROOT/.github/dependabot.yml")"
+    run jq -e '
+        .version == 2
+        and ([.updates[] | select(."package-ecosystem" == "github-actions"
+            and .directory == "/" and .schedule.interval == "weekly")] | length == 1)' <<<"$dep"
+    [ "$status" -eq 0 ]
+}
+
+# ---------------------------------------------------------------------------
 # Required checks: the summary job gates on every job, and the format and
 # style linters block.
 # ---------------------------------------------------------------------------
