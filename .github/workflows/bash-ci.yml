@@ -52,10 +52,25 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
-  # Shellcheck version (check https://github.com/koalaman/shellcheck/releases)
+  # Downloaded tools: the version and the sha256 of the exact file the install
+  # step downloads. A download that does not match is never installed. Bump a
+  # version and its hash together.
+  #
+  # ShellCheck v0.11.0 and shfmt v3.13.1 publish no checksum file, so those two
+  # hashes were computed from the downloaded release assets (two independent
+  # downloads agreed). actionlint's is from the checksums file of its release.
+  # https://github.com/koalaman/shellcheck/releases
   SHELLCHECK_VERSION: 'v0.11.0'
-  # shfmt version (check https://github.com/mvdan/sh/releases)
+  # shellcheck-v0.11.0.linux.x86_64.tar.xz
+  SHELLCHECK_SHA256: '8c3be12b05d5c177a04c29e3c78ce89ac86f1595681cab149b65b97c4e227198'
+  # https://github.com/mvdan/sh/releases
   SHFMT_VERSION: 'v3.13.1'
+  # shfmt_v3.13.1_linux_amd64
+  SHFMT_SHA256: 'fb096c5d1ac6beabbdbaa2874d025badb03ee07929f0c9ff67563ce8c75398b1'
+  # https://github.com/rhysd/actionlint/releases
+  ACTIONLINT_VERSION: 'v1.7.12'
+  # actionlint_1.7.12_linux_amd64.tar.gz
+  ACTIONLINT_SHA256: '8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8'
 
 jobs:
   # ===========================================================================
@@ -82,6 +97,42 @@ jobs:
           count=$(echo "$scripts" | jq '. | length')
           echo "count=${count}" >> "$GITHUB_OUTPUT"
           echo "Found ${count} shell scripts"
+
+  # ===========================================================================
+  # Job 1b: Lint the workflows themselves (actionlint)
+  #
+  # actionlint also runs ShellCheck over every `run:` script, so the pinned
+  # ShellCheck is installed here as well.
+  # ===========================================================================
+  workflow-lint:
+    name: Workflow Lint (actionlint)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+
+      - name: Install ShellCheck (pinned, sha256-verified)
+        run: |
+          archive="shellcheck-${SHELLCHECK_VERSION}.linux.x86_64.tar.xz"
+          curl -sSfL --retry 3 -o "${RUNNER_TEMP}/${archive}" \
+            "https://github.com/koalaman/shellcheck/releases/download/${SHELLCHECK_VERSION}/${archive}"
+          echo "${SHELLCHECK_SHA256}  ${RUNNER_TEMP}/${archive}" | sha256sum -c -
+          tar -xJf "${RUNNER_TEMP}/${archive}" -C "${RUNNER_TEMP}"
+          sudo install -m 0755 "${RUNNER_TEMP}/shellcheck-${SHELLCHECK_VERSION}/shellcheck" /usr/local/bin/shellcheck
+          shellcheck --version
+
+      - name: Install actionlint (pinned, sha256-verified)
+        run: |
+          archive="actionlint_${ACTIONLINT_VERSION#v}_linux_amd64.tar.gz"
+          curl -sSfL --retry 3 -o "${RUNNER_TEMP}/${archive}" \
+            "https://github.com/rhysd/actionlint/releases/download/${ACTIONLINT_VERSION}/${archive}"
+          echo "${ACTIONLINT_SHA256}  ${RUNNER_TEMP}/${archive}" | sha256sum -c -
+          tar -xzf "${RUNNER_TEMP}/${archive}" -C "${RUNNER_TEMP}" actionlint
+          sudo install -m 0755 "${RUNNER_TEMP}/actionlint" /usr/local/bin/actionlint
+          actionlint -version
+
+      - name: Lint the workflows
+        run: actionlint -color
 
   # ===========================================================================
   # Job 2: Bash Syntax Validation (bash -n)
@@ -135,16 +186,17 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
-      - name: Install ShellCheck
+      - name: Install ShellCheck (pinned, sha256-verified)
         run: |
-          # Use GitHub's pre-installed shellcheck or install specific version
-          if command -v shellcheck &>/dev/null; then
-            echo "Using pre-installed shellcheck: $(shellcheck --version | head -2)"
-          else
-            echo "Installing shellcheck ${SHELLCHECK_VERSION}..."
-            wget -qO- "https://github.com/koalaman/shellcheck/releases/download/${SHELLCHECK_VERSION}/shellcheck-${SHELLCHECK_VERSION}.linux.x86_64.tar.xz" | tar -xJf -
-            sudo mv "shellcheck-${SHELLCHECK_VERSION}/shellcheck" /usr/local/bin/
-          fi
+          # Always the pinned version: the runner image's own shellcheck can be
+          # any version, and the gate is defined against this one.
+          archive="shellcheck-${SHELLCHECK_VERSION}.linux.x86_64.tar.xz"
+          curl -sSfL --retry 3 -o "${RUNNER_TEMP}/${archive}" \
+            "https://github.com/koalaman/shellcheck/releases/download/${SHELLCHECK_VERSION}/${archive}"
+          echo "${SHELLCHECK_SHA256}  ${RUNNER_TEMP}/${archive}" | sha256sum -c -
+          tar -xJf "${RUNNER_TEMP}/${archive}" -C "${RUNNER_TEMP}"
+          sudo install -m 0755 "${RUNNER_TEMP}/shellcheck-${SHELLCHECK_VERSION}/shellcheck" /usr/local/bin/shellcheck
+          shellcheck --version
 
       - name: Run ShellCheck
         run: |
@@ -223,11 +275,12 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
-      - name: Install shfmt
+      - name: Install shfmt (pinned, sha256-verified)
         run: |
-          echo "Installing shfmt ${SHFMT_VERSION}..."
-          wget -qO /usr/local/bin/shfmt "https://github.com/mvdan/sh/releases/download/${SHFMT_VERSION}/shfmt_${SHFMT_VERSION}_linux_amd64"
-          chmod +x /usr/local/bin/shfmt
+          curl -sSfL --retry 3 -o "${RUNNER_TEMP}/shfmt" \
+            "https://github.com/mvdan/sh/releases/download/${SHFMT_VERSION}/shfmt_${SHFMT_VERSION}_linux_amd64"
+          echo "${SHFMT_SHA256}  ${RUNNER_TEMP}/shfmt" | sha256sum -c -
+          sudo install -m 0755 "${RUNNER_TEMP}/shfmt" /usr/local/bin/shfmt
           echo "Installed: $(shfmt --version)"
 
       - name: Check formatting with shfmt
@@ -278,10 +331,18 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
-      - name: Install bashate
+      - name: Install bashate (pinned, hash-verified)
         run: |
-          pip install bashate
-          echo "Installed: $(bashate --version)"
+          # bashate==2.1.1 and its dependencies (pbr, setuptools), each pinned
+          # with the sha256 of its wheel and sdist in .github/ci/requirements.txt;
+          # pip refuses anything else. A venv keeps the system Python untouched.
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq python3-venv
+          python3 -m venv "${RUNNER_TEMP}/bashate-venv"
+          "${RUNNER_TEMP}/bashate-venv/bin/pip" install --quiet --disable-pip-version-check \
+            --require-hashes -r .github/ci/requirements.txt
+          echo "${RUNNER_TEMP}/bashate-venv/bin" >> "$GITHUB_PATH"
+          echo "Installed: $("${RUNNER_TEMP}/bashate-venv/bin/bashate" --version)"
 
       - name: Run bashate style check
         run: |
@@ -572,6 +633,7 @@ jobs:
     runs-on: ubuntu-latest
     needs:
       - discover-scripts
+      - workflow-lint
       - bash-syntax
       - shellcheck
       - shfmt
@@ -601,6 +663,8 @@ jobs:
             echo "|------|---------|"
             echo "| ShellCheck | ${SHELLCHECK_VERSION} |"
             echo "| shfmt | ${SHFMT_VERSION} |"
+            echo "| actionlint | ${ACTIONLINT_VERSION} |"
+            echo "| bashate | pinned in .github/ci/requirements.txt |"
             echo ""
             echo "## Reproduce locally"
             echo ""

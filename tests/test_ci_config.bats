@@ -357,6 +357,189 @@ uses_lines() {
     [ "$status" -eq 0 ]
 }
 
+@test "dependabot proposes weekly updates for the pinned Python tools, and their requirements file exists" {
+    require_yaml
+    local dep dir
+    dep="$(wf_json "$ROOT/.github/dependabot.yml")"
+    dir="$(jq -er '.updates[] | select(."package-ecosystem" == "pip" and .schedule.interval == "weekly") | .directory' <<<"$dep")"
+    [ -f "$ROOT${dir%/}/requirements.txt" ]
+}
+
+# ---------------------------------------------------------------------------
+# Downloaded tools are pinned and verified before they are installed.
+# ---------------------------------------------------------------------------
+
+# installer_shims: curl that "downloads" $FAKE_DOWNLOAD to the -o path, sudo
+# that only records its arguments, and stand-ins for the installed tools, all
+# in $TEST_SCRATCH/bin; $FAKE_LOG receives the URL and the sudo calls.
+installer_shims() {
+    local t
+    mkdir -p "$TEST_SCRATCH/bin" "$TEST_SCRATCH/runner"
+    cat >"$TEST_SCRATCH/bin/curl" <<'SH'
+#!/bin/bash
+out="" url=""
+while (($#)); do
+    case "$1" in
+        -o) out="$2"; shift 2 ;;
+        -*) shift ;;
+        *) url="$1"; shift ;;
+    esac
+done
+echo "curl $url" >>"$FAKE_LOG"
+cp "$FAKE_DOWNLOAD" "$out"
+SH
+    cat >"$TEST_SCRATCH/bin/sudo" <<'SH'
+#!/bin/bash
+echo "sudo $*" >>"$FAKE_LOG"
+SH
+    for t in shellcheck shfmt actionlint; do
+        printf '#!/bin/bash\necho "%s stand-in"\n' "$t" >"$TEST_SCRATCH/bin/$t"
+    done
+    chmod +x "$TEST_SCRATCH"/bin/*
+}
+
+# check_installer JOB STEP PIN_VAR TOOL URL_PART FORMAT: the install step of
+# TOOL in JOB must refuse a download that does not match the pinned sha256 and
+# install one that does. FORMAT says how the fake download is packed.
+check_installer() {
+    local job="$1" step="$2" pin_var="$3" tool="$4" url_part="$5" format="$6" ver good
+    ver="$(jq -er '.env | [.SHELLCHECK_VERSION, .SHFMT_VERSION, .ACTIONLINT_VERSION] | join(" ")' <<<"$WF")"
+    if [[ "$format" == xz ]] && ! command -v xz >/dev/null; then
+        skip "xz not installed"
+    fi
+    rm -rf "${TEST_SCRATCH:?}/pack" "${TEST_SCRATCH:?}/bin" "${TEST_SCRATCH:?}/runner" "${TEST_SCRATCH:?}/log"
+    mkdir -p "$TEST_SCRATCH/pack"
+    installer_shims
+    case "$format" in
+        xz)
+            mkdir "$TEST_SCRATCH/pack/shellcheck-${ver%% *}"
+            echo payload >"$TEST_SCRATCH/pack/shellcheck-${ver%% *}/$tool"
+            tar -cJf "$TEST_SCRATCH/download" -C "$TEST_SCRATCH/pack" "shellcheck-${ver%% *}"
+            ;;
+        gz)
+            echo payload >"$TEST_SCRATCH/pack/$tool"
+            tar -czf "$TEST_SCRATCH/download" -C "$TEST_SCRATCH/pack" "$tool"
+            ;;
+        raw)
+            echo payload >"$TEST_SCRATCH/download"
+            ;;
+    esac
+    good="$(sha256sum "$TEST_SCRATCH/download" | cut -d' ' -f1)"
+
+    # The pin from the workflow is not the hash of this fake download: refused,
+    # nothing installed.
+    run_step "$job" "$step" PATH="$TEST_SCRATCH/bin:$PATH" RUNNER_TEMP="$TEST_SCRATCH/runner" \
+        FAKE_LOG="$TEST_SCRATCH/log" FAKE_DOWNLOAD="$TEST_SCRATCH/download"
+    [ "$status" -ne 0 ] || {
+        echo "$tool: a download that does not match the pin was accepted"
+        return 1
+    }
+    [[ "$output" == *"FAILED"* ]]
+    grep -qF "releases/download/" "$TEST_SCRATCH/log"
+    grep -qF "$url_part" "$TEST_SCRATCH/log"
+    if grep -q '^sudo' "$TEST_SCRATCH/log"; then
+        echo "$tool was installed although its hash did not match"
+        return 1
+    fi
+
+    # With the hash of the download as the pin, it installs.
+    run_step "$job" "$step" PATH="$TEST_SCRATCH/bin:$PATH" RUNNER_TEMP="$TEST_SCRATCH/runner" \
+        FAKE_LOG="$TEST_SCRATCH/log" FAKE_DOWNLOAD="$TEST_SCRATCH/download" "$pin_var=$good"
+    [ "$status" -eq 0 ]
+    grep -qE "^sudo install -m 0755 .* /usr/local/bin/$tool\$" "$TEST_SCRATCH/log"
+}
+
+@test "bash-ci installs ShellCheck only from a download that matches the pinned sha256" {
+    load_wf bash-ci
+    local job
+    for job in shellcheck workflow-lint; do
+        check_installer "$job" "Install ShellCheck (pinned, sha256-verified)" SHELLCHECK_SHA256 shellcheck \
+            "koalaman/shellcheck/releases/download/v0.11.0/shellcheck-v0.11.0.linux.x86_64.tar.xz" xz
+    done
+}
+
+@test "bash-ci installs shfmt only from a download that matches the pinned sha256" {
+    load_wf bash-ci
+    check_installer shfmt "Install shfmt (pinned, sha256-verified)" SHFMT_SHA256 shfmt \
+        "mvdan/sh/releases/download/v3.13.1/shfmt_v3.13.1_linux_amd64" raw
+}
+
+@test "bash-ci installs actionlint only from a download that matches the pinned sha256" {
+    load_wf bash-ci
+    check_installer workflow-lint "Install actionlint (pinned, sha256-verified)" ACTIONLINT_SHA256 actionlint \
+        "rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_amd64.tar.gz" gz
+}
+
+@test "bash-ci tool pins are exact versions with a 64-hex sha256" {
+    load_wf bash-ci
+    run jq -e '.env
+        | ([.SHELLCHECK_VERSION, .SHFMT_VERSION, .ACTIONLINT_VERSION] | all(test("^v[0-9]+\\.[0-9]+\\.[0-9]+$")))
+        and ([.SHELLCHECK_SHA256, .SHFMT_SHA256, .ACTIONLINT_SHA256] | all(test("^[0-9a-f]{64}$")))' <<<"$WF"
+    [ "$status" -eq 0 ]
+}
+
+@test "no workflow step downloads a file without verifying a sha256, or pip-installs without hashes" {
+    require_yaml
+    local f json unverified
+    local n=0 p=0
+    for f in "$ROOT"/.github/workflows/*.yml; do
+        json="$(wf_json "$f")"
+        # A line that starts a curl/wget command (not a word in a package list
+        # or in a grep pattern).
+        unverified="$(jq -r '[.jobs[] | .steps[]? | select(.run != null)
+            | select(.run | split("\n") | any(.[]; test("^[[:space:]]*(curl|wget)[[:space:]]")
+                or test("[|;&(][[:space:]]*(curl|wget)[[:space:]]")))
+            | select((.run | contains("sha256sum -c")) | not) | .name] | .[]' <<<"$json")"
+        [ -z "$unverified" ] || {
+            echo "$f downloads without sha256sum -c: $unverified"
+            return 1
+        }
+        unverified="$(jq -r '[.jobs[] | .steps[]? | select(.run != null)
+            | select(.run | test("pip3?\"?[[:space:]]+install"))
+            | select((.run | contains("--require-hashes")) | not) | .name] | .[]' <<<"$json")"
+        [ -z "$unverified" ] || {
+            echo "$f installs with pip without --require-hashes: $unverified"
+            return 1
+        }
+        n=$((n + $(jq '[.jobs[] | .steps[]? | select(.run != null) | select(.run | contains("sha256sum -c"))] | length' <<<"$json")))
+        p=$((p + $(jq '[.jobs[] | .steps[]? | select(.run != null) | select(.run | test("pip3?\"?[[:space:]]+install"))] | length' <<<"$json")))
+    done
+    # The patterns must not pass by matching nothing: four verified installs
+    # exist (ShellCheck twice, shfmt, actionlint) and one hash-checked pip install.
+    [ "$n" -ge 4 ]
+    [ "$p" -ge 1 ]
+}
+
+@test "bashate is installed at an exact version from a requirements file where every pin has hashes" {
+    require_yaml
+    local req="$ROOT/.github/ci/requirements.txt"
+    grep -qE '^bashate==2\.1\.1 \\$' "$req"
+    # Every requirement (a "name==version" line plus its --hash continuation
+    # lines) carries at least one sha256, and nothing else is in the file.
+    local line name="" hashes=0 bad="" pin_re hash_re
+    pin_re='^([A-Za-z0-9._-]+==[^[:space:]]+)'
+    hash_re='^[[:space:]]+--hash=sha256:[0-9a-f]{64}( \\)?$'
+    while IFS= read -r line; do
+        [[ "$line" =~ ^[[:space:]]*(#|$) ]] && continue
+        if [[ "$line" =~ $pin_re ]]; then
+            if [[ -n "$name" && "$hashes" -eq 0 ]]; then bad+=" $name"; fi
+            name="${BASH_REMATCH[1]}"
+            hashes=0
+        elif [[ "$line" =~ $hash_re ]]; then
+            hashes=$((hashes + 1))
+        else
+            bad+=" [$line]"
+        fi
+    done <"$req"
+    if [[ -n "$name" && "$hashes" -eq 0 ]]; then bad+=" $name"; fi
+    [ -z "$bad" ] || {
+        echo "requirements without a sha256, or lines that are not pins:$bad"
+        return 1
+    }
+    # bashate's dependencies are pinned too: three requirements in all.
+    [ "$(grep -cE '^[A-Za-z0-9._-]+==' "$req")" -ge 3 ]
+}
+
 # ---------------------------------------------------------------------------
 # Required checks: the summary job gates on every job, and the format and
 # style linters block.
@@ -388,7 +571,7 @@ SH
     [ "$status" -eq 0 ]
     # The jobs the register names are all there.
     run jq -e '[.jobs.summary.needs[]] as $n
-        | ["discover-scripts", "bash-syntax", "shellcheck", "shfmt", "bashate",
+        | ["discover-scripts", "workflow-lint", "bash-syntax", "shellcheck", "shfmt", "bashate",
            "security-scan", "bats-tests", "live-mediamtx"] | all(. as $j | $n | index($j) != null)' <<<"$WF"
     [ "$status" -eq 0 ]
 }
