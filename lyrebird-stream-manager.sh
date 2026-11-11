@@ -337,6 +337,24 @@ readonly RESTART_STABILIZATION_DELAY
 STOP_LOCK_TIMEOUT=$(_uint_or "${STOP_LOCK_TIMEOUT:-}" 5)
 readonly STOP_LOCK_TIMEOUT
 
+# MediaMTX configuration ownership and exposure (D9, D10; LB-06, LB-22)
+# - A file whose first line is "# Managed by LyreBirdAudio" is rewritten when
+#   its content changes, after a timestamped backup (the newest
+#   MEDIAMTX_CONFIG_BACKUPS are kept); any other file is the operator's.
+# - The control API and the metrics endpoint listen on the loopback address
+#   unless MEDIAMTX_API_BIND / MEDIAMTX_METRICS_BIND say otherwise (an address,
+#   or the empty string for every interface).
+# - RTSP_AUTH_MODE=local-only-publish renders internal authentication: this
+#   machine needs no password, everybody else needs a user from RTSP_USERS_FILE
+#   ("user:sha256:<base64>" lines).
+MEDIAMTX_CONFIG_BACKUPS=$(_uint_or "${MEDIAMTX_CONFIG_BACKUPS:-}" 5)
+((MEDIAMTX_CONFIG_BACKUPS >= 1)) || MEDIAMTX_CONFIG_BACKUPS=1
+readonly MEDIAMTX_CONFIG_BACKUPS
+readonly MEDIAMTX_API_BIND="${MEDIAMTX_API_BIND-127.0.0.1}"
+readonly MEDIAMTX_METRICS_BIND="${MEDIAMTX_METRICS_BIND-127.0.0.1}"
+readonly RTSP_AUTH_MODE="${RTSP_AUTH_MODE:-open}"
+readonly RTSP_USERS_FILE="${RTSP_USERS_FILE:-${CONFIG_DIR}/rtsp-users.conf}"
+
 # Resource monitoring thresholds
 MAX_FD_WARNING=$(_uint_or "${MAX_FD_WARNING:-}" 500)
 readonly MAX_FD_WARNING
@@ -485,6 +503,9 @@ declare -g LOCK_DEPRECATION_LOGGED=false
 
 # Skip cleanup flag
 declare -g SKIP_CLEANUP=false
+
+# Set by --regenerate-config: take over a MediaMTX configuration the operator owns
+declare -g REGENERATE_CONFIG=false
 
 # Command being executed (COMMAND used by cleanup trap, must be initialized early)
 declare -g COMMAND=""
@@ -1758,9 +1779,21 @@ rtsp_publish_url() {
     printf '%s/%s' "$(mediamtx_rtsp_base)" "$1"
 }
 
-# Root URL of the MediaMTX control API: http://MEDIAMTX_HOST:MEDIAMTX_API_PORT
+# Host the manager asks the control API on: where MEDIAMTX_API_BIND says it
+# listens, or MEDIAMTX_HOST when that is every interface
+mediamtx_api_host() {
+    local host
+    case "${MEDIAMTX_API_BIND}" in
+        '' | 0.0.0.0 | ::) host="${MEDIAMTX_HOST}" ;;
+        *) host="${MEDIAMTX_API_BIND}" ;;
+    esac
+    [[ "$host" == *:* && "$host" != \[* ]] && host="[${host}]"
+    printf '%s' "$host"
+}
+
+# Root URL of the MediaMTX control API: http://HOST:MEDIAMTX_API_PORT
 mediamtx_api_root() {
-    printf 'http://%s:%s' "${MEDIAMTX_HOST}" "${MEDIAMTX_API_PORT}"
+    printf 'http://%s:%s' "$(mediamtx_api_host)" "${MEDIAMTX_API_PORT}"
 }
 
 # Detect MediaMTX API version and return appropriate base URL
@@ -4753,9 +4786,9 @@ stop_all_ffmpeg_streams() {
     pkill -f "^ffmpeg.*rtsp://${MEDIAMTX_HOST}:8554" 2>/dev/null || true
 }
 
-# Does the installed MediaMTX accept the top-level "moq" key (>= 1.19.0)?
-# Fails when the binary is missing or its version cannot be read.
-mediamtx_supports_moq_key() {
+# The version the installed MediaMTX reports (first line of --version, e.g.
+# v1.21.1). Fails when the binary is missing or prints nothing.
+mediamtx_binary_version() {
     local ver
     [[ -x "${MEDIAMTX_BIN}" ]] || return 1
     if command_exists timeout; then
@@ -4763,9 +4796,112 @@ mediamtx_supports_moq_key() {
     else
         ver=$("${MEDIAMTX_BIN}" --version 2>/dev/null | head -n 1) || return 1
     fi
-    [[ "$ver" =~ ^v?([0-9]+)\.([0-9]+)\.[0-9]+ ]] || return 1
-    local major=$((10#${BASH_REMATCH[1]})) minor=$((10#${BASH_REMATCH[2]}))
-    ((major > 1 || (major == 1 && minor >= 19)))
+    [[ -n "$ver" ]] || return 1
+    printf '%s' "$ver"
+}
+
+# Does the installed MediaMTX have --validate-conf (1.21 and later)?
+mediamtx_supports_validate_conf() {
+    local help
+    [[ -x "${MEDIAMTX_BIN}" ]] || return 1
+    if command_exists timeout; then
+        help=$(timeout 10 "${MEDIAMTX_BIN}" --help 2>&1) || true
+    else
+        help=$("${MEDIAMTX_BIN}" --help 2>&1) || true
+    fi
+    [[ "$help" == *--validate-conf* ]]
+}
+
+# Is configuration file $1 acceptable to MediaMTX? Uses MediaMTX's own
+# --validate-conf where the binary has it; older binaries get a structural
+# check (a readable, non-empty text file with at least one top-level key and no
+# tab indentation, which YAML forbids). Problems are logged as errors.
+# Returns: 0 = acceptable, 1 = not
+mediamtx_validate_config() {
+    local file="$1" out="" line="" rc=0
+    if mediamtx_supports_validate_conf; then
+        if command_exists timeout; then
+            out=$(timeout 20 "${MEDIAMTX_BIN}" "--validate-conf=${file}" 2>&1) || rc=$?
+        else
+            out=$("${MEDIAMTX_BIN}" "--validate-conf=${file}" 2>&1) || rc=$?
+        fi
+        if [[ $rc -ne 0 ]]; then
+            log ERROR "MediaMTX rejects the configuration ${file}:"
+            while IFS= read -r line; do
+                [[ -n "$line" ]] && log ERROR "  ${line}"
+            done <<<"$out"
+            return 1
+        fi
+        return 0
+    fi
+    if [[ ! -f "$file" || ! -r "$file" ]]; then
+        log ERROR "MediaMTX configuration ${file} is not a readable file"
+        return 1
+    fi
+    if [[ ! -s "$file" ]]; then
+        log ERROR "MediaMTX configuration ${file} is empty (MediaMTX would start without the control API this manager needs)"
+        return 1
+    fi
+    if [[ "$(LC_ALL=C tr -d '\0' <"$file" | wc -c)" -ne "$(wc -c <"$file")" ]]; then
+        log ERROR "MediaMTX configuration ${file} contains NUL bytes: it is not a text file"
+        return 1
+    fi
+    if grep -q $'^[ ]*\t' "$file"; then
+        log ERROR "MediaMTX configuration ${file} is indented with tabs, which YAML does not allow"
+        return 1
+    fi
+    if ! grep -qE '^[A-Za-z_][A-Za-z0-9_]*:' "$file"; then
+        log ERROR "MediaMTX configuration ${file} has no top-level key"
+        return 1
+    fi
+    return 0
+}
+
+# Is the first line of $1 the marker that says LyreBirdAudio manages the file?
+mediamtx_config_is_managed() {
+    local first=""
+    IFS= read -r first <"$1" || [[ -n "$first" ]] || return 1
+    # trailing blanks and the CR of a CRLF line ending do not count
+    first="${first%"${first##*[![:space:]]}"}"
+    [[ "$first" == "${LYREBIRD_MEDIAMTX_CONFIG_MARKER:-# Managed by LyreBirdAudio}" ]]
+}
+
+# Save a timestamped copy of ${CONFIG_FILE} next to it (same mode and owner)
+# and keep only the newest MEDIAMTX_CONFIG_BACKUPS of them. Prints the path.
+# Returns: 0 = saved, 1 = could not save (the caller must not replace the file)
+mediamtx_config_backup() {
+    local stamp last=-1 c bak mode
+    stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+    # Several backups in one second are numbered after the highest number
+    # there is, never into a gap an earlier retention pass left: the names must
+    # sort in the order the backups were made
+    for bak in "${CONFIG_FILE}.${stamp}".??.bak; do
+        [[ -e "$bak" ]] || continue
+        c="${bak%.bak}"
+        c=$((10#${c##*.}))
+        if ((c > last)); then
+            last=$c
+        fi
+    done
+    if ((last >= 99)); then
+        log ERROR "Too many MediaMTX configuration backups in one second"
+        return 1
+    fi
+    printf -v bak '%s.%s.%02d.bak' "${CONFIG_FILE}" "$stamp" "$((last + 1))"
+    mode="$(stat -c %a "${CONFIG_FILE}" 2>/dev/null)" || mode=644
+    lyrebird_atomic_write "$bak" "$mode" "${CONFIG_FILE}" <"${CONFIG_FILE}" || return 1
+
+    # Retention: the names sort by time, the oldest are removed
+    local -a backups=()
+    local f excess i
+    while IFS= read -r f; do
+        [[ -n "$f" ]] && backups+=("$f")
+    done < <(printf '%s\n' "${CONFIG_FILE}".????????T??????Z.??.bak 2>/dev/null | LC_ALL=C sort)
+    excess=$((${#backups[@]} - MEDIAMTX_CONFIG_BACKUPS))
+    for ((i = 0; i < excess; i++)); do
+        rm -f -- "${backups[$i]}"
+    done
+    printf '%s' "$bak"
 }
 
 # Generate MediaMTX configuration without subshell locking
@@ -4791,84 +4927,145 @@ generate_mediamtx_config() {
         return 1
     fi
 
-    # Create temp file for atomic write
-    local tmp_config
-    tmp_config="$(mktemp -p "$(dirname "${CONFIG_FILE}")" "$(basename "${CONFIG_FILE}").XXXXXX")"
-
-    # Ensure temp file and lock are cleaned up on any failure
-    local _config_cleanup_needed=true
-    trap 'if [[ "${_config_cleanup_needed:-}" == "true" ]]; then rm -f "$tmp_config" 2>/dev/null; release_config_lock_unsafe; fi' RETURN
-
-    cat >"$tmp_config" <<EOF
-# MediaMTX Configuration - Audio Streams
-logLevel: info
-readTimeout: 30s
-writeTimeout: 30s
-
-api: yes
-apiAddress: :${MEDIAMTX_API_PORT}
-
-metrics: yes
-metricsAddress: :${MEDIAMTX_METRICS_PORT}
-
-rtsp: yes
-rtspAddress: :${MEDIAMTX_RTSP_PORT}
-rtspTransports: [tcp, udp]
-
-rtmp: no
-hls: no
-webrtc: no
-srt: no
-EOF
-
-    # MediaMTX >= 1.19.0 also starts a MoQ (Media over QUIC) server by default:
-    # :8892/tcp, :8892/udp and :8893/udp on every interface. Turn it off, but
-    # only where the key exists -- 1.15-1.18 reject an unknown "moq" key and
-    # refuse to start, so an unknown version leaves the key out.
-    if mediamtx_supports_moq_key; then
-        printf 'moq: no\n' >>"$tmp_config"
-    fi
-    printf '\npaths:\n' >>"$tmp_config"
-
-    # Add paths based on stream mode
-    if [[ "${STREAM_MODE}" == "multiplex" ]]; then
-        cat >>"$tmp_config" <<EOF
-  ${MULTIPLEX_STREAM_NAME}:
-    source: publisher
-    sourceProtocol: automatic
-    sourceOnDemand: no
-EOF
-    else
-        # Individual mode - accept any stream name
-        cat >>"$tmp_config" <<EOF
-  '~^[a-zA-Z0-9_-]+$':
-    source: publisher
-    sourceProtocol: automatic
-    sourceOnDemand: no
-EOF
-    fi
-
-    # Set permissions BEFORE atomic move (following write_pid_atomic pattern)
-    chmod 644 "$tmp_config" 2>/dev/null || {
-        rm -f "$tmp_config"
-        log ERROR "Failed to set permissions on temp config file"
-        release_config_lock_unsafe
-        return 1
-    }
-
-    # Atomically move into place
-    mv -f "$tmp_config" "${CONFIG_FILE}" || {
-        rm -f "$tmp_config"
-        log ERROR "Failed to move config file into place"
-        release_config_lock_unsafe
-        return 1
-    }
-
-    # Release config lock
+    local rc=0
+    mediamtx_config_apply || rc=$?
     release_config_lock_unsafe
+    return "$rc"
+}
 
-    _config_cleanup_needed=false
-    log INFO "Configuration generated successfully"
+# Bring ${CONFIG_FILE} to the rendered configuration, under the config lock.
+#
+# Ownership (D10): the file is rewritten only when it does not exist or its
+# first line is the "# Managed by LyreBirdAudio" marker. Any other file belongs
+# to the operator: it is validated and used as it is, never rewritten (one
+# warning says how to hand it over: --regenerate-config, which saves a
+# timestamped backup first). A rendered configuration identical to the file
+# leaves the file untouched (no new mtime); a different one is validated by
+# MediaMTX first, the old file is backed up, and the replacement is atomic and
+# durable (lyrebird_atomic_write, D14). The mode and owner of an existing file
+# are kept, except that a file that now carries password hashes loses world
+# access and group write.
+mediamtx_config_apply() {
+    local state=new
+    # A zero-length file is what a power cut during an old, non-durable write
+    # leaves behind; nobody keeps an empty configuration on purpose
+    if [[ -s "${CONFIG_FILE}" ]]; then
+        if mediamtx_config_is_managed "${CONFIG_FILE}"; then
+            state=managed
+        elif [[ "${REGENERATE_CONFIG}" == "true" ]]; then
+            state=takeover
+        else
+            state=operator
+        fi
+    elif [[ -e "${CONFIG_FILE}" ]]; then
+        state=managed
+    fi
+
+    if [[ "$state" == operator ]]; then
+        local origin=""
+        if [[ "$(head -n 1 "${CONFIG_FILE}" 2>/dev/null)" == "# MediaMTX Configuration - Audio Streams" ]]; then
+            origin=" (it looks like the file an earlier release of this script wrote: its API and metrics listen on every interface)"
+        fi
+        log WARN "MediaMTX configuration ${CONFIG_FILE} does not start with the line '${LYREBIRD_MEDIAMTX_CONFIG_MARKER:-# Managed by LyreBirdAudio}'${origin}: it is treated as yours and used as it is, never rewritten. To let ${SCRIPT_NAME} manage it, run '${SCRIPT_NAME} --regenerate-config start' (a timestamped backup is saved first)"
+        if [[ "${RTSP_AUTH_MODE}" != "open" ]]; then
+            log WARN "RTSP_AUTH_MODE=${RTSP_AUTH_MODE} has no effect on a configuration you manage yourself"
+        fi
+        mediamtx_validate_config "${CONFIG_FILE}"
+        return
+    fi
+
+    if ! declare -F lyrebird_render_mediamtx_config >/dev/null; then
+        log ERROR "lyrebird-common.sh with lyrebird_render_mediamtx_config is required next to ${SCRIPT_NAME}"
+        return 1
+    fi
+
+    # What to render
+    local -a args=(
+        --rtsp-port "${MEDIAMTX_RTSP_PORT}"
+        --api-port "${MEDIAMTX_API_PORT}"
+        --metrics-port "${MEDIAMTX_METRICS_PORT}"
+        --api-bind "${MEDIAMTX_API_BIND}"
+        --metrics-bind "${MEDIAMTX_METRICS_BIND}"
+        --auth-mode "${RTSP_AUTH_MODE}"
+    )
+    local version=""
+    if version="$(mediamtx_binary_version)"; then
+        args+=(--mediamtx-version "$version")
+    fi
+    if [[ "${STREAM_MODE}" == "multiplex" ]]; then
+        args+=(--stream-name "${MULTIPLEX_STREAM_NAME}")
+    fi
+    if [[ "${RTSP_AUTH_MODE}" == "local-only-publish" ]]; then
+        if [[ -f "${RTSP_USERS_FILE}" ]]; then
+            args+=(--users-file "${RTSP_USERS_FILE}")
+        else
+            log WARN "RTSP_AUTH_MODE=local-only-publish but ${RTSP_USERS_FILE} does not exist: only this machine can use RTSP"
+        fi
+        case "${MEDIAMTX_HOST}" in
+            localhost | 127.* | ::1) ;;
+            *) log WARN "RTSP_AUTH_MODE=local-only-publish: publishers connect to ${MEDIAMTX_HOST}, which is not a loopback name; MediaMTX will refuse them" ;;
+        esac
+    fi
+
+    local tmp err rc=0
+    tmp="$(mktemp)" || {
+        log ERROR "Cannot create a temporary file for the MediaMTX configuration"
+        return 1
+    }
+    if ! err="$(lyrebird_render_mediamtx_config "${args[@]}" 2>&1 >"$tmp")"; then
+        log ERROR "Cannot render the MediaMTX configuration: ${err}"
+        rm -f "$tmp"
+        return 1
+    fi
+
+    mediamtx_config_install "$state" "$tmp" || rc=$?
+    rm -f "$tmp"
+    return "$rc"
+}
+
+# Install the rendered configuration $2 over ${CONFIG_FILE} (state $1 is new,
+# managed or takeover); see mediamtx_config_apply
+mediamtx_config_install() {
+    local state="$1" tmp="$2" mode=644 existing
+
+    if [[ "$state" != new ]] && cmp -s "$tmp" "${CONFIG_FILE}"; then
+        log INFO "MediaMTX configuration is up to date: ${CONFIG_FILE} left untouched"
+        return 0
+    fi
+
+    # MediaMTX must accept it before it can replace a file that may be working
+    if ! mediamtx_validate_config "$tmp"; then
+        log ERROR "Not writing ${CONFIG_FILE}"
+        return 1
+    fi
+
+    if grep -q 'sha256:' "$tmp"; then
+        mode=640
+    fi
+    if [[ "$state" != new ]]; then
+        existing="$(stat -c %a "${CONFIG_FILE}" 2>/dev/null)" || existing=644
+        mode="$existing"
+        if grep -q 'sha256:' "$tmp"; then
+            mode="$(printf '%o' $((8#$existing & 8#750)))"
+        fi
+        if [[ -s "${CONFIG_FILE}" ]]; then
+            local bak
+            if ! bak="$(mediamtx_config_backup)"; then
+                log ERROR "Cannot save a backup of ${CONFIG_FILE}: leaving it as it is"
+                return 1
+            fi
+            log INFO "Saved the previous MediaMTX configuration as ${bak}"
+        fi
+        if is_mediamtx_running; then
+            log INFO "MediaMTX is running; it reloads the changed configuration itself"
+        fi
+    fi
+
+    if ! lyrebird_atomic_write "${CONFIG_FILE}" "$mode" "${CONFIG_FILE}" <"$tmp"; then
+        log ERROR "Failed to write ${CONFIG_FILE}"
+        return 1
+    fi
+    log INFO "MediaMTX configuration written: ${CONFIG_FILE} (mode ${mode})"
     return 0
 }
 
@@ -4930,10 +5127,6 @@ start_mediamtx() {
         return "${E_USB_NO_DEVICES}"
     fi
 
-    if ! generate_mediamtx_config; then
-        error_exit "Failed to generate configuration" "${E_CONFIG_ERROR}"
-    fi
-
     # Check ports if lsof is available
     if command_exists lsof; then
         for port in "${MEDIAMTX_RTSP_PORT}" "${MEDIAMTX_API_PORT}" "${MEDIAMTX_METRICS_PORT}"; do
@@ -4951,6 +5144,11 @@ start_mediamtx() {
         done
     else
         log WARN "Cannot check if MediaMTX ports are in use"
+    fi
+
+    # Only now is the configuration rendered and, if it changed, written
+    if ! generate_mediamtx_config; then
+        error_exit "Failed to generate configuration" "${E_CONFIG_ERROR}"
     fi
 
     # Set limits
@@ -5421,6 +5619,9 @@ Options:
     -m, --mode MODE      Stream mode (individual|multiplex) [default: individual]
     -f, --filter TYPE    Multiplex filter type (amix|amerge) [default: amix]
     -n, --name NAME      Multiplex stream name [default: all_mics]
+        --regenerate-config  start/restart: replace a MediaMTX configuration that is
+                         not managed by this script (a timestamped backup is
+                         saved first)
     -d, --debug          Enable debug output
     -h, --help           Show this help message
 
@@ -5428,6 +5629,17 @@ Environment Variables:
     MULTIPLEX_FILTER_TYPE    Multiplex audio filter type [default: amix]
                              - amix: Mix all audio sources into one output
                              - amerge: Merge sources keeping channels separate
+    MEDIAMTX_RTSP_PORT       RTSP port [default: 8554]
+    MEDIAMTX_API_PORT        Control API port [default: 9997]
+    MEDIAMTX_METRICS_PORT    Metrics port [default: 9998]
+    MEDIAMTX_API_BIND        Address the API listens on [default: 127.0.0.1;
+    MEDIAMTX_METRICS_BIND    same for metrics; empty = every interface]
+    RTSP_AUTH_MODE           open (default) | local-only-publish: this machine
+                             needs no password, everybody else must be listed in
+                             RTSP_USERS_FILE [default: ${CONFIG_DIR}/rtsp-users.conf]
+                             as "user:sha256:<base64 of the SHA-256 of the password>"
+    MEDIAMTX_CONFIG_BACKUPS  Timestamped backups of the MediaMTX configuration
+                             kept when it changes [default: 5]
 
 Commands:
     start       Start MediaMTX and FFmpeg streams
@@ -5527,6 +5739,10 @@ parse_arguments() {
                 ;;
             -d | --debug)
                 export DEBUG=true
+                shift
+                ;;
+            --regenerate-config)
+                REGENERATE_CONFIG=true
                 shift
                 ;;
             -h | --help)

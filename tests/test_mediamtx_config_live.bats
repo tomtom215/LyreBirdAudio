@@ -199,6 +199,72 @@ default_listeners() {
     done
 }
 
+# Run the real generate_mediamtx_config (the manager's own validation, with
+# this binary) in a private configuration directory $1; $2... are environment
+# assignments. Prints its messages; the status is generate's.
+manager_generate() {
+    local dir="$1" bin="$2"
+    shift 2
+    mkdir -p "$dir/cfg" "$dir/ff"
+    env "$@" MEDIAMTX_BINARY="$bin" MEDIAMTX_CONFIG_DIR="$dir/cfg" MEDIAMTX_FFMPEG_DIR="$dir/ff" \
+        MEDIAMTX_PID_FILE="$dir/p" MEDIAMTX_LOCK_FILE="$dir/l" MEDIAMTX_LOG_FILE="$dir/log" \
+        MEDIAMTX_RTSP_PORT="$P_RTSP" MEDIAMTX_API_PORT="$P_API" MEDIAMTX_METRICS_PORT="$P_METRICS" \
+        bash -c 'source "$1" >/dev/null 2>&1; set +e; generate_mediamtx_config' _ "$PROJECT_ROOT/lyrebird-stream-manager.sh" 2>&1
+}
+
+@test "the manager validates a configuration with MediaMTX's own check where the binary has one, and says what the structural check cannot see [LB-22]" {
+    require_live
+    local bin dir validates
+    for bin in $LYREBIRD_TEST_MEDIAMTX_BINS; do
+        each_binary_begin "$bin"
+        dir="$TEST_SCRATCH/mg"
+        rm -rf "$dir"
+        validates=false
+        "$bin" --help 2>&1 | grep -q -- '--validate-conf' && validates=true
+
+        # what it renders is accepted, and is the file MediaMTX then runs on
+        manager_generate "$dir" "$bin" >"$TEST_SCRATCH/gen.out" || {
+            cat "$TEST_SCRATCH/gen.out"
+            false
+        }
+        [ "$(head -n 1 "$dir/cfg/mediamtx.yml")" = "# Managed by LyreBirdAudio" ]
+        if $validates; then
+            "$bin" --validate-conf="$dir/cfg/mediamtx.yml" >/dev/null
+        fi
+        mtx_start "$bin" "$dir/cfg/mediamtx.yml"
+        mtx_stop
+
+        # a path name MediaMTX refuses: stopped before the file is replaced where
+        # the binary can say so; otherwise MediaMTX refuses at start
+        rm -rf "$dir"
+        if $validates; then
+            ! manager_generate "$dir" "$bin" STREAM_MODE=multiplex MULTIPLEX_STREAM_NAME="Studio Mix" >"$TEST_SCRATCH/gen.out"
+            grep -q "invalid path name 'Studio Mix'" "$TEST_SCRATCH/gen.out" || {
+                cat "$TEST_SCRATCH/gen.out"
+                false
+            }
+            [ ! -e "$dir/cfg/mediamtx.yml" ]
+        else
+            manager_generate "$dir" "$bin" STREAM_MODE=multiplex MULTIPLEX_STREAM_NAME="Studio Mix" >/dev/null
+            ! (cd "$TEST_SCRATCH" && timeout 10 "$bin" "$dir/cfg/mediamtx.yml") >/dev/null 2>&1
+        fi
+
+        # an operator's file with a key MediaMTX does not know
+        rm -rf "$dir"
+        mkdir -p "$dir/cfg"
+        printf 'logLevel: info\nbogusKey: 1\n' >"$dir/cfg/mediamtx.yml"
+        if $validates; then
+            ! manager_generate "$dir" "$bin" >"$TEST_SCRATCH/gen.out"
+            grep -q 'unknown field "bogusKey"' "$TEST_SCRATCH/gen.out"
+        else
+            # no validator in this MediaMTX: the structural check passes it, and
+            # MediaMTX itself refuses to start on it
+            manager_generate "$dir" "$bin" >/dev/null
+            ! (cd "$TEST_SCRATCH" && timeout 10 "$bin" "$dir/cfg/mediamtx.yml") >/dev/null 2>&1
+        fi
+    done
+}
+
 @test "every option of the renderer produces a configuration MediaMTX accepts and honours [LB-22]" {
     require_live
     local bin
