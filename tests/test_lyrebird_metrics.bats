@@ -838,6 +838,116 @@ _publish() {
     [ "$(ls -A "$TEST_SCRATCH/pub")" = "lyrebird.prom" ]
 }
 
+# --- heartbeat health threshold (X-13) -------------------------------------------
+
+# Run collect_stream_manager_metrics for real against a heartbeat file written
+# AGE seconds ago ("none": no file; "raw:TEXT": that content). Further arguments
+# are env assignments. Output goes to $TEST_SCRATCH/hb.prom, stderr to hb.err.
+_heartbeat_scrape() {
+    local age="$1" hb="$TEST_SCRATCH/heartbeat"
+    shift
+    rm -f "$hb"
+    case "$age" in
+        none) ;;
+        raw:*) printf '%s\n' "${age#raw:}" >"$hb" ;;
+        *) echo $(($(date +%s) - age)) >"$hb" ;;
+    esac
+    RUN_RC=0
+    env -u LYREBIRD_HEARTBEAT_MAX_AGE PROJECT_ROOT="$PROJECT_ROOT" HEARTBEAT_FILE="$hb" \
+        PID_FILE="$PID_FILE" FFMPEG_PID_DIR="$FFMPEG_PID_DIR" "$@" \
+        "$BASH" -c 'set -euo pipefail; source "$PROJECT_ROOT/lyrebird-metrics.sh"; collect_stream_manager_metrics' \
+        >"$TEST_SCRATCH/hb.prom" 2>"$TEST_SCRATCH/hb.err" || RUN_RC=$?
+}
+
+_heartbeat_healthy() {
+    awk '/^lyrebird_heartbeat_healthy /{print $2}' "$TEST_SCRATCH/hb.prom"
+}
+
+@test "heartbeat_healthy is 1 at 59, 299 and 899 s and 0 at 901 s with the default 900 s maximum [X-13]" {
+    local age expected
+    for age in 59 299 899 901; do
+        _heartbeat_scrape "$age"
+        [ "$RUN_RC" -eq 0 ]
+        expected=1
+        [ "$age" -gt 900 ] && expected=0
+        [ "$(_heartbeat_healthy)" = "$expected" ] || { echo "age ${age}s: healthy=$(_heartbeat_healthy), want $expected"; return 1; }
+        grep -Eq "^lyrebird_heartbeat_age_seconds ($age|$((age + 1)))$" "$TEST_SCRATCH/hb.prom"
+    done
+}
+
+@test "LYREBIRD_HEARTBEAT_MAX_AGE sets the heartbeat threshold [X-13]" {
+    _heartbeat_scrape 59 LYREBIRD_HEARTBEAT_MAX_AGE=60
+    [ "$(_heartbeat_healthy)" = "1" ]
+    _heartbeat_scrape 70 LYREBIRD_HEARTBEAT_MAX_AGE=60
+    [ "$(_heartbeat_healthy)" = "0" ]
+    _heartbeat_scrape 3000 LYREBIRD_HEARTBEAT_MAX_AGE=3600
+    [ "$(_heartbeat_healthy)" = "1" ]
+    _heartbeat_scrape 3700 LYREBIRD_HEARTBEAT_MAX_AGE=3600
+    [ "$(_heartbeat_healthy)" = "0" ]
+}
+
+@test "the heartbeat HELP text says what it proves and names the threshold in force [X-13]" {
+    _heartbeat_scrape 10
+    grep -q '^# HELP lyrebird_heartbeat_healthy 1 if the stream-manager monitor ran within the last 900 seconds' "$TEST_SCRATCH/hb.prom"
+    grep -q 'proves only that the monitor ran, not that streams are healthy' "$TEST_SCRATCH/hb.prom"
+    grep -q '^# HELP lyrebird_heartbeat_age_seconds Seconds since the stream-manager monitor last wrote' "$TEST_SCRATCH/hb.prom"
+    _heartbeat_scrape 10 LYREBIRD_HEARTBEAT_MAX_AGE=120
+    grep -q 'monitor ran within the last 120 seconds' "$TEST_SCRATCH/hb.prom"
+    run prom_validate "$TEST_SCRATCH/hb.prom"
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+}
+
+@test "an invalid LYREBIRD_HEARTBEAT_MAX_AGE is ignored with a warning and 900 s is used [X-13]" {
+    local bad
+    for bad in abc 0 -5 1.5 '10 20'; do
+        _heartbeat_scrape 800 LYREBIRD_HEARTBEAT_MAX_AGE="$bad"
+        [ "$RUN_RC" -eq 0 ]
+        grep -q "ignoring LYREBIRD_HEARTBEAT_MAX_AGE='${bad}'" "$TEST_SCRATCH/hb.err" || { echo "no warning for '$bad'"; return 1; }
+        [ "$(_heartbeat_healthy)" = "1" ] || { echo "'$bad' did not fall back to 900"; return 1; }
+    done
+    # unset or empty is the default, without a warning
+    _heartbeat_scrape 800 LYREBIRD_HEARTBEAT_MAX_AGE=
+    [ ! -s "$TEST_SCRATCH/hb.err" ]
+    [ "$(_heartbeat_healthy)" = "1" ]
+}
+
+@test "heartbeat edge cases: no file, a timestamp from the future, a corrupt file, leading zeros [X-13]" {
+    _heartbeat_scrape none
+    [ "$RUN_RC" -eq 0 ]
+    grep -qx 'lyrebird_heartbeat_age_seconds -1' "$TEST_SCRATCH/hb.prom"
+    [ "$(_heartbeat_healthy)" = "0" ]
+
+    _heartbeat_scrape -300 # written 300 s in the future: the clock was stepped back
+    [ "$RUN_RC" -eq 0 ]
+    [ "$(_heartbeat_healthy)" = "0" ]
+
+    _heartbeat_scrape "raw:garbage"
+    [ "$RUN_RC" -eq 0 ]
+    [ "$(_heartbeat_healthy)" = "0" ]
+
+    _heartbeat_scrape "raw:08" # a leading zero must not be read as octal
+    [ "$RUN_RC" -eq 0 ] || { cat "$TEST_SCRATCH/hb.err"; return 1; }
+    [ "$(_heartbeat_healthy)" = "0" ]
+}
+
+@test "an unreadable heartbeat file is left out and fails the collector instead of reading as stale [X-13]" {
+    local real_cat
+    mkdir -p "$TEST_SCRATCH/bin"
+    real_cat="$(command -v cat)"
+    cat >"$TEST_SCRATCH/bin/cat" <<EOF
+#!/bin/bash
+for a in "\$@"; do
+    if [[ "\$a" == */heartbeat ]]; then echo "cat: \$a: Permission denied" >&2; exit 1; fi
+done
+exec "$real_cat" "\$@"
+EOF
+    chmod +x "$TEST_SCRATCH/bin/cat"
+    _heartbeat_scrape 10 PATH="$TEST_SCRATCH/bin:$PATH"
+    [ "$RUN_RC" -eq 1 ]
+    grep -q 'cannot read' "$TEST_SCRATCH/hb.err"
+    ! grep -q '^lyrebird_heartbeat_' "$TEST_SCRATCH/hb.prom" || false
+}
+
 @test "emit_metric refuses an empty or non-numeric value: no output, counted, status 0 [LB-18]" {
     local v expected=0
     for v in '' 'N/A' '1,5' 'abc' '1 2' '--1'; do

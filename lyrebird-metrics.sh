@@ -69,6 +69,28 @@ get_timestamp_ms() {
     fi
 }
 
+# The longest age, in seconds, at which the stream-manager heartbeat file still
+# counts as "the monitor ran recently" (lyrebird_heartbeat_healthy). The file is
+# written by the manager's monitor pass, which cron runs every 5 minutes, so the
+# default is three cycles (900 s); a threshold below the cadence would report
+# "unhealthy" on most scrapes of a healthy node. Override with
+# LYREBIRD_HEARTBEAT_MAX_AGE (a positive integer number of seconds).
+resolve_heartbeat_max_age() {
+    local raw="${LYREBIRD_HEARTBEAT_MAX_AGE-}"
+    local default=900
+
+    if [[ -z "$raw" ]]; then
+        printf '%s' "$default"
+    elif [[ "$raw" =~ ^[0-9]+$ ]] && ((10#$raw > 0)); then
+        printf '%s' "$((10#$raw))"
+    else
+        log "WARN: ignoring LYREBIRD_HEARTBEAT_MAX_AGE='${raw}' (need a positive integer number of seconds); using ${default}"
+        printf '%s' "$default"
+    fi
+}
+HEARTBEAT_MAX_AGE="$(resolve_heartbeat_max_age)"
+readonly HEARTBEAT_MAX_AGE
+
 # ============================================================================
 # Metric Collection Functions
 # ============================================================================
@@ -264,25 +286,45 @@ collect_stream_manager_metrics() {
 
     [[ -z "$configured_devices" ]] || emit_metric "configured_devices" "$configured_devices" "Number of configured audio devices"
 
-    # Heartbeat freshness
+    # Heartbeat freshness. The file holds the Unix time of the stream manager's
+    # last monitor pass (run from cron every 5 minutes), so what it can prove is
+    # that the monitor ran recently: not that MediaMTX or any stream is up (the
+    # monitor also writes it while MediaMTX is down). Streams are lyrebird_stream_up
+    # and lyrebird_api_up.
+    local heartbeat_age_help="Seconds since the stream-manager monitor last wrote its heartbeat file (-1 if there is none)"
+    local heartbeat_healthy_help="1 if the stream-manager monitor ran within the last ${HEARTBEAT_MAX_AGE} seconds (LYREBIRD_HEARTBEAT_MAX_AGE), else 0; proves only that the monitor ran, not that streams are healthy"
+    local heartbeat_time=""
+    local heartbeat_state="missing" # missing | read | unreadable
     if [[ -f "$HEARTBEAT_FILE" ]]; then
-        local heartbeat_time
-        heartbeat_time=$(cat "$HEARTBEAT_FILE" 2>/dev/null || echo 0)
-        # Validate numeric to prevent arithmetic crash on corrupted file
-        [[ "$heartbeat_time" =~ ^[0-9]+$ ]] || heartbeat_time=0
-        local now
-        now=$(date +%s)
-        local heartbeat_age=$((now - heartbeat_time))
-        emit_metric "heartbeat_age_seconds" "$heartbeat_age" "Seconds since last heartbeat"
-
-        # Heartbeat healthy (< 60 seconds old)
-        local heartbeat_healthy=0
-        [[ $heartbeat_age -lt 60 ]] && heartbeat_healthy=1
-        emit_metric "heartbeat_healthy" "$heartbeat_healthy" "Heartbeat is recent (1=healthy, 0=stale)"
-    else
-        emit_metric "heartbeat_age_seconds" "-1" "Seconds since last heartbeat"
-        emit_metric "heartbeat_healthy" "0" "Heartbeat is recent (1=healthy, 0=stale)"
+        if heartbeat_time=$(cat "$HEARTBEAT_FILE" 2>/dev/null); then
+            heartbeat_state="read"
+        elif [[ -e "$HEARTBEAT_FILE" ]]; then
+            log "ERROR: cannot read ${HEARTBEAT_FILE}"
+            heartbeat_state="unreadable"
+            failed=1
+        fi
     fi
+
+    case "$heartbeat_state" in
+        read)
+            # a corrupt or non-numeric file reads as "never" (age = now)
+            [[ "$heartbeat_time" =~ ^[0-9]+$ ]] || heartbeat_time=0
+            local now
+            now=$(date +%s)
+            local heartbeat_age=$((now - 10#$heartbeat_time))
+            emit_metric "heartbeat_age_seconds" "$heartbeat_age" "$heartbeat_age_help"
+
+            # Within the maximum age, and not from the future: a clock that was
+            # stepped back cannot vouch for recency.
+            local heartbeat_healthy=0
+            ((heartbeat_age >= 0 && heartbeat_age <= HEARTBEAT_MAX_AGE)) && heartbeat_healthy=1
+            emit_metric "heartbeat_healthy" "$heartbeat_healthy" "$heartbeat_healthy_help"
+            ;;
+        missing)
+            emit_metric "heartbeat_age_seconds" "-1" "$heartbeat_age_help"
+            emit_metric "heartbeat_healthy" "0" "$heartbeat_healthy_help"
+            ;;
+    esac
     return "$failed"
 }
 
