@@ -3201,6 +3201,19 @@ should_restart_stream() {
     return 1
 }
 
+# The ALSA check monitor_streams makes before it asks for a restart; logs why
+# a stream is not restarted. It runs BEFORE should_restart_stream, which charges
+# the restart budget: a detected card that cannot be opened used to burn
+# CRON_RESTART_MAX_PER_HOUR without any restart being attempted (X-04).
+monitor_card_available() {
+    local stream_path="$1" card_num="$2"
+    if check_alsa_device_available "$card_num"; then
+        return 0
+    fi
+    log WARN "Stream $stream_path: ALSA device not available (card $card_num), skipping restart"
+    return 1
+}
+
 # --- Deep health probe (H9) --------------------------------------------------
 # Ask the MediaMTX control API whether a path is actually publishing.
 # Returns: 0 = ready, 1 = not ready, 2 = unknown (curl absent/API unreachable).
@@ -3407,13 +3420,12 @@ monitor_streams() {
 
             # Check if PID file exists
             if [[ ! -f "$pid_file" ]]; then
+                # Before the restart budget is charged (X-04)
+                if ! monitor_card_available "$stream_path" "$card_num"; then
+                    ((streams_failed++)) || true
+                    continue
+                fi
                 if should_restart_stream "$stream_path"; then
-                    # v1.4.2: Check ALSA device availability before restart
-                    if ! check_alsa_device_available "$card_num"; then
-                        log WARN "Stream $stream_path: ALSA device not available (card $card_num), skipping restart"
-                        ((streams_failed++)) || true
-                        continue
-                    fi
                     log WARN "Stream $stream_path has no PID file - restarting"
                     if start_ffmpeg_stream "$device_name" "$card_num" "$stream_path"; then
                         ((streams_restarted++)) || true
@@ -3434,13 +3446,12 @@ monitor_streams() {
             pid="$(read_pid_safe "$pid_file")"
 
             if [[ -z "$pid" ]]; then
+                # Before the restart budget is charged (X-04)
+                if ! monitor_card_available "$stream_path" "$card_num"; then
+                    ((streams_failed++)) || true
+                    continue
+                fi
                 if should_restart_stream "$stream_path"; then
-                    # v1.4.2: Check ALSA device availability before restart
-                    if ! check_alsa_device_available "$card_num"; then
-                        log WARN "Stream $stream_path: ALSA device not available (card $card_num), skipping restart"
-                        ((streams_failed++)) || true
-                        continue
-                    fi
                     log WARN "Stream $stream_path PID is invalid - restarting"
                     if start_ffmpeg_stream "$device_name" "$card_num" "$stream_path"; then
                         ((streams_restarted++)) || true
@@ -3458,13 +3469,12 @@ monitor_streams() {
 
             # Verify the PID actually belongs to our wrapper
             if pid_is_foreign_wrapper "$pid" "$stream_path"; then
+                # Before the restart budget is charged (X-04)
+                if ! monitor_card_available "$stream_path" "$card_num"; then
+                    ((streams_failed++)) || true
+                    continue
+                fi
                 if should_restart_stream "$stream_path"; then
-                    # v1.4.2: Check ALSA device availability before restart
-                    if ! check_alsa_device_available "$card_num"; then
-                        log WARN "Stream $stream_path: ALSA device not available (card $card_num), skipping restart"
-                        ((streams_failed++)) || true
-                        continue
-                    fi
                     log WARN "Stream $stream_path PID $pid is stale - restarting"
                     rm -f "$pid_file"
                     if start_ffmpeg_stream "$device_name" "$card_num" "$stream_path"; then
@@ -3485,12 +3495,12 @@ monitor_streams() {
             # stays not-ready across consecutive checks while its wrapper is
             # alive is a hung FFmpeg or endless backoff -- restart it.
             if deep_stream_unhealthy "$stream_path"; then
+                # Before the restart budget is charged (X-04)
+                if ! monitor_card_available "$stream_path" "$card_num"; then
+                    ((streams_failed++)) || true
+                    continue
+                fi
                 if should_restart_stream "$stream_path"; then
-                    if ! check_alsa_device_available "$card_num"; then
-                        log WARN "Stream $stream_path: ALSA device not available (card $card_num), skipping restart"
-                        ((streams_failed++)) || true
-                        continue
-                    fi
                     log WARN "Stream $stream_path wrapper (PID $pid) is alive but path is not ready - restarting"
                     terminate_process_group "$pid" 5 || true
                     rm -f "$pid_file"

@@ -168,7 +168,7 @@ detect_audio_devices() {
     done
 }
 check_audio_device() { [[ -e "$HW/$1" ]]; }
-check_alsa_device_available() { [[ -e "$HW/$1" ]]; }
+check_alsa_device_available() { [[ -e "$HW/$1" && ! -e "$HW/busy-$1" ]]; }
 eval "$(declare -f start_all_ffmpeg_streams | sed "s#/dev/snd/#$HW/dev-snd/#g")"
 '
     export STAGE_STABILIZE='wait_for_usb_stabilization() { return 0; }'
@@ -196,6 +196,11 @@ device_add() {
 device_remove() {
     rm -f "$HW/$2" "$HW/dev-snd/controlC$1" "$HW/$1"
 }
+
+# card_unavailable CARD / card_available CARD: the card stays detected but ALSA
+# cannot open it (the device is busy, or its node is not usable yet)
+card_unavailable() { : >"$HW/busy-$1"; }
+card_available() { rm -f "$HW/busy-$1"; }
 
 # bad_card CARD: the capture of this card fails at once (a broken microphone)
 bad_card() {
@@ -231,6 +236,21 @@ pid_running() {
     local state
     state="$(awk '{print $3}' "/proc/$1/stat" 2>/dev/null || true)"
     [[ -n "$state" && "$state" != Z ]]
+}
+
+# mediamtx_stub_up: a running MediaMTX stand-in on the configured binary and
+# configuration file, recorded in the PID file by the real write_pid_atomic
+mediamtx_stub_up() {
+    local pid i want
+    "$MEDIAMTX_BINARY" "$MEDIAMTX_CONFIG_DIR/mediamtx.yml" </dev/null >/dev/null 2>&1 3>&- &
+    pid=$!
+    disown "$pid" 2>/dev/null || true
+    want="$(readlink -f "$MEDIAMTX_BINARY")"
+    for ((i = 0; i < 100; i++)); do
+        [[ "$(readlink "/proc/$pid/exe" 2>/dev/null || true)" == "$want" ]] && break
+        sleep 0.05
+    done
+    bash -c 'source "$PROJECT_ROOT/lyrebird-stream-manager.sh"; write_pid_atomic "$1" "$MEDIAMTX_PID_FILE"' _ "$pid"
 }
 
 # The PID recorded for a stream wrapper / for MediaMTX
