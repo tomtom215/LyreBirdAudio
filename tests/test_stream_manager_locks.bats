@@ -618,7 +618,9 @@ _force_stop_fixture() {
     run bash "$ROLE" eval 'force_stop_mediamtx; echo "rc=$? fd=$MAIN_LOCK_FD"'
     [ "$status" -eq 0 ]
     [[ "$output" == *"rc=0 fd="* ]]
-    [ -s "$LK/pkill.calls" ]
+    # force-stop no longer picks processes by pattern: it used to call pkill
+    # here, and this assertion expected that call (LB-10, D11)
+    [ ! -e "$LK/pkill.calls" ]
     [ ! -e "$LK/ff/mic1.pid" ]
     [ ! -e "$LK/ff/mic1.sh" ]
     [ ! -e "$LK/restart.marker" ]
@@ -639,7 +641,8 @@ _force_stop_fixture() {
     _stop_holder
     wait "$waiter"
     [ ! -e "$LK/ff/mic1.pid" ]
-    [ -s "$LK/pkill.calls" ]
+    # it went ahead without a pattern kill (see the test above)
+    [ ! -e "$LK/pkill.calls" ]
     grep -q 'force-stop done rc=0' "$LK/bg.1.out"
 }
 
@@ -770,20 +773,23 @@ _fds_on() {
     [ -z "$output" ]
 }
 
-# A MediaMTX stand-in the real start_mediamtx can launch. It names itself
-# "mediamtx" (the process-identity check accepts that comm) and, unlike a
-# background bash script, dies on SIGINT, which is how stop_mediamtx asks.
+# A MediaMTX stand-in the real start_mediamtx can launch. The manager signals a
+# process only when its executable is the configured binary and argv[1] is the
+# configuration file (LB-10, D11), so the stand-in is a copy of the bash binary
+# at the configured path: BASH_ENV makes that copy, and only that copy, wait
+# instead of running the configuration file as a script. It waits with bash
+# builtins and dies on SIGTERM, which is how stop_mediamtx asks.
 _write_mediamtx_stub() {
     mkdir -p "$LK/stub"
-    cat >"$LK/stub/mediamtx" <<'STUB_EOF'
-#!/bin/bash
-[[ "${1:-}" == --version ]] && { echo v1.21.1; exit 0; }
-exec python3 -I -c 'import ctypes, signal, time
-ctypes.CDLL(None).prctl(15, b"mediamtx", 0, 0, 0)
-signal.signal(signal.SIGINT, signal.SIG_DFL)
-time.sleep(300)'
+    cp "$(command -v bash)" "$LK/stub/mediamtx"
+    cat >"$LK/stub/prelude.sh" <<'STUB_EOF'
+if [[ "$BASH" == */stub/mediamtx ]]; then
+    exec {stub_fd}<>"$LB_IDLE_FIFO"
+    read -r -t 300 -u "$stub_fd" || true
+    exit 0
+fi
 STUB_EOF
-    chmod +x "$LK/stub/mediamtx"
+    export BASH_ENV="$LK/stub/prelude.sh"
     export MEDIAMTX_BINARY="$LK/stub/mediamtx"
 }
 

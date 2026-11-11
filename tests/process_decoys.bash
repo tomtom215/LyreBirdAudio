@@ -101,15 +101,19 @@ EOF
     # Guarded kill: log every call, refuse anything that is not a decoy.
     # shellcheck disable=SC2329  # shadows the kill builtin for the code under test
     kill() {
-        local arg pid=""
+        local arg pid="" probe=false
         for arg in "$@"; do
             case "$arg" in
+                -0) probe=true ;;
                 -*) ;;
                 *) pid="$arg" ;;
             esac
         done
         echo "kill $*" >>"$SIGNAL_LOG"
-        if [[ -n "$pid" ]] && ! decoy_registered "$pid"; then
+        # kill -0 sends no signal (it only asks whether the process exists), so
+        # it is allowed for any process: the code under test may probe a
+        # process it has itself started during the test
+        if [[ "$probe" == "false" && -n "$pid" ]] && ! decoy_registered "$pid"; then
             echo "REFUSED kill $*" >>"$SIGNAL_LOG"
             return 1
         fi
@@ -181,6 +185,29 @@ decoy_spawn() {
     disown "$pid" 2>/dev/null || true
     # Registered at once (with the start time, which does not change on exec)
     # so teardown cleans up even if the wait below fails.
+    echo "$label $pid $(decoy_starttime "$pid")" >>"$DECOY_REGISTRY"
+    want="$(readlink -f "$exe")"
+    for ((i = 0; i < 200; i++)); do
+        if [[ "$(readlink "/proc/$pid/exe" 2>/dev/null || true)" == "$want" ]]; then
+            return 0
+        fi
+        sleep 0.05
+    done
+    echo "decoy $label never reached its final image" >&2
+    return 1
+}
+
+# decoy_spawn_as LABEL ARGV0 EXE [ARG...]: decoy_spawn with a chosen argv[0], so
+# the process shows up as the bare command name an operator would type (for
+# example "ffmpeg"), which is what a name-based pattern such as
+# '^ffmpeg.*rtsp://' looks at. Its output goes to $DECOY_STDOUT when that is
+# set (a file it keeps open, as an FFmpeg keeps its log open), else nowhere.
+decoy_spawn_as() {
+    local label="$1" argv0="$2" exe="$3" want pid i
+    shift 3
+    (exec -a "$argv0" "$exe" "$@") </dev/null >>"${DECOY_STDOUT:-/dev/null}" 2>&1 3>&- &
+    pid=$!
+    disown "$pid" 2>/dev/null || true
     echo "$label $pid $(decoy_starttime "$pid")" >>"$DECOY_REGISTRY"
     want="$(readlink -f "$exe")"
     for ((i = 0; i < 200; i++)); do
