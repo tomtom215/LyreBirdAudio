@@ -261,15 +261,11 @@ jobs:
           echo "============================================"
 
           if [[ $errors -gt 0 ]]; then
-            echo "::warning::${errors} script(s) have formatting inconsistencies"
-            echo "Note: Format issues are warnings, not failures"
+            echo "::error::${errors} script(s) have formatting inconsistencies"
             echo "Run 'shfmt -w -i 4 -bn -ci <script>' to auto-fix"
-            # Don't fail the build for formatting - just warn
-            # Uncomment the next line to make formatting failures block PRs:
-            # exit 1
-          else
-            echo "All scripts are consistently formatted"
+            exit 1
           fi
+          echo "All scripts are consistently formatted"
 
   # ===========================================================================
   # Job 5: bashate Style Check
@@ -315,14 +311,10 @@ jobs:
           echo "============================================"
 
           if [[ $errors -gt 0 ]]; then
-            echo "::warning::bashate found style issues in ${errors} script(s)"
-            echo "Note: Style issues are warnings, not failures"
-            # Don't fail the build for style - just warn
-            # Uncomment the next line to make style failures block PRs:
-            # exit 1
-          else
-            echo "All scripts pass bashate style checks"
+            echo "::error::bashate found style issues in ${errors} script(s)"
+            exit 1
           fi
+          echo "All scripts pass bashate style checks"
 
   # ===========================================================================
   # Job 6: Security Scan (basic checks)
@@ -412,6 +404,8 @@ jobs:
           echo "4. Checking for unquoted command substitutions in dangerous commands..."
 
           # Look for rm/mv with unquoted $(...) - a real injection risk
+          # (the single-quoted '"$(' below is the text being searched for)
+          # shellcheck disable=SC2016
           unquoted_cmd=$(grep -rn --include='*.sh' -E '(rm|mv|cp)\s+-[rf]*\s+\$\(' . 2>/dev/null \
             | grep -v '"$(' \
             | grep -v '#' \
@@ -489,18 +483,20 @@ jobs:
 
       - name: Security Summary Report
         if: always()
+        env:
+          WARNING_COUNT: ${{ steps.security.outputs.warning_count }}
+          WARNING_LIST: ${{ steps.security.outputs.warning_list }}
         run: |
           {
             echo "## Security Scan Report"
             echo ""
-            echo "| Check | Status |"
-            echo "|-------|--------|"
-            echo "| Dangerous eval patterns | OK |"
-            echo "| Insecure downloads (-k/--insecure) | OK |"
-            echo "| World-writable permissions (777/666) | OK |"
-            echo "| Unquoted command substitutions | OK |"
-            echo "| Hardcoded secrets | OK |"
-            echo "| Predictable temp files | OK |"
+            if [[ -z "${WARNING_COUNT}" ]]; then
+              echo "The scan did not finish; see the step log."
+            elif [[ "${WARNING_COUNT}" == "0" ]]; then
+              echo "No pattern matched (eval, insecure downloads, world-writable chmod, unquoted command substitution in rm/mv/cp, hardcoded secrets, predictable temp files)."
+            else
+              echo "${WARNING_COUNT} pattern(s) matched: ${WARNING_LIST}. The step log lists the lines."
+            fi
             echo ""
             echo "_Note: This scan uses pattern matching and may have false positives/negatives._"
             echo "_ShellCheck provides more comprehensive variable quoting analysis._"
@@ -564,184 +560,81 @@ jobs:
 
   # ===========================================================================
   # Job 8: Final Summary
+  #
+  # The one check that says whether the pipeline passed. It needs EVERY job
+  # above (the advisory canary excepted: it is not a gate and is not listed)
+  # and fails unless each of them finished as "success": a failed, cancelled
+  # or skipped job all fail it. Make this job the required status check in
+  # branch protection.
   # ===========================================================================
   summary:
     name: CI Summary
     runs-on: ubuntu-latest
-    needs: [discover-scripts, bash-syntax, shellcheck, shfmt, bashate, security-scan, bats-tests, live-mediamtx]
+    needs:
+      - discover-scripts
+      - bash-syntax
+      - shellcheck
+      - shfmt
+      - bashate
+      - security-scan
+      - bats-tests
+      - live-mediamtx
     if: always()
+    env:
+      NEEDS_JSON: ${{ toJSON(needs) }}
+      SCRIPT_COUNT: ${{ needs.discover-scripts.outputs.script_count }}
     steps:
-      - name: Generate Comprehensive Summary
+      - name: Report job results
         run: |
           {
-            # Header
             echo "# Bash CI Pipeline Results"
             echo ""
-            echo "---"
+            echo "Every job below is required: the pipeline passes only if all of them succeed."
             echo ""
-
-            # Overall Status
-            echo "## Overall Status"
+            echo "| Job | Result |"
+            echo "|-----|--------|"
+            jq -r 'to_entries[] | "| \(.key) | \(.value.result) |"' <<<"$NEEDS_JSON"
             echo ""
-
-            # Determine overall result
-            if [[ "${{ needs.bash-syntax.result }}" == "success" && "${{ needs.shellcheck.result }}" == "success" && "${{ needs.bats-tests.result }}" == "success" && "${{ needs.live-mediamtx.result }}" == "success" ]]; then
-              echo "### All Required Checks Passed"
-            else
-              echo "### Required Checks Failed"
-            fi
+            echo "## Tools"
             echo ""
-
-            # Results Table
-            echo "## Check Results"
-            echo ""
-            echo "| Check | Type | Status | Description |"
-            echo "|-------|------|--------|-------------|"
-            echo "| **Bash Syntax** | Required | ${{ needs.bash-syntax.result == 'success' && 'Passed' || 'Failed' }} | Validates script syntax with \`bash -n\` |"
-            echo "| **ShellCheck** | Required | ${{ needs.shellcheck.result == 'success' && 'Passed' || 'Failed' }} | Static analysis for bugs and issues |"
-            echo "| **Bats Tests** | Required | ${{ needs.bats-tests.result == 'success' && 'Passed' || 'Failed' }} | Unit and regression test suite |"
-            echo "| **Live MediaMTX** | Required | ${{ needs.live-mediamtx.result == 'success' && 'Passed' || 'Failed' }} | Stream manager, soak harness and observer against real MediaMTX 1.15.0-1.21.1 |"
-            echo "| **shfmt** | Advisory | ${{ needs.shfmt.result == 'success' && 'Passed' || 'Warnings' }} | Code formatting consistency |"
-            echo "| **bashate** | Advisory | ${{ needs.bashate.result == 'success' && 'Passed' || 'Warnings' }} | OpenStack style guidelines |"
-            echo "| **Security** | Advisory | ${{ needs.security-scan.result == 'success' && 'Passed' || 'Warnings' }} | Security anti-pattern detection |"
-            echo ""
-
-            # Legend
-            echo "<details>"
-            echo "<summary>Check Type Legend</summary>"
-            echo ""
-            echo "| Type | Meaning |"
+            echo "| Tool | Version |"
             echo "|------|---------|"
-            echo "| Required | Must pass for PR to be merged |"
-            echo "| Advisory | Informational only, does not block merge |"
+            echo "| ShellCheck | ${SHELLCHECK_VERSION} |"
+            echo "| shfmt | ${SHFMT_VERSION} |"
             echo ""
-            echo "</details>"
+            echo "## Reproduce locally"
             echo ""
-
-            echo "---"
+            echo '```bash'
+            echo "bash -n script.sh"
+            echo "shellcheck --format=gcc --severity=warning --external-sources --shell=bash script.sh"
+            echo "shfmt -d -i 4 -bn -ci script.sh        # fix with: shfmt -w -i 4 -bn -ci script.sh"
+            echo "bashate --ignore E001,E006,E040,E042,E043 script.sh"
+            echo "tests/check_tmp_leaks.sh               # the whole bats suite"
+            echo '```'
             echo ""
-
-            # Tool Information
-            echo "## Tools & Versions"
-            echo ""
-            echo "| Tool | Version | Purpose |"
-            echo "|------|---------|---------|"
-            echo "| \`bash -n\` | System | Syntax validation |"
-            echo "| [ShellCheck](https://github.com/koalaman/shellcheck) | ${{ env.SHELLCHECK_VERSION }} | Static analysis |"
-            echo "| [shfmt](https://github.com/mvdan/sh) | ${{ env.SHFMT_VERSION }} | Formatting |"
-            echo "| [bashate](https://github.com/openstack/bashate) | Latest | Style checking |"
-            echo ""
-
-            echo "---"
-            echo ""
-
-            # What Gets Checked
-            echo "## What's Being Checked"
-            echo ""
-            echo "### Required Checks (blocking)"
-            echo ""
-            echo "1. **Bash Syntax (\`bash -n\`)** - Ensures all scripts are syntactically valid"
-            echo "2. **ShellCheck** - Catches:"
-            echo "   - Unquoted variables that may cause word splitting"
-            echo "   - Deprecated syntax and bashisms"
-            echo "   - Common scripting bugs and pitfalls"
-            echo "   - Potential security issues"
-            echo ""
-            echo "### Advisory Checks (non-blocking)"
-            echo ""
-            echo "3. **shfmt** - Checks formatting consistency:"
-            echo "   - 4-space indentation"
-            echo "   - Binary operators at start of line"
-            echo "   - Case statement indentation"
-            echo ""
-            echo "4. **bashate** - OpenStack style guidelines"
-            echo ""
-            echo "5. **Security Scan** - Pattern-based detection of:"
-            echo "   - Dangerous \`eval\` usage"
-            echo "   - Insecure download flags (\`-k\`, \`--insecure\`)"
-            echo "   - World-writable permissions (777/666)"
-            echo "   - Unquoted command substitutions"
-            echo "   - Hardcoded secrets"
-            echo "   - Predictable temp file names"
-            echo ""
-
-            echo "---"
-            echo ""
-
-            # Quick Fix Guide
-            echo "## Quick Fix Guide"
-            echo ""
-            echo "<details>"
-            echo "<summary>How to fix common issues</summary>"
-            echo ""
-            echo "### Bash Syntax Errors"
-            echo "\`\`\`bash"
-            echo "# Check syntax locally:"
-            echo "bash -n your-script.sh"
-            echo "\`\`\`"
-            echo ""
-            echo "### ShellCheck Issues"
-            echo "\`\`\`bash"
-            echo "# Run shellcheck locally:"
-            echo "shellcheck your-script.sh"
-            echo ""
-            echo "# Or install via package manager:"
-            echo "# Ubuntu/Debian: apt install shellcheck"
-            echo "# macOS: brew install shellcheck"
-            echo "\`\`\`"
-            echo ""
-            echo "### Format Issues (shfmt)"
-            echo "\`\`\`bash"
-            echo "# Auto-fix formatting:"
-            echo "shfmt -w -i 4 -bn -ci your-script.sh"
-            echo ""
-            echo "# Check without modifying:"
-            echo "shfmt -d -i 4 -bn -ci your-script.sh"
-            echo "\`\`\`"
-            echo ""
-            echo "</details>"
-            echo ""
-
-            echo "---"
-            echo ""
-            echo "_Generated by Bash CI Pipeline • Scripts analyzed: ${{ needs.discover-scripts.outputs.script_count }}_"
-
+            echo "_Scripts analyzed: ${SCRIPT_COUNT}_"
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Check required jobs
+      - name: Require every job to succeed
         run: |
-          echo "Checking required job results..."
-          echo ""
-
           failed=0
+          count=0
+          while IFS=$'\t' read -r job result; do
+            count=$((count + 1))
+            if [[ "$result" == "success" ]]; then
+              echo "PASS  ${job}"
+            else
+              echo "::error::${job} finished as '${result}' (required: success)"
+              failed=1
+            fi
+          done < <(jq -r 'to_entries[] | [.key, .value.result] | @tsv' <<<"$NEEDS_JSON")
 
-          if [[ "${{ needs.bash-syntax.result }}" != "success" ]]; then
-            echo "::error::Bash syntax validation failed"
-            failed=1
-          else
-            echo "Bash syntax: passed"
-          fi
-
-          if [[ "${{ needs.shellcheck.result }}" != "success" ]]; then
-            echo "::error::ShellCheck found errors or warnings"
-            failed=1
-          else
-            echo "ShellCheck: passed"
-          fi
-
-          if [[ "${{ needs.bats-tests.result }}" != "success" ]]; then
-            echo "::error::Bats test suite failed"
-            failed=1
-          else
-            echo "Bats tests: passed"
-          fi
-
-          echo ""
-          if [[ $failed -eq 1 ]]; then
-            echo "::error::One or more required checks failed. Please fix the issues above."
+          if [[ $count -eq 0 ]]; then
+            echo "::error::no job results were available to check"
             exit 1
           fi
-
-          echo "============================================"
-          echo "🎉 All required checks passed!"
-          echo "============================================"
+          if [[ $failed -ne 0 ]]; then
+            echo "::error::One or more required jobs did not succeed."
+            exit 1
+          fi
+          echo "All ${count} required jobs succeeded."

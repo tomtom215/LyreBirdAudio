@@ -294,3 +294,119 @@ SH
     [ "$status" -eq 0 ]
     grep -qF '| FAIL ./a.sh | 1 | 1 | 1 |' "$TEST_SCRATCH/summary.md"
 }
+
+# ---------------------------------------------------------------------------
+# Required checks: the summary job gates on every job, and the format and
+# style linters block.
+# ---------------------------------------------------------------------------
+
+# fake_tool NAME: a stand-in for a linter that, like the real shfmt -d and
+# bashate, exits 1 for a file whose text contains UNFORMATTED and 0 otherwise.
+fake_tool() {
+    mkdir -p "$TEST_SCRATCH/bin"
+    cat >"$TEST_SCRATCH/bin/$1" <<'SH'
+#!/bin/bash
+file="${*: -1}"
+if grep -q UNFORMATTED "$file"; then
+    echo "finding in $file"
+    exit 1
+fi
+SH
+    chmod +x "$TEST_SCRATCH/bin/$1"
+}
+
+@test "bash-ci summary needs every other job, so none can fail or be skipped unnoticed" {
+    load_wf bash-ci
+    run jq -e '
+        ([.jobs | to_entries[] | select(.key != "summary" and (.value["continue-on-error"] != true)) | .key] | sort) as $all
+        | ([.jobs.summary.needs[]] | sort) as $needed
+        | ($needed | length) == ($needed | unique | length)
+        and $needed == $all
+        and (.jobs.summary["if"] == "always()")' <<<"$WF"
+    [ "$status" -eq 0 ]
+    # The jobs the register names are all there.
+    run jq -e '[.jobs.summary.needs[]] as $n
+        | ["discover-scripts", "bash-syntax", "shellcheck", "shfmt", "bashate",
+           "security-scan", "bats-tests", "live-mediamtx"] | all(. as $j | $n | index($j) != null)' <<<"$WF"
+    [ "$status" -eq 0 ]
+}
+
+@test "bash-ci summary fails unless every needed job succeeded: failure, cancelled, skipped and an empty result all fail" {
+    load_wf bash-ci
+    run_step summary "Require every job to succeed" \
+        'NEEDS_JSON={"a":{"result":"success"},"b":{"result":"success"}}'
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"All 2 required jobs succeeded"* ]]
+
+    local bad
+    for bad in failure cancelled skipped ""; do
+        run_step summary "Require every job to succeed" \
+            "NEEDS_JSON={\"a\":{\"result\":\"success\"},\"live\":{\"result\":\"$bad\"}}"
+        [ "$status" -ne 0 ] || {
+            echo "a job that finished as '$bad' passed the summary"
+            return 1
+        }
+        [[ "$output" == *"::error::live finished as '$bad'"* ]]
+    done
+
+    run_step summary "Require every job to succeed" 'NEEDS_JSON={}'
+    [ "$status" -ne 0 ]
+}
+
+@test "bash-ci summary report lists every needed job with its result" {
+    load_wf bash-ci
+    run_step summary "Report job results" \
+        'NEEDS_JSON={"shellcheck":{"result":"success"},"live-mediamtx":{"result":"failure"}}' \
+        SCRIPT_COUNT=7 GITHUB_STEP_SUMMARY="$TEST_SCRATCH/summary.md"
+    [ "$status" -eq 0 ]
+    grep -qF '| shellcheck | success |' "$TEST_SCRATCH/summary.md"
+    grep -qF '| live-mediamtx | failure |' "$TEST_SCRATCH/summary.md"
+    grep -qF 'Scripts analyzed: 7' "$TEST_SCRATCH/summary.md"
+}
+
+@test "bash-ci shfmt job fails when a script is not formatted, and passes when all are" {
+    load_wf bash-ci
+    fake_tool shfmt
+    mkdir "$TEST_SCRATCH/repo"
+    cd "$TEST_SCRATCH/repo"
+    echo ok >good.sh
+    run_step shfmt "Check formatting with shfmt" PATH="$TEST_SCRATCH/bin:$PATH"
+    [ "$status" -eq 0 ]
+
+    echo UNFORMATTED >bad.sh
+    run_step shfmt "Check formatting with shfmt" PATH="$TEST_SCRATCH/bin:$PATH"
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"::error::1 script(s) have formatting inconsistencies"* ]]
+}
+
+@test "bash-ci bashate job fails when a script has style findings, and passes when none has" {
+    load_wf bash-ci
+    fake_tool bashate
+    mkdir "$TEST_SCRATCH/repo"
+    cd "$TEST_SCRATCH/repo"
+    echo ok >good.sh
+    run_step bashate "Run bashate style check" PATH="$TEST_SCRATCH/bin:$PATH"
+    [ "$status" -eq 0 ]
+
+    echo UNFORMATTED >bad.sh
+    run_step bashate "Run bashate style check" PATH="$TEST_SCRATCH/bin:$PATH"
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"::error::bashate found style issues in 1 script(s)"* ]]
+}
+
+@test "bash-ci security report states what the scan found instead of a fixed OK table" {
+    load_wf bash-ci
+    run_step security-scan "Security Summary Report" \
+        WARNING_COUNT=2 'WARNING_LIST=Dangerous eval patterns found Hardcoded secrets' \
+        GITHUB_STEP_SUMMARY="$TEST_SCRATCH/summary.md"
+    [ "$status" -eq 0 ]
+    grep -qF '2 pattern(s) matched: Dangerous eval patterns found Hardcoded secrets' "$TEST_SCRATCH/summary.md"
+    if grep -q '| OK |' "$TEST_SCRATCH/summary.md"; then
+        echo "the report still contains a fixed OK table"
+        return 1
+    fi
+
+    run_step security-scan "Security Summary Report" \
+        WARNING_COUNT=0 WARNING_LIST=None GITHUB_STEP_SUMMARY="$TEST_SCRATCH/summary.md"
+    grep -qF 'No pattern matched' "$TEST_SCRATCH/summary.md"
+}
