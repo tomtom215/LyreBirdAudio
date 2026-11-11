@@ -7,7 +7,7 @@
 # Copyright: Tom F and LyreBirdAudio contributors
 # License: Apache 2.0
 #
-# Version: 1.0.1
+# Version: 1.1.0
 #
 # DESCRIPTION:
 #   Pure-bash webhook alerting system for remote monitoring of LyreBirdAudio
@@ -16,9 +16,10 @@
 #
 # FEATURES:
 #   - Webhook alerts (Discord, Slack, ntfy, generic HTTP POST)
-#   - Rate limiting to prevent alert spam
-#   - Alert deduplication within configurable window
-#   - Multiple webhook destinations
+#   - Per-destination delivery de-duplication: an identical alert (same type
+#     and message) is not sent again to a destination that has already
+#     confirmed it within LYREBIRD_ALERT_RATE_LIMIT seconds
+#   - Multiple webhook destinations, each tracked and retried independently
 #   - Customizable alert templates
 #   - No external dependencies beyond curl (already required)
 #
@@ -41,6 +42,8 @@
 #   LYREBIRD_WEBHOOK_URL="https://your-webhook-url"
 #   LYREBIRD_WEBHOOK_TYPE="generic"  # generic, discord, slack, ntfy
 #   LYREBIRD_ALERT_RATE_LIMIT=60     # Minimum seconds between same alerts
+#   LYREBIRD_ALERT_DEDUP_WINDOW=3600 # How long delivery state is kept (the
+#                                    # larger of this and RATE_LIMIT applies)
 #   LYREBIRD_ALERT_ENABLED=true
 #
 # SUPPORTED WEBHOOK TYPES:
@@ -50,12 +53,16 @@
 #   - ntfy:     ntfy.sh notification service
 #   - pushover: Pushover notification service
 #
-# EXIT CODES:
-#   0 - Success
+# EXIT CODES (send_alert return status and `send` exit status):
+#   0 - Delivered: every destination that needed the alert received it
+#       (destinations that already had it within the window are not re-sent)
 #   1 - General error
 #   2 - Configuration error
-#   3 - Webhook delivery failed
-#   4 - Rate limited (not an error, alert suppressed)
+#   3 - Total failure: no destination holds the alert, at least one failed
+#   4 - Suppressed (not an error): every destination already has this alert
+#       within the rate-limit window, or another sender is delivering it now
+#   5 - Partial failure: at least one destination has the alert and at least
+#       one failed; the next identical alert retries only the failed ones
 
 set -euo pipefail
 
@@ -64,7 +71,7 @@ set -euo pipefail
 #=============================================================================
 
 readonly SCRIPT_NAME="lyrebird-alerts"
-readonly SCRIPT_VERSION="1.0.1"
+readonly SCRIPT_VERSION="1.1.0"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly SCRIPT_DIR
 
@@ -87,6 +94,22 @@ else
     log_warn() { echo "[WARN] $*" >&2; }
     log_error() { echo "[ERROR] $*" >&2; }
     log_debug() { [[ "${DEBUG:-false}" == "true" ]] && echo "[DEBUG] $*"; }
+fi
+
+# Delivery stamps are replaced atomically. If the common library is missing, or is an
+# older copy without lyrebird_atomic_write, use the same-directory temp file + rename
+# part of it (no fsync) so a reader still never sees a half-written stamp.
+if ! declare -F lyrebird_atomic_write >/dev/null 2>&1; then
+    lyrebird_atomic_write() {
+        local dest="${1:?lyrebird_atomic_write: destination required}"
+        local mode="${2:-0644}"
+        local tmp
+        tmp="$(mktemp "$(dirname -- "$dest")/.$(basename -- "$dest").XXXXXX")" || return 1
+        if ! cat >"$tmp" || ! chmod "$mode" -- "$tmp" || ! mv -f -- "$tmp" "$dest"; then
+            rm -f -- "$tmp"
+            return 1
+        fi
+    }
 fi
 
 #=============================================================================
@@ -156,6 +179,13 @@ declare -gA ALERT_PREFIX=(
     [error]="[ERROR]"
     [critical]="[CRITICAL]"
 )
+
+# send_alert return statuses (see EXIT CODES in the header). Callers that source this
+# script can compare against these instead of the literal numbers.
+readonly ALERT_RC_DELIVERED=0
+readonly ALERT_RC_FAILED=3
+readonly ALERT_RC_SUPPRESSED=4
+readonly ALERT_RC_PARTIAL=5
 
 # Get alert prefix for level
 get_alert_prefix() {
@@ -290,24 +320,89 @@ generate_alert_hash() {
     fi
 }
 
-# Check if alert should be rate limited
+#=============================================================================
+# Delivery State (rate limit, de-duplication and claims)
+#=============================================================================
+#
+# State is kept per (alert, destination). An alert is identified by a hash of its
+# type and message (generate_alert_hash), a destination by a hash of its type,
+# endpoint and credentials (generate_destination_id): no URL or token is ever
+# written to disk. Files in LYREBIRD_ALERT_STATE_DIR:
+#
+#   <alert>.<destination>.last   epoch second at which THAT destination confirmed
+#                                delivery (HTTP 2xx). Replaced atomically and only
+#                                after the confirmation, so a destination that failed
+#                                has no stamp and the next identical alert retries it,
+#                                while destinations that succeeded are not re-sent.
+#   <alert>.<destination>.lock   claim lock. A sender holds an flock on it from before
+#                                the first request until it has recorded the result, so
+#                                concurrent identical alerts send once per destination.
+#                                The kernel drops the lock when the holder dies; there
+#                                is no staleness heuristic. Never written, only locked.
+#   .claim.guard                 held for microseconds while a claim file is opened and
+#                                locked, and by cleanup_state while it removes unheld
+#                                claim files, so that removal cannot split a lock across
+#                                two inodes. Never held while sending.
+
+readonly ALERT_GUARD_WAIT=5
+# FD of the claim currently held by this process (empty when none).
+_ALERT_CLAIM_FD=""
+_ALERT_GUARD_FD=""
+
+# Print VALUE as a plain unsigned integer, or DEFAULT when it is not one.
+_alert_uint() {
+    local value="$1" default="$2"
+    if [[ "$value" =~ ^[0-9]{1,9}$ ]]; then
+        printf '%s' "$((10#$value))"
+    else
+        printf '%s' "$default"
+    fi
+}
+
+# Identify a destination without exposing it: a short hash of its type, endpoint and,
+# for Pushover, the token and user key.
+# Usage: generate_destination_id <type> <endpoint> [<secret>]
+generate_destination_id() {
+    local type="$1" endpoint="$2" secret="${3:-}"
+    generate_alert_hash "destination" "${type}|${endpoint}|${secret}"
+}
+
+# Path of the stamp file for an (alert, destination) pair.
+alert_stamp_file() {
+    printf '%s/%s.%s.last' "$ALERT_STATE_DIR" "$1" "$2"
+}
+
+# Print the epoch second recorded in a stamp file. Fails, printing nothing, when the file
+# is absent, unreadable, empty, torn or holds anything but a plain number.
+read_delivery_stamp() {
+    local file="$1" value=""
+    [[ -f "$file" ]] || return 1
+    { IFS= read -r value || true; } 2>/dev/null <"$file" || return 1
+    [[ "$value" =~ ^[0-9]{1,12}$ ]] || return 1
+    printf '%s' "$((10#$value))"
+}
+
+# Is <destination> still inside the rate-limit window for <alert>?
+# Returns 0 (rate limited) when that destination confirmed delivery of this alert less
+# than LYREBIRD_ALERT_RATE_LIMIT seconds ago; 1 when the alert may be sent: no stamp, an
+# expired one, or one that cannot be trusted (empty, torn, not a number, dated in the
+# future). A duplicate alert is better than a lost one.
+# Usage: is_rate_limited <alert_hash> <destination_id>
 is_rate_limited() {
-    local alert_hash="$1"
-    local rate_limit="${LYREBIRD_ALERT_RATE_LIMIT}"
-    local state_file="${ALERT_STATE_DIR}/${alert_hash}.last"
+    local alert_hash="$1" dest_id="$2"
+    local rate_limit last_sent now elapsed
+
+    rate_limit="$(_alert_uint "${LYREBIRD_ALERT_RATE_LIMIT}" 300)"
 
     ensure_state_dir || return 1 # Not rate limited if we can't check
+    last_sent="$(read_delivery_stamp "$(alert_stamp_file "$alert_hash" "$dest_id")")" || return 1
 
-    if [[ ! -f "$state_file" ]]; then
-        return 1 # Not rate limited
+    now="$(date +%s)"
+    elapsed=$((now - last_sent))
+    if ((elapsed < 0)); then
+        log_debug "Ignoring a delivery stamp dated in the future"
+        return 1
     fi
-
-    local last_sent
-    last_sent=$(cat "$state_file" 2>/dev/null || echo 0)
-    local now
-    now=$(date +%s)
-    local elapsed=$((now - last_sent))
-
     if ((elapsed < rate_limit)); then
         log_debug "Alert rate limited: ${elapsed}s since last (limit: ${rate_limit}s)"
         return 0 # Rate limited
@@ -316,28 +411,123 @@ is_rate_limited() {
     return 1 # Not rate limited
 }
 
-# Update rate limit state
+# Record that <destination> confirmed delivery of <alert> now. Atomic: a concurrent
+# reader or a crash sees the old stamp or the new one, never a partial file.
+# Usage: update_rate_limit <alert_hash> <destination_id>
 update_rate_limit() {
-    local alert_hash="$1"
-    local state_file="${ALERT_STATE_DIR}/${alert_hash}.last"
+    local alert_hash="$1" dest_id="$2"
 
     ensure_state_dir || return 1
-    date +%s >"$state_file" 2>/dev/null || true
+    date +%s | lyrebird_atomic_write "$(alert_stamp_file "$alert_hash" "$dest_id")"
+}
+
+# Take the claim guard; its FD number is left in _ALERT_GUARD_FD.
+_alert_guard_acquire() {
+    _ALERT_GUARD_FD=""
+    { exec {_ALERT_GUARD_FD}>>"${ALERT_STATE_DIR}/.claim.guard"; } 2>/dev/null || return 1
+    if ! flock -w "$ALERT_GUARD_WAIT" "$_ALERT_GUARD_FD" 2>/dev/null; then
+        exec {_ALERT_GUARD_FD}>&-
+        return 1
+    fi
+}
+
+_alert_guard_release() {
+    exec {_ALERT_GUARD_FD}>&-
+    _ALERT_GUARD_FD=""
+}
+
+# Claim <destination> for <alert> before sending to it.
+# Returns 0 when claimed (the lock FD stays open in _ALERT_CLAIM_FD until alert_release),
+# 1 when another process holds the claim (it is delivering this alert right now), and 2
+# when claiming is impossible (state directory unusable, flock missing or failing); the
+# caller then sends without the claim: a duplicate alert is better than a lost one.
+# Usage: alert_claim <alert_hash> <destination_id>
+alert_claim() {
+    local alert_hash="$1" dest_id="$2"
+    local lock_fd="" rc=0
+    _ALERT_CLAIM_FD=""
+
+    ensure_state_dir || return 2
+    _alert_guard_acquire || return 2
+
+    if { exec {lock_fd}>>"${ALERT_STATE_DIR}/${alert_hash}.${dest_id}.lock"; } 2>/dev/null; then
+        # 200 = somebody else holds it; anything else non-zero is a flock failure.
+        flock -n -E 200 "$lock_fd" 2>/dev/null || rc=$?
+    else
+        rc=70
+    fi
+    _alert_guard_release
+
+    case "$rc" in
+        0)
+            _ALERT_CLAIM_FD="$lock_fd"
+            return 0
+            ;;
+        200)
+            exec {lock_fd}>&-
+            return 1
+            ;;
+        *)
+            if [[ -n "$lock_fd" ]]; then
+                exec {lock_fd}>&-
+            fi
+            return 2
+            ;;
+    esac
+}
+
+# Drop the claim taken by alert_claim (a no-op when none is held).
+alert_release() {
+    if [[ -n "${_ALERT_CLAIM_FD:-}" ]]; then
+        exec {_ALERT_CLAIM_FD}>&-
+        _ALERT_CLAIM_FD=""
+    fi
+}
+
+# Close the claim FD in the CURRENT process. Called first thing inside every subshell
+# that runs a long-lived command (curl, sleep): neither the subshell nor the command may
+# keep the claim alive after the sender itself has died. The sender's own copy stays open.
+_alert_drop_claim() {
+    if [[ -n "${_ALERT_CLAIM_FD:-}" ]]; then
+        exec {_ALERT_CLAIM_FD}>&-
+    fi
+}
+
+# Remove claim files older than MINUTES that nobody holds. Taken under the claim guard,
+# so a claimant cannot open a file between the lock test and the unlink.
+_alert_reap_locks() {
+    local minutes="$1" lock fd
+    _alert_guard_acquire || return 0
+    while IFS= read -r -d '' lock; do
+        fd=""
+        if { exec {fd}<"$lock"; } 2>/dev/null; then
+            if flock -n "$fd" 2>/dev/null; then
+                rm -f -- "$lock"
+            fi
+            exec {fd}>&-
+        fi
+    done < <(find "$ALERT_STATE_DIR" -maxdepth 1 -name '*.lock' -mmin "+${minutes}" -print0 2>/dev/null)
+    _alert_guard_release
 }
 
 # Clean old state files.
 # State is what enforces the rate limit, so it must outlive LYREBIRD_ALERT_RATE_LIMIT:
 # the retention is the larger of that and LYREBIRD_ALERT_DEDUP_WINDOW, rounded UP to
 # whole minutes (find -mmin compares in minutes, and rounding down would delete a stamp
-# before its rate-limit window has elapsed).
+# before its rate-limit window has elapsed). Besides stamps this removes the ".<stamp>.XXXXXX"
+# temp file a killed writer can leave behind and claim files nobody holds.
 cleanup_state() {
-    local dedup_window="${LYREBIRD_ALERT_DEDUP_WINDOW}"
-    local rate_limit="${LYREBIRD_ALERT_RATE_LIMIT}"
-    local retain=$((dedup_window > rate_limit ? dedup_window : rate_limit))
+    local dedup_window rate_limit retain minutes
+    dedup_window="$(_alert_uint "${LYREBIRD_ALERT_DEDUP_WINDOW}" 3600)"
+    rate_limit="$(_alert_uint "${LYREBIRD_ALERT_RATE_LIMIT}" 300)"
+    retain=$((dedup_window > rate_limit ? dedup_window : rate_limit))
+    minutes=$(((retain + 59) / 60))
 
     ensure_state_dir || return 0
 
-    find "$ALERT_STATE_DIR" -name "*.last" -mmin "+$(((retain + 59) / 60))" -delete 2>/dev/null || true
+    find "$ALERT_STATE_DIR" -maxdepth 1 \( -name '*.last' -o -name '.*.last.??????' \) \
+        -mmin "+${minutes}" -delete 2>/dev/null || true
+    _alert_reap_locks "$minutes"
 }
 
 #=============================================================================
@@ -588,30 +778,39 @@ send_webhook() {
 
                     # --data-raw (not -d): a message beginning with "@" must be
                     # sent literally, not interpreted by curl as a filename.
-                    http_code=$(curl "${curl_args[@]}" \
-                        -H "Title: ${title}" \
-                        -H "Priority: ${priority}" \
-                        -H "Tags: lyrebird" \
-                        --data-raw "${message}" \
-                        "$ntfy_url" 2>/dev/null) || http_code="000"
+                    http_code=$(
+                        _alert_drop_claim
+                        curl "${curl_args[@]}" \
+                            -H "Title: ${title}" \
+                            -H "Priority: ${priority}" \
+                            -H "Tags: lyrebird" \
+                            --data-raw "${message}" \
+                            "$ntfy_url" 2>/dev/null
+                    ) || http_code="000"
                 else
                     log_error "Invalid ntfy payload format"
                     return 1
                 fi
                 ;;
             pushover)
-                http_code=$(curl "${curl_args[@]}" \
-                    -X POST \
-                    -d "$payload" \
-                    "https://api.pushover.net/1/messages.json" 2>/dev/null) || http_code="000"
+                http_code=$(
+                    _alert_drop_claim
+                    curl "${curl_args[@]}" \
+                        -X POST \
+                        -d "$payload" \
+                        "https://api.pushover.net/1/messages.json" 2>/dev/null
+                ) || http_code="000"
                 ;;
             *)
                 # Generic, Discord, Slack all use JSON POST
-                http_code=$(curl "${curl_args[@]}" \
-                    -X POST \
-                    -H "Content-Type: application/json" \
-                    -d "$payload" \
-                    "$webhook_url" 2>/dev/null) || http_code="000"
+                http_code=$(
+                    _alert_drop_claim
+                    curl "${curl_args[@]}" \
+                        -X POST \
+                        -H "Content-Type: application/json" \
+                        -d "$payload" \
+                        "$webhook_url" 2>/dev/null
+                ) || http_code="000"
                 ;;
         esac
 
@@ -627,7 +826,10 @@ send_webhook() {
         if ((attempt < retries)); then
             local delay=$(((attempt * 2) + (RANDOM % 3)))
             log_debug "Webhook failed, retrying in ${delay}s..."
-            sleep "$delay"
+            (
+                _alert_drop_claim
+                exec sleep "$delay"
+            )
         fi
     done
 
@@ -684,24 +886,15 @@ send_alert() {
         return 0
     fi
 
-    # Generate deduplication hash
+    # Identify the alert (type + message). State is kept per destination, so the
+    # per-destination decisions below are all keyed by this hash and a destination id.
     local alert_hash
     alert_hash=$(generate_alert_hash "$alert_type" "$message")
-
-    # Check rate limiting
-    if is_rate_limited "$alert_hash"; then
-        log_debug "Alert rate limited: ${alert_type}"
-        log_alert "$level" "[RATE LIMITED] ${message}"
-        return 4
-    fi
-
-    # Log the alert
-    log_alert "$level" "${message}"
 
     # Build list of webhooks to send to. ntfy/Pushover get an entry from their own
     # config vars even when LYREBIRD_WEBHOOK_URL is empty -- send_webhook builds
     # the real endpoint for those types, so the URL field here is unused for them.
-    local webhooks=()
+    local webhooks=() url
     case "${LYREBIRD_WEBHOOK_TYPE}" in
         ntfy)
             [[ -n "${LYREBIRD_NTFY_TOPIC}" ]] \
@@ -724,14 +917,58 @@ send_alert() {
         done
     fi
 
-    # Send to all configured webhooks
-    local sent=0 failed=0
+    if ((${#webhooks[@]} == 0)); then
+        log_error "Alert not sent: no usable destination (check the webhook type and its settings)"
+        return "$ALERT_RC_FAILED"
+    fi
+
+    # Deliver to every destination independently. Per destination:
+    #   - skip it when it already confirmed this alert inside the rate-limit window;
+    #   - claim it (flock) BEFORE sending, so identical alerts racing each other send
+    #     once; a destination another process is delivering to right now is skipped;
+    #   - record the delivery only after the destination confirmed it, so a failed
+    #     destination is retried by the next identical alert and the others are not.
+    local delivered=0 failed=0 already=0 inflight=0 logged=0
+    local webhook_spec type dest_id dest_secret claim_rc payload
     for webhook_spec in "${webhooks[@]}"; do
-        local url="${webhook_spec%:*}"
-        local type="${webhook_spec##*:}"
+        url="${webhook_spec%:*}"
+        type="${webhook_spec##*:}"
+        dest_secret=""
+        if [[ "$type" == "pushover" ]]; then
+            dest_secret="${LYREBIRD_PUSHOVER_TOKEN}|${LYREBIRD_PUSHOVER_USER}"
+        fi
+        dest_id="$(generate_destination_id "$type" "$url" "$dest_secret")"
+
+        if is_rate_limited "$alert_hash" "$dest_id"; then
+            already=$((already + 1))
+            log_debug "Alert already delivered to destination ${dest_id}: ${alert_type}"
+            continue
+        fi
+
+        claim_rc=0
+        alert_claim "$alert_hash" "$dest_id" || claim_rc=$?
+        if ((claim_rc == 1)); then
+            inflight=$((inflight + 1))
+            log_debug "Alert is being delivered to destination ${dest_id} by another process: ${alert_type}"
+            continue
+        elif ((claim_rc == 2)); then
+            log_warn "Cannot claim destination ${dest_id} (state directory or flock unusable); sending without duplicate protection"
+        fi
+
+        # Another sender may have finished between the check above and the claim.
+        if is_rate_limited "$alert_hash" "$dest_id"; then
+            alert_release
+            already=$((already + 1))
+            continue
+        fi
+
+        # Log the alert (once per call, before the first request goes out)
+        if ((logged == 0)); then
+            log_alert "$level" "${message}"
+            logged=1
+        fi
 
         # Format payload based on webhook type
-        local payload
         case "$type" in
             discord)
                 payload=$(format_discord "$level" "$title" "$message" "$alert_type")
@@ -751,29 +988,38 @@ send_alert() {
         esac
 
         if send_webhook "$url" "$type" "$payload"; then
-            ((sent++)) || true
+            delivered=$((delivered + 1))
+            if ! update_rate_limit "$alert_hash" "$dest_id" 2>/dev/null; then
+                log_warn "Alert delivered to destination ${dest_id} but its delivery state could not be recorded; an identical alert may be sent again"
+            fi
         else
-            ((failed++)) || true
-            log_error "Alert delivery to a ${type} destination failed: $(mask_url "$url")"
+            failed=$((failed + 1))
+            log_error "Alert delivery to a ${type} destination failed: $(mask_url "$url") (destination ${dest_id}); the next identical alert will retry it"
         fi
+        alert_release
     done
 
-    # Surface partial failures: without this, a working destination masks a
-    # broken one (any_success), the rate limit is then set, and the missed
-    # destination silently never sees the alert.
-    if ((failed > 0 && sent > 0)); then
-        log_warn "Alert reached ${sent} destination(s) but ${failed} FAILED — check webhook configuration"
+    # Expire old state (this also removes claim files created above).
+    if ((delivered + failed > 0)); then
+        cleanup_state
     fi
 
-    if ((sent > 0)); then
-        # Update rate limit once at least one destination accepted the alert.
-        update_rate_limit "$alert_hash"
-        # Clean up old state files periodically
-        cleanup_state
-        return 0
-    else
-        return 3
+    if ((failed == 0)); then
+        if ((delivered > 0)); then
+            return "$ALERT_RC_DELIVERED"
+        fi
+        # Nothing to send: every destination has it already or is being served by
+        # another sender.
+        log_alert "$level" "[RATE LIMITED] ${message}"
+        return "$ALERT_RC_SUPPRESSED"
     fi
+
+    # Surface partial failures: a working destination must not mask a broken one.
+    if ((delivered > 0 || already > 0)); then
+        log_warn "Alert reached ${delivered} destination(s) now and ${already} earlier, but ${failed} FAILED -- check webhook configuration"
+        return "$ALERT_RC_PARTIAL"
+    fi
+    return "$ALERT_RC_FAILED"
 }
 
 #=============================================================================
@@ -914,6 +1160,13 @@ SEND OPTIONS:
     --message <msg>     Alert message
     --type <type>       Alert type for deduplication
 
+EXIT STATUS (send, and send_alert when sourced):
+    0   delivered: every destination that needed the alert received it
+    3   total failure: no destination has the alert, at least one failed
+    4   suppressed: every destination already has it within the rate limit
+    5   partial failure: some destinations have the alert, at least one failed;
+        the next identical alert retries only the failed ones
+
 EXAMPLES:
     # Send test alert
     ${SCRIPT_NAME}.sh test
@@ -934,6 +1187,8 @@ CONFIGURATION:
 
     Optional:
       LYREBIRD_ALERT_RATE_LIMIT=300  (seconds between duplicate alerts)
+      LYREBIRD_ALERT_DEDUP_WINDOW=3600  (seconds delivery state is kept; the
+                                         larger of this and the rate limit applies)
       LYREBIRD_HOSTNAME=<hostname>   (identifier in alerts)
       LYREBIRD_LOCATION=<location>   (physical location description)
 
@@ -1177,15 +1432,26 @@ cmd_test() {
         return 1
     fi
 
-    if send_alert "info" "Test Alert from LyreBirdAudio" \
+    local rc=0
+    send_alert "info" "Test Alert from LyreBirdAudio" \
         "This is a test alert from ${LYREBIRD_HOSTNAME}. If you received this, alerts are working!" \
-        "$ALERT_TYPE_TEST"; then
-        echo "Test alert sent successfully!"
-        return 0
-    else
-        echo "Failed to send test alert. Check your configuration."
-        return 1
-    fi
+        "$ALERT_TYPE_TEST" || rc=$?
+
+    case "$rc" in
+        "$ALERT_RC_DELIVERED")
+            echo "Test alert sent successfully!"
+            return 0
+            ;;
+        "$ALERT_RC_PARTIAL")
+            echo "Test alert reached only some destinations; at least one FAILED."
+            echo "Check the failed destination's webhook configuration (see the log above)."
+            return 1
+            ;;
+        *)
+            echo "Failed to send test alert. Check your configuration."
+            return 1
+            ;;
+    esac
 }
 
 #=============================================================================
