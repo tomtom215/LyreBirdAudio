@@ -1,84 +1,124 @@
-# LyreBirdAudio Stream Manager systemd Service
-# Manages FFmpeg audio streams for MediaMTX RTSP server
+# LyreBirdAudio Stream Manager: the systemd unit (mediamtx-audio.service)
 #
-# Installation:
-#   sudo cp config/mediamtx-audio.service /etc/systemd/system/
-#   sudo systemctl daemon-reload
-#   sudo systemctl enable mediamtx-audio
-#   sudo systemctl start mediamtx-audio
+# ONE template. `sudo ./lyrebird-stream-manager.sh install` renders it into
+# /etc/systemd/system/mediamtx-audio.service; copying it there by hand
+# (sudo cp config/mediamtx-audio.service /etc/systemd/system/) works when the
+# script is installed at /usr/local/bin and MediaMTX uses the default paths.
+# The values below are the defaults. The renderer replaces them where they differ:
+#   - the script path /usr/local/bin/lyrebird-stream-manager.sh (ExecStart, ExecStop, ExecReload)
+#   - PIDFile=, StandardOutput=, StandardError= (the manager's PID file and log file)
+#   - TimeoutStartSec=, TimeoutStopSec= (worst case of the manager's own start and
+#     stop for LYREBIRD_UNIT_MAX_STREAMS streams, see unit_start_timeout_seconds)
+#   - ReadWritePaths= (every directory the manager writes outside the state directories)
+#   - the STREAM_MODE, MULTIPLEX_FILTER_TYPE and MULTIPLEX_STREAM_NAME Environment= lines
+# Nothing else is rewritten. Edit the unit with `systemctl edit mediamtx-audio`
+# (a drop-in), not here, to change anything else.
 #
-# Note: Requires mediamtx.service to be running first
+# One MediaMTX owner: this unit runs MediaMTX and its FFmpeg children. It
+# conflicts with the standalone mediamtx.service (config/mediamtx.service, for
+# MediaMTX-only installs); both cannot run, and starting one stops the other.
+# Install MediaMTX first (install_mediamtx.sh creates /etc/mediamtx).
 
 [Unit]
-Description=LyreBirdAudio Stream Manager
+Description=LyreBirdAudio Stream Manager (MediaMTX and FFmpeg audio streams)
 Documentation=https://github.com/tomtom215/LyreBirdAudio
-After=network.target mediamtx.service sound.target
-Wants=mediamtx.service
-PartOf=mediamtx.service
-
-# Wait for audio subsystem
-After=alsa-restore.service
-Wants=alsa-restore.service
-
-# Limit restart frequency (max 5 restarts in 300 seconds). These belong in
-# [Unit]; systemd IGNORES StartLimitIntervalSec in [Service], so the rate limit
-# there would silently not apply.
-StartLimitIntervalSec=300
-StartLimitBurst=5
+# network.target, not network-online.target: the streams are served from this
+# machine and need no address, and waiting for "online" would hold the audio
+# stack back for the wait-online timeout on a node with no uplink. alsa-restore
+# restores the mixer settings before capture starts.
+After=network.target sound.target alsa-restore.service
+Wants=sound.target
+# One owner of MediaMTX. Conflicts= stops the standalone unit when this one is
+# started, After= makes that stop finish first. No Wants=/Requires=/PartOf= of
+# mediamtx.service: this unit does not depend on it, it replaces it.
+Conflicts=mediamtx.service
+After=mediamtx.service
+# At most 10 starts in 20 minutes (USB hubs that arrive late make a start fail
+# and be retried), then the unit stays failed until `systemctl reset-failed`.
+# These belong in [Unit]: StartLimitIntervalSec= is not valid in [Service].
+StartLimitIntervalSec=1200
+StartLimitBurst=10
 
 [Service]
-# Type=forking (NOT simple): `start` daemonizes the FFmpeg wrappers and returns,
-# writing the PID file below. With Type=simple systemd would treat that return as
-# the service exiting and, with Restart=always, restart it in a loop.
+# Type=forking: `start` returns once MediaMTX and the FFmpeg wrappers run in the
+# background and writes the PID file below, which systemd follows (the main
+# process is MediaMTX). Type=simple would take the return of `start` for the
+# service exiting.
 Type=forking
 PIDFile=/run/mediamtx-audio.pid
 ExecStart=/usr/local/bin/lyrebird-stream-manager.sh start
 ExecStop=/usr/local/bin/lyrebird-stream-manager.sh stop
+# `reload` re-renders the MediaMTX configuration and lets the running MediaMTX
+# apply it, then starts any missing stream; nothing is restarted. (MediaMTX does
+# not handle SIGHUP: it ends the process. It re-reads its file by itself.)
 ExecReload=/usr/local/bin/lyrebird-stream-manager.sh reload
 
-# Working directory
+# Worst case of the manager's own start / stop for 8 streams (derivation:
+# unit_start_timeout_seconds, unit_stop_timeout_seconds in the script). A
+# `reload` is bounded by TimeoutStartSec= too, and is shorter than a start.
+TimeoutStartSec=480
+TimeoutStopSec=130
+
+# 24/7 operation: a MediaMTX that exits for any reason (a configuration it
+# cannot load ends it with status 0) is started again, with the start limit above.
+Restart=always
+RestartSec=30
+
+# The manager needs root: it signals its own processes, raises limits and
+# opens /dev/snd. root needs no Group= for the sound devices.
+User=root
 WorkingDirectory=/var/lib/lyrebird
 
-# User/Group (uncomment to run as non-root)
-# User=mediamtx
-# Group=mediamtx
-
-# Restart policy for 24/7 operation
-Restart=always
-RestartSec=10
-RestartPreventExitStatus=SIGTERM SIGINT
-
-# NOTE: no WatchdogSec. The stream manager sends no sd_notify watchdog
-# keep-alives (it has no code for them), so a WatchdogSec would receive none and
-# systemd would kill the service every interval. Recovery is Restart= below and
-# the cron health monitor. For a hardware watchdog use systemd's own
-# RuntimeWatchdogSec= in /etc/systemd/system.conf (the machine is reset if PID 1
-# stops, whatever this service does) or a watchdog daemon.
-
-# Give time for graceful shutdown
-TimeoutStopSec=30
-
-# Optional: increase file descriptor limit for many streams
-LimitNOFILE=65535
-
-# Security hardening
-NoNewPrivileges=yes
-ProtectHome=yes
-PrivateTmp=yes
-ProtectSystem=strict
-ReadWritePaths=/var/log /var/lib/lyrebird /etc/mediamtx /run
-ProtectKernelTunables=yes
-ProtectKernelModules=yes
-ProtectControlGroups=yes
-
-# Resource limits for production stability
-MemoryMax=1G
-MemoryHigh=800M
-
-# Logging
 StandardOutput=append:/var/log/lyrebird-stream-manager.log
 StandardError=append:/var/log/lyrebird-stream-manager.log
 SyslogIdentifier=lyrebird-audio
+
+LimitNOFILE=65536
+LimitNPROC=4096
+
+# Directories the unit creates and the manager writes (see ReadWritePaths= for
+# the rest). RuntimeDirectoryPreserve=yes: /run/lyrebird holds the cron
+# monitor's restart budgets and the status the manager reports; they live until
+# reboot, not until the service stops.
+StateDirectory=lyrebird mediamtx-ffmpeg
+RuntimeDirectory=lyrebird
+RuntimeDirectoryPreserve=yes
+ConfigurationDirectory=mediamtx
+
+# Sandbox. Kept: every directive below. Deliberately NOT set, because the
+# manager needs what they would take away: PrivateDevices=, DevicePolicy= and
+# DeviceAllow= (USB audio and hotplug need /dev/snd and new device nodes at
+# any time), PrivateNetwork=, RestrictAddressFamilies= (RTSP, the API, ping),
+# MemoryDenyWriteExecute=, SystemCallFilter= (FFmpeg), CapabilityBoundingSet=
+# and ProtectClock= (root signals processes and raises limits; ProtectClock=
+# adds a device policy that would hide /dev/snd), MemoryMax= (a cgroup OOM kill
+# would take streams down at random; the manager watches its own processes).
+NoNewPrivileges=yes
+PrivateTmp=yes
+# The whole file system read-only except what is listed here (and the state and
+# runtime directories above). /run is writable as a whole because the PID file,
+# the lock, the markers and the heartbeat sit directly in it.
+ProtectSystem=strict
+ReadWritePaths=/etc/mediamtx /var/log /run
+# read-only, not yes: the script may be installed under /home or /root.
+ProtectHome=read-only
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ProtectHostname=yes
+LockPersonality=yes
+RestrictSUIDSGID=yes
+
+Environment="HOME=/root"
+Environment="PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+# Tells the manager it is run by systemd (it then installs no signal handlers and
+# no logrotate file of its own).
+Environment="LYREBIRD_UNDER_SYSTEMD=1"
+# A USB hub may take seconds to enumerate its microphones at boot.
+Environment="USB_STABILIZATION_DELAY=10"
+Environment="STREAM_MODE=individual"
+Environment="MULTIPLEX_FILTER_TYPE=amix"
+Environment="MULTIPLEX_STREAM_NAME=all_mics"
 
 [Install]
 WantedBy=multi-user.target

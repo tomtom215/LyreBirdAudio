@@ -681,6 +681,7 @@ detect_service_customizations() {
         ["MULTIPLEX_FILTER_TYPE"]="amix"
         ["MULTIPLEX_STREAM_NAME"]="all_mics"
         ["INVOCATION_ID"]="systemd"
+        ["LYREBIRD_UNDER_SYSTEMD"]="1"
     )
 
     # Extract Environment= lines from service file

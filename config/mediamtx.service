@@ -14,6 +14,11 @@ Description=MediaMTX RTSP Media Server
 Documentation=https://github.com/bluenviron/mediamtx
 After=network-online.target
 Wants=network-online.target
+# For MediaMTX-only installs. mediamtx-audio.service (the LyreBirdAudio stream
+# manager) runs its own MediaMTX with the FFmpeg streams on the same ports and the
+# same configuration file: the two cannot run together, and starting one stops
+# the other. (The stream manager refuses to start beside a running mediamtx.service.)
+Conflicts=mediamtx-audio.service
 
 # Limit restart frequency (max 5 restarts in 300 seconds). These belong in
 # [Unit]; systemd IGNORES StartLimitIntervalSec in [Service], so the rate limit
@@ -24,7 +29,9 @@ StartLimitBurst=5
 [Service]
 Type=simple
 ExecStart=/usr/local/bin/mediamtx /etc/mediamtx/mediamtx.yml
-ExecReload=/bin/kill -HUP $MAINPID
+# No ExecReload=: MediaMTX re-reads its configuration file by itself when the
+# file changes (edit it and the change is applied, no signal needed). It does not
+# handle SIGHUP: that signal ends the process.
 
 # Working directory
 WorkingDirectory=/var/lib/mediamtx

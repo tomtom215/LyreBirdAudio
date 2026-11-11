@@ -6179,67 +6179,333 @@ show_config() {
     cat "${DEVICE_CONFIG_FILE}"
 }
 
+# ============================================================================
+# systemd unit and monitor cron job (`install`)
+# ============================================================================
+# One template, config/mediamtx-audio.service (LB-11, LB-12, X-12; decision
+# D12). It is a complete unit with the manager's defaults; render_systemd_unit
+# replaces the few values that depend on the installation (the directive lines
+# the template header lists) and copies everything else as it is.
+
+# Where the unit's template is: LYREBIRD_UNIT_TEMPLATE, else config/ next to the script
+unit_template_path() {
+    printf '%s' "${LYREBIRD_UNIT_TEMPLATE:-${SCRIPT_DIR}/config/mediamtx-audio.service}"
+}
+
+# Is $1 an absolute path made only of characters a unit file and a cron line carry
+# without any quoting or escaping?
+_unit_safe_path() {
+    [[ "$1" =~ ^/[A-Za-z0-9_./+-]*$ ]]
+}
+
+# Escape $1 for inside the double quotes of an Environment="NAME=VALUE" line:
+# backslash, double quote and (systemd specifier) percent are escaped. A value
+# with a control character (a newline would start a new directive) cannot be
+# carried at all: fails, printing nothing.
+systemd_escape_env_value() {
+    local v="$1"
+    if [[ "$v" =~ [[:cntrl:]] ]]; then
+        return 1
+    fi
+    v="${v//\\/\\\\}"
+    v="${v//\"/\\\"}"
+    v="${v//"%"/"%%"}"
+    printf '%s' "$v"
+}
+
+# Worst case, in seconds, of this manager's own `start` for STREAMS streams (the
+# unit's TimeoutStartSec=; a `reload` is bounded by it too and is shorter). The
+# longest path is a restart: waiting for the lifecycle lock, cleaning up (5 s
+# per recorded process: the streams and MediaMTX), the two USB stabilization
+# waits (RESTART_STABILIZATION_DELAY and USB_DELAY, the delay the unit sets),
+# the MediaMTX API wait, and for every stream the settle sleep of
+# start_ffmpeg_stream (STREAM_STARTUP_DELAY + 3) plus validate_stream's attempts
+# (STREAM_VALIDATION_DELAY plus up to 2 s of curl each). 10 % are added and the
+# result is rounded up to 10 s.
+#   unit_start_timeout_seconds [STREAMS=8] [USB_DELAY=10]
+unit_start_timeout_seconds() {
+    local streams="${1:-8}" usb="${2:-10}"
+    local per_stream=$(((STREAM_STARTUP_DELAY + 3) + STREAM_VALIDATION_ATTEMPTS * (STREAM_VALIDATION_DELAY + 2)))
+    local sum=$((LOCK_ACQUISITION_TIMEOUT + (streams + 1) * 5 + RESTART_STABILIZATION_DELAY + usb + MEDIAMTX_API_TIMEOUT + streams * per_stream))
+    local scaled=$(((sum * 110 + 99) / 100))
+    printf '%s' "$(((scaled + 9) / 10 * 10))"
+}
+
+# Worst case, in seconds, of `stop` for STREAMS streams (TimeoutStopSec=): the
+# lifecycle lock wait, up to 10 s for each wrapper (stop_ffmpeg_stream) one
+# after the other and up to 30 s for MediaMTX (stop_mediamtx); +10 %, rounded
+# up to 10 s.
+#   unit_stop_timeout_seconds [STREAMS=8]
+unit_stop_timeout_seconds() {
+    local streams="${1:-8}"
+    local sum=$((STOP_LOCK_TIMEOUT + streams * 10 + 30))
+    local scaled=$(((sum * 110 + 99) / 100))
+    printf '%s' "$(((scaled + 9) / 10 * 10))"
+}
+
+# The directories the unit must make writable besides the ones it creates
+# itself (StateDirectory=, RuntimeDirectory= of the template): the directory of
+# every file and the directory the manager writes, as this process has them
+# configured, without the ones below another listed directory or below /dev
+# (not read-only under ProtectSystem=strict). The recording directory is
+# prefixed with "-" (ignored when it does not exist, for example a USB disk that
+# is not mounted yet: recording fails, the streams do not).
+#   unit_read_write_paths TEMPLATE
+# Prints them space-separated; fails for a path a unit file cannot carry.
+unit_read_write_paths() {
+    local template="$1" line name
+    local -a covered=() candidates=() kept=()
+    while IFS= read -r line; do
+        case "$line" in
+            StateDirectory=*) for name in ${line#StateDirectory=}; do covered+=("/var/lib/${name}"); done ;;
+            RuntimeDirectory=*) for name in ${line#RuntimeDirectory=}; do covered+=("/run/${name}"); done ;;
+            LogsDirectory=*) for name in ${line#LogsDirectory=}; do covered+=("/var/log/${name}"); done ;;
+            *) ;;
+        esac
+    done <"$template"
+
+    candidates=("${CONFIG_DIR}" "$(dirname "${LOG_FILE}")" "$(dirname "${MEDIAMTX_LOG_FILE}")" "$(dirname "${PID_FILE}")"
+    "$(dirname "${LOCK_FILE}")" "$(dirname "${RESTART_MARKER}")" "$(dirname "${CLEANUP_MARKER}")"
+    "$(dirname "${HEARTBEAT_FILE}")" "${FFMPEG_PID_DIR}" "$(dirname "${MEM_SAMPLE_FILE}")"
+    "${CRON_RESTART_STATE_DIR}" "${DEEP_HEALTH_STATE_DIR}" "${SILENCE_STATE_DIR}")
+    local path other skip
+    for path in "${candidates[@]}"; do
+        if ! _unit_safe_path "$path"; then
+            log ERROR "Cannot write the unit: '${path}' is not an absolute path of letters, digits and _ . / + - only"
+            return 1
+        fi
+        skip=false
+        for other in ${covered[@]+"${covered[@]}"}; do
+            if [[ "$path" == "$other" || "$path" == "$other"/* ]]; then
+                skip=true
+            fi
+        done
+        if [[ "$path" == /dev || "$path" == /dev/* ]]; then
+            skip=true
+        fi
+        if [[ "$skip" == "false" ]]; then
+            kept+=("$path")
+        fi
+    done
+    local -a result=()
+    local keep
+    for path in ${kept[@]+"${kept[@]}"}; do
+        keep=true
+        for other in ${kept[@]+"${kept[@]}"}; do
+            if [[ "$path" != "$other" && "$path" == "${other%/}"/* ]]; then
+                keep=false
+            fi
+        done
+        for other in ${result[@]+"${result[@]}"}; do
+            if [[ "$path" == "$other" ]]; then
+                keep=false
+            fi
+        done
+        if [[ "$keep" == "true" ]]; then
+            result+=("$path")
+        fi
+    done
+    if [[ "${AUDIO_LOCAL_RECORDING}" == "true" && "${AUDIO_RECORDING_PATH}" != /dev/* ]]; then
+        if ! _unit_safe_path "${AUDIO_RECORDING_PATH}"; then
+            log ERROR "Cannot write the unit: AUDIO_RECORDING_PATH '${AUDIO_RECORDING_PATH}' is not an absolute path of letters, digits and _ . / + - only"
+            return 1
+        fi
+        result+=("-${AUDIO_RECORDING_PATH}")
+    fi
+    printf '%s' "${result[*]}"
+}
+
+# Render the unit to stdout: the template with the lines the header of the
+# template lists replaced by this installation's values. Everything else, the
+# comments included, is copied unchanged, so with the default settings the
+# output is the template byte for byte.
+render_systemd_unit() {
+    local template stream_mode="${STREAM_MODE:-individual}"
+    local multiplex_filter="${MULTIPLEX_FILTER_TYPE:-amix}" multiplex_name="${MULTIPLEX_STREAM_NAME:-all_mics}"
+    local script="${SCRIPT_DIR}/${SCRIPT_NAME}"
+    template="$(unit_template_path)"
+    if [[ ! -r "$template" ]]; then
+        log ERROR "The unit template ${template} is missing: run install from a complete checkout of LyreBirdAudio (config/mediamtx-audio.service), or set LYREBIRD_UNIT_TEMPLATE"
+        return 1
+    fi
+    case "$stream_mode" in
+        individual | multiplex) ;;
+        *)
+            log ERROR "Cannot write the unit: STREAM_MODE '${stream_mode}' is neither individual nor multiplex"
+            return 1
+            ;;
+    esac
+    case "$multiplex_filter" in
+        amix | amerge) ;;
+        *)
+            log ERROR "Cannot write the unit: MULTIPLEX_FILTER_TYPE '${multiplex_filter}' is neither amix nor amerge"
+            return 1
+            ;;
+    esac
+    local path
+    for path in "$script" "${PID_FILE}" "${LOG_FILE}"; do
+        if ! _unit_safe_path "$path"; then
+            log ERROR "Cannot write the unit: '${path}' is not an absolute path of letters, digits and _ . / + - only (move the script or the file to such a path)"
+            return 1
+        fi
+    done
+    local escaped_name
+    if ! escaped_name="$(systemd_escape_env_value "$multiplex_name")" || [[ -z "$multiplex_name" ]]; then
+        log ERROR "Cannot write the unit: MULTIPLEX_STREAM_NAME is empty or contains a control character"
+        return 1
+    fi
+
+    local -a lines=()
+    mapfile -t lines <"$template"
+    # the template's own values: the script path and the USB delay the unit sets
+    local line template_script="" usb_delay=10
+    for line in ${lines[@]+"${lines[@]}"}; do
+        case "$line" in
+            ExecStart=*)
+                template_script="${line#ExecStart=}"
+                template_script="${template_script%% *}"
+                ;;
+            'Environment="USB_STABILIZATION_DELAY='*)
+                usb_delay="${line#*=}"
+                usb_delay="${usb_delay#*=}"
+                usb_delay="${usb_delay%\"}"
+                ;;
+            *) ;;
+        esac
+    done
+    if [[ -z "$template_script" ]]; then
+        log ERROR "The unit template ${template} has no ExecStart= line"
+        return 1
+    fi
+    if [[ ! "$usb_delay" =~ ^[0-9]+$ ]]; then
+        usb_delay=10
+    fi
+    local streams
+    streams="$(_uint_or "${LYREBIRD_UNIT_MAX_STREAMS:-}" 8)"
+    ((streams >= 1)) || streams=8
+    local rw_paths=""
+    rw_paths="$(unit_read_write_paths "$template")" || return 1
+
+    for line in ${lines[@]+"${lines[@]}"}; do
+        case "$line" in
+            ExecStart=* | ExecStop=* | ExecReload=*)
+                line="${line/"$template_script"/"$script"}"
+                ;;
+            PIDFile=*) line="PIDFile=${PID_FILE}" ;;
+            StandardOutput=append:*) line="StandardOutput=append:${LOG_FILE}" ;;
+            StandardError=append:*) line="StandardError=append:${LOG_FILE}" ;;
+            TimeoutStartSec=*) line="TimeoutStartSec=$(unit_start_timeout_seconds "$streams" "$usb_delay")" ;;
+            TimeoutStopSec=*) line="TimeoutStopSec=$(unit_stop_timeout_seconds "$streams")" ;;
+            ReadWritePaths=*) line="ReadWritePaths=${rw_paths}" ;;
+            'Environment="STREAM_MODE='*) line="Environment=\"STREAM_MODE=${stream_mode}\"" ;;
+            'Environment="MULTIPLEX_FILTER_TYPE='*) line="Environment=\"MULTIPLEX_FILTER_TYPE=${multiplex_filter}\"" ;;
+            'Environment="MULTIPLEX_STREAM_NAME='*) line="Environment=\"MULTIPLEX_STREAM_NAME=${escaped_name}\"" ;;
+            *) ;;
+        esac
+        printf '%s\n' "$line"
+    done
+}
+
+# Render the monitor's cron file to stdout. The monitor runs in a process of its
+# own (cron's), so it is given the stream mode, the filter and the multiplex
+# stream name here: without them a cron `monitor` always runs in individual
+# mode and, on a multiplex node, starts per-device streams next to the
+# multiplexed one. cron files take NAME=value lines without quoting, so the
+# values are limited to what needs none. The restart policy is unchanged: only
+# exit status 2 restarts the service.
+render_monitor_cron() {
+    local stream_mode="${STREAM_MODE:-individual}"
+    local multiplex_filter="${MULTIPLEX_FILTER_TYPE:-amix}" multiplex_name="${MULTIPLEX_STREAM_NAME:-all_mics}"
+    local script="${SCRIPT_DIR}/${SCRIPT_NAME}"
+    case "$stream_mode" in
+        individual | multiplex) ;;
+        *)
+            log ERROR "Cannot write the cron file: STREAM_MODE '${stream_mode}' is neither individual nor multiplex"
+            return 1
+            ;;
+    esac
+    case "$multiplex_filter" in
+        amix | amerge) ;;
+        *)
+            log ERROR "Cannot write the cron file: MULTIPLEX_FILTER_TYPE '${multiplex_filter}' is neither amix nor amerge"
+            return 1
+            ;;
+    esac
+    if [[ ! "$multiplex_name" =~ ^[A-Za-z0-9_-]+$ ]]; then
+        log ERROR "Cannot write the cron file: MULTIPLEX_STREAM_NAME '${multiplex_name}' has characters outside A-Z a-z 0-9 _ - that a cron environment line cannot carry"
+        return 1
+    fi
+    if ! _unit_safe_path "$script"; then
+        log ERROR "Cannot write the cron file: '${script}' is not an absolute path of letters, digits and _ . / + - only"
+        return 1
+    fi
+    cat <<EOF
+# Monitor MediaMTX resource usage and stream health every 5 minutes
+# Conservative restart policy (only on critical resource failure):
+#   Exit 0: All healthy - no action
+#   Exit 2: Critical resource state - RESTART SERVICE
+#   Exit 6: No USB devices - LOG ONLY (transient, will recover)
+#   Exit 7: MediaMTX not running - LOG ONLY (may recover)
+#   Exit 10: Stream degradation - LOG ONLY (monitor will fix on next cycle)
+#
+# CRON=1 enables explicit cron context detection
+# STREAM_MODE, MULTIPLEX_FILTER_TYPE and MULTIPLEX_STREAM_NAME give the monitor
+# the stream mode of the unit (change them by running install again)
+# flock prevents overlapping runs when monitor exceeds 5-minute interval
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+CRON=1
+STREAM_MODE=${stream_mode}
+MULTIPLEX_FILTER_TYPE=${multiplex_filter}
+MULTIPLEX_STREAM_NAME=${multiplex_name}
+
+*/5 * * * * root flock -n /run/mediamtx-monitor.lock -c '${script} monitor; EXIT=\$?; if [ \$EXIT -eq 2 ]; then systemctl restart mediamtx-audio; elif [ \$EXIT -ne 0 ]; then logger -t mediamtx-monitor "Non-critical exit code \$EXIT (no restart)"; fi' || logger -t mediamtx-monitor "Monitor already running or locked"
+EOF
+}
+
+# Write TEXT ($2) to FILE ($1) atomically (a temporary file next to it, then rename)
+_unit_install_file() {
+    local file="$1" text="$2" tmp
+    mkdir -p "$(dirname "$file")" || return 1
+    tmp="$(mktemp "${file}.XXXXXX")" || return 1
+    if printf '%s\n' "$text" >"$tmp" && chmod 644 "$tmp" && mv -f "$tmp" "$file"; then
+        return 0
+    fi
+    rm -f "$tmp"
+    return 1
+}
+
 # Create systemd service
+#
+# LYREBIRD_SYSROOT (default empty) is a prefix for /etc/systemd/system,
+# /etc/logrotate.d and /etc/cron.d, for packaging and tests; with it set, systemd
+# is not asked to reload.
 create_systemd_service() {
-    local service_file="/etc/systemd/system/mediamtx-audio.service"
+    SKIP_CLEANUP=true
+    local root="${LYREBIRD_SYSROOT:-}"
+    local service_file="${root}/etc/systemd/system/mediamtx-audio.service"
+    local cron_file="${root}/etc/cron.d/mediamtx-monitor"
 
     # Capture current configuration for systemd service
     local stream_mode="${STREAM_MODE:-individual}"
     local multiplex_filter="${MULTIPLEX_FILTER_TYPE:-amix}"
     local multiplex_name="${MULTIPLEX_STREAM_NAME:-all_mics}"
 
-    cat >"$service_file" <<EOF
-[Unit]
-Description=MediaMTX Audio Stream Manager v${VERSION}
-After=network.target sound.target
-Wants=sound.target
+    # Render everything before anything is written: a value that cannot be
+    # carried safely stops the install with nothing changed
+    local unit_text cron_text
+    unit_text="$(render_systemd_unit)" || return "${E_CONFIG_ERROR}"
+    cron_text="$(render_monitor_cron)" || return "${E_CONFIG_ERROR}"
 
-[Service]
-Type=forking
-ExecStart=${SCRIPT_DIR}/${SCRIPT_NAME} start
-ExecStop=${SCRIPT_DIR}/${SCRIPT_NAME} stop
-ExecReload=${SCRIPT_DIR}/${SCRIPT_NAME} restart
-PIDFile=${PID_FILE}
-Restart=on-failure
-RestartSec=30
-StartLimitInterval=1200
-StartLimitBurst=10
-User=root
-Group=audio
-
-StandardOutput=append:${LOG_FILE}
-StandardError=append:${LOG_FILE}
-
-TimeoutStartSec=300
-TimeoutStopSec=120
-
-LimitNOFILE=65536
-LimitNPROC=4096
-
-PrivateTmp=yes
-ProtectSystem=full
-NoNewPrivileges=yes
-ReadWritePaths=/etc/mediamtx /var/lib/mediamtx-ffmpeg /var/log /var/run
-
-Environment="HOME=/root"
-Environment="PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-Environment="USB_STABILIZATION_DELAY=10"
-Environment="STREAM_MODE=${stream_mode}"
-Environment="MULTIPLEX_FILTER_TYPE=${multiplex_filter}"
-Environment="MULTIPLEX_STREAM_NAME=${multiplex_name}"
-Environment="LYREBIRD_UNDER_SYSTEMD=1"
-WorkingDirectory=${SCRIPT_DIR}
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-    chmod 644 "$service_file"
+    if ! _unit_install_file "$service_file" "$unit_text"; then
+        log ERROR "Could not write ${service_file}"
+        return "${E_GENERAL}"
+    fi
 
     # Setup logrotate configuration during install
-    if command_exists logrotate && [[ -d /etc/logrotate.d ]]; then
+    if command_exists logrotate && [[ -d "${root}/etc/logrotate.d" ]]; then
         log INFO "Setting up log rotation configuration"
-        cat >/etc/logrotate.d/mediamtx <<EOF
+        cat >"${root}/etc/logrotate.d/mediamtx" <<EOF
 ${MEDIAMTX_LOG_FILE} {
     daily
     rotate 7
@@ -6283,35 +6549,23 @@ ${FFMPEG_PID_DIR}/*.log {
     size ${FFMPEG_LOG_MAX_SIZE}
 }
 EOF
-        chmod 644 /etc/logrotate.d/mediamtx
+        chmod 644 "${root}/etc/logrotate.d/mediamtx"
         log INFO "Log rotation configured successfully"
     fi
 
-    # Create monitoring cron job with conservative restart policy and overlap protection
-    # Conservative restart policy: only restart on critical resource failure
-    # Using flock to prevent overlapping monitor instances when checks exceed 5 minutes
-    cat >/etc/cron.d/mediamtx-monitor <<EOF
-# Monitor MediaMTX resource usage and stream health every 5 minutes
-# Conservative restart policy (only on critical resource failure):
-#   Exit 0: All healthy - no action
-#   Exit 2: Critical resource state - RESTART SERVICE
-#   Exit 6: No USB devices - LOG ONLY (transient, will recover)
-#   Exit 7: MediaMTX not running - LOG ONLY (may recover)
-#   Exit 10: Stream degradation - LOG ONLY (monitor will fix on next cycle)
-#
-# CRON=1 enables explicit cron context detection
-# flock prevents overlapping runs when monitor exceeds 5-minute interval
-SHELL=/bin/bash
-PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-CRON=1
+    # Monitoring cron job: conservative restart policy (exit 2 only) and flock
+    # against overlapping runs
+    if ! _unit_install_file "$cron_file" "$cron_text"; then
+        log ERROR "Could not write ${cron_file}"
+        return "${E_GENERAL}"
+    fi
 
-*/5 * * * * root flock -n /run/mediamtx-monitor.lock -c '${SCRIPT_DIR}/${SCRIPT_NAME} monitor; EXIT=\$?; if [ \$EXIT -eq 2 ]; then systemctl restart mediamtx-audio; elif [ \$EXIT -ne 0 ]; then logger -t mediamtx-monitor "Non-critical exit code \$EXIT (no restart)"; fi' || logger -t mediamtx-monitor "Monitor already running or locked"
-EOF
-
-    systemctl daemon-reload
+    if [[ -z "$root" ]]; then
+        systemctl daemon-reload
+    fi
 
     echo "Systemd service created: $service_file"
-    echo "Monitoring cron job created: /etc/cron.d/mediamtx-monitor"
+    echo "Monitoring cron job created: $cron_file"
     echo ""
     echo "=== v1.4.1 Configuration Enhancements ==="
     echo "  * Friendly name support for audio device configuration"
@@ -6332,15 +6586,14 @@ EOF
         echo "  Stream name: ${multiplex_name}"
     fi
     echo ""
-    echo "To change mode after installation:"
-    echo "  sudo systemctl edit mediamtx-audio"
-    echo "  Add/modify: Environment=\"STREAM_MODE=multiplex\""
-    echo "  Add/modify: Environment=\"MULTIPLEX_FILTER_TYPE=amix\""
-    echo "  Add/modify: Environment=\"MULTIPLEX_STREAM_NAME=studio\""
-    echo "  Then: sudo systemctl daemon-reload && sudo systemctl restart mediamtx-audio"
+    echo "To change mode after installation run install again, with the options, so the"
+    echo "unit and the monitor cron job get the same mode:"
+    echo "  sudo ./${SCRIPT_NAME} -m multiplex -f amix -n studio install"
+    echo "  Then: sudo systemctl restart mediamtx-audio"
     echo ""
     echo "Enable: sudo systemctl enable mediamtx-audio"
     echo "Start: sudo systemctl start mediamtx-audio"
+    echo "Apply a changed MediaMTX configuration without an outage: sudo systemctl reload mediamtx-audio"
 }
 
 # Show help
@@ -6393,7 +6646,9 @@ Commands:
     monitor     Check resource usage and stream health
                 Exit codes: 0=healthy, 2=critical resources, 3=MediaMTX down,
                             7=no devices, 10=streams degraded
-    install     Create systemd service
+    install     Create the systemd unit (rendered from config/mediamtx-audio.service,
+                next to this script) and the monitor cron job, both with the stream
+                mode given by -m/-f/-n. Run it again to change the mode.
     help        Show this help
 
 Configuration files:
