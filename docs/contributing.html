@@ -38,11 +38,12 @@
     <h2 id="getting-started">Getting Started</h2>
 
     <h3>Prerequisites</h3>
-    <pre><code># Install development dependencies (Ubuntu/Debian)
-sudo apt install -y shellcheck bats
-
-# macOS
-brew install shellcheck bats-core</code></pre>
+    <pre><code># Development dependencies (Ubuntu/Debian)
+sudo apt install -y shellcheck bats shfmt jq curl ffmpeg python3 openssl</code></pre>
+    <p>
+      The test suite runs on Linux (the project's CI uses the <code>ubuntu-latest</code> runner); macOS is not a tested platform.
+      <code>bashate</code> (a Python package) is the fourth style gate. Package names and versions differ between distributions: CI pins ShellCheck 0.11.0 and shfmt 3.13.1.
+    </p>
 
     <h3>Fork and Clone</h3>
     <pre><code># 1. Fork on GitHub, then clone your fork
@@ -56,29 +57,35 @@ git remote add upstream https://github.com/tomtom215/LyreBirdAudio.git
 chmod +x *.sh</code></pre>
 
     <h3>Verify Development Setup</h3>
-    <pre><code># Syntax check all scripts
+    <p>These are the gates CI runs on every script (a pull request has to pass all of them):</p>
+    <pre><code># Syntax check
 for script in *.sh; do
-    bash -n "$script" && echo "✓ $script"
+    bash -n "$script" &amp;&amp; echo "✓ $script"
 done
 
-# ShellCheck all scripts
-shellcheck *.sh
+# ShellCheck (warnings and above)
+shellcheck --severity=warning --external-sources --shell=bash *.sh
 
-# Run test suite (requires BATS)
-cd tests && bats *.bats</code></pre>
+# Formatting
+shfmt -d -i 4 -bn -ci *.sh
+
+# Style
+bashate --ignore E001,E006,E040,E042,E043 *.sh
+
+# Tests, from the repository root (also fails if a test leaves files in TMPDIR)
+tests/check_tmp_leaks.sh</code></pre>
+    <p>The full suite takes a long time. While you work, run the files for the code you changed (<code>bats tests/test_stream_names.bats</code>) and the whole suite before you push.</p>
 
     <hr>
     <h2 id="code-standards">Code Standards</h2>
 
     <h3>Required Header Format</h3>
-    <p>Every script must begin with a standard header:</p>
+    <p>Every script begins with a standard header:</p>
     <pre><code>#!/bin/bash
 # script-name.sh - Brief Description
 # Part of LyreBirdAudio - RTSP Audio Streaming Suite
 # https://github.com/tomtom215/LyreBirdAudio
 #
-# Author: Your Name (https://github.com/yourusername)
-# Copyright: Tom F and LyreBirdAudio contributors
 # License: Apache 2.0
 #
 # Version: X.Y.Z
@@ -95,6 +102,7 @@ cd tests && bats *.bats</code></pre>
 #   - ffmpeg, curl, etc.
 
 set -euo pipefail</code></pre>
+    <p>The version is a <code>readonly VERSION=</code> (or <code>SCRIPT_VERSION=</code>) assignment; <code>grep -m1 -E '^readonly (SCRIPT_)?VERSION=' *.sh</code> lists them. Change it, and the version table on the <a href="components.html#overview">Component Reference</a> page, together with the behaviour that needs a new version.</p>
 
     <h3>Safety Requirements</h3>
     <ul>
@@ -104,7 +112,18 @@ set -euo pipefail</code></pre>
       <li><strong>Use <code>readonly</code></strong> for constants</li>
       <li><strong>Validate all inputs</strong> at system boundaries (user input, external APIs)</li>
       <li><strong>Use <code>mktemp</code></strong> for all temporary files</li>
-      <li><strong>Implement signal handlers</strong> in long-running scripts: <code>trap cleanup EXIT INT TERM</code></li>
+      <li><strong>Implement signal handlers</strong> in scripts that start or change something: <code>trap cleanup EXIT INT TERM</code></li>
+    </ul>
+
+    <h3>Project Rules</h3>
+    <p>These decisions came out of an audit of the suite; changes are expected to follow them.</p>
+    <ul>
+      <li><strong>Configuration is data.</strong> Never <code>source</code> or <code>eval</code> a configuration file. Parse it with an allowlist, as the device configuration, <code>storage.conf</code> and <code>alerts.conf</code> are.</li>
+      <li><strong>Find processes by identity, not by name.</strong> No <code>pkill</code>/<code>pgrep -f</code> patterns on a normal path. Signal only a PID you recorded, after checking its start time (field 22 of <code>/proc/&lt;pid&gt;/stat</code>) and its executable.</li>
+      <li><strong>Locks never unlink.</strong> Use <code>flock</code> on a stable path, open it without truncation, and close the descriptor in every child you spawn.</li>
+      <li><strong>Durable atomic writes</strong> go through <code>lyrebird_atomic_write</code>.</li>
+      <li><strong>Ports are configuration.</strong> Honour <code>MEDIAMTX_RTSP_PORT</code>, <code>MEDIAMTX_API_PORT</code> and <code>MEDIAMTX_METRICS_PORT</code> everywhere; never hard-code 8554, 9997 or 9998.</li>
+      <li><strong>Do not claim what you have not run.</strong> Documentation and help text say only what a command or test showed; say plainly what is not verified.</li>
     </ul>
 
     <hr>
@@ -126,8 +145,8 @@ set -euo pipefail</code></pre>
 
     <h3>Formatting Rules</h3>
     <ul>
-      <li>4 spaces for indentation — no tabs</li>
-      <li>Maximum line length: 100 characters</li>
+      <li>Formatting is enforced by <code>shfmt -d -i 4 -bn -ci</code>: 4 spaces, no tabs, binary operators at the start of a continued line, indented <code>case</code> bodies. Run <code>shfmt -w -i 4 -bn -ci script.sh</code> to fix a file.</li>
+      <li><code>bashate</code> runs with <code>E001,E006,E040,E042,E043</code> ignored, so line length is not enforced; keep lines readable</li>
       <li>Use <code>[[ ]]</code> instead of <code>[ ]</code> for conditionals</li>
       <li>Use <code>(( ))</code> for arithmetic</li>
       <li>Add comments for non-obvious logic</li>
@@ -147,31 +166,31 @@ check_stream_health() {
 }</code></pre>
 
     <h3>Logging Pattern</h3>
-    <pre><code># Use the shared logging functions (from lyrebird-common.sh)
+    <pre><code># Use the shared logging functions (from lyrebird-common.sh);
+# the stream manager has its own: log INFO "message"
 log_debug "Processing device: ${device_name}"
 log_info "Stream started: ${stream_url}"
 log_warn "Device busy, retrying in ${delay}s"
 log_error "Failed to start MediaMTX: ${error_msg}"</code></pre>
 
     <h3>Atomic File Operations</h3>
-    <pre><code># Always write to temp first, then move atomically
-local tmp_file
-tmp_file=$(mktemp "${config_file}.tmp.XXXXXX")
-trap 'rm -f "${tmp_file}"' EXIT
-
-cat > "${tmp_file}" << EOF
-# Configuration generated by lyrebird-mic-check.sh
-${config_content}
-EOF
-
-mv "${tmp_file}" "${config_file}"</code></pre>
+    <pre><code># Replace a file durably: temp file in the same directory, fsync, rename, fsync of the directory
+source "${SCRIPT_DIR}/lyrebird-common.sh"
+printf '%s\n' "${config_content}" | lyrebird_atomic_write "${config_file}" 0644</code></pre>
+    <p>For a file that is only a temporary result, <code>mktemp</code> in a directory you own and a <code>trap</code> that removes it is enough.</p>
 
     <hr>
     <h2 id="testing">Testing</h2>
 
     <h3>Running Tests</h3>
-    <pre><code># Run all tests
+    <pre><code># Run all tests (from the repository root)
 bats tests/
+
+# What CI runs: the suite, failing if it leaves files in TMPDIR
+tests/check_tmp_leaks.sh
+
+# How many tests there are
+bats --count tests/
 
 # Run a specific test file
 bats tests/test_lyrebird_common.bats
@@ -179,40 +198,38 @@ bats tests/test_lyrebird_common.bats
 # Run tests matching a pattern
 bats --filter "validation" tests/
 
-# Verbose output
+# Verbose output / TAP format (for CI)
 bats --verbose-run tests/
-
-# TAP format (for CI)
 bats --tap tests/</code></pre>
 
     <h3>Test Suite Overview</h3>
-    <div class="table-wrapper">
-      <table>
-        <thead><tr><th>Test File</th><th>Tests</th><th>What's Covered</th></tr></thead>
-        <tbody>
-          <tr><td><code>test_lyrebird_common.bats</code></td><td>47</td><td>Shared library functions</td></tr>
-          <tr><td><code>test_lyrebird_updater.bats</code></td><td>55</td><td>Version management, git operations</td></tr>
-          <tr><td><code>test_install_mediamtx.bats</code></td><td>55</td><td>MediaMTX installation flow</td></tr>
-          <tr><td><code>test_lyrebird_orchestrator.bats</code></td><td>44</td><td>Menu system, integration</td></tr>
-          <tr><td><code>test_lyrebird_alerts.bats</code></td><td>45</td><td>Webhook formatting, rate limiting</td></tr>
-          <tr><td><code>test_lyrebird_mic_check.bats</code></td><td>45</td><td>Hardware detection, config gen</td></tr>
-          <tr><td><code>test_lyrebird_storage.bats</code></td><td>42</td><td>Disk management, retention</td></tr>
-          <tr><td><code>test_lyrebird_diagnostics.bats</code></td><td>34</td><td>Health checks</td></tr>
-          <tr><td><code>test_usb_audio_mapper.bats</code></td><td>33</td><td>udev rule generation</td></tr>
-          <tr><td><code>test_stream_manager.bats</code></td><td>32</td><td>Stream lifecycle, recovery</td></tr>
-          <tr><td><code>test_lyrebird_metrics.bats</code></td><td>32</td><td>Prometheus metrics format</td></tr>
-          <tr><td><code>test_integration.bats</code></td><td>—</td><td>End-to-end integration</td></tr>
-        </tbody>
-      </table>
-    </div>
+    <ul>
+      <li>One file per script (<code>tests/test_lyrebird_common.bats</code>, <code>test_install_mediamtx.bats</code>, ...) plus files for one area of behaviour (<code>test_stream_*.bats</code>, <code>test_mediamtx_*.bats</code>, <code>test_storage_*.bats</code>, <code>test_lyrebird_updater_*.bats</code>, <code>test_orchestrator_*.bats</code>). <code>tests/README.md</code> lists them.</li>
+      <li><strong>Live tests</strong> run against real MediaMTX releases and are skipped unless <code>LYREBIRD_TEST_MEDIAMTX_BINS</code> names the binaries. <code>tests/fetch_mediamtx.sh</code> downloads checksum-pinned 1.15.0, 1.18.0, 1.19.0, 1.21.1, 1.21.2 and 1.21.3 (see the command below). They need <code>curl</code>, <code>ffmpeg</code>, <code>jq</code>, <code>openssl</code> and <code>python3</code>.</li>
+      <li>The suite uses stand-ins for USB hardware, <code>systemctl</code>, <code>sudo</code> and <code>git</code> failures. No test runs on ARM, Bash 4.x or macOS, with real USB audio hardware, or under a real systemd manager (units are checked with <code>systemd-analyze verify</code>).</li>
+      <li>The documentation pages in <code>docs/</code> are covered too: <code>tests/test_docs_html.bats</code> checks their links and the claims that were once wrong against the scripts' own <code>--help</code>.</li>
+    </ul>
+    <pre><code>LYREBIRD_TEST_MEDIAMTX_BINS="$(tests/fetch_mediamtx.sh)" \
+    bats tests/test_mediamtx_live.bats</code></pre>
 
     <h3>Writing Tests</h3>
+    <p>
+      Source the real script (every script has a main guard) and call the real functions; do not re-implement a function inside a test and test the copy.
+      Give a test that writes anything a private temporary directory with <code>load scratch_tmpdir</code>. A regression test for a fix should fail on the code
+      before the fix: revert only the fix, run the test, see it fail, restore. End the test name with a tag for what it pins, as the existing tests do
+      (<code>[LB-05]</code>, <code>[DOC-02]</code>).
+    </p>
     <pre><code>#!/usr/bin/env bats
 
-# Source the script being tested
+load scratch_tmpdir
+
 setup() {
-    # Load the script or helper
+    scratch_setup
     source "${BATS_TEST_DIRNAME}/../lyrebird-common.sh" 2>/dev/null || true
+}
+
+teardown() {
+    scratch_teardown
 }
 
 @test "lyrebird_command_exists returns 0 for bash" {
@@ -220,20 +237,21 @@ setup() {
     [ "$status" -eq 0 ]
 }
 
-@test "log_info outputs formatted message" {
-    run log_info "Test message"
-    [ "$status" -eq 0 ]
-    [[ "$output" =~ "Test message" ]]
+@test "lyrebird_atomic_write replaces the file and leaves no temp file [example]" {
+    printf 'old\n' >"$TEST_SCRATCH/f"
+    printf 'new\n' | lyrebird_atomic_write "$TEST_SCRATCH/f" 0644
+    [ "$(cat "$TEST_SCRATCH/f")" = "new" ]
+    [ "$(ls -A "$TEST_SCRATCH")" = "f" ]
 }</code></pre>
 
     <h3>Testing Requirements Before PR</h3>
     <ul>
-      <li>☐ All existing tests pass: <code>bats tests/</code></li>
-      <li>☐ New tests added for new functionality</li>
+      <li>☐ All existing tests pass: <code>tests/check_tmp_leaks.sh</code></li>
+      <li>☐ New tests added for new functionality, each shown to fail without the change</li>
       <li>☐ <code>bash -n script.sh</code> passes (syntax check)</li>
-      <li>☐ <code>shellcheck script.sh</code> passes with no errors</li>
-      <li>☐ Manual testing on Ubuntu 20.04+ or equivalent</li>
-      <li>☐ Tested with at least one real USB audio device (if applicable)</li>
+      <li>☐ <code>shellcheck --severity=warning script.sh</code>, <code>shfmt -d -i 4 -bn -ci script.sh</code> and <code>bashate</code> pass</li>
+      <li>☐ Documentation updated: a changed flag, default, exit code or file path is changed in the <code>--help</code> text and on the pages that mention it</li>
+      <li>☐ Manual testing on a Linux node when the change touches devices, units or MediaMTX; say what you ran and on what, and what you could not run</li>
     </ul>
 
     <hr>
@@ -257,14 +275,15 @@ git checkout -b fix/issue-description</code></pre>
         <div>
           <strong>Validate your changes</strong>
           <pre><code>bash -n your-script.sh
-shellcheck your-script.sh
-bats tests/</code></pre>
+shellcheck --severity=warning your-script.sh
+shfmt -d -i 4 -bn -ci your-script.sh
+tests/check_tmp_leaks.sh</code></pre>
         </div>
       </li>
       <li>
         <div>
           <strong>Test on target platforms</strong>
-          <p>Ubuntu 20.04+, Debian 11+, and Raspberry Pi OS if applicable. Test with actual USB devices.</p>
+          <p>On the platform you changed it for, with actual USB devices where the change touches them. Say in the pull request what you ran it on; the automated tests do not cover real hardware.</p>
         </div>
       </li>
       <li>
@@ -290,9 +309,10 @@ bats tests/</code></pre>
     <h3>Include in Your Report</h3>
     <ol>
       <li><strong>System info</strong>: <code>cat /etc/os-release && uname -a</code></li>
-      <li><strong>Script versions</strong>: From the Orchestrator menu or <code>head -5 *.sh | grep Version</code></li>
+      <li><strong>Script versions</strong>: From the Orchestrator menu (Version Management → Show Component Versions) or <code>grep -m1 -E '^readonly (SCRIPT_)?VERSION=' *.sh</code></li>
       <li><strong>Diagnostics</strong>: <code>sudo ./lyrebird-diagnostics.sh full > diagnostics.txt 2>&amp;1</code></li>
-      <li><strong>Relevant logs</strong>: Last 50 lines showing the error from <code>/var/log/lyrebird-stream-manager.log</code></li>
+      <li><strong>Stream state</strong>: <code>./lyrebird-stream-manager.sh status --json</code></li>
+      <li><strong>Relevant logs</strong>: Last 50 lines showing the error from <code>/var/log/lyrebird-stream-manager.log</code>, and the stream's <code>/var/lib/mediamtx-ffmpeg/&lt;stream&gt;.log</code></li>
       <li><strong>Hardware info</strong>: <code>lsusb && ./lyrebird-mic-check.sh</code></li>
     </ol>
 

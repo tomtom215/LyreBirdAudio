@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>LyreBirdAudio Documentation</title>
-  <meta name="description" content="Production-hardened RTSP audio streaming suite for USB microphones with 24/7 reliability.">
+  <meta name="description" content="RTSP audio streaming for USB microphones, built on MediaMTX and FFmpeg and written in Bash.">
   <link rel="stylesheet" href="css/style.css">
 </head>
 <body>
@@ -20,9 +20,9 @@
     <div class="hero">
       <div class="hero-label">🐦 Open Source · Apache 2.0</div>
       <h1>LyreBirdAudio</h1>
-      <p>Production-hardened RTSP audio streaming for USB microphones. 24/7 reliability with automatic recovery, persistent device naming, and comprehensive diagnostics — built entirely in Bash.</p>
+      <p>RTSP audio streaming for USB microphones, built on MediaMTX and FFmpeg: persistent device names, supervised FFmpeg processes, a monitor that restarts dead streams, a per-stream status report, and diagnostics. Written in Bash.</p>
       <div class="hero-badges">
-        <span class="hero-badge">🐧 Linux / Raspberry Pi</span>
+        <span class="hero-badge">🐧 Linux</span>
         <span class="hero-badge">🎙️ USB Microphones</span>
         <span class="hero-badge">📡 RTSP Streaming</span>
         <span class="hero-badge">🔄 Auto-Recovery</span>
@@ -36,36 +36,37 @@
 
     <h2 id="what-is-lyrebirdaudio">What is LyreBirdAudio?</h2>
     <p>
-      LyreBirdAudio turns USB microphones into reliable, always-on RTSP audio streams. Built on top of
-      <a href="https://github.com/bluenviron/mediamtx" target="_blank" rel="noopener">MediaMTX</a> and FFmpeg,
-      it handles every aspect of long-term unattended operation: device persistence across reboots,
-      automatic stream recovery, health monitoring, alerting, and metrics export — all without requiring
-      Docker, Python runtimes, or complex dependencies.
+      LyreBirdAudio publishes USB microphones as RTSP audio streams. It is a set of Bash scripts around
+      <a href="https://github.com/bluenviron/mediamtx" target="_blank" rel="noopener">MediaMTX</a> and FFmpeg for
+      nodes that run unattended: persistent device names across reboots, a stream manager that starts MediaMTX and one
+      FFmpeg process per microphone and reports which streams are really publishing, a cron monitor that restarts what died,
+      webhook alerts and Prometheus metrics you can wire up, and storage cleanup. It needs no Docker and no language runtime
+      beyond Bash and the standard tools it lists.
     </p>
     <p>
-      Originally created to monitor bird activity using USB microphones on spare mini PCs, it has grown into
-      a complete, production-hardened streaming suite suitable for wildlife monitoring, environmental sensing,
-      security audio, and any scenario requiring continuous, reliable audio capture.
+      It was written to monitor bird activity with USB microphones on spare mini PCs, and suits any setup that needs
+      continuous audio capture from a few USB microphones on a Linux machine.
     </p>
 
     <h2 id="key-features">Key Features</h2>
     <ul class="feature-list">
       <li>Persistent USB device naming via udev</li>
       <li>Automatic stream recovery &amp; restart</li>
-      <li>Hardware capability auto-detection</li>
+      <li>Hardware capability detection and device configuration generation</li>
       <li>Interactive setup wizard (Orchestrator)</li>
-      <li>Systemd service with watchdog</li>
+      <li>Systemd service that restarts on failure</li>
       <li>Cron-based health monitoring</li>
+      <li>Per-stream status document (JSON)</li>
       <li>Multiplex streaming (amix / amerge)</li>
-      <li>Opus, AAC, PCM codec support</li>
+      <li>Opus, AAC and MP3 encoding</li>
       <li>Prometheus metrics export</li>
-      <li>Webhook alerts (Discord, Slack, ntfy…)</li>
+      <li>Webhook alerts you trigger yourself (Discord, Slack, ntfy, Pushover, generic)</li>
       <li>Storage management &amp; retention</li>
-      <li>Git-based version management</li>
-      <li>Atomic config file operations</li>
-      <li>Comprehensive diagnostic suite</li>
-      <li>Optional RTSP authentication &amp; TLS</li>
-      <li>No Docker, no Python, pure Bash</li>
+      <li>Git-based version management with history and rollback</li>
+      <li>Durable, atomic writes of configuration files</li>
+      <li>Diagnostics: 25 check groups in full mode</li>
+      <li>RTSP authentication: a local-only-publish mode, or your own MediaMTX settings</li>
+      <li>No Docker, no language runtime beyond Bash</li>
     </ul>
 
     <h2 id="architecture-overview">Architecture Overview</h2>
@@ -93,7 +94,7 @@
           <tr>
             <td>Media Server</td>
             <td>MediaMTX</td>
-            <td>RTSP / WebRTC / HLS serving</td>
+            <td>RTSP serving (the generated configuration disables the other protocols)</td>
           </tr>
           <tr>
             <td>Capture</td>
@@ -124,7 +125,7 @@
       <a href="components.html#stream-manager" class="card">
         <div class="card-icon">📡</div>
         <div class="card-title">Stream Manager</div>
-        <div class="card-desc">Manages FFmpeg processes, health monitoring, and automatic recovery.</div>
+        <div class="card-desc">Starts MediaMTX and the FFmpeg streams, reports what is publishing, and restarts what died.</div>
       </a>
       <a href="components.html#usb-mapper" class="card">
         <div class="card-icon">🔌</div>
@@ -134,17 +135,17 @@
       <a href="components.html#mic-check" class="card">
         <div class="card-icon">🎙️</div>
         <div class="card-title">Capability Checker</div>
-        <div class="card-desc">Non-invasively detects hardware capabilities and generates optimal configs.</div>
+        <div class="card-desc">Reads each card's capabilities from /proc/asound and can write the per-device configuration.</div>
       </a>
       <a href="components.html#diagnostics" class="card">
         <div class="card-icon">🩺</div>
         <div class="card-title">Diagnostics</div>
-        <div class="card-desc">20+ health checks covering devices, services, connectivity, and resources.</div>
+        <div class="card-desc">25 check groups in full mode: devices, MediaMTX, RTSP, resources, time, permissions.</div>
       </a>
       <a href="components.html#alerts" class="card">
         <div class="card-icon">🔔</div>
         <div class="card-title">Webhook Alerts</div>
-        <div class="card-desc">Discord, Slack, ntfy.sh, Pushover notifications with rate limiting.</div>
+        <div class="card-desc">Discord, Slack, ntfy.sh, Pushover and generic webhooks with rate limiting; you call it.</div>
       </a>
       <a href="components.html#metrics" class="card">
         <div class="card-icon">📊</div>
@@ -158,7 +159,7 @@
       </a>
     </div>
 
-    <h2 id="quick-start-summary">Get Streaming in 5 Minutes</h2>
+    <h2 id="quick-start-summary">Get Streaming</h2>
     <ol class="steps">
       <li>
         <div>
@@ -178,47 +179,32 @@ chmod +x *.sh</code></pre>
       <li>
         <div>
           <strong>Access your streams</strong>
-          <pre><code>rtsp://your-server-ip:8554/device-name</code></pre>
+          <pre><code>rtsp://your-server-ip:8554/mic-left</code></pre>
         </div>
       </li>
     </ol>
     <p>
-      The wizard installs MediaMTX, maps USB devices, generates an optimal configuration, starts streams,
-      and runs initial diagnostics — all in one guided flow. See the <a href="quick-start.html">Quick Start guide</a>
-      for more detail.
+      The wizard installs MediaMTX, maps USB devices, starts the streams and runs quick diagnostics. It does not
+      generate the per-device configuration or install the systemd service; the <a href="quick-start.html">Quick Start guide</a>
+      says how to add both.
     </p>
 
     <h2 id="platform-support">Platform Support</h2>
     <div class="table-wrapper">
       <table>
         <thead>
-          <tr><th>Platform</th><th>Support</th><th>Notes</th></tr>
+          <tr><th>Platform</th><th>Status</th><th>Notes</th></tr>
         </thead>
         <tbody>
           <tr>
-            <td>Ubuntu 20.04+</td>
-            <td><span class="badge badge-green">✓ Recommended</span></td>
-            <td>Primary development platform</td>
+            <td>Linux (systemd, ALSA, udev)</td>
+            <td><span class="badge badge-blue">Targeted</span></td>
+            <td>Written for Ubuntu 20.04+, Debian 11+ and Raspberry Pi OS. The test suite runs on one Linux x86_64 system with Bash 5.2, with stand-ins for USB hardware and systemd; no test runs on ARM, a Raspberry Pi, Bash 4.x or real hardware</td>
           </tr>
           <tr>
-            <td>Debian 11+</td>
-            <td><span class="badge badge-green">✓ Supported</span></td>
-            <td>Fully tested</td>
-          </tr>
-          <tr>
-            <td>Raspberry Pi OS</td>
-            <td><span class="badge badge-blue">✓ Supported</span></td>
-            <td>Max 2 USB mics recommended</td>
-          </tr>
-          <tr>
-            <td>Intel N100 Mini PC</td>
-            <td><span class="badge badge-green">✓ Recommended</span></td>
-            <td>4+ mics, best stability</td>
-          </tr>
-          <tr>
-            <td>macOS / Windows</td>
+            <td>macOS, Windows, BSD</td>
             <td><span class="badge badge-gray">✗ Not supported</span></td>
-            <td>Linux-specific udev required</td>
+            <td>The USB mapper and the stream manager need Linux udev and ALSA</td>
           </tr>
         </tbody>
       </table>
@@ -229,7 +215,7 @@ chmod +x *.sh</code></pre>
       <table>
         <tbody>
           <tr><td><strong>License</strong></td><td>Apache 2.0</td></tr>
-          <tr><td><strong>Language</strong></td><td>Bash 4.0+</td></tr>
+          <tr><td><strong>Language</strong></td><td>Bash (the scripts check for 4.0 or newer; the tests run on 5.2)</td></tr>
           <tr><td><strong>Author</strong></td><td><a href="https://github.com/tomtom215" target="_blank" rel="noopener">Tom F (tomtom215)</a></td></tr>
           <tr><td><strong>GitHub</strong></td><td><a href="https://github.com/tomtom215/LyreBirdAudio" target="_blank" rel="noopener">tomtom215/LyreBirdAudio</a></td></tr>
           <tr><td><strong>Issues</strong></td><td><a href="https://github.com/tomtom215/LyreBirdAudio/issues" target="_blank" rel="noopener">GitHub Issues</a></td></tr>

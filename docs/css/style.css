@@ -794,7 +794,7 @@ td code { font-size: 12.5px; }
   margin-top: 2px;
 }
 
-.steps li > div { flex: 1; }
+.steps li > div { flex: 1; min-width: 0; }
 .steps li strong { display: block; margin-bottom: 4px; }
 
 /* ---------- Command reference ---------- */
@@ -1128,6 +1128,10 @@ h4:hover .anchor-link { opacity: 1; }
 }
 
 @media (max-width: 600px) {
+  /* The copy button sits over the first line of code; leave it a row of its own */
+  .code-wrapper pre { padding-top: 38px; }
+  /* Long paths and variable names may break, so a table fits the screen instead of scrolling */
+  td code, th code { overflow-wrap: anywhere; }
   .hero-badges { display: none; }
   .topbar-actions { display: none; }
   .page-nav { flex-direction: column; }

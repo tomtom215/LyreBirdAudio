@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Troubleshooting - LyreBirdAudio Docs</title>
-  <meta name="description" content="Diagnose and fix common LyreBirdAudio issues.">
+  <meta name="description" content="Diagnose and fix common LyreBirdAudio problems.">
   <link rel="stylesheet" href="css/style.css">
 </head>
 <body>
@@ -40,28 +40,36 @@
     </div>
 
     <h2 id="quick-check">Start Here: Quick Check</h2>
-    <p>Always run the built-in diagnostics first — they check all common failure points automatically:</p>
-    <pre><code># Run quick health check
-sudo ./lyrebird-diagnostics.sh quick
+    <p>Look at the stream state first, then run the diagnostics:</p>
+    <pre><code># Which streams are publishing, and why not (no root needed)
+./lyrebird-stream-manager.sh status
 
-# Check stream status
-./lyrebird-stream-manager.sh status</code></pre>
-    <p>The exit code tells you the severity:</p>
+# Node checks
+sudo ./lyrebird-diagnostics.sh quick</code></pre>
+    <p>
+      <code>status</code> shows, for each stream, whether its path is ready in MediaMTX, whether bytes are flowing, and the last error,
+      then an overall state: <code>ok</code>, <code>degraded</code>, <code>failed</code>, <code>waiting_for_devices</code> or <code>stopped</code>.
+      The diagnostics do not tell you whether a stream is publishing. Their exit code gives the severity of what they found:
+    </p>
     <div class="table-wrapper">
       <table>
         <thead><tr><th>Exit Code</th><th>Meaning</th></tr></thead>
         <tbody>
           <tr><td>0</td><td>All checks passed</td></tr>
-          <tr><td>1</td><td>Warnings — system functional but needs attention</td></tr>
-          <tr><td>2</td><td>Failures — system degraded or non-functional</td></tr>
-          <tr><td>127</td><td>Prerequisites missing — cannot complete diagnostics</td></tr>
+          <tr><td>1</td><td>Warnings: system functional but needs attention</td></tr>
+          <tr><td>2</td><td>Failures: system degraded or non-functional</td></tr>
+          <tr><td>127</td><td>Script error: missing dependencies or permissions</td></tr>
         </tbody>
       </table>
     </div>
 
     <hr>
     <h2 id="no-devices">No USB Devices Found</h2>
-    <p><strong>Symptom:</strong> Stream manager reports no USB audio devices, or device list is empty.</p>
+    <p>
+      <strong>Symptom:</strong> the stream manager reports no USB audio devices, or <code>status</code> says <code>waiting_for_devices</code>.
+      By default <code>start</code> then still brings MediaMTX up and exits 0; with <code>LYREBIRD_ALLOW_EMPTY_START=false</code> it exits 6 instead.
+      The monitor starts a stream for each device that appears later. A USB speaker or DAC has no capture device and is skipped on purpose.
+    </p>
 
     <pre><code># Step 1: Check what Linux sees
 lsusb | grep -i audio
@@ -89,42 +97,67 @@ sudo ./usb-audio-mapper.sh</code></pre>
 
     <hr>
     <h2 id="stream-issues">Streams Won't Start</h2>
-    <p><strong>Symptom:</strong> Start command completes but no streams are active, or streams immediately die.</p>
+    <p><strong>Symptom:</strong> <code>start</code> fails, or completes but a stream is not publishing, or a stream dies right after it starts.</p>
 
-    <pre><code># Check stream manager logs
+    <p>Start with the exit status of <code>start</code>:</p>
+    <div class="table-wrapper">
+      <table>
+        <thead><tr><th>Exit</th><th>Meaning</th><th>What to do</th></tr></thead>
+        <tbody>
+          <tr><td>1</td><td>Not root, MediaMTX did not come up, a port is in use, or something could not be stopped</td><td>Read the message and the manager log; <code>sudo ss -tlnp | grep -E '8554|9997|9998'</code></td></tr>
+          <tr><td>3</td><td>A dependency is missing: <code>ffmpeg</code>, <code>jq</code>, <code>arecord</code>, <code>curl</code> or the MediaMTX binary</td><td>Install what the message names (<code>sudo ./install_mediamtx.sh install</code> for MediaMTX)</td></tr>
+          <tr><td>4</td><td>Invalid configuration: a bad <code>LYREBIRD_*</code> setting or port variable, an unusable MediaMTX configuration</td><td><code>./lyrebird-stream-manager.sh validate</code>, and the message</td></tr>
+          <tr><td>5</td><td>Another start, stop or restart holds the lock</td><td>Wait for it. The message names the holder (PID, start time, command). Never delete a lock file</td></tr>
+          <tr><td>6</td><td>No USB audio device, with <code>LYREBIRD_ALLOW_EMPTY_START=false</code></td><td>Plug in a microphone, or allow the empty start</td></tr>
+          <tr><td>8</td><td>Another MediaMTX owns the node (for example <code>mediamtx.service</code>); nothing was changed</td><td><code>sudo systemctl stop mediamtx</code> and disable it if you use the stream manager, or stop the other process</td></tr>
+          <tr><td>9</td><td>No stream is publishing (or not every one, under <code>LYREBIRD_START_POLICY=strict</code>); what the start launched was stopped</td><td>The output lists each stream with its reason; see below</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <pre><code># Per stream: path ready? bytes flowing? last error?
+./lyrebird-stream-manager.sh status --json | jq .
+
+# Check the device configuration file
+./lyrebird-stream-manager.sh validate
+
+# Manager log, FFmpeg log of one stream, MediaMTX output
 sudo tail -50 /var/log/lyrebird-stream-manager.log
+sudo tail -50 /var/lib/mediamtx-ffmpeg/mic-left.log
+sudo tail -50 /var/log/mediamtx.out
 
-# Check per-device FFmpeg logs
-sudo tail -50 /var/log/lyrebird/*.log
+# Check that MediaMTX answers (the API listens on this machine only)
+curl -s http://127.0.0.1:9997/v3/paths/list | head -20
 
-# Validate device configuration
-sudo ./lyrebird-mic-check.sh -V
+# Check the MediaMTX configuration (needs a MediaMTX that has the flag: 1.21.1 or later)
+/usr/local/bin/mediamtx --validate-conf=/etc/mediamtx/mediamtx.yml
 
-# Check if MediaMTX is running
-./install_mediamtx.sh status
-curl -s http://localhost:9997/v3/paths/list | head -20
-
-# Try a force-restart
+# Still stuck: stop what the manager started, then start again
 sudo ./lyrebird-stream-manager.sh force-stop
 sudo ./lyrebird-stream-manager.sh start</code></pre>
 
     <p><strong>Common causes:</strong></p>
     <ul>
-      <li>MediaMTX is not running — start it first</li>
-      <li>Configuration has an unsupported sample rate for the device</li>
-      <li>Device is busy (another process has it open)</li>
-      <li>Lock file is stale from a crashed previous run</li>
+      <li>The device configuration asks for a sample rate or channel count the card or the codec cannot do: the stream's <code>last_error</code> and the manager log name the setting (for example opus refuses some channel counts; use <code>aac</code> or another count)</li>
+      <li>The device is busy (another process has it open)</li>
+      <li>The card has no capture PCM, or its capture PCM is not number 0 (set <code>DEVICE_&lt;NAME&gt;_PCM</code>)</li>
+      <li>A configuration file of yours that MediaMTX rejects (see <a href="configuration.html#mediamtx-config">Who Owns mediamtx.yml</a>)</li>
     </ul>
 
-    <pre><code># Check if device is busy
-sudo lsof /dev/snd/*
+    <pre><code># Check if a device is busy
+sudo lsof /dev/snd/*</code></pre>
 
-# Remove stale lock file
-sudo rm -f /run/mediamtx-audio.lock /run/mediamtx-audio.pid</code></pre>
+    <p>
+      If a lifecycle command was killed and a stack was left running that the manager no longer recognises (<code>Refusing to start: MediaMTX
+      (PID n) is already running ... but was not started by this script</code>), list what <code>force-stop --kill-all</code> would kill, read the list,
+      and only then add <code>--yes</code>:
+    </p>
+    <pre><code>sudo ./lyrebird-stream-manager.sh force-stop --kill-all
+sudo ./lyrebird-stream-manager.sh force-stop --kill-all --yes</code></pre>
 
     <hr>
     <h2 id="device-names">Device Names Change After Reboot</h2>
-    <p><strong>Symptom:</strong> <code>Device_1</code> becomes <code>Device_2</code> after reboot, or devices swap names.</p>
+    <p><strong>Symptom:</strong> a stream's name changes after reboot, or devices swap names.</p>
 
     <pre><code># Show cards, ports and mappings; flags rules from older versions
 ./usb-audio-mapper.sh --list
@@ -146,120 +179,131 @@ sudo ./usb-audio-mapper.sh -n --card N -f NAME</code></pre>
 
     <hr>
     <h2 id="permissions">Permission Errors</h2>
-    <p><strong>Symptom:</strong> "Permission denied" errors when accessing audio devices or log directories.</p>
-
-    <pre><code># Add your user to the audio group
-sudo usermod -a -G audio $USER
-
-# Fix log directory permissions
-sudo mkdir -p /var/log/lyrebird
-sudo chmod 755 /var/log/lyrebird
-
-# Fix state directory permissions
-sudo mkdir -p /var/lib/mediamtx-ffmpeg
-sudo chmod 755 /var/lib/mediamtx-ffmpeg
-
-# Apply group changes (requires reboot or re-login)
-sudo reboot</code></pre>
+    <p><strong>Symptom:</strong> "Permission denied", or the manager exits 1 saying it must run as root.</p>
 
     <div class="callout warning">
       <span class="callout-icon">⚠️</span>
       <div class="callout-body">
         <strong>Run as Root or via Sudo</strong>
-        <p>The stream manager requires root to access USB audio devices and write to system directories. Always use <code>sudo ./lyrebird-stream-manager.sh start</code>. The diagnostics script can be run as a regular user for read-only checks.</p>
+        <p>Every stream manager command except <code>status</code>, <code>config</code> and <code>validate</code> needs root, and so do the orchestrator, the installer, the USB mapper (to write rules) and the monitor. The diagnostics and <code>status</code> can run as a regular user for read-only checks, with some results limited: as a regular user <code>status</code> shows a wrapper it cannot identify as <code>Unknown ... run as root</code> rather than "Not running".</p>
       </div>
     </div>
 
+    <pre><code># Only if you run arecord or ffmpeg by hand as your own user
+sudo usermod -a -G audio $USER
+# then log out and back in</code></pre>
+    <p>
+      Under the systemd unit the state and log directories are created by systemd. If <code>systemctl status mediamtx-audio</code> shows
+      <code>status=226/NAMESPACE</code>, a path in the unit's <code>ReadWritePaths=</code> does not exist. <code>install</code> prefixes a local
+      recording directory with <code>-</code> so that a missing mount (a USB disk that is not there yet) costs the recording, not the streams; any
+      other missing path stops the unit.
+    </p>
+
     <hr>
     <h2 id="mediamtx-crash">MediaMTX Crashes</h2>
-    <p><strong>Symptom:</strong> MediaMTX process dies unexpectedly, streams go offline.</p>
+    <p><strong>Symptom:</strong> the MediaMTX process dies unexpectedly, streams go offline.</p>
 
     <pre><code># Check system resources
 free -h
 df -h
-ulimit -n
 
-# View crash logs
-sudo journalctl -u mediamtx -n 100
+# MediaMTX's own output (both service modes write it here)
+sudo tail -100 /var/log/mediamtx.out
 
-# Increase file descriptor limits
-sudo bash -c 'echo "* soft nofile 4096" >> /etc/security/limits.conf'
-sudo bash -c 'echo "* hard nofile 8192" >> /etc/security/limits.conf'
-sudo bash -c 'echo "mediamtx soft nofile 4096" >> /etc/security/limits.conf'
-sudo bash -c 'echo "mediamtx hard nofile 8192" >> /etc/security/limits.conf'
+# systemd's messages about the unit (the output itself goes to the files above)
+sudo journalctl -u mediamtx-audio -n 100
+sudo journalctl -u mediamtx -n 100       # only with the standalone unit
 
-# Restart the service
-sudo systemctl restart mediamtx</code></pre>
+# Restart
+sudo systemctl restart mediamtx-audio    # stream manager install
+sudo systemctl restart mediamtx          # standalone install</code></pre>
+
+    <ul>
+      <li><strong>It exited after you edited <code>mediamtx.yml</code>.</strong> A MediaMTX that cannot load a changed configuration file logs the error and exits (with status 0). The unit has <code>Restart=always</code> for that reason, and it will fail again on the same file. Fix the file, or validate it first (MediaMTX 1.21.1 or later: <code>mediamtx --validate-conf=FILE</code>).</li>
+      <li><strong>File descriptors.</strong> The units set <code>LimitNOFILE</code> (65536 for the stream manager's service, 65535 for the standalone one); <code>/etc/security/limits.conf</code> does not apply to services. The monitor treats more than 1000 MediaMTX descriptors as critical and has cron restart the service.</li>
+      <li><strong>Reloading.</strong> The standalone <code>mediamtx.service</code> has no <code>ExecReload</code>, so <code>systemctl reload mediamtx</code> does nothing useful; MediaMTX re-reads its file by itself. The stream manager's unit has a real <code>reload</code>.</li>
+    </ul>
 
     <hr>
     <h2 id="cpu-usage">High CPU Usage</h2>
-    <p><strong>Symptom:</strong> System becomes unresponsive, CPU at 100%.</p>
+    <p><strong>Symptom:</strong> the system becomes unresponsive, CPU at 100%.</p>
 
-    <pre><code># Identify which processes are hot
+    <pre><code># One monitor pass logs MediaMTX CPU, descriptors and wrapper counts
 sudo ./lyrebird-stream-manager.sh monitor
-top -p $(pgrep -f ffmpeg | tr '\n' ',')</code></pre>
+
+# Which processes are hot (read-only; this signals nothing)
+ps -eo pid,pcpu,args --sort=-pcpu | head -10</code></pre>
 
     <p><strong>Solutions:</strong></p>
     <ul>
-      <li>Reduce sample rate: change <code>SAMPLE_RATE=48000</code> to <code>16000</code></li>
-      <li>Use a lower bitrate: <code>BITRATE=64k</code> instead of <code>192k</code></li>
-      <li>Reduce number of simultaneous streams</li>
-      <li>Check for FFmpeg zombie process accumulation (<code>ps aux | grep ffmpeg</code>)</li>
+      <li>Reduce the sample rate of a device: <code>DEVICE_&lt;NAME&gt;_SAMPLE_RATE=16000</code> in <code>/etc/mediamtx/audio-devices.conf</code>, then <code>restart</code></li>
+      <li>Use a lower bitrate: <code>DEVICE_&lt;NAME&gt;_BITRATE=64k</code></li>
+      <li>Reduce the number of simultaneous streams</li>
+      <li>Look for FFmpeg processes that no wrapper owns (below)</li>
     </ul>
 
-    <pre><code># Clean up zombie FFmpeg processes
-sudo pkill -f ffmpeg
-sudo ./lyrebird-stream-manager.sh start</code></pre>
+    <pre><code># Stop every stream and MediaMTX the manager started
+sudo ./lyrebird-stream-manager.sh stop
+
+# Anything left? This only lists; read it before you add --yes
+sudo ./lyrebird-stream-manager.sh force-stop --kill-all</code></pre>
+    <p>
+      Do not use <code>pkill -f ffmpeg</code> or <code>pkill mediamtx</code>: they kill every such process on the machine, including other
+      recorders, readers and other MediaMTX installations. <code>stop</code> and <code>force-stop</code> signal only processes the manager recorded.
+    </p>
 
     <hr>
     <h2 id="update-fail">Update Failed</h2>
-    <p><strong>Symptom:</strong> <code>lyrebird-updater.sh</code> reports errors, git conflicts, or update won't complete.</p>
+    <p><strong>Symptom:</strong> <code>lyrebird-updater.sh</code> reports errors, git conflicts, or an update will not complete.</p>
 
-    <pre><code># Check repository state
-git status
-git stash list
-
-# Check update status
+    <pre><code># What the updater knows: version, branch, sync state
 ./lyrebird-updater.sh --status
 
-# Stash local changes and retry
-git stash
-./lyrebird-updater.sh
+# Past updates and rollbacks, and an update that did not finish (local, no network)
+./lyrebird-updater.sh --history
 
-# Reset to known-good state
-git reset --hard origin/main
-git checkout $(git describe --tags --abbrev=0)
-chmod +x *.sh</code></pre>
+# Go back to the version before the last update
+./lyrebird-updater.sh --rollback
+
+# Your saved changes, if an update stashed them
+git stash list</code></pre>
+    <ul>
+      <li>An update that was killed or lost power is found by the next run of the updater, which undoes it (or completes a self-update). Your uncommitted changes are saved in a stash entry named <code>lyrebird-tx-...</code> or <code>lyrebird-recovery-...</code>; they are never discarded.</li>
+      <li>Exit 10: the switch is done, but your changes conflict with the new version; they are in the stash, not re-applied. Exit 11: the automatic rollback could not restore everything; the message names a <code>git checkout --force</code> command. The full list is in the <a href="components.html#updater">Version Manager</a> reference.</li>
+      <li>Exit 7: another updater is running. Wait for it; never delete the lock file.</li>
+      <li>The menu's "discard all changes and reset" (option 6) is the way to a clean tree; it permanently deletes local modifications.</li>
+    </ul>
 
     <hr>
     <h2 id="debug">Debug Procedures</h2>
 
     <h3>Enable Debug Mode</h3>
-    <pre><code>export DEBUG=1
-sudo ./lyrebird-stream-manager.sh start</code></pre>
+    <pre><code>sudo ./lyrebird-stream-manager.sh -d start</code></pre>
+    <p><code>DEBUG=1</code> does nothing: the scripts compare <code>DEBUG</code> with the word <code>true</code>. In the stream manager <code>DEBUG=true</code> also turns on shell tracing, which is very verbose; the <code>-d</code> option does not.</p>
 
     <h3>Test FFmpeg Directly</h3>
-    <pre><code># Test ALSA capture for a specific device
-arecord -D hw:0,0 -f cd -t wav -d 5 test.wav
+    <pre><code># Test ALSA capture for a mapped card (here: card id mic-left)
+arecord -D hw:CARD=mic-left,DEV=0 -f cd -t wav -d 5 test.wav
 
-# Test FFmpeg capture and publish
-ffmpeg -f alsa -i hw:0,0 \
+# Test FFmpeg capture and publish to a path of its own
+ffmpeg -f alsa -i hw:CARD=mic-left,DEV=0 \
   -acodec libopus \
   -b:a 128k \
   -ar 48000 \
   -ac 2 \
   -f rtsp \
   rtsp://localhost:8554/test</code></pre>
+    <p>Stop the stream manager's stream for that card first: a second open of a busy capture device may fail.</p>
 
     <h3>Test RTSP Connectivity</h3>
-    <pre><code># Check if port 8554 is listening
+    <pre><code># Check if the RTSP port is listening
 ss -tlnp | grep 8554
 
-# Test RTSP connection
-ffplay -i rtsp://localhost:8554/Device_1 -loglevel debug 2>&1 | head -50
+# Test an RTSP connection
+ffplay -i rtsp://localhost:8554/mic-left -loglevel debug 2>&amp;1 | head -50
 
-# Check MediaMTX API
-curl -s http://localhost:9997/v3/paths/list | python3 -m json.tool</code></pre>
+# Check the MediaMTX API
+curl -s http://127.0.0.1:9997/v3/paths/list | python3 -m json.tool</code></pre>
 
     <hr>
     <h2 id="log-locations">Log Locations</h2>
@@ -269,46 +313,52 @@ curl -s http://localhost:9997/v3/paths/list | python3 -m json.tool</code></pre>
         <tbody>
           <tr><td>MediaMTX output</td><td><code>/var/log/mediamtx.out</code></td></tr>
           <tr><td>Stream Manager</td><td><code>/var/log/lyrebird-stream-manager.log</code></td></tr>
+          <tr><td>Per-stream FFmpeg</td><td><code>/var/lib/mediamtx-ffmpeg/&lt;stream&gt;.log</code> (earlier runs: <code>.log.prev.1</code>, ...)</td></tr>
+          <tr><td>Stream state</td><td><code>/run/lyrebird/status.json</code></td></tr>
           <tr><td>Orchestrator</td><td><code>/var/log/lyrebird-orchestrator.log</code></td></tr>
           <tr><td>Diagnostics</td><td><code>/var/log/lyrebird-diagnostics.log</code></td></tr>
-          <tr><td>Per-device FFmpeg</td><td><code>/var/log/lyrebird/&lt;device&gt;.log</code></td></tr>
-          <tr><td>systemd (MediaMTX)</td><td><code>journalctl -u mediamtx</code></td></tr>
-          <tr><td>systemd (Streams)</td><td><code>journalctl -u mediamtx-audio</code></td></tr>
+          <tr><td>Alerts</td><td><code>/var/log/lyrebird/alerts.log</code></td></tr>
+          <tr><td>systemd (the unit's own messages)</td><td><code>journalctl -u mediamtx-audio</code>, <code>journalctl -u mediamtx</code></td></tr>
           <tr><td>USB events</td><td><code>dmesg | grep -i usb</code></td></tr>
         </tbody>
       </table>
     </div>
+    <p>
+      The stream manager's unit appends its output to <code>/var/log/lyrebird-stream-manager.log</code>; the journal holds what systemd says about the unit.
+      The storage script logs to stderr, so its output goes wherever your cron job sends it.
+    </p>
 
-    <pre><code># Follow all lyrebird logs in real time
-sudo tail -f /var/log/lyrebird-stream-manager.log /var/log/lyrebird/*.log
-
-# Follow systemd service logs
-sudo journalctl -u mediamtx-audio -f</code></pre>
+    <pre><code># Follow the manager and one stream in real time
+sudo tail -f /var/log/lyrebird-stream-manager.log /var/lib/mediamtx-ffmpeg/mic-left.log</code></pre>
 
     <hr>
     <h2 id="collecting-info">Collecting Debug Information for Bug Reports</h2>
     <p>When filing a GitHub issue, please include the following:</p>
 
     <pre><code># 1. Run full diagnostics (safe to share)
-sudo ./lyrebird-diagnostics.sh full > /tmp/diagnostics.txt 2>&1
+sudo ./lyrebird-diagnostics.sh full > /tmp/diagnostics.txt 2>&amp;1
 
-# 2. Collect logs (review before sharing — may contain paths)
-tar -czf /tmp/lyrebird-logs-$(date +%Y%m%d).tar.gz \
+# 2. The stream state
+./lyrebird-stream-manager.sh status --json > /tmp/status.json
+
+# 3. Collect logs (review before sharing — may contain paths)
+sudo tar -czf /tmp/lyrebird-logs-$(date +%Y%m%d).tar.gz \
   /var/log/mediamtx.out \
   /var/log/lyrebird-stream-manager.log \
-  /var/log/lyrebird/*.log \
+  /var/lib/mediamtx-ffmpeg/*.log \
   /etc/mediamtx/audio-devices.conf \
   /etc/udev/rules.d/99-usb-soundcards.rules 2>/dev/null
 
-# 3. System info
+# 4. System info
 cat /etc/os-release > /tmp/system-info.txt
 uname -a >> /tmp/system-info.txt
 lsusb >> /tmp/system-info.txt
 bash --version >> /tmp/system-info.txt</code></pre>
 
     <p>
-      Include <code>/tmp/diagnostics.txt</code>, the logs tarball, and <code>/tmp/system-info.txt</code> in your
-      <a href="https://github.com/tomtom215/LyreBirdAudio/issues" target="_blank" rel="noopener">GitHub issue</a>.
+      Include <code>/tmp/diagnostics.txt</code>, <code>/tmp/status.json</code>, the logs tarball, and <code>/tmp/system-info.txt</code> in your
+      <a href="https://github.com/tomtom215/LyreBirdAudio/issues" target="_blank" rel="noopener">GitHub issue</a>. Leave out <code>/etc/mediamtx/mediamtx.yml</code>
+      and <code>rtsp-users.conf</code>: they can contain password hashes.
     </p>
 
   </main>

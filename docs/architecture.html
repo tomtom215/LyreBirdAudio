@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Architecture - LyreBirdAudio Docs</title>
-  <meta name="description" content="System architecture, component diagrams, and Architecture Decision Records for LyreBirdAudio.">
+  <meta name="description" content="How the scripts fit together: process ownership, locks, configuration ownership, the stream lifecycle and the design decisions behind them.">
   <link rel="stylesheet" href="css/style.css">
 </head>
 <body>
@@ -19,7 +19,7 @@
     <div class="page-header">
       <span class="page-label">Reference</span>
       <h1 class="page-title">Architecture &amp; Design</h1>
-      <p class="page-subtitle">System design principles, component interactions, and the rationale behind key architectural decisions.</p>
+      <p class="page-subtitle">How the scripts fit together, who owns which process, file and lock, and the decisions behind them.</p>
     </div>
 
     <div class="toc">
@@ -28,6 +28,9 @@
         <li><a href="#philosophy">Design Philosophy</a></li>
         <li><a href="#system-overview">System Architecture</a></li>
         <li><a href="#management-arch">Management Architecture</a></li>
+        <li><a href="#ownership">Process Ownership</a></li>
+        <li><a href="#locking">Locking</a></li>
+        <li><a href="#config-ownership">Configuration Ownership</a></li>
         <li><a href="#data-flow">Data Flow</a></li>
         <li><a href="#adrs">Architecture Decision Records</a></li>
       </ul>
@@ -38,74 +41,70 @@
     <h3>Why Bash?</h3>
     <p>
       Bash is pre-installed on virtually every Linux system. Choosing Bash means: no pip/npm/gem
-      conflicts, no version mismatches, no build processes, no containers. Deployment is:
-      <em>git clone, chmod +x, run</em>.
-    </p>
-    <p>
-      This choice eliminates entire categories of deployment failures that are common with Python,
-      Node.js, or Ruby-based tools — especially on minimal embedded systems like Raspberry Pi.
+      conflicts, no build processes, no containers. Deployment is:
+      <em>git clone, chmod +x, run</em>. The scripts check for Bash 4.0 or newer (the diagnostics for 4.4); the project's tests run on Bash 5.2 only.
     </p>
 
     <h3>Why Not Docker?</h3>
     <p>
       USB device management requires host-level udev rule creation and direct USB subsystem access.
       Containers add complexity that conflicts with physical USB port mapping, which is a core feature.
-      LyreBirdAudio is designed for dedicated bare-metal hosts where systemd services provide
-      sufficient process isolation.
+      LyreBirdAudio is designed for dedicated hosts where systemd services provide the process supervision.
     </p>
 
     <h3>Single-Responsibility Principle</h3>
-    <p>Each script has exactly one domain:</p>
+    <p>Each script has one domain:</p>
     <ul>
-      <li><strong>Orchestrator</strong>: User interface and delegation only — no business logic</li>
-      <li><strong>Stream Manager</strong>: FFmpeg process management</li>
-      <li><strong>USB Mapper</strong>: Device persistence via udev</li>
-      <li><strong>Capability Checker</strong>: Hardware capability detection</li>
-      <li><strong>Updater</strong>: Version management</li>
-      <li><strong>Diagnostics</strong>: System health validation</li>
-      <li><strong>Installer</strong>: MediaMTX lifecycle</li>
+      <li><strong>Orchestrator</strong>: user interface and delegation; it runs the other scripts and reports their results, and holds no streaming logic</li>
+      <li><strong>Stream Manager</strong>: MediaMTX and FFmpeg process management, stream health, the status document</li>
+      <li><strong>USB Mapper</strong>: device persistence via udev</li>
+      <li><strong>Capability Checker</strong>: hardware capability detection and device configuration</li>
+      <li><strong>Updater</strong>: version management</li>
+      <li><strong>Diagnostics</strong>: system health checks</li>
+      <li><strong>Installer</strong>: MediaMTX install, update and removal</li>
     </ul>
-    <p>This modularity prevents duplicate business logic, simplifies testing, and ensures maintainability.</p>
+    <p>The shared library (<code>lyrebird-common.sh</code>) holds what two scripts would otherwise copy: logging, the durable file writer and the MediaMTX configuration generator.</p>
 
     <h2 id="system-overview">System Architecture</h2>
-    <p>The full system stack from physical devices to client applications:</p>
+    <p>The stack from physical devices to client applications:</p>
 
     <pre><code>+----------------------------------------------------------+
 |                     Client Applications                  |
 |            (VLC, FFplay, OBS, Custom RTSP Clients)       |
 +--------------------+-------------------------------------+
-                     | RTSP://host:8554/DeviceName
+                     | rtsp://host:8554/stream-name
                      ▼
 +----------------------------------------------------------+
 |                       MediaMTX                           |
-|                  (Real-time Media Server)                |
 |  ┌────────────────────────────────────────────────────┐  |
-|  │  RTSP Server (port 8554)                           │  |
-|  │  HTTP API (port 9997)                              │  |
-|  │  WebRTC (port 8889)                                │  |
-|  │  RTP/RTCP (ports 8000-8001)                        │  |
+|  │  RTSP server (port 8554, every interface)          │  |
+|  │  RTP/RTCP over UDP (ports 8000-8001)               │  |
+|  │  Control API (127.0.0.1:9997)                      │  |
+|  │  Metrics (127.0.0.1:9998)                          │  |
+|  │  RTMP, HLS, WebRTC, SRT, MoQ: off                  │  |
 |  └────────────────────────────────────────────────────┘  |
 +--------------------+-------------------------------------+
-                     | Managed by
+                     | Started and supervised by
                      ▼
 +----------------------------------------------------------+
-|              Stream Manager + systemd                    |
+|              Stream Manager (+ systemd, cron)            |
 |  ┌────────────────────────────────────────────────────┐  |
-|  │  Process lifecycle management                      │  |
-|  │  Automatic stream recovery (exp. backoff)          │  |
-|  │  Health monitoring via MediaMTX API                │  |
-|  │  Resource monitoring (CPU, FD, memory)             │  |
+|  │  Owns MediaMTX and the FFmpeg wrapper processes    │  |
+|  │  Restarts FFmpeg with exponential backoff          │  |
+|  │  Health via MediaMTX API: path ready, bytes flow   │  |
+|  │  Cron monitor: restarts what died, within a budget │  |
+|  │  Status document: /run/lyrebird/status.json        │  |
 |  └────────────────────────────────────────────────────┘  |
 +--------------------+-------------------------------------+
-                     | Captures from
+                     | Starts one wrapper per microphone
                      ▼
 +----------------------------------------------------------+
 |                  FFmpeg Audio Pipeline                   |
 |  ┌────────────────────────────────────────────────────┐  |
-|  │  ALSA capture (hw:Device_N)                        │  |
-|  │  Audio encoding (Opus/AAC/PCM)                     │  |
+|  │  ALSA capture (plughw:CARD,PCM)                    │  |
+|  │  Audio encoding (Opus / AAC / MP3)                 │  |
 |  │  RTSP publishing to MediaMTX                       │  |
-|  │  Thread queue buffering                            │  |
+|  │  Optional local segment ring (RAM by default)      │  |
 |  └────────────────────────────────────────────────────┘  |
 +--------------------+-------------------------------------+
                      | Reads from
@@ -115,7 +114,7 @@
 |  ┌────────────────────────────────────────────────────┐  |
 |  │  card id mic-left → hw:CARD=mic-left               │  |
 |  │  /dev/sound/by-id/mic-left → ../snd/controlC0      │  |
-|  │  Consistent naming across reboots                  │  |
+|  │  Same name for the same USB port across reboots    │  |
 |  └────────────────────────────────────────────────────┘  |
 +--------------------+-------------------------------------+
                      | Physical layer
@@ -130,17 +129,17 @@
 +----------------------------------------------------------+</code></pre>
 
     <h2 id="management-arch">Management Architecture</h2>
-    <p>The Orchestrator is the single management entry point, delegating to specialized scripts:</p>
+    <p>The Orchestrator is the menu front end; each script also works alone:</p>
 
-    <pre><code>lyrebird-orchestrator.sh (Unified Interface)
+    <pre><code>lyrebird-orchestrator.sh (menu front end)
 │
 ├── install_mediamtx.sh
-│     MediaMTX installation/upgrade lifecycle
-│     Atomic install with checksum verification &amp; rollback
+│     MediaMTX install/update/uninstall
+│     Checksum-verified download, atomic install, rollback
 │
 ├── lyrebird-stream-manager.sh
-│     FFmpeg process management
-│     Stream health + auto-recovery
+│     MediaMTX and FFmpeg process management
+│     Start policy, status document, cron monitor
 │     Individual + multiplex modes
 │
 ├── usb-audio-mapper.sh
@@ -155,50 +154,80 @@
 │
 ├── lyrebird-updater.sh
 │     Git-based version management
-│     Transaction-based updates with rollback
+│     Transaction-based updates with history and rollback
 │     Post-update migration system
 │
-├── lyrebird-diagnostics.sh
-│     20+ system health checks
-│     USB, MediaMTX, streams, resources
-│     Quick / full / debug modes
-│
-├── lyrebird-alerts.sh
-│     Webhook notifications
-│     Discord, Slack, ntfy, Pushover
-│     Rate limiting &amp; deduplication
-│
-├── lyrebird-metrics.sh
-│     Prometheus metrics export
-│     HTTP server mode for scraping
-│
-└── lyrebird-storage.sh
-      Disk space management
-      Retention policy enforcement</code></pre>
+└── lyrebird-diagnostics.sh
+      System health checks (quick / full / debug)
+
+Run on their own (the orchestrator does not call them, and neither does the monitor):
+  lyrebird-alerts.sh    webhook notifications
+  lyrebird-metrics.sh   Prometheus metrics export
+  lyrebird-storage.sh   disk space and retention</code></pre>
+
+    <h2 id="ownership">Process Ownership</h2>
+    <p>
+      The stream manager is the single owner of the MediaMTX it starts and of the FFmpeg wrappers it launches
+      (the systemd unit <code>mediamtx-audio.service</code>). The standalone <code>mediamtx.service</code> stays supported for MediaMTX-only installs, but the two
+      units conflict, and the manager refuses to start (exit 8) while another MediaMTX owns the node.
+    </p>
+    <ul>
+      <li><strong>Processes are identified, not matched by name.</strong> The manager records each PID in its own PID file, and beside it, in <code>&lt;pid file&gt;.id</code>, the process start time (field 22 of <code>/proc/&lt;pid&gt;/stat</code>). A process is "ours" only while its start time still matches and its image is the expected one: for MediaMTX the configured binary run with the configuration file as its first argument; for a wrapper a Bash running that stream's generated script. A reused PID, another installation's MediaMTX, or an operator's <code>ffmpeg</code> reading a stream is never signalled.</li>
+      <li><strong>Signals.</strong> <code>stop</code> sends SIGTERM to a wrapper's process group and every descendant, then SIGKILL after a timeout; <code>force-stop</code> sends SIGKILL at once. Both act only on recorded, verified processes. <code>force-stop --kill-all --yes</code> is the only broad kill; without <code>--yes</code> it prints what it would kill.</li>
+      <li><strong>The installer follows the same rule.</strong> It stops MediaMTX through its owner (systemd or the stream manager), and otherwise only a process that runs the installed binary on the installed configuration. It never signals FFmpeg.</li>
+      <li><strong>A repeated <code>start</code> changes nothing that works.</strong> When the recorded MediaMTX is alive and verified, only missing streams are started.</li>
+    </ul>
+
+    <h2 id="locking">Locking</h2>
+    <p>The scripts serialise on kernel <code>flock</code> locks, with one rule: a lock file is never deleted and never truncated.</p>
+    <ul>
+      <li>The stream manager's lifecycle lock is <code>/run/mediamtx-audio.lock</code>; its configuration lock is <code>/etc/mediamtx/.config.lock</code>. <code>start</code>, <code>stop</code>, <code>restart</code>, <code>reload</code> and <code>force-stop</code> take the lifecycle lock; <code>start</code>/<code>restart</code> wait up to 30 s, <code>stop</code>/<code>force-stop</code> 5 s and then exit 5; the monitor takes it for its stream checks and skips its cycle if it is busy. The cron line's own <code>/run/mediamtx-monitor.lock</code> only keeps two monitor runs apart.</li>
+      <li>The kernel drops a <code>flock</code> when its holder exits, however it exits, so there is no stale lock and no lock-age or process-name guesswork. After the lock is won, the holder writes a record <code>pid starttime</code> into the file for humans: a failed acquire prints the holder from it (only if the start time still matches, so a recycled PID is never blamed) and the processes that have the file open.</li>
+      <li>Every long-lived child (MediaMTX, wrappers, their FFmpeg) is started with the lock descriptor closed, so a child cannot keep a lock after its parent is gone.</li>
+      <li>The updater (<code>.git/lyrebird-updater/updater.lock</code>) and the installer (<code>/run/lock/mediamtx-installer.lock</code>) have locks of their own.</li>
+    </ul>
+
+    <h2 id="config-ownership">Configuration Ownership</h2>
+    <ul>
+      <li><strong>MediaMTX configuration.</strong> One generator (<code>lyrebird_render_mediamtx_config</code> in the shared library) serves the stream manager and the installer. A file whose first line is <code># Managed by LyreBirdAudio</code> is ours and is rewritten, validated first, after a timestamped backup; any other file is the operator's and is never written. The rules are on <a href="configuration.html#mediamtx-config">Configuration</a>.</li>
+      <li><strong>Device configuration.</strong> <code>audio-devices.conf</code> is parsed as data by an allowlist parser: unknown keys, bad values and shell syntax are reported with file, line and key, and never executed. One parser serves <code>validate</code>, <code>start</code>, <code>restart</code> and <code>monitor</code>.</li>
+      <li><strong>Generated wrapper scripts.</strong> Every value reaches a wrapper through <code>printf %q</code>, so a value is a quoted word and never code. The wrapper is checked with <code>bash -n</code> and installed by rename, so a running wrapper is never rewritten under its feet.</li>
+      <li><strong>Durable writes.</strong> Files the suite replaces (MediaMTX configuration, device configuration, the unit and cron files) go through <code>lyrebird_atomic_write</code>: a temporary file in the same directory, fsync, rename, fsync of the directory. Whether a power cut leaves the file intact depends on the storage and was not tested.</li>
+    </ul>
 
     <h2 id="data-flow">Data Flow</h2>
 
     <h3>Stream Startup Sequence</h3>
     <ol>
-      <li>Stream manager reads <code>/etc/mediamtx/audio-devices.conf</code></li>
-      <li>Scans <code>/dev/snd/by-id/</code> (falling back to <code>/proc/asound/cards</code>) for available devices</li>
-      <li>For each device, looks up config (friendly name → full ID → defaults)</li>
-      <li>Starts MediaMTX if not running</li>
-      <li>Launches FFmpeg wrapper for each device</li>
-      <li>Wrapper supervises FFmpeg with exponential backoff restart logic</li>
-      <li>MediaMTX API confirms stream is active</li>
-      <li>Cron job monitors health every 5 minutes via <code>monitor</code> command</li>
+      <li><code>start</code> checks its settings, takes the lifecycle lock (exit 5 if another command holds it), and refuses (exit 8) if another MediaMTX owns the node</li>
+      <li>If its own MediaMTX is already running, it keeps it and goes on to start only the streams that are missing. Otherwise it cleans up stale state and waits for the USB device list to settle</li>
+      <li>It lists devices from <code>/dev/snd/by-id/</code> (falling back to <code>/proc/asound/cards</code>) and skips any card with no capture PCM</li>
+      <li>It checks that the three MediaMTX ports are free, renders the MediaMTX configuration if the file is managed, and launches MediaMTX; its PID is recorded before the wait for the API</li>
+      <li>For each device it looks up the settings (friendly name, then full device name, then defaults), asks FFmpeg whether it can encode that channel count with that codec, generates the wrapper and launches it in its own session</li>
+      <li>The wrapper supervises FFmpeg with exponential backoff</li>
+      <li>MediaMTX's API confirms each path is ready; the result is judged against <code>LYREBIRD_START_POLICY</code>, written to <code>/run/lyrebird/status.json</code>, and returned as the exit status (0, or 9 after stopping what that run started)</li>
+      <li>The cron job runs <code>monitor</code> every 5 minutes (see <a href="monitoring.html#monitor">Monitoring</a>)</li>
     </ol>
 
-    <h3>Exponential Backoff Recovery</h3>
-    <pre><code>Attempt 1: Wait 10s before restart
-Attempt 2: Wait 20s
-Attempt 3: Wait 40s
-...
-Max delay: 300s (5 minutes)
+    <h3 id="backoff">Exponential Backoff Recovery</h3>
+    <p>
+      Each wrapper starts FFmpeg and, when it exits, waits before the next attempt. The wait starts at <code>INITIAL_RESTART_DELAY</code> (10 s) and is doubled
+      before each wait, up to <code>MAX_RESTART_DELAY</code> (300 s), so with the defaults the waits are:
+    </p>
+    <pre><code>After failure 1: wait 20s
+After failure 2: wait 40s
+After failure 3: wait 80s
+After failure 4: wait 160s
+After failure 5: wait 300s, then the wrapper exits
 
-After 300s of stable operation: reset backoff counter
-After MAX_CONSECUTIVE_FAILURES: alert and stop retrying</code></pre>
+A run longer than WRAPPER_SUCCESS_DURATION (300s) resets the failure
+counter, the restart counter and the delay.
+The wrapper also exits after MAX_WRAPPER_RESTARTS (50) restarts without such a run,
+or when its device is gone.</code></pre>
+    <p>
+      A wrapper that has exited stays down until the cron monitor starts it again (at most <code>CRON_RESTART_MAX_PER_HOUR</code> times per hour per stream).
+      The wrapper itself sends no alert.
+    </p>
 
     <h3>USB Device Persistence Flow</h3>
     <ol>
@@ -216,9 +245,9 @@ After MAX_CONSECUTIVE_FAILURES: alert and stop retrying</code></pre>
     <h3>ADR-001: Bash as Primary Language</h3>
     <dl>
       <dt>Decision</dt>
-      <dd>Bash 4.0+ for all scripts</dd>
+      <dd>Bash for all scripts (4.0 or newer is checked; tested on 5.2)</dd>
       <dt>Rationale</dt>
-      <dd>Universal availability on Linux, zero runtime dependencies, native system integration, easy to audit, familiar to sysadmins</dd>
+      <dd>Universal availability on Linux, no runtime to install, native system integration, easy to audit, familiar to sysadmins</dd>
       <dt>Trade-offs</dt>
       <dd>Limited to Linux/Unix; more verbose than Python for complex logic; requires careful quoting discipline</dd>
     </dl>
@@ -228,9 +257,9 @@ After MAX_CONSECUTIVE_FAILURES: alert and stop retrying</code></pre>
       <dt>Decision</dt>
       <dd>MediaMTX (formerly rtsp-simple-server) as the RTSP server</dd>
       <dt>Rationale</dt>
-      <dd>Single binary deployment, low resource usage (suitable for Pi), REST API for programmatic control, supports RTSP/WebRTC/HLS, active development</dd>
+      <dd>Single binary deployment, low resource usage, REST API for health checks, active development</dd>
       <dt>Trade-offs</dt>
-      <dd>External dependency; must handle API version changes</dd>
+      <dd>External dependency; its API and configuration keys change between versions (the suite is tested against MediaMTX 1.15.0 to 1.21.3 and detects the API version)</dd>
     </dl>
 
     <h3>ADR-003: FFmpeg for Audio Transcoding</h3>
@@ -238,79 +267,79 @@ After MAX_CONSECUTIVE_FAILURES: alert and stop retrying</code></pre>
       <dt>Decision</dt>
       <dd>FFmpeg as the audio capture and encoding pipeline</dd>
       <dt>Rationale</dt>
-      <dd>Native ALSA support, codec flexibility, battle-tested stability, configurable for quality/performance trade-offs</dd>
+      <dd>Native ALSA support, codec flexibility, configurable for quality/performance trade-offs</dd>
       <dt>Trade-offs</dt>
-      <dd>Must be installed; process lifecycle management complexity</dd>
+      <dd>Must be installed; process lifecycle management complexity; some options are missing from older FFmpeg releases (the amix <code>normalize</code> option), which the manager detects by asking FFmpeg</dd>
     </dl>
 
     <h3>ADR-004: Shared Library Pattern</h3>
     <dl>
       <dt>Decision</dt>
-      <dd><code>lyrebird-common.sh</code> sourced by all scripts</dd>
+      <dd><code>lyrebird-common.sh</code> sourced by the scripts</dd>
       <dt>Rationale</dt>
-      <dd>DRY principle, consistent logging format, backward compatibility via override pattern</dd>
+      <dd>One copy of logging, the durable writer and the MediaMTX configuration generator</dd>
       <dt>Trade-offs</dt>
-      <dd>Must maintain backward compatibility; source order matters</dd>
+      <dd>Must maintain backward compatibility; source order matters; the stream manager and the installer's <code>install</code> cannot run without it</dd>
     </dl>
 
-    <h3>ADR-005: Atomic File Operations</h3>
+    <h3>ADR-005: Atomic, Durable File Operations</h3>
     <dl>
       <dt>Decision</dt>
-      <dd>Write to <code>.tmp</code> file, then <code>mv</code> to final location</dd>
+      <dd>Write to a temporary file in the same directory, fsync, rename over the destination, fsync the directory (<code>lyrebird_atomic_write</code>)</dd>
       <dt>Rationale</dt>
-      <dd>Prevents partial reads by concurrent processes; POSIX guarantees <code>mv</code> on same filesystem is atomic; crash-safe</dd>
+      <dd>Prevents partial reads by concurrent processes; rename on one filesystem is atomic; the file survives a crash in either its old or its new form</dd>
       <dt>Trade-offs</dt>
-      <dd>Slightly more complex code; stale <code>.tmp</code> cleanup needed</dd>
+      <dd>Slightly more complex code; a killed writer can leave a hidden temporary file, which nothing reads</dd>
     </dl>
 
     <h3>ADR-006: udev for Device Persistence</h3>
     <dl>
       <dt>Decision</dt>
-      <dd>udev rules create persistent symlinks by USB port topology</dd>
+      <dd>udev rules name the sound card by its USB port position</dd>
       <dt>Rationale</dt>
       <dd>Kernel-integrated, no daemon required, survives reboots and reconnections</dd>
       <dt>Trade-offs</dt>
-      <dd>Root required to install rules; USB hub changes require remapping; reboot needed</dd>
+      <dd>Root required to install rules; moving a microphone to another port or changing hubs needs a new mapping; the mapper applies a mapping immediately, so no reboot is needed</dd>
     </dl>
 
     <h3>ADR-007: Webhook-Based Alerting</h3>
     <dl>
       <dt>Decision</dt>
-      <dd>Pure-Bash webhook support for Discord, Slack, ntfy, Pushover</dd>
+      <dd>Pure-Bash webhook support for Discord, Slack, ntfy, Pushover and generic endpoints, called by the operator</dd>
       <dt>Rationale</dt>
-      <dd>Users choose their own notification platform; no email/SMS infrastructure required; easy to extend</dd>
+      <dd>Users choose their own notification platform; no email/SMS infrastructure required</dd>
       <dt>Trade-offs</dt>
-      <dd>Requires network connectivity; rate limiting needed to prevent spam</dd>
+      <dd>Requires network connectivity; rate limiting needed to prevent spam; no LyreBirdAudio component triggers it, so the operator decides what raises an alert</dd>
     </dl>
 
     <h3>ADR-008: Prometheus Metrics Format</h3>
     <dl>
       <dt>Decision</dt>
-      <dd>Export metrics in Prometheus/OpenMetrics text format</dd>
+      <dd>Export metrics in the Prometheus text exposition format</dd>
       <dt>Rationale</dt>
-      <dd>Industry standard, plain text (easy to debug), wide ecosystem (Grafana, AlertManager)</dd>
+      <dd>Plain text (easy to debug), wide ecosystem (Grafana, Alertmanager)</dd>
       <dt>Trade-offs</dt>
-      <dd>Must maintain metric naming conventions; metric cardinality control required</dd>
+      <dd>Metric names must stay stable; a source that cannot be read makes its metrics absent rather than 0</dd>
     </dl>
 
-    <h3>ADR-009: Lockfile Concurrency Control</h3>
+    <h3>ADR-009: Kernel Locks That Are Never Deleted</h3>
     <dl>
       <dt>Decision</dt>
-      <dd>Lockfiles prevent concurrent script execution</dd>
+      <dd><code>flock</code> on a stable path; the file is opened without truncation and never removed</dd>
       <dt>Rationale</dt>
-      <dd>Simple, debuggable, atomic acquisition via <code>mkdir</code> or <code>flock</code></dd>
+      <dd>The kernel releases the lock when its holder dies, so there is nothing to clean up and no staleness test that can be wrong. Deleting a held lock file would give the next process a different lock</dd>
       <dt>Trade-offs</dt>
-      <dd>Stale locks possible after crash; cleanup logic required</dd>
+      <dd>A child that inherits the lock descriptor keeps the lock, so every long-lived child is started with it closed</dd>
     </dl>
 
     <h3>ADR-010: Signal Handler Pattern</h3>
     <dl>
       <dt>Decision</dt>
-      <dd><code>trap cleanup EXIT INT TERM HUP QUIT</code> in all long-running scripts</dd>
+      <dd>Scripts that start or change something install an <code>EXIT</code> trap and traps for the terminating signals (the stream manager: INT, TERM, QUIT, with the conventional 128+N exit status)</dd>
       <dt>Rationale</dt>
-      <dd>Ensures cleanup (remove locks, kill child processes) on all exit paths</dd>
+      <dd>Takes down what the run itself launched and removes its temporary files on every exit path</dd>
       <dt>Trade-offs</dt>
-      <dd>More complex code; cleanup must be idempotent</dd>
+      <dd>More complex code; cleanup must be idempotent. A SIGHUP to an interactive stream manager run is a <code>reload</code>, not a restart</dd>
     </dl>
 
   </main>

@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Quick Start - LyreBirdAudio Docs</title>
-  <meta name="description" content="Get LyreBirdAudio set up and streaming in 5 minutes.">
+  <meta name="description" content="Install LyreBirdAudio and get your first USB microphone streaming over RTSP.">
   <link rel="stylesheet" href="css/style.css">
 </head>
 <body>
@@ -19,7 +19,7 @@
     <div class="page-header">
       <span class="page-label">Getting Started</span>
       <h1 class="page-title">Quick Start</h1>
-      <p class="page-subtitle">Get LyreBirdAudio installed and streaming in 5 minutes using the guided setup wizard.</p>
+      <p class="page-subtitle">Get LyreBirdAudio installed and streaming, with the guided setup wizard or by hand.</p>
     </div>
 
     <div class="toc">
@@ -38,119 +38,102 @@
     <h2 id="requirements">System Requirements</h2>
 
     <h3>Operating System</h3>
-    <div class="table-wrapper">
-      <table>
-        <thead><tr><th>OS</th><th>Minimum Version</th><th>Status</th></tr></thead>
-        <tbody>
-          <tr><td>Ubuntu</td><td>20.04 LTS</td><td><span class="badge badge-green">Supported</span></td></tr>
-          <tr><td>Debian</td><td>11 (Bullseye)</td><td><span class="badge badge-green">Supported</span></td></tr>
-          <tr><td>Raspberry Pi OS</td><td>Bullseye</td><td><span class="badge badge-blue">Supported</span></td></tr>
-        </tbody>
-      </table>
-    </div>
+    <p>
+      A Linux system with systemd, ALSA and udev; the USB mapper and the stream manager do not run elsewhere.
+      The scripts are written for Debian-family distributions: Ubuntu 20.04 or newer, Debian 11 or newer, and
+      Raspberry Pi OS. That is what the code assumes, not what the project tests. The test suite runs on one Linux
+      system (x86_64, Bash 5.2) with stand-ins for USB hardware and for systemd; it has not been run on a Raspberry Pi,
+      on ARM, on Bash 4.x or on any distribution above, and no test uses real USB audio hardware or a real systemd manager.
+    </p>
 
     <h3>Hardware</h3>
-    <div class="table-wrapper">
-      <table>
-        <thead><tr><th>Component</th><th>Minimum</th><th>Recommended</th></tr></thead>
-        <tbody>
-          <tr><td>CPU</td><td>1 core</td><td>2+ cores (for multiple streams)</td></tr>
-          <tr><td>RAM</td><td>512 MB</td><td>1 GB+ (for 4+ streams)</td></tr>
-          <tr><td>Storage</td><td>100 MB</td><td>1 GB+ (for recordings)</td></tr>
-          <tr><td>Architecture</td><td colspan="2">x86_64, ARM64, ARMv7, ARMv6</td></tr>
-        </tbody>
-      </table>
-    </div>
+    <p>
+      The installer can fetch MediaMTX builds for x86_64 (amd64), 386, ARM64, ARMv7 and ARMv6. The project has not measured
+      CPU, memory or disk needs: watch <code>lyrebird_mediamtx_memory_bytes</code> and <code>lyrebird_stream_memory_bytes</code>
+      (see <a href="monitoring.html#prometheus">Monitoring</a>) on your own hardware before you plan for many streams.
+    </p>
 
     <div class="callout warning">
       <span class="callout-icon">⚠️</span>
       <div class="callout-body">
-        <strong>Raspberry Pi Limitations</strong>
-        <p>Raspberry Pi (especially Pi Zero and 3B+) supports a maximum of 1–2 USB microphones due to shared USB bandwidth. For 4+ simultaneous microphones, an Intel N100 mini PC ($100–150) is strongly recommended.</p>
+        <strong>USB bandwidth on small boards</strong>
+        <p>A Raspberry Pi shares USB bandwidth between its ports, so the project's advice is one or two microphones per board; for more, use a machine with several USB controllers. The test suite does not measure this.</p>
       </div>
     </div>
 
     <h3>Software Dependencies</h3>
     <p>Verify these are installed before proceeding:</p>
     <pre><code># Check required tools
-bash --version           # Must be 4.0+
-ffmpeg -version          # Required for audio capture
-git --version            # Required for installation
-lsusb                    # From usbutils package
-arecord --version        # From alsa-utils package
+bash --version           # The scripts check for Bash 4.0 or newer
+ffmpeg -version          # Audio capture and encoding
+jq --version             # Required by the stream manager (start exits 3 without it)
+curl --version           # MediaMTX download, API checks
+git --version            # Cloning and the version manager
+lsusb                    # From usbutils
+arecord --version        # From alsa-utils
+flock --version          # From util-linux (installed by default on Debian-family systems)
 
 # Install missing dependencies (Ubuntu/Debian)
 sudo apt update
-sudo apt install -y ffmpeg git usbutils alsa-utils curl</code></pre>
+sudo apt install -y ffmpeg jq curl git usbutils alsa-utils</code></pre>
 
-    <p><strong>Optional but recommended:</strong></p>
-    <pre><code>sudo apt install -y jq          # Better MediaMTX API parsing
-sudo apt install -y shellcheck  # For script validation (developers)</code></pre>
+    <p><strong>Optional:</strong></p>
+    <pre><code>sudo apt install -y netcat-openbsd  # Only for lyrebird-metrics.sh serve
+sudo apt install -y shellcheck bats # Developers only</code></pre>
 
     <h2 id="clone">Clone the Repository</h2>
 
-    <h3>Option A: Latest Stable Release (Recommended for Production)</h3>
-    <pre><code>git clone https://github.com/tomtom215/LyreBirdAudio.git
-cd LyreBirdAudio
-
-# Checkout the latest tagged release
-git checkout $(git describe --tags --abbrev=0)
-
-chmod +x *.sh</code></pre>
-
-    <h3>Option B: Latest Main Branch</h3>
+    <h3>Option A: Main Branch</h3>
     <pre><code>git clone https://github.com/tomtom215/LyreBirdAudio.git
 cd LyreBirdAudio
 chmod +x *.sh</code></pre>
 
-    <div class="callout tip">
-      <span class="callout-icon">💡</span>
+    <h3>Option B: A Tagged Release</h3>
+    <pre><code>git clone https://github.com/tomtom215/LyreBirdAudio.git
+cd LyreBirdAudio
+
+# See which tags contain everything that is on main
+git tag --contains origin/main
+
+git checkout vX.Y.Z    # a tag from that list
+chmod +x *.sh</code></pre>
+
+    <div class="callout warning">
+      <span class="callout-icon">⚠️</span>
       <div class="callout-body">
-        <strong>Production Tip</strong>
-        <p>For 24/7 deployments, always use tagged releases. The main branch may contain work-in-progress features. Tagged releases are tested for at least 72 hours on real hardware before publishing.</p>
+        <strong>Do not pin a node to a tag that predates the fixes</strong>
+        <p>The newest tag at the time of writing, <code>v1.3.0</code>, was made before the changes these pages describe (the status document, the start policy, the MediaMTX configuration ownership rules, and others). <code>git describe --tags --abbrev=0</code> returns that tag, and the version manager's "latest stable release" is the same tag, so neither gives you the current code until a newer tag exists. If <code>git tag --contains origin/main</code> prints nothing, no release contains the current code yet: use the main branch.</p>
       </div>
     </div>
 
     <h2 id="wizard">Run the Setup Wizard</h2>
-    <p>The Orchestrator provides a guided wizard that handles everything in one flow:</p>
+    <p>The Orchestrator's wizard walks through four steps:</p>
     <pre><code>sudo ./lyrebird-orchestrator.sh</code></pre>
 
-    <p>When the menu appears, select <strong>"Quick Setup Wizard"</strong>. The wizard will:</p>
+    <p>When the menu appears, select <strong>1) Quick Setup Wizard</strong>:</p>
     <ol class="steps">
       <li>
         <div>
           <strong>Install MediaMTX</strong>
-          <p>Downloads the latest MediaMTX binary with SHA256 checksum verification and sets up a systemd service.</p>
+          <p>Runs <code>install_mediamtx.sh install</code>: downloads the latest MediaMTX release, verifies its SHA-256 checksum, installs it, and writes <code>/etc/mediamtx/mediamtx.yml</code> and a <code>mediamtx.service</code> unit. If MediaMTX is already installed the wizard carries on.</p>
         </div>
       </li>
       <li>
         <div>
-          <strong>Map USB Audio Devices</strong>
-          <p>Scans connected USB microphones and creates persistent udev rules so device names never change across reboots.</p>
+          <strong>Map USB audio devices</strong>
+          <p>Opens the USB mapper in interactive mode, which writes udev rules that give each microphone a fixed name tied to its USB port. Names take effect immediately; no reboot is needed.</p>
         </div>
       </li>
       <li>
         <div>
-          <strong>Detect Hardware Capabilities</strong>
-          <p>Non-invasively analyzes each microphone's supported sample rates, channels, and formats to generate an optimal configuration.</p>
+          <strong>Start audio streams</strong>
+          <p>Runs the stream manager's <code>start</code> and then reads what it left behind: for each stream whether it is publishing, and for each stream that is not, the reason. The summary at the end says whether setup completed, whether only some of the streams are publishing, whether MediaMTX is running and waiting for a microphone, or that setup did not finish, and lists the real stream URLs.</p>
         </div>
       </li>
       <li>
         <div>
-          <strong>Generate Configuration</strong>
-          <p>Creates <code>/etc/mediamtx/audio-devices.conf</code> with device-specific settings for the best audio quality.</p>
-        </div>
-      </li>
-      <li>
-        <div>
-          <strong>Start Streams</strong>
-          <p>Launches FFmpeg for each device and publishes streams to MediaMTX with automatic recovery on failure.</p>
-        </div>
-      </li>
-      <li>
-        <div>
-          <strong>Run Diagnostics</strong>
-          <p>Verifies all components are healthy and streams are accessible.</p>
+          <strong>Run quick diagnostics</strong>
+          <p>Runs <code>lyrebird-diagnostics.sh quick</code> and reports whether it passed, warned or failed.</p>
         </div>
       </li>
     </ol>
@@ -158,26 +141,35 @@ chmod +x *.sh</code></pre>
     <div class="callout info">
       <span class="callout-icon">ℹ️</span>
       <div class="callout-body">
-        <strong>Reboot Recommended After Device Mapping</strong>
-        <p>After USB devices are mapped, a reboot ensures udev rules take full effect and device symlinks are created. The wizard will prompt you. After rebooting, run <code>sudo ./lyrebird-orchestrator.sh</code> again to start streams.</p>
+        <strong>What the wizard does not do</strong>
+        <p>It does not detect hardware capabilities or generate <code>/etc/mediamtx/audio-devices.conf</code> (that is <code>lyrebird-mic-check.sh -g</code>, or USB Device Management in the menu; without a file every stream uses the defaults), and it does not install the stream manager's systemd unit or the monitor cron job. Run <code>sudo ./lyrebird-stream-manager.sh install</code> afterwards for a node that must come back by itself after a reboot.</p>
       </div>
     </div>
 
     <h2 id="access">Access Your Streams</h2>
-    <p>Streams are available at:</p>
-    <pre><code>rtsp://your-server-ip:8554/Device_1
-rtsp://your-server-ip:8554/Device_2
+    <p>Each microphone is published under the name you gave it with the USB mapper (the ALSA card id), on RTSP port 8554 unless you changed <code>MEDIAMTX_RTSP_PORT</code>:</p>
+    <pre><code>rtsp://your-server-ip:8554/mic-left
+rtsp://your-server-ip:8554/mic-right
 # etc.</code></pre>
+    <p><code>./lyrebird-stream-manager.sh status</code> prints the URL of every stream.</p>
 
     <p>Test with common players:</p>
     <pre><code># Test with ffplay (from ffmpeg)
-ffplay rtsp://localhost:8554/Device_1
+ffplay rtsp://localhost:8554/mic-left
 
 # Test with VLC
-vlc rtsp://localhost:8554/Device_1
+vlc rtsp://localhost:8554/mic-left
 
 # Record a stream
-ffmpeg -i rtsp://your-ip:8554/Device_1 -c copy recording.mkv</code></pre>
+ffmpeg -i rtsp://your-ip:8554/mic-left -c copy recording.mkv</code></pre>
+
+    <div class="callout warning">
+      <span class="callout-icon">⚠️</span>
+      <div class="callout-body">
+        <strong>Anyone who can reach port 8554 can listen and publish</strong>
+        <p>The generated configuration has no RTSP authentication. Use a firewall, and see <a href="security.html">Security</a> and <a href="configuration.html#mediamtx">Configuration</a> for <code>RTSP_AUTH_MODE</code>.</p>
+      </div>
+    </div>
 
     <h2 id="installation">Manual Installation</h2>
     <p>If you prefer step-by-step control or are automating the setup:</p>
@@ -191,41 +183,52 @@ sudo ./usb-audio-mapper.sh
 # Step 3: Check the names (applied immediately; no reboot needed)
 ./usb-audio-mapper.sh --list
 
-# Step 4: Generate optimal configuration
+# Step 4 (optional): Generate the per-device configuration from the hardware
 sudo ./lyrebird-mic-check.sh -g
 
 # Step 5: Start streams
 sudo ./lyrebird-stream-manager.sh start
 
-# Step 6 (Recommended): Install as systemd service for 24/7 operation
+# Step 6 (recommended): Install as a systemd service for 24/7 operation
 sudo ./lyrebird-stream-manager.sh install
 sudo systemctl enable mediamtx-audio
 sudo systemctl start mediamtx-audio</code></pre>
+    <p>
+      Step 5 is safe to repeat: a <code>start</code> on a node where this manager's MediaMTX is already running changes
+      nothing that works. The stream manager's service and the standalone <code>mediamtx.service</code> installed by step 1
+      conflict with each other; do not enable both (the manager refuses to start, exit 8, while <code>mediamtx.service</code> is active).
+    </p>
 
     <div class="callout warning">
       <span class="callout-icon">⚠️</span>
       <div class="callout-body">
         <strong>Install as a Systemd Service for Production</strong>
-        <p>Running the stream manager directly (without systemd) means streams stop when your SSH session ends or the system reboots. For 24/7 bird monitoring or continuous recording, the systemd service is essential — it automatically starts streams on boot and restarts them if they fail.</p>
+        <p>Running the stream manager directly (without systemd) means nothing starts the streams again after a reboot. The service starts them at boot and restarts the manager when it exits; the cron job written by <code>install</code> brings back streams that died.</p>
       </div>
     </div>
 
     <h2 id="verification">Verification</h2>
-    <p>Run the built-in health check to confirm everything is working:</p>
+    <p>Run the built-in health check and look at the stream state:</p>
     <pre><code># Quick health check
 sudo ./lyrebird-diagnostics.sh quick
 
-# Check stream status
+# Stream status: each stream, whether it is publishing, and the overall state
 ./lyrebird-stream-manager.sh status</code></pre>
 
-    <p>The quick check verifies:</p>
+    <p>The quick check covers:</p>
     <ul>
-      <li>MediaMTX is installed and running</li>
-      <li>USB audio devices are detected</li>
-      <li>FFmpeg streams are active</li>
-      <li>RTSP port 8554 is listening</li>
-      <li>System resources are healthy</li>
+      <li>Prerequisites: Bash version, required tools</li>
+      <li>The project's files, versions and log locations</li>
+      <li>USB audio devices detected</li>
+      <li>MediaMTX: binary, configuration file, process, and whether the RTSP port is listening</li>
+      <li>RTSP connectivity, and the entropy pool</li>
     </ul>
+    <p>
+      <code>status</code> ends with <code>Overall: ok</code> when every expected stream is publishing, and otherwise
+      <code>degraded</code>, <code>failed</code>, <code>waiting_for_devices</code> or <code>stopped</code>
+      (see <a href="monitoring.html#status-file">Monitoring</a>). It exits 0 whatever the state; use
+      <code>status --json</code> when a script has to decide.
+    </p>
 
     <h2 id="next-steps">Next Steps</h2>
     <div class="card-grid">

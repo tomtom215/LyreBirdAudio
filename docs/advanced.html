@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Advanced Topics - LyreBirdAudio Docs</title>
-  <meta name="description" content="Advanced LyreBirdAudio topics: recovery, version management, API integration, backup, and uninstallation.">
+  <meta name="description" content="Recovery procedures, version management, API integration, backup and restore, and uninstallation.">
   <link rel="stylesheet" href="css/style.css">
 </head>
 <body>
@@ -37,14 +37,19 @@
     <h2 id="recovery">Recovery Procedures</h2>
 
     <h3>Stream Not Starting</h3>
-    <pre><code># Quick recovery
-sudo ./lyrebird-stream-manager.sh status
+    <pre><code># See which stream is not publishing and why
+./lyrebird-stream-manager.sh status
+
+# Restart everything (interrupts running streams)
 sudo ./lyrebird-stream-manager.sh restart
 
-# If that fails: force cleanup and fresh start
+# If that fails: kill what the manager started, then start fresh
 sudo ./lyrebird-stream-manager.sh force-stop
-sudo rm -f /run/mediamtx-audio.lock /run/mediamtx-audio.pid
 sudo ./lyrebird-stream-manager.sh start</code></pre>
+    <p>
+      Do not delete files under <code>/run</code> to get past a refusal. A refused command names its reason: exit 5 means another lifecycle command holds the
+      lock (the message names it), exit 8 means another MediaMTX owns the node. See <a href="troubleshooting.html#stream-issues">Troubleshooting</a>.
+    </p>
 
     <h3>Device Not Found After Reboot</h3>
     <pre><code># Show USB sound cards, their ports and mappings
@@ -59,61 +64,69 @@ ls -la /dev/sound/by-id/</code></pre>
 
     <h3>Complete System Recovery</h3>
     <p>Use this procedure when the system is in an unknown or corrupted state:</p>
-    <pre><code># 1. Stop everything
+    <pre><code># 1. Stop everything the manager started
 sudo systemctl stop mediamtx-audio 2>/dev/null || true
 sudo ./lyrebird-stream-manager.sh force-stop
 
-# 2. Clean up stale files
-sudo rm -f /run/mediamtx-audio.{pid,lock,restart,cleanup}
-sudo rm -f /var/lib/mediamtx-ffmpeg/*.pid
+# 2. Anything left that belongs to this suite? This only lists; read it before adding --yes
+sudo ./lyrebird-stream-manager.sh force-stop --kill-all
 
-# 3. Verify MediaMTX installation
+# 3. Verify the MediaMTX installation
 sudo ./install_mediamtx.sh status
-# If corrupted: sudo ./install_mediamtx.sh update
+# If the binary is damaged: sudo ./install_mediamtx.sh update
 
 # 4. Verify device mapping
 sudo ./usb-audio-mapper.sh --test
 
-# 5. Run full diagnostics
+# 5. Check the device configuration, then run full diagnostics
+./lyrebird-stream-manager.sh validate
 sudo ./lyrebird-diagnostics.sh full
 
 # 6. Fresh start
 sudo ./lyrebird-stream-manager.sh start</code></pre>
+    <p>
+      <code>force-stop</code> removes the manager's PID files, wrapper scripts and markers itself. Leave the lock files (<code>/run/mediamtx-audio.lock</code>,
+      <code>/etc/mediamtx/.config.lock</code>) alone: the kernel releases a lock when its holder exits, so there is no stale lock to clear, and removing a lock file
+      that is held gives the next process a different lock.
+    </p>
 
     <h3>Emergency Field Recovery (No Internet)</h3>
     <p>If in the field without internet access:</p>
     <ul>
-      <li><strong>Use local backups</strong> — keep a USB drive with a known-good configuration tarball</li>
-      <li><strong>Config backup</strong> — <code>/etc/mediamtx/audio-devices.conf.bak</code> (auto-created by mic-check)</li>
-      <li><strong>Restore config</strong>: <code>sudo cp /etc/mediamtx/audio-devices.conf.bak /etc/mediamtx/audio-devices.conf</code></li>
+      <li><strong>Per-device configuration backups</strong>: <code>lyrebird-mic-check.sh</code> saves <code>/etc/mediamtx/audio-devices.conf.backup.&lt;YYYYmmdd_HHMMSS&gt;</code> before it overwrites the file. <code>sudo ./lyrebird-mic-check.sh --list-backups</code> lists them and <code>sudo ./lyrebird-mic-check.sh --restore</code> restores one. No script creates an <code>audio-devices.conf.bak</code>.</li>
+      <li><strong>MediaMTX configuration backups</strong>: when the stream manager replaces a generated <code>mediamtx.yml</code> it keeps the old one as <code>mediamtx.yml.&lt;UTC stamp&gt;.&lt;nn&gt;.bak</code> (the newest 5); the installer saves <code>mediamtx.yml.backup.&lt;YYYYmmdd-HHMMSS&gt;</code>. Copy one back over <code>/etc/mediamtx/mediamtx.yml</code> and restart.</li>
+      <li><strong>Software versions</strong>: <code>./lyrebird-updater.sh --history</code> and <code>./lyrebird-updater.sh --rollback [VERSION]</code> need no network when the version is already in the clone.</li>
+      <li><strong>Keep your own copy</strong> of a known-good configuration on a USB drive (see <a href="#backup">Backup &amp; Restore</a>).</li>
       <li><strong>Restart</strong>: <code>sudo systemctl restart mediamtx-audio</code></li>
     </ul>
 
     <hr>
     <h2 id="versions">Version Management</h2>
 
-    <h3>Branch Structure</h3>
+    <h3>Branches and Tags</h3>
     <div class="table-wrapper">
       <table>
-        <thead><tr><th>Branch/Tag</th><th>Stability</th><th>Use</th></tr></thead>
+        <thead><tr><th>Branch/Tag</th><th>What it is</th><th>Use</th></tr></thead>
         <tbody>
           <tr>
-            <td>Tagged releases (e.g., <code>v1.4.2</code>)</td>
-            <td><span class="badge badge-green">Stable</span></td>
-            <td>Production deployments — <strong>recommended</strong></td>
+            <td>Release tags (<code>git tag</code>)</td>
+            <td>Fixed points in the history</td>
+            <td>Pin a production node to one only after checking that it contains the changes you rely on: <code>git tag --contains &lt;commit&gt;</code></td>
           </tr>
           <tr>
             <td><code>main</code></td>
-            <td><span class="badge badge-blue">Generally stable</span></td>
-            <td>Latest features, tested but may have minor issues</td>
-          </tr>
-          <tr>
-            <td><code>development</code></td>
-            <td><span class="badge badge-orange">Unstable</span></td>
-            <td>Active development only — not for production</td>
+            <td>The default branch; where changes land</td>
+            <td>The current code. The updater's option 2 switches to the default branch</td>
           </tr>
         </tbody>
       </table>
+    </div>
+    <div class="callout warning">
+      <span class="callout-icon">⚠️</span>
+      <div class="callout-body">
+        <strong>The newest tag predates the fixes</strong>
+        <p>The newest tag at the time of writing, <code>v1.3.0</code>, was made before the changes these pages describe, and the updater's option 1 ("latest stable release") is the newest tag. Until a newer tag exists, use <code>main</code> (option 2, or <code>git checkout main</code>). <code>git tag --contains origin/main</code> prints nothing while no release contains the current code.</p>
+      </div>
     </div>
 
     <h3>Check for Updates</h3>
@@ -123,89 +136,87 @@ sudo ./lyrebird-stream-manager.sh start</code></pre>
 # Command-line status
 ./lyrebird-updater.sh --status
 
-# List available versions/tags
+# Fetch and list available versions/tags (needs the network)
 ./lyrebird-updater.sh --list</code></pre>
 
-    <h3>Upgrade to Latest</h3>
-    <pre><code># Via updater (recommended — handles service coordination)
+    <h3>Upgrade to the Latest</h3>
+    <pre><code># Via the updater (recommended: it stashes your changes, coordinates the service, and rolls back on failure)
 ./lyrebird-updater.sh
-# Select option 2: Upgrade to Latest Version
+# Option 1: latest stable release (the newest tag)
+# Option 2: the default branch (main)
 
-# Or manually (not recommended)
-git fetch origin
-git checkout $(git describe --tags --abbrev=0 origin)
+# Or by hand (no service handling, no rollback)
+git fetch --tags origin
+git checkout main
+git pull --ff-only
 chmod +x *.sh</code></pre>
 
-    <h3>Switch to Specific Version</h3>
-    <pre><code># Via updater
+    <h3>Switch to a Specific Version</h3>
+    <pre><code># Via the updater
 ./lyrebird-updater.sh
-# Select option 3: Switch to Specific Version
-# Enter: v1.4.0
+# Select option 3: Switch to Specific Version or Branch
+# Enter a tag, for example: vX.Y.Z
 
-# Or manually
+# Or by hand
 git fetch --tags
-git checkout v1.4.0
+git checkout vX.Y.Z
 chmod +x *.sh</code></pre>
 
-    <h3>Rollback</h3>
-    <pre><code># Quick rollback via updater
+    <h3>History and Rollback</h3>
+    <pre><code># What was installed when, and any update that did not finish (local, no network)
+./lyrebird-updater.sh --history
+
+# Back to the version before the last completed update
 ./lyrebird-updater.sh --rollback
 
-# Rollback to specific version
-./lyrebird-updater.sh --rollback v1.3.0
-
-# Manual rollback via git
-git reflog          # Find previous good state
-git checkout HEAD~1 # Or specific commit
-chmod +x *.sh</code></pre>
+# To a release tag or a commit that is already in the clone
+./lyrebird-updater.sh --rollback v1.3.0</code></pre>
+    <p>
+      A rollback is the update's own transaction run to a version already in the clone: your changes are stashed and restored, the service is stopped and started again,
+      and nothing is fetched. A branch name is refused (exit 1) and a version that is not in the clone exits 6. Rolling back to a release older than updater 1.7.0
+      replaces the updater with that release's own, which has neither <code>--history</code> nor <code>--rollback</code>. The state (history, journal, lock) lives in
+      <code>.git/lyrebird-updater/</code>; nothing needs to be deleted there.
+    </p>
 
     <h3>Post-Update Migrations</h3>
-    <p>The updater automatically runs migrations for breaking changes (e.g., script renames).
-    To run manually:</p>
+    <p>The updater automatically runs migrations for breaking changes (for example script renames), including after an update that restarts the updater itself.
+    To run them manually:</p>
     <pre><code>sudo ./lyrebird-updater.sh --migrate</code></pre>
 
-    <p>Migration history is tracked in <code>/var/lib/lyrebird/migrations/</code>. Migrations are
-    idempotent — safe to run multiple times.</p>
+    <p>Migration markers are kept in <code>/var/lib/lyrebird/migrations/</code>. Migrations are
+    idempotent, so running them again is safe.</p>
 
     <div class="callout info">
       <span class="callout-icon">ℹ️</span>
       <div class="callout-body">
-        <strong>Script Rename Migration (v1.4.3+)</strong>
-        <p><code>mediamtx-stream-manager.sh</code> was renamed to <code>lyrebird-stream-manager.sh</code>. Running <code>lyrebird-updater.sh</code> automatically updates systemd service files, cron jobs, and log paths. The orchestrator will warn you at startup if old names are detected.</p>
+        <strong>Script Rename Migration (release v1.3.0)</strong>
+        <p><code>mediamtx-stream-manager.sh</code> was renamed to <code>lyrebird-stream-manager.sh</code>. Running <code>lyrebird-updater.sh</code> updates systemd service files, cron jobs, and log paths. The orchestrator warns at startup if old names are detected.</p>
       </div>
     </div>
 
     <hr>
     <h2 id="api">API Integration</h2>
-    <p>The MediaMTX REST API (port 9997) enables programmatic stream control:</p>
+    <p>
+      MediaMTX's control API listens on <code>127.0.0.1:9997</code> by default (<code>MEDIAMTX_API_PORT</code>, <code>MEDIAMTX_API_BIND</code>), and the default MediaMTX policy
+      refuses callers that are not this machine. It is for reading state from the node itself:
+    </p>
 
-    <pre><code># List all configured paths/streams
-curl -s http://localhost:9997/v3/paths/list | python3 -m json.tool
+    <pre><code># List the paths MediaMTX knows
+curl -s http://127.0.0.1:9997/v3/paths/list | python3 -m json.tool
 
-# Get details for a specific stream
-curl -s http://localhost:9997/v3/paths/get/Device_1
+# Details for one stream ("available" says whether it is publishing)
+curl -s http://127.0.0.1:9997/v3/paths/get/mic-left
 
 # Global configuration
-curl -s http://localhost:9997/v3/config/global/get</code></pre>
-
-    <h3>Custom Automation Example</h3>
-    <pre><code>#!/bin/bash
-# Auto-restart on stream failure
-
-while true; do
-    if ! ./lyrebird-stream-manager.sh status | grep -q "running"; then
-        echo "Streams down, restarting..."
-        sudo ./lyrebird-stream-manager.sh restart
-        # Send webhook alert
-        source ./lyrebird-alerts.sh
-        alert_stream_down "all" "Auto-restart triggered"
-    fi
-    sleep 30
-done</code></pre>
+curl -s http://127.0.0.1:9997/v3/config/global/get</code></pre>
+    <p>
+      For a decision in a script, prefer the stream manager's own report: <code>./lyrebird-stream-manager.sh status --json | jq -e '.overall == "ok"'</code>.
+      An example that sends a webhook when that fails is on <a href="monitoring.html#alerts">Monitoring</a>.
+    </p>
 
     <h3>Prometheus Integration</h3>
-    <pre><code># Start metrics server
-./lyrebird-metrics.sh serve --port 9100 &
+    <pre><code># Start the metrics server (127.0.0.1:9100; add --bind for another host's Prometheus)
+./lyrebird-metrics.sh serve --port 9100 &amp;
 
 # Configure Prometheus to scrape
 # prometheus.yml:
@@ -213,23 +224,34 @@ done</code></pre>
 #   - job_name: 'lyrebird'
 #     static_configs:
 #       - targets: ['your-host:9100']</code></pre>
+    <p>For anything beyond one poller on loopback, use <code>--file</code> and node_exporter's textfile collector; see <a href="monitoring.html#prometheus">Monitoring</a>.</p>
 
     <hr>
     <h2 id="backup">Backup &amp; Restore</h2>
+
+    <div class="callout warning">
+      <span class="callout-icon">⚠️</span>
+      <div class="callout-body">
+        <strong>Protect the archive</strong>
+        <p><code>/etc/mediamtx/</code> can contain <code>rtsp-users.conf</code> and, with RTSP authentication, password hashes in <code>mediamtx.yml</code>. Keep the archive mode 600 and off shared media.</p>
+      </div>
+    </div>
 
     <h3>Create Backup</h3>
     <pre><code># Backup all configuration
 sudo tar -czf lyrebird-backup-$(date +%Y%m%d).tar.gz \
   /etc/mediamtx/ \
   /etc/udev/rules.d/99-usb-soundcards.rules \
-  /etc/lyrebird/ \
-  /var/lib/mediamtx/ 2>/dev/null
+  /etc/systemd/system/mediamtx-audio.service \
+  /etc/cron.d/mediamtx-monitor \
+  /etc/lyrebird/ 2>/dev/null
+sudo chmod 600 lyrebird-backup-$(date +%Y%m%d).tar.gz
 
 echo "Backup created: lyrebird-backup-$(date +%Y%m%d).tar.gz"</code></pre>
 
     <h3>Restore from Backup</h3>
     <pre><code># Restore configuration
-sudo tar -xzf lyrebird-backup-20250101.tar.gz -C /
+sudo tar -xzf lyrebird-backup-20261101.tar.gz -C /
 
 # Reload udev rules
 sudo udevadm control --reload-rules
@@ -238,9 +260,8 @@ sudo udevadm trigger
 # Reload systemd
 sudo systemctl daemon-reload
 
-# Restart services
-sudo systemctl restart mediamtx
-sudo ./lyrebird-stream-manager.sh restart</code></pre>
+# Restart the stream manager's service
+sudo systemctl restart mediamtx-audio</code></pre>
 
     <h3>Configuration-Only Backup</h3>
     <pre><code># Just the audio device configuration
@@ -248,29 +269,31 @@ sudo cp /etc/mediamtx/audio-devices.conf \
   /etc/mediamtx/audio-devices.conf.backup.$(date +%Y%m%d)
 
 # Restore
-sudo cp /etc/mediamtx/audio-devices.conf.backup.20250101 \
+sudo cp /etc/mediamtx/audio-devices.conf.backup.20261101 \
   /etc/mediamtx/audio-devices.conf</code></pre>
+    <p><code>lyrebird-mic-check.sh -g</code> makes such a backup by itself; see <a href="#recovery">Emergency Field Recovery</a>.</p>
 
     <hr>
     <h2 id="debug">Debug Mode</h2>
-    <p>Enable verbose output for all scripts:</p>
-    <pre><code># Enable debug for current session
-export DEBUG=1
+    <p>Debug output is per script:</p>
+    <pre><code># Stream manager
+sudo ./lyrebird-stream-manager.sh -d start
 
-# Now all commands produce verbose output
-sudo ./lyrebird-stream-manager.sh start
-sudo ./usb-audio-mapper.sh --test
-sudo ./lyrebird-diagnostics.sh full</code></pre>
-
-    <h3>Per-Script Debug Flags</h3>
-    <pre><code># USB mapper debug
+# USB mapper debug
 sudo ./usb-audio-mapper.sh -D
 
 # MediaMTX installer verbose
 sudo ./install_mediamtx.sh --verbose install
 
 # Diagnostics debug
-sudo ./lyrebird-diagnostics.sh debug</code></pre>
+sudo ./lyrebird-diagnostics.sh debug
+
+# Storage script debug
+sudo ./lyrebird-storage.sh --debug status</code></pre>
+    <p>
+      <code>export DEBUG=1</code> does not enable debug output: the scripts that read <code>DEBUG</code> compare it with the word <code>true</code>, and in the stream manager
+      <code>DEBUG=true</code> also turns on shell tracing (<code>set -x</code>), which is very verbose. Use <code>-d</code>.
+    </p>
 
     <hr>
     <h2 id="uninstall">Complete Uninstallation</h2>
@@ -280,14 +303,18 @@ sudo ./lyrebird-diagnostics.sh debug</code></pre>
 sudo ./lyrebird-stream-manager.sh stop
 sudo systemctl stop mediamtx-audio 2>/dev/null
 sudo systemctl disable mediamtx-audio 2>/dev/null
+sudo systemctl stop mediamtx 2>/dev/null
+sudo systemctl disable mediamtx 2>/dev/null
 
 # 2. Uninstall MediaMTX
 sudo ./install_mediamtx.sh uninstall
 
-# 3. Remove systemd services and cron jobs
+# 3. Remove systemd units, the cron job and the logrotate file
 sudo rm -f /etc/systemd/system/mediamtx-audio.service
+sudo rm -f /etc/systemd/system/mediamtx.service
 sudo systemctl daemon-reload
 sudo rm -f /etc/cron.d/mediamtx-monitor
+sudo rm -f /etc/logrotate.d/mediamtx
 
 # 4. Remove USB device rules
 sudo rm -f /etc/udev/rules.d/99-usb-soundcards.rules
@@ -298,8 +325,7 @@ sudo udevadm trigger
 sudo rm -rf /etc/mediamtx/
 sudo rm -rf /etc/lyrebird/
 
-# 6. Remove state and runtime files
-sudo rm -f /run/mediamtx-audio.*
+# 6. Remove state files
 sudo rm -rf /var/lib/mediamtx-ffmpeg/
 sudo rm -rf /var/lib/mediamtx/
 sudo rm -rf /var/lib/lyrebird/
@@ -308,11 +334,16 @@ sudo rm -rf /var/lib/lyrebird/
 sudo rm -f /var/log/mediamtx.out
 sudo rm -f /var/log/lyrebird-stream-manager.log
 sudo rm -rf /var/log/lyrebird/
-sudo rm -f /etc/logrotate.d/mediamtx
 
 # 8. Remove the repository
 cd ~
 rm -rf /path/to/LyreBirdAudio</code></pre>
+    <p>
+      The files in <code>/run</code> (<code>/run/mediamtx-audio.*</code>, <code>/run/lyrebird/</code>) are on a tmpfs and disappear at the next reboot; leave them.
+      If the stream manager's <code>stop</code> reports that it could not stop something, list what is left with
+      <code>sudo ./lyrebird-stream-manager.sh force-stop --kill-all</code> (it prints, and signals nothing without <code>--yes</code>). Do not use
+      <code>pkill</code> by name: it also kills other installations' processes.
+    </p>
 
     <h3>Verify Complete Removal</h3>
     <pre><code># Check for remaining processes
@@ -330,7 +361,6 @@ ls /var/lib/mediamtx-ffmpeg/ 2>/dev/null || echo "✓ State removed"</code></pre
     <pre><code># Remove only streaming state (keep MediaMTX installed)
 sudo ./lyrebird-stream-manager.sh stop
 sudo rm -rf /var/lib/mediamtx-ffmpeg/
-sudo rm -f /run/mediamtx-audio.*
 sudo rm -f /var/log/lyrebird-stream-manager.log</code></pre>
 
   </main>

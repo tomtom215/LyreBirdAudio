@@ -19,7 +19,7 @@
     <div class="page-header">
       <span class="page-label">Components</span>
       <h1 class="page-title">Component Reference</h1>
-      <p class="page-subtitle">Detailed documentation for every script in the LyreBirdAudio suite.</p>
+      <p class="page-subtitle">Commands, options and exit codes of every script in the LyreBirdAudio suite. Each script's <code>--help</code> is the final word.</p>
     </div>
 
     <div class="toc">
@@ -47,41 +47,71 @@
           <tr><th>Script</th><th>Version</th><th>Purpose</th></tr>
         </thead>
         <tbody>
-          <tr><td><code>lyrebird-orchestrator.sh</code></td><td><span class="version-badge">2.1.3</span></td><td>Unified management interface</td></tr>
-          <tr><td><code>lyrebird-stream-manager.sh</code></td><td><span class="version-badge">1.5.0</span></td><td>Stream lifecycle management</td></tr>
-          <tr><td><code>usb-audio-mapper.sh</code></td><td><span class="version-badge">4.0.0</span></td><td>USB device persistence via udev</td></tr>
-          <tr><td><code>lyrebird-mic-check.sh</code></td><td><span class="version-badge">1.0.0</span></td><td>Hardware capability detection</td></tr>
+          <tr><td><code>lyrebird-orchestrator.sh</code></td><td><span class="version-badge">2.2.0</span></td><td>Menu-driven management interface</td></tr>
+          <tr><td><code>lyrebird-stream-manager.sh</code></td><td><span class="version-badge">2.0.0</span></td><td>MediaMTX and FFmpeg stream lifecycle</td></tr>
+          <tr><td><code>usb-audio-mapper.sh</code></td><td><span class="version-badge">4.0.1</span></td><td>Persistent USB sound-card names via udev</td></tr>
+          <tr><td><code>lyrebird-mic-check.sh</code></td><td><span class="version-badge">1.0.2</span></td><td>Hardware capability detection and device configuration</td></tr>
           <tr><td><code>lyrebird-diagnostics.sh</code></td><td><span class="version-badge">1.0.2</span></td><td>System health diagnostics</td></tr>
-          <tr><td><code>install_mediamtx.sh</code></td><td><span class="version-badge">2.0.1</span></td><td>MediaMTX installation &amp; upgrade</td></tr>
-          <tr><td><code>lyrebird-alerts.sh</code></td><td><span class="version-badge">1.0.0</span></td><td>Webhook alerting system</td></tr>
-          <tr><td><code>lyrebird-metrics.sh</code></td><td><span class="version-badge">1.2.0</span></td><td>Prometheus metrics export</td></tr>
-          <tr><td><code>lyrebird-storage.sh</code></td><td><span class="version-badge">1.1.0</span></td><td>Storage management &amp; cleanup</td></tr>
-          <tr><td><code>lyrebird-updater.sh</code></td><td><span class="version-badge">1.6.0</span></td><td>Version management &amp; rollback</td></tr>
-          <tr><td><code>lyrebird-common.sh</code></td><td>—</td><td>Shared utility library</td></tr>
+          <tr><td><code>install_mediamtx.sh</code></td><td><span class="version-badge">2.1.0</span></td><td>MediaMTX install, update, uninstall</td></tr>
+          <tr><td><code>lyrebird-alerts.sh</code></td><td><span class="version-badge">1.1.0</span></td><td>Webhook alerts (a tool you call; see below)</td></tr>
+          <tr><td><code>lyrebird-metrics.sh</code></td><td><span class="version-badge">1.4.0</span></td><td>Prometheus metrics export</td></tr>
+          <tr><td><code>lyrebird-storage.sh</code></td><td><span class="version-badge">1.3.0</span></td><td>Recording and log retention, disk monitoring</td></tr>
+          <tr><td><code>lyrebird-updater.sh</code></td><td><span class="version-badge">1.8.0</span></td><td>Git-based version management, history and rollback</td></tr>
+          <tr><td><code>lyrebird-common.sh</code></td><td><span class="version-badge">1.1.0</span></td><td>Shared library</td></tr>
         </tbody>
       </table>
+    </div>
+
+    <div class="callout info">
+      <span class="callout-icon">ℹ️</span>
+      <div class="callout-body">
+        <strong>What the suite does and does not run by itself</strong>
+        <p>The stream manager's <code>install</code> command sets up a systemd unit and a cron job that runs <code>monitor</code> every 5 minutes. Nothing else is scheduled for you: the alert, metrics and storage scripts do their work only when you run them (from cron, a timer or your own scripts), and no LyreBirdAudio script sends an alert on its own.</p>
+      </div>
     </div>
 
     <!-- ── ORCHESTRATOR ─────────────────────────────────────────── -->
     <hr>
     <h2 id="orchestrator">🎛️ Orchestrator</h2>
     <p>
-      <strong><code>lyrebird-orchestrator.sh</code></strong> — Unified management interface that delegates
-      to all other scripts. This is the recommended entry point for all operations.
+      <strong><code>lyrebird-orchestrator.sh</code></strong> is an interactive, menu-driven front end that runs the
+      other scripts. It needs root and a terminal, and takes only <code>-h/--help</code> and <code>-v/--version</code>.
     </p>
 
     <h3>Usage</h3>
     <pre><code>sudo ./lyrebird-orchestrator.sh</code></pre>
 
-    <h3>Features</h3>
+    <h3>Main menu</h3>
+    <div class="table-wrapper">
+      <table>
+        <thead><tr><th>Option</th><th>Submenu</th></tr></thead>
+        <tbody>
+          <tr><td>1) Quick Setup Wizard</td><td>Four steps: install MediaMTX, map USB devices, start streams, quick diagnostics</td></tr>
+          <tr><td>2) MediaMTX Installation &amp; Updates</td><td>Install, update, reinstall (force), uninstall, installation status</td></tr>
+          <tr><td>3) USB Device Management</td><td>Map devices, dry-run test, view mappings, detect capabilities, generate and validate the device configuration, remove mappings, reload udev rules</td></tr>
+          <tr><td>4) Audio Streaming Control</td><td>Start, stop, restart, status, stream URLs, monitor health</td></tr>
+          <tr><td>5) System Diagnostics</td><td>Quick, full, verbose, export a report</td></tr>
+          <tr><td>6) Version Management</td><td>Launch the updater, show component versions, show update history, roll back</td></tr>
+          <tr><td>7) Logs &amp; Status</td><td>MediaMTX, orchestrator, stream manager and stream (FFmpeg) logs; quick health check</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h3>What it adds to the scripts it runs</h3>
     <ul>
-      <li>Interactive TUI menu for all operations</li>
-      <li>Quick Setup Wizard for first-time configuration</li>
-      <li>Hardware capability inspection and display</li>
-      <li>SHA256 integrity verification for sourced scripts</li>
-      <li>Automatic detection of outdated script names</li>
-      <li>Comprehensive logging to <code>/var/log/lyrebird-orchestrator.log</code></li>
+      <li>It checks each delegated script against a SHA-256 baseline before running it, and logs to <code>/var/log/lyrebird-orchestrator.log</code>.</li>
+      <li>Start and Restart (menu 4, and the wizard's step 3) read the stream manager's <a href="monitoring.html#status-file">status document</a> after the command and report each stream: publishing, no bytes flowing, not publishing (with the manager's reason), or waiting for devices. Reading the document needs <code>jq</code>; without it only the exit status is shown.</li>
+      <li>A failed delegated script is reported with its exit status and what that status means (the tables below).</li>
+      <li>Version Management can show the updater's history and run <code>--rollback</code>.</li>
     </ul>
+
+    <div class="callout warning">
+      <span class="callout-icon">⚠️</span>
+      <div class="callout-body">
+        <strong>The wizard does not install the systemd unit or the monitor cron job</strong>
+        <p>The wizard never runs the stream manager's <code>install</code> command. A node set up only through the wizard has no service that restarts the streams at boot and no monitor. Run <code>sudo ./lyrebird-stream-manager.sh install</code> afterwards (see <a href="usage.html#systemd-service">Systemd Service</a>).</p>
+      </div>
+    </div>
 
     <h3>Exit Codes</h3>
     <div class="table-wrapper">
@@ -89,10 +119,10 @@
         <thead><tr><th>Code</th><th>Meaning</th></tr></thead>
         <tbody>
           <tr><td>0</td><td>Success</td></tr>
-          <tr><td>1</td><td>General error</td></tr>
-          <tr><td>2</td><td>Permission denied</td></tr>
+          <tr><td>1</td><td>General error (including an unknown option)</td></tr>
+          <tr><td>2</td><td>Not run as root</td></tr>
           <tr><td>3</td><td>Missing dependencies</td></tr>
-          <tr><td>4</td><td>Script not found</td></tr>
+          <tr><td>4</td><td>A delegated script was not found</td></tr>
         </tbody>
       </table>
     </div>
@@ -101,46 +131,78 @@
     <hr>
     <h2 id="stream-manager">📡 Stream Manager</h2>
     <p>
-      <strong><code>lyrebird-stream-manager.sh</code></strong> — Core audio streaming script.
-      Detects USB microphones, manages FFmpeg processes, monitors stream health, and provides
-      automatic recovery with exponential backoff.
+      <strong><code>lyrebird-stream-manager.sh</code></strong> detects USB microphones, starts MediaMTX and one
+      FFmpeg wrapper per microphone, and reports which streams are actually publishing. It is the single owner of
+      the MediaMTX process it starts: it only ever signals processes it recorded itself (PID file plus process
+      start time), and refuses to start (exit 8) while another MediaMTX, such as <code>mediamtx.service</code>, owns the node.
     </p>
 
     <h3>Usage</h3>
-    <pre><code># Individual streams (default)
+    <pre><code># Individual streams (default): one RTSP path per microphone
 sudo ./lyrebird-stream-manager.sh start
 
-# Multiplex (mix all mics)
+# Multiplex (mix all mics into one stream)
 sudo ./lyrebird-stream-manager.sh -m multiplex -f amix start
 
 # Multiplex (merge channels)
 sudo ./lyrebird-stream-manager.sh -m multiplex -f amerge start
 
 # Custom multiplex stream name
-sudo ./lyrebird-stream-manager.sh -m multiplex -n studio start</code></pre>
+sudo ./lyrebird-stream-manager.sh -m multiplex -n studio start
+
+# Machine-readable state, no root needed
+./lyrebird-stream-manager.sh status --json</code></pre>
 
     <h3>Commands</h3>
     <div class="command-ref">
-      <div class="command-ref-header">Available Commands</div>
-      <div class="command-row"><span class="command-name">start</span><span class="command-desc">Start all configured streams</span></div>
-      <div class="command-row"><span class="command-name">stop</span><span class="command-desc">Gracefully stop all streams</span></div>
-      <div class="command-row"><span class="command-name">restart</span><span class="command-desc">Stop then start all streams</span></div>
-      <div class="command-row"><span class="command-name">status</span><span class="command-desc">Show stream status and process info</span></div>
-      <div class="command-row"><span class="command-name">monitor</span><span class="command-desc">Health check + restart failed streams (cron use)</span></div>
-      <div class="command-row"><span class="command-name">config</span><span class="command-desc">Display active stream configuration</span></div>
-      <div class="command-row"><span class="command-name">force-stop</span><span class="command-desc">Force kill all and clean stale files</span></div>
-      <div class="command-row"><span class="command-name">install</span><span class="command-desc">Install systemd service + cron monitoring</span></div>
+      <div class="command-ref-header">Commands (root is required except for status, config, validate and help)</div>
+      <div class="command-row"><span class="command-name">start</span><span class="command-desc">Start MediaMTX and the streams. Safe to repeat: a running MediaMTX of this manager is left alone and only missing streams are started. Exit 0 when the start policy is met, 9 when not</span></div>
+      <div class="command-row"><span class="command-name">stop</span><span class="command-desc">Stop the streams and MediaMTX this manager started (SIGTERM, then SIGKILL after a timeout)</span></div>
+      <div class="command-row"><span class="command-name">restart</span><span class="command-desc">Stop, then start (running streams are interrupted; use <code>reload</code> to apply a MediaMTX configuration change without that)</span></div>
+      <div class="command-row"><span class="command-name">reload</span><span class="command-desc">Re-render the MediaMTX configuration and let the running MediaMTX apply it; start missing streams; stop nothing. Exit 7 when MediaMTX is not running</span></div>
+      <div class="command-row"><span class="command-name">status [--json]</span><span class="command-desc">Show MediaMTX, each stream (path ready, bytes flowing, last error) and the overall state; <code>--json</code> prints the same as one JSON document. Exit 0 whatever the state</span></div>
+      <div class="command-row"><span class="command-name">monitor</span><span class="command-desc">One health check; restarts what needs it (cron runs this every 5 minutes). See <a href="monitoring.html#monitor">Monitoring</a></span></div>
+      <div class="command-row"><span class="command-name">config</span><span class="command-desc">Print the device configuration file; a commented template is created first when the file does not exist</span></div>
+      <div class="command-row"><span class="command-name">validate</span><span class="command-desc">Check the device configuration file. Exit 0, or 4 when a line cannot be used</span></div>
+      <div class="command-row"><span class="command-name">force-stop</span><span class="command-desc">SIGKILL at once to the processes this manager started, and remove its PID files and markers</span></div>
+      <div class="command-row"><span class="command-name">force-stop --kill-all [--yes]</span><span class="command-desc">The only broad kill: every process that runs the configured MediaMTX binary or a file in the wrapper directory, with an FFmpeg logging there. Without <code>--yes</code> it prints the list and exits 1 without signalling anything</span></div>
+      <div class="command-row"><span class="command-name">install</span><span class="command-desc">Write the systemd unit (rendered from <code>config/mediamtx-audio.service</code> next to the script), a logrotate file (when logrotate is installed) and the monitor cron job. Run it from a checkout; run it again to change the stream mode</span></div>
     </div>
+
+    <h3>Options</h3>
+    <div class="table-wrapper">
+      <table>
+        <thead><tr><th>Option</th><th>Description</th></tr></thead>
+        <tbody>
+          <tr><td><code>-m, --mode MODE</code></td><td><code>individual</code> (default) or <code>multiplex</code></td></tr>
+          <tr><td><code>-f, --filter TYPE</code></td><td>Multiplex filter: <code>amix</code> (default) or <code>amerge</code></td></tr>
+          <tr><td><code>-n, --name NAME</code></td><td>Multiplex stream name (default <code>all_mics</code>): lower-case letters, digits, <code>_</code> and <code>-</code>, at most 64 characters. Anything else is replaced by <code>_</code> and the result is logged</td></tr>
+          <tr><td><code>--regenerate-config</code></td><td><code>start</code>/<code>restart</code>: replace a MediaMTX configuration that is not managed by LyreBirdAudio (a timestamped backup is saved first)</td></tr>
+          <tr><td><code>-d, --debug</code></td><td>Debug output</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h3 id="start-outcome">What start reports</h3>
+    <p>
+      A stream counts as started when MediaMTX's API reports its path as ready, not when FFmpeg is running.
+      <code>LYREBIRD_START_POLICY</code> decides what <code>start</code> requires: <code>degraded</code> (default)
+      needs at least one stream publishing, <code>strict</code> needs the stream of every detected microphone. A start
+      that does not meet the policy exits 9 and stops what that run started; a stack that was already running is not touched.
+      With no USB audio device at all, <code>start</code> brings MediaMTX up, reports <code>waiting_for_devices</code> and
+      exits 0 (<code>LYREBIRD_ALLOW_EMPTY_START=false</code> makes it exit 6 instead); the monitor starts a stream for each
+      device that appears later. A USB sound card with no capture PCM (a speaker or DAC) is skipped and does not count for the policy.
+      The <a href="configuration.html#env-vars">Configuration</a> page lists both variables.
+    </p>
 
     <h3>Features</h3>
     <ul>
-      <li>Wrapper-based FFmpeg supervision with exponential backoff (10s → 300s)</li>
-      <li>Health monitoring via MediaMTX REST API</li>
-      <li>Dual-lookup config (friendly name first, then full device ID, then defaults)</li>
-      <li>CPU, memory, and file descriptor monitoring</li>
-      <li>Lock file prevents concurrent executions</li>
-      <li>Graceful shutdown with process tree termination</li>
-      <li>Per-device FFmpeg log files with rotation</li>
+      <li>One wrapper script per stream supervises FFmpeg and restarts it with exponential backoff (see <a href="architecture.html#backoff">Architecture</a>)</li>
+      <li>Per-device settings in <code>/etc/mediamtx/audio-devices.conf</code>, read as data and never executed; <code>validate</code> checks the file</li>
+      <li>Locks are kernel <code>flock</code> locks on files that are never deleted, so a crashed run leaves no stale lock</li>
+      <li>MediaMTX configuration ownership: a file whose first line is <code># Managed by LyreBirdAudio</code> is rewritten (after a timestamped backup) when its content changes; any other file is yours and is never rewritten (see <a href="configuration.html#mediamtx-config">Configuration</a>)</li>
+      <li>Optional local recording: a ring of the last 12 five-minute segments per stream, in RAM by default (see <a href="configuration.html#env-vars">Configuration</a>)</li>
+      <li>One FFmpeg log per stream in <code>/var/lib/mediamtx-ffmpeg/&lt;stream&gt;.log</code>; the logs of the previous runs are kept as <code>.log.prev.1</code>, <code>.prev.2</code>, ...</li>
     </ul>
 
     <h3>Exit Codes</h3>
@@ -148,15 +210,18 @@ sudo ./lyrebird-stream-manager.sh -m multiplex -n studio start</code></pre>
       <table>
         <thead><tr><th>Code</th><th>Meaning</th></tr></thead>
         <tbody>
-          <tr><td>0</td><td>Success</td></tr>
-          <tr><td>1</td><td>General error</td></tr>
-          <tr><td>2</td><td>Critical resource state (triggers restart)</td></tr>
-          <tr><td>3</td><td>Missing dependencies</td></tr>
-          <tr><td>4</td><td>Configuration error</td></tr>
-          <tr><td>5</td><td>Lock acquisition failed (another instance running)</td></tr>
-          <tr><td>6</td><td>No USB devices found</td></tr>
-          <tr><td>7</td><td>MediaMTX not running</td></tr>
-          <tr><td>10</td><td>Stream monitoring degraded</td></tr>
+          <tr><td>0</td><td>Success. <code>start</code>: the start policy is met (or no device and empty start allowed). <code>monitor</code>: healthy, waiting for devices, or skipped because a start/stop/restart was running</td></tr>
+          <tr><td>1</td><td>General error: unknown option, MediaMTX did not come up, a port is already in use, <code>stop</code> could not stop something, not run as root, <code>force-stop --kill-all</code> without <code>--yes</code></td></tr>
+          <tr><td>2</td><td>Critical resource state (monitor); the cron job restarts the service</td></tr>
+          <tr><td>3</td><td>Missing dependency (<code>ffmpeg</code>, <code>jq</code>, <code>arecord</code>, <code>curl</code> or the MediaMTX binary)</td></tr>
+          <tr><td>4</td><td>Configuration error: an invalid <code>LYREBIRD_*</code> setting or port variable, invalid device configuration (<code>validate</code>), no usable MediaMTX configuration</td></tr>
+          <tr><td>5</td><td>Another lifecycle command holds the lock; nothing was changed</td></tr>
+          <tr><td>6</td><td>No USB audio device (<code>start</code> or <code>monitor</code> with <code>LYREBIRD_ALLOW_EMPTY_START=false</code>)</td></tr>
+          <tr><td>7</td><td>MediaMTX not running (monitor, <code>reload</code>)</td></tr>
+          <tr><td>8</td><td>Another MediaMTX owns the node; <code>start</code>/<code>restart</code> refused, nothing changed</td></tr>
+          <tr><td>9</td><td><code>start</code> did not meet <code>LYREBIRD_START_POLICY</code>; what that run started was stopped</td></tr>
+          <tr><td>10</td><td>Some streams are not publishing (monitor; logged, not restarted by cron)</td></tr>
+          <tr><td>128+N</td><td>Terminated by signal N (130 SIGINT, 143 SIGTERM, 131 SIGQUIT)</td></tr>
         </tbody>
       </table>
     </div>
@@ -165,9 +230,10 @@ sudo ./lyrebird-stream-manager.sh -m multiplex -n studio start</code></pre>
     <hr>
     <h2 id="usb-mapper">🔌 USB Audio Mapper</h2>
     <p>
-      <strong><code>usb-audio-mapper.sh</code></strong> — Creates persistent udev rules that give
+      <strong><code>usb-audio-mapper.sh</code></strong> creates persistent udev rules that give
       each USB audio device a fixed ALSA card name, tied to the USB port it is plugged into, so
       identical microphones keep their names across reboots whatever the enumeration order.
+      It runs on Linux only and needs Bash 4.0 or newer.
     </p>
 
     <h3>Usage</h3>
@@ -198,25 +264,42 @@ sudo ./usb-audio-mapper.sh --remove mic-left
           <tr><td><code>-v, --vendor &lt;id&gt;</code></td><td>4-digit hex vendor ID</td></tr>
           <tr><td><code>-p, --product &lt;id&gt;</code></td><td>4-digit hex product ID</td></tr>
           <tr><td><code>-u, --usb-port &lt;port&gt;</code></td><td>Physical port, e.g. <code>1-2</code> or <code>1-2.3</code> (see <code>--list</code>)</td></tr>
-          <tr><td><code>--any-port</code></td><td>Match the device on any port (single device only)</td></tr>
+          <tr><td><code>--any-port</code></td><td>Match the device on any port (only safe with one device of that vendor/product id)</td></tr>
           <tr><td><code>-f, --friendly &lt;name&gt;</code></td><td>Name: lowercase letters, digits, hyphens; starts with a letter; at most 15 characters</td></tr>
           <tr><td><code>-d, --device &lt;text&gt;</code></td><td>Description stored in the rule comment (optional)</td></tr>
           <tr><td><code>-l, --list</code></td><td>List USB sound cards, ports and mappings</td></tr>
           <tr><td><code>-t, --test</code></td><td>List every USB device with its port (no changes)</td></tr>
           <tr><td><code>-r, --remove &lt;name&gt;</code></td><td>Remove a mapping</td></tr>
-          <tr><td><code>--dry-run</code> / <code>--no-apply</code></td><td>Print rules only / write rules without triggering udev</td></tr>
+          <tr><td><code>--dry-run</code> / <code>--no-apply</code></td><td>Print the rules only / write the rules without triggering udev</td></tr>
+          <tr><td><code>--rules-file &lt;path&gt;</code></td><td>Rules file (default <code>/etc/udev/rules.d/99-usb-soundcards.rules</code>)</td></tr>
           <tr><td><code>-D, --debug</code></td><td>Enable debug output</td></tr>
+          <tr><td><code>-V, --version</code></td><td>Print the version</td></tr>
         </tbody>
       </table>
     </div>
 
     <h3>Output</h3>
-    <p>The script creates:</p>
     <ul>
-      <li><code>/etc/udev/rules.d/99-usb-soundcards.rules</code> — udev rules file</li>
+      <li><code>/etc/udev/rules.d/99-usb-soundcards.rules</code>: the udev rules</li>
       <li>The ALSA card id (shown in <code>/proc/asound/cards</code>, usable as <code>hw:CARD=&lt;name&gt;</code>)</li>
-      <li><code>/dev/sound/by-id/&lt;name&gt;</code> — symlink to the card's control device</li>
+      <li><code>/dev/sound/by-id/&lt;name&gt;</code>: symlink to the card's control device</li>
     </ul>
+
+    <h3>Exit Codes</h3>
+    <div class="table-wrapper">
+      <table>
+        <thead><tr><th>Code</th><th>Meaning</th></tr></thead>
+        <tbody>
+          <tr><td>0</td><td>Success</td></tr>
+          <tr><td>1</td><td>Error</td></tr>
+          <tr><td>2</td><td>Usage error</td></tr>
+          <tr><td>3</td><td>Permission (not root)</td></tr>
+          <tr><td>4</td><td>Missing dependency (or not Linux, or Bash older than 4.0)</td></tr>
+          <tr><td>5</td><td>Device not found or ambiguous</td></tr>
+          <tr><td>6</td><td>Rule written, but the kernel did not apply the name</td></tr>
+        </tbody>
+      </table>
+    </div>
 
     <div class="callout info">
       <span class="callout-icon">ℹ️</span>
@@ -230,79 +313,63 @@ sudo ./usb-audio-mapper.sh --remove mic-left
     <hr>
     <h2 id="mic-check">🎙️ Capability Checker</h2>
     <p>
-      <strong><code>lyrebird-mic-check.sh</code></strong> — Non-invasively detects USB audio hardware
-      capabilities via the ALSA proc filesystem. Never opens devices (won't interrupt active streams).
+      <strong><code>lyrebird-mic-check.sh</code></strong> reads each USB sound card's capabilities from the ALSA proc
+      filesystem (<code>/proc/asound</code>) without opening the device, so it does not interrupt a running stream. It
+      can write <code>/etc/mediamtx/audio-devices.conf</code> from what it finds. The stream manager does not run it:
+      nothing generates the device configuration unless you do (or the stream manager writes its commented template).
     </p>
 
     <h3>Usage</h3>
     <pre><code># List all detected devices
 ./lyrebird-mic-check.sh
 
-# Show details for device index 0
+# Show details for card number 0
 ./lyrebird-mic-check.sh 0
 
-# Generate configuration file (recommended)
+# Generate the configuration file (a backup is made first)
 sudo ./lyrebird-mic-check.sh -g --quality=normal
 
-# Validate existing configuration
+# Validate the existing configuration against the hardware
 sudo ./lyrebird-mic-check.sh -V
 
 # JSON output for scripting
-./lyrebird-mic-check.sh --json
+./lyrebird-mic-check.sh --format=json
 
-# Restore configuration from backup
-sudo ./lyrebird-mic-check.sh --restore
-
-# Dry-run (preview without writing)
-./lyrebird-mic-check.sh -g --dry-run</code></pre>
-
-    <h3>What It Detects</h3>
-    <ul>
-      <li>Supported sample rates (16kHz, 44.1kHz, 48kHz, 96kHz, etc.)</li>
-      <li>Channel configurations (mono, stereo)</li>
-      <li>Supported audio formats and bit depths</li>
-      <li>Device busy state (non-destructively)</li>
-      <li>USB audio adapter chip type (with warnings for limited chips)</li>
-    </ul>
-
-    <div class="callout info">
-      <span class="callout-icon">ℹ️</span>
-      <div class="callout-body">
-        <strong>USB Audio Adapter Note</strong>
-        <p>For USB adapters with 3.5mm inputs, detected capabilities reflect the USB chip — not the microphone plugged into the analog jack. Always verify audio quality after configuration by checking actual recordings.</p>
-      </div>
-    </div>
-
-    <!-- ── DIAGNOSTICS ────────────────────────────────────────────── -->
-    <hr>
-    <h2 id="diagnostics">🩺 Diagnostics</h2>
-    <p>
-      <strong><code>lyrebird-diagnostics.sh</code></strong> — Comprehensive system health checker
-      with 20+ checks covering devices, services, connectivity, and resources.
-    </p>
-
-    <h3>Usage</h3>
-    <pre><code># Quick check (essential systems, fast)
-sudo ./lyrebird-diagnostics.sh quick
-
-# Full check (comprehensive analysis)
-sudo ./lyrebird-diagnostics.sh full
-
-# Debug check (maximum verbosity)
-sudo ./lyrebird-diagnostics.sh debug</code></pre>
+# List and restore configuration backups
+./lyrebird-mic-check.sh --list-backups
+sudo ./lyrebird-mic-check.sh --restore</code></pre>
 
     <h3>Options</h3>
     <div class="table-wrapper">
       <table>
         <thead><tr><th>Option</th><th>Description</th></tr></thead>
         <tbody>
-          <tr><td><code>--config &lt;path&gt;</code></td><td>Specify alternate MediaMTX config file</td></tr>
-          <tr><td><code>--timeout &lt;seconds&gt;</code></td><td>Set command timeout (default: 30)</td></tr>
-          <tr><td><code>--debug</code></td><td>Enable verbose debug output</td></tr>
-          <tr><td><code>--quiet</code></td><td>Suppress non-error output</td></tr>
-          <tr><td><code>--no-color</code></td><td>Disable colored output</td></tr>
+          <tr><td><code>-g, --generate-config</code></td><td>Write <code>/etc/mediamtx/audio-devices.conf</code> (asks before overwriting)</td></tr>
+          <tr><td><code>-f, --force</code></td><td>With <code>-g</code>: overwrite without asking (a backup is still made)</td></tr>
+          <tr><td><code>--no-backup</code></td><td>With <code>-g</code>: skip the backup (not recommended)</td></tr>
+          <tr><td><code>--quality=TIER</code></td><td><code>low</code>, <code>normal</code> (default) or <code>high</code>; see <a href="configuration.html#quality-tiers">Quality Tiers</a></td></tr>
+          <tr><td><code>-V, --validate</code></td><td>Check the existing configuration against the hardware</td></tr>
+          <tr><td><code>--format=FORMAT</code></td><td><code>text</code> (default) or <code>json</code></td></tr>
+          <tr><td><code>--list-backups</code>, <code>--restore [TIMESTAMP]</code></td><td>List the backups; restore one (interactively, or the one with that timestamp)</td></tr>
+          <tr><td><code>-q, --quiet</code></td><td>Errors and warnings only</td></tr>
         </tbody>
       </table>
+    </div>
+    <p>There is no <code>--dry-run</code> and no <code>--json</code> option. Backups are written next to the configuration as <code>audio-devices.conf.backup.&lt;YYYYmmdd_HHMMSS&gt;</code> (mode 600).</p>
+
+    <h3>What It Detects</h3>
+    <ul>
+      <li>Supported sample rates, channel counts and sample formats of each USB sound card</li>
+      <li>Whether a device is in use (read from the ALSA proc files; the device is not opened)</li>
+      <li>Known USB audio adapter chips, with a warning that the capabilities are the chip's</li>
+    </ul>
+
+    <div class="callout info">
+      <span class="callout-icon">ℹ️</span>
+      <div class="callout-body">
+        <strong>USB Audio Adapter Note</strong>
+        <p>For USB adapters with 3.5mm inputs, detected capabilities reflect the USB chip, not the microphone plugged into the analog jack. Always verify audio quality after configuration by checking actual recordings.</p>
+      </div>
     </div>
 
     <h3>Exit Codes</h3>
@@ -310,10 +377,56 @@ sudo ./lyrebird-diagnostics.sh debug</code></pre>
       <table>
         <thead><tr><th>Code</th><th>Meaning</th></tr></thead>
         <tbody>
+          <tr><td>0</td><td>Success</td></tr>
+          <tr><td>1</td><td>General error (invalid arguments, no devices, no <code>/proc/asound</code>)</td></tr>
+          <tr><td>2</td><td>Configuration error (validation failed, write error)</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <!-- ── DIAGNOSTICS ────────────────────────────────────────────── -->
+    <hr>
+    <h2 id="diagnostics">🩺 Diagnostics</h2>
+    <p>
+      <strong><code>lyrebird-diagnostics.sh</code></strong> runs groups of read-only checks: 8 in <code>quick</code> mode,
+      25 in <code>full</code> mode. The <a href="monitoring.html#check-categories">Monitoring</a> page lists what they cover.
+    </p>
+
+    <h3>Usage</h3>
+    <pre><code># Quick check (prerequisites, project files, USB, MediaMTX, RTSP, entropy)
+sudo ./lyrebird-diagnostics.sh quick
+
+# Full check (default)
+sudo ./lyrebird-diagnostics.sh full
+
+# Debug check (all checks, verbose; "verbose" is an alias)
+sudo ./lyrebird-diagnostics.sh debug</code></pre>
+
+    <h3>Options</h3>
+    <div class="table-wrapper">
+      <table>
+        <thead><tr><th>Option</th><th>Description</th></tr></thead>
+        <tbody>
+          <tr><td><code>-c, --config &lt;file&gt;</code></td><td>Use another MediaMTX configuration file</td></tr>
+          <tr><td><code>--timeout &lt;seconds&gt;</code></td><td>Operation timeout (default 30, range 1-3600)</td></tr>
+          <tr><td><code>-d, --debug</code></td><td>Debug output</td></tr>
+          <tr><td><code>-q, --quiet</code></td><td>Suppress non-error output</td></tr>
+          <tr><td><code>--no-color</code></td><td>Disable colored output</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <p>The RTSP port it checks comes from <code>MEDIAMTX_PORT</code> (default 8554), not from <code>MEDIAMTX_RTSP_PORT</code>: on a node with a different RTSP port, set both. It requires Bash 4.4 or newer.</p>
+
+    <h3>Exit Codes</h3>
+    <div class="table-wrapper">
+      <table>
+        <thead><tr><th>Code</th><th>Meaning</th></tr></thead>
+        <tbody>
           <tr><td>0</td><td>All checks passed</td></tr>
-          <tr><td>1</td><td>Warnings detected (system functional but needs attention)</td></tr>
-          <tr><td>2</td><td>Failures detected (system degraded or non-functional)</td></tr>
-          <tr><td>127</td><td>Prerequisites missing (cannot complete diagnostics)</td></tr>
+          <tr><td>1</td><td>Some checks warned (the system works but needs attention)</td></tr>
+          <tr><td>2</td><td>Some checks failed</td></tr>
+          <tr><td>127</td><td>Script error (missing dependencies, permissions)</td></tr>
         </tbody>
       </table>
     </div>
@@ -322,30 +435,30 @@ sudo ./lyrebird-diagnostics.sh debug</code></pre>
     <hr>
     <h2 id="installer">📦 MediaMTX Installer</h2>
     <p>
-      <strong><code>install_mediamtx.sh</code></strong> — Downloads, verifies, and installs MediaMTX
-      with atomic updates and automatic rollback on failure.
+      <strong><code>install_mediamtx.sh</code></strong> downloads MediaMTX from its GitHub releases, verifies the
+      download against the release's <code>checksums.sha256</code>, installs the binary atomically and writes a
+      configuration file and a systemd unit. Run it from a checkout: it needs <code>lyrebird-common.sh</code> and
+      <code>config/mediamtx.service</code> next to it (without the library <code>install</code> stops with exit 4).
     </p>
 
     <h3>Usage</h3>
-    <pre><code># Install latest version
+    <pre><code># Install the latest release
 sudo ./install_mediamtx.sh install
 
-# Install specific version
+# Install a specific version
 sudo ./install_mediamtx.sh -V v1.15.0 install
 
-# Update existing installation
+# Update: verified download, atomic replace, rollback on failure
 sudo ./install_mediamtx.sh update
 
-# Check current status
+# Check the installation, verify its integrity
 ./install_mediamtx.sh status
-
-# Verify installation integrity
 sudo ./install_mediamtx.sh verify
 
-# Uninstall MediaMTX
+# Uninstall
 sudo ./install_mediamtx.sh uninstall
 
-# Dry-run (show what would happen)
+# Show what would happen
 sudo ./install_mediamtx.sh --dry-run install</code></pre>
 
     <h3>Options</h3>
@@ -353,34 +466,56 @@ sudo ./install_mediamtx.sh --dry-run install</code></pre>
       <table>
         <thead><tr><th>Option</th><th>Description</th></tr></thead>
         <tbody>
-          <tr><td><code>-V &lt;version&gt;</code></td><td>Install specific MediaMTX version (e.g., v1.15.0)</td></tr>
-          <tr><td><code>-p &lt;prefix&gt;</code></td><td>Custom installation prefix (default: /usr/local)</td></tr>
-          <tr><td><code>-f, --force</code></td><td>Force installation, skip verification</td></tr>
+          <tr><td><code>-V, --target-version &lt;version&gt;</code></td><td>Install this MediaMTX version (e.g. <code>v1.15.0</code>)</td></tr>
+          <tr><td><code>-p, --prefix &lt;dir&gt;</code></td><td>Installation prefix (default <code>/usr/local</code>)</td></tr>
+          <tr><td><code>-f, --force</code></td><td>Skip confirmations; skip the checksum check only when no checksum is available (a mismatch is always fatal); replace a configuration file that is not LyreBirdAudio's, after saving a backup</td></tr>
           <tr><td><code>-n, --dry-run</code></td><td>Show actions without executing</td></tr>
-          <tr><td><code>-q, --quiet</code></td><td>Suppress non-error output</td></tr>
-          <tr><td><code>-v, --verbose</code></td><td>Enable debug output</td></tr>
-          <tr><td><code>--no-service</code></td><td>Skip systemd service creation</td></tr>
+          <tr><td><code>-q, --quiet</code>, <code>-v, --verbose</code></td><td>Suppress non-error output / debug output</td></tr>
+          <tr><td><code>-c, --config &lt;file&gt;</code></td><td>Read <code>INSTALL_PREFIX</code>, <code>CONFIG_DIR</code>, <code>STATE_DIR</code>, <code>SERVICE_USER</code> and <code>SERVICE_GROUP</code> from a <code>KEY=value</code> file</td></tr>
+          <tr><td><code>--no-service</code></td><td>Skip the systemd unit</td></tr>
+          <tr><td><code>--no-config</code></td><td>Skip the MediaMTX configuration file</td></tr>
         </tbody>
       </table>
     </div>
 
-    <h3>Features</h3>
+    <h3>Behaviour</h3>
     <ul>
-      <li>Platform-aware: Linux (x86_64, ARM64, ARMv7, ARMv6), macOS, FreeBSD</li>
-      <li>SHA256 checksum verification of downloaded binaries</li>
-      <li>Atomic installation (writes to temp, then renames)</li>
-      <li>Automatic rollback if verification fails</li>
-      <li>Built-in upgrade support for MediaMTX 1.15.0+</li>
-      <li>Creates dedicated <code>mediamtx</code> service user</li>
-      <li>Generates default <code>mediamtx.yml</code> if not present</li>
+      <li><strong>Update</strong> downloads and verifies the new release first, and only then stops MediaMTX through its owner (systemd, or the stream manager). It installs the binary atomically and starts MediaMTX again; if the new binary does not run or the service does not come back, the previous binary is restored. MediaMTX's own <code>--upgrade</code> is not used because it replaces the executable without any checksum check.</li>
+      <li>A MediaMTX that nobody supervises (started by hand) is stopped and <em>not</em> started again: the installer prints the command to start it and exits 0.</li>
+      <li>Processes are stopped through systemd or the stream manager, or, as a last resort, only a process that runs the installed binary with the installed configuration, after SIGTERM and a bounded wait. The installer never signals FFmpeg and never selects a process by name.</li>
+      <li>The configuration it writes comes from the same generator as the stream manager's: first line <code># Managed by LyreBirdAudio</code>, API and metrics on <code>127.0.0.1</code>, only RTSP enabled otherwise. An existing file without that first line is yours and is left alone unless <code>--force</code> is given. See <a href="configuration.html#mediamtx-config">Configuration</a>.</li>
+      <li>The systemd unit <code>mediamtx.service</code> is rendered from <code>config/mediamtx.service</code>. It conflicts with <code>mediamtx-audio.service</code> (the stream manager's unit), so only one of the two runs, and it has no <code>ExecReload</code>: MediaMTX picks up a changed configuration file by itself.</li>
+      <li><code>install</code> creates a <code>mediamtx</code> system user (<code>MEDIAMTX_USER</code>) when it does not exist.</li>
+      <li>The installer picks the release file for the host's OS and CPU: it recognises Linux, macOS and FreeBSD on amd64, 386, arm64, armv7 and armv6. The test suite runs on Linux x86_64; the other targets, and the BSD and macOS code paths in particular, are not tested.</li>
     </ul>
+
+    <h3>Exit Codes</h3>
+    <div class="table-wrapper">
+      <table>
+        <thead><tr><th>Code</th><th>Meaning</th></tr></thead>
+        <tbody>
+          <tr><td>0</td><td>Success</td></tr>
+          <tr><td>1</td><td>General error (unknown option or command, could not take the lock, could not write a file)</td></tr>
+          <tr><td>2</td><td>Not run as root</td></tr>
+          <tr><td>3</td><td>Unsupported operating system or CPU</td></tr>
+          <tr><td>4</td><td>Missing prerequisite (Bash 4.0+, <code>curl</code>, <code>tar</code>, <code>flock</code>, <code>lyrebird-common.sh</code>)</td></tr>
+          <tr><td>5</td><td>Could not fetch or download the release</td></tr>
+          <tr><td>6</td><td>Checksum verification failed</td></tr>
+          <tr><td>7</td><td>Already installed (use <code>update</code> or <code>--force</code>), not installed, MediaMTX could not be stopped, or an install or update step failed (including a rollback)</td></tr>
+          <tr><td>8</td><td>The installation prefix cannot be created or written</td></tr>
+          <tr><td>9</td><td>MediaMTX rejected the generated configuration, or the file given with <code>-c</code> is missing</td></tr>
+          <tr><td>10</td><td>A port, path, account name or version the configuration or unit cannot carry (ports must be integers from 1 to 65535)</td></tr>
+        </tbody>
+      </table>
+    </div>
 
     <!-- ── ALERTS ─────────────────────────────────────────────────── -->
     <hr>
     <h2 id="alerts">🔔 Webhook Alerts</h2>
     <p>
-      <strong><code>lyrebird-alerts.sh</code></strong> — Pure-Bash webhook alerting with rate limiting
-      and deduplication. No new dependencies required.
+      <strong><code>lyrebird-alerts.sh</code></strong> sends webhook notifications with per-destination rate limiting,
+      using <code>curl</code>. It is a command and a set of functions you call; <strong>no other LyreBirdAudio script
+      calls it</strong>, so nothing alerts until you run it from your own cron job or script.
     </p>
 
     <h3>Usage</h3>
@@ -404,141 +539,159 @@ sudo ./install_mediamtx.sh --dry-run install</code></pre>
       <table>
         <thead><tr><th>Type</th><th>Config Value</th><th>Notes</th></tr></thead>
         <tbody>
-          <tr><td>Discord</td><td><code>discord</code></td><td>Rich embeds with color-coded severity</td></tr>
+          <tr><td>Discord</td><td><code>discord</code></td><td>Embeds with color-coded severity</td></tr>
           <tr><td>Slack</td><td><code>slack</code></td><td>Incoming webhook format</td></tr>
-          <tr><td>ntfy.sh</td><td><code>ntfy</code></td><td>Free, self-hostable push notifications</td></tr>
+          <tr><td>ntfy.sh</td><td><code>ntfy</code></td><td>Self-hostable push notifications</td></tr>
           <tr><td>Pushover</td><td><code>pushover</code></td><td>Mobile push for iOS/Android</td></tr>
           <tr><td>Generic HTTP</td><td><code>generic</code></td><td>Any HTTP POST endpoint</td></tr>
         </tbody>
       </table>
     </div>
+    <p>Only the request format was tested, against a stand-in for <code>curl</code>; no real webhook service was contacted.</p>
 
     <h3>Configuration</h3>
+    <p><code>/etc/lyrebird/alerts.conf</code> holds <code>KEY=value</code> lines, read as data (never executed); only names starting with <code>LYREBIRD_</code> are accepted.</p>
     <pre><code># /etc/lyrebird/alerts.conf
 LYREBIRD_ALERT_ENABLED=true
 LYREBIRD_WEBHOOK_URL="https://discord.com/api/webhooks/..."
 LYREBIRD_WEBHOOK_TYPE="discord"
-LYREBIRD_ALERT_RATE_LIMIT=300    # Seconds between duplicate alerts
+LYREBIRD_ALERT_RATE_LIMIT=300    # seconds an identical alert is suppressed per destination
 LYREBIRD_HOSTNAME="field-unit-1"
 LYREBIRD_LOCATION="North Forest"</code></pre>
 
-    <h3>Pre-Built Alert Functions</h3>
-    <pre><code># Source in your scripts
-source ./lyrebird-alerts.sh
+    <h3>Rate Limiting and Exit Codes</h3>
+    <p>
+      An identical alert (same type and message text) is not sent again to a destination that already confirmed it
+      (HTTP 2xx) within <code>LYREBIRD_ALERT_RATE_LIMIT</code> seconds (default 300). A destination that failed has no
+      record and is retried by the next identical alert. Concurrent identical alerts are delivered once per destination.
+      A message that differs in any character (&ldquo;87%&rdquo; and &ldquo;88%&rdquo;) is a different alert.
+      <code>LYREBIRD_ALERT_DEDUP_WINDOW</code> (default 3600) only sets how long delivery state is kept on disk.
+    </p>
+    <div class="table-wrapper">
+      <table>
+        <thead><tr><th>Exit code of <code>send</code></th><th>Meaning</th></tr></thead>
+        <tbody>
+          <tr><td>0</td><td>Delivered: every destination that needed the alert received it</td></tr>
+          <tr><td>1</td><td>General error (for example <code>send</code> without <code>--message</code>)</td></tr>
+          <tr><td>3</td><td>Total failure: no destination has the alert, at least one failed</td></tr>
+          <tr><td>4</td><td>Suppressed: every destination already has it within the rate-limit window (not an error)</td></tr>
+          <tr><td>5</td><td>Partial failure: some destinations have it, at least one failed; the next identical alert retries only the failed ones</td></tr>
+        </tbody>
+      </table>
+    </div>
 
-alert_stream_down "mic1" "FFmpeg process died"
+    <h3>Pre-Built Alert Functions</h3>
+    <p>Source the script from your own script. <code>send_alert</code> returns the statuses above, so under <code>set -e</code> call it as <code>send_alert ... || rc=$?</code>.</p>
+    <pre><code>source ./lyrebird-alerts.sh
+
+alert_stream_down "mic1" "FFmpeg process died"   # stream, reason
 alert_stream_up "mic1"
 alert_device_disconnect "USB_Mic_2"
-alert_disk_warning "/" "82%"
-alert_mediamtx_down
-alert_network_down</code></pre>
+alert_disk_warning "82%" "/"                     # usage, mount point
+alert_mediamtx_down "API not answering"          # reason (optional)
+alert_network_down "eth0"                        # interface</code></pre>
 
     <!-- ── METRICS ─────────────────────────────────────────────────── -->
     <hr>
     <h2 id="metrics">📊 Prometheus Metrics</h2>
     <p>
-      <strong><code>lyrebird-metrics.sh</code></strong> — Exports operational metrics in
-      Prometheus/OpenMetrics text format for Grafana dashboards.
+      <strong><code>lyrebird-metrics.sh</code></strong> prints metrics in the Prometheus text exposition format, to
+      stdout, to a file, or over HTTP. Run it as root for a complete scrape: another user's processes cannot be
+      inspected closely enough, and what cannot be read is left out of the document and its collector reported failed.
     </p>
 
     <h3>Usage</h3>
-    <pre><code># One-time metrics output (stdout)
+    <pre><code># One-time output (stdout)
 ./lyrebird-metrics.sh
 
-# Start HTTP server (for Prometheus scraping)
+# HTTP server for Prometheus, on 127.0.0.1:9100
 ./lyrebird-metrics.sh serve --port 9100
 
-# Export only stream metrics
-./lyrebird-metrics.sh --streams-only
+# The same on every interface (no authentication, no TLS)
+./lyrebird-metrics.sh serve --port 9100 --bind 0.0.0.0
 
-# Export only system metrics
-./lyrebird-metrics.sh --system-only</code></pre>
+# Atomic file for node_exporter's textfile collector
+./lyrebird-metrics.sh --file /var/lib/node_exporter/textfile_collector/lyrebird.prom</code></pre>
+    <p><code>--serve [PORT]</code> is the older spelling of <code>serve --port PORT</code>. There is no <code>--streams-only</code> or <code>--system-only</code>. See <a href="monitoring.html#prometheus">Monitoring</a> for the metric names, limits of the server and alerting rules.</p>
 
-    <h3>Available Metrics</h3>
-    <pre><code># Service status
-lyrebird_mediamtx_up 1
-lyrebird_mediamtx_uptime_seconds 3600
-
-# Per-stream metrics
-lyrebird_stream_active{name="mic1"} 1
-lyrebird_stream_uptime_seconds{name="mic1"} 1800
-
-# USB device status
-lyrebird_usb_devices_total 3
-lyrebird_usb_device_connected{name="mic1"} 1
-
-# System resources
-lyrebird_cpu_usage_percent 15.5
-lyrebird_memory_usage_percent 45.2
-lyrebird_disk_usage_percent{mount="/"} 62
-lyrebird_load_average_1m 0.5</code></pre>
-
-    <h3>Prometheus Configuration</h3>
-    <pre><code># prometheus.yml
-scrape_configs:
-  - job_name: 'lyrebird'
-    static_configs:
-      - targets: ['field-unit-1:9100']
-    scrape_interval: 30s</code></pre>
+    <h3>Exit Codes</h3>
+    <div class="table-wrapper">
+      <table>
+        <thead><tr><th>Code</th><th>Meaning</th></tr></thead>
+        <tbody>
+          <tr><td>0</td><td>Every collector completed (the server: stopped by a signal)</td></tr>
+          <tr><td>1</td><td>Command-line error</td></tr>
+          <tr><td>2</td><td>Nothing could be delivered: <code>--file</code> could not publish (the previous file is kept), or the server cannot run (no usable netcat, port in use)</td></tr>
+          <tr><td>3</td><td>The output was delivered, but at least one collector failed (<code>lyrebird_scrape_success</code> is 0)</td></tr>
+        </tbody>
+      </table>
+    </div>
 
     <!-- ── STORAGE ─────────────────────────────────────────────────── -->
     <hr>
     <h2 id="storage">💾 Storage Management</h2>
     <p>
-      <strong><code>lyrebird-storage.sh</code></strong> — Manages disk space with configurable
-      retention policies. Essential for long-running deployments.
+      <strong><code>lyrebird-storage.sh</code></strong> deletes old recordings, logs and temporary files under a
+      retention policy, and cleans up harder when the disk fills. It runs once per invocation; there is no loop and no
+      <code>--interval</code> option, so schedule it from cron or a timer.
     </p>
 
     <h3>Usage</h3>
-    <pre><code># Check storage status
+    <pre><code># Show storage status
 ./lyrebird-storage.sh status
 
-# Run cleanup (respects retention policy)
+# Standard cleanup (retention policy); --dry-run shows what would be deleted
 sudo ./lyrebird-storage.sh cleanup
+sudo ./lyrebird-storage.sh --dry-run cleanup
 
-# Emergency cleanup (aggressive)
+# Emergency cleanup (oldest recordings first)
 sudo ./lyrebird-storage.sh emergency
 
-# Monitor mode (continuous)
-./lyrebird-storage.sh monitor --interval 300</code></pre>
+# One disk check, cleaning up when a threshold is crossed
+sudo ./lyrebird-storage.sh monitor</code></pre>
+
+    <h3>Options</h3>
+    <div class="table-wrapper">
+      <table>
+        <thead><tr><th>Option</th><th>Description</th></tr></thead>
+        <tbody>
+          <tr><td><code>-n, --dry-run</code></td><td>Show what would be deleted without deleting</td></tr>
+          <tr><td><code>-d, --debug</code></td><td>Debug output</td></tr>
+          <tr><td><code>-q, --quiet</code></td><td><code>cleanup</code> and <code>monitor</code>: only warnings, errors and one summary line per run (on stderr)</td></tr>
+          <tr><td><code>--once</code></td><td><code>monitor</code>: accepted for clarity; monitor always checks once</td></tr>
+        </tbody>
+      </table>
+    </div>
 
     <h3>Configuration</h3>
-    <pre><code># /etc/lyrebird/storage.conf
+    <p>
+      Settings come from the environment, or from <code>/etc/lyrebird/storage.conf</code> when it exists (the environment wins).
+      The file holds <code>KEY=value</code> lines, read as data, never executed; a line that is not accepted is reported and
+      ignored, and the run exits 4. A file that anyone can write, or that belongs to another user than root, is not read.
+      In the file, directories must be absolute and <code>RECORDING_DIR</code>/<code>LOG_DIR</code> are accepted as other
+      names for <code>LYREBIRD_RECORDING_DIR</code>/<code>LYREBIRD_LOG_DIR</code>; as environment variables only the
+      <code>LYREBIRD_</code> names exist.
+    </p>
+    <pre id="example-storage-conf"><code># /etc/lyrebird/storage.conf
 RECORDING_RETENTION_DAYS=30   # Keep recordings for 30 days
 LOG_RETENTION_DAYS=7          # Keep logs for 7 days
 DISK_WARNING_PERCENT=80       # Warn at 80% disk usage
 DISK_CRITICAL_PERCENT=90      # Critical at 90% usage
-RECORDING_DIR="/var/recordings"
-LOG_DIR="/var/log/lyrebird"</code></pre>
-
-    <h3>Automated Cleanup</h3>
-    <pre><code># /etc/cron.d/lyrebird-storage
-0 3 * * * root /path/to/lyrebird-storage.sh cleanup --quiet
-*/15 * * * * root /path/to/lyrebird-storage.sh monitor --once</code></pre>
-
-    <!-- ── UPDATER ─────────────────────────────────────────────────── -->
-    <hr>
-    <h2 id="updater">🔄 Version Manager</h2>
+DISK_EMERGENCY_PERCENT=95     # Emergency cleanup at 95%
+LYREBIRD_RECORDING_DIR=/var/lib/mediamtx-ffmpeg/recordings
+LYREBIRD_LOG_DIR=/var/log/lyrebird</code></pre>
     <p>
-      <strong><code>lyrebird-updater.sh</code></strong> — Safe git-based version management with
-      transaction-based updates and automatic rollback.
+      The script never reads the stream manager's <code>AUDIO_RECORDING_PATH</code>. If you move the recording
+      directory of the manager, set <code>LYREBIRD_RECORDING_DIR</code> (and, for the emergency clear of the RAM buffer,
+      <code>LYREBIRD_BUFFER_DIR</code>, default <code>/dev/shm/lyrebird-buffer</code>) to the same place.
+      Files count as recordings when they end in <code>opus ogg aac adts m4a mp3 flac wav</code>.
     </p>
 
-    <h3>Usage</h3>
-    <pre><code># Interactive menu
-./lyrebird-updater.sh
-
-# Check for updates
-./lyrebird-updater.sh --status
-
-# List available versions
-./lyrebird-updater.sh --list
-
-# Rollback to previous version
-./lyrebird-updater.sh --rollback
-
-# Run post-update migrations manually
-sudo ./lyrebird-updater.sh --migrate</code></pre>
+    <h3>Automated Cleanup</h3>
+    <pre id="example-storage-cron"><code># /etc/cron.d/lyrebird-storage
+0 3 * * *    root /path/to/lyrebird-storage.sh cleanup --quiet >>/var/log/lyrebird-storage.log 2&gt;&amp;1
+*/15 * * * * root /path/to/lyrebird-storage.sh monitor --once >>/var/log/lyrebird-storage.log 2&gt;&amp;1</code></pre>
+    <p><code>monitor</code> prints nothing while the disk is fine, so the second line does not fill the log.</p>
 
     <h3>Exit Codes</h3>
     <div class="table-wrapper">
@@ -546,11 +699,65 @@ sudo ./lyrebird-updater.sh --migrate</code></pre>
         <thead><tr><th>Code</th><th>Meaning</th></tr></thead>
         <tbody>
           <tr><td>0</td><td>Success</td></tr>
-          <tr><td>2</td><td>Prerequisites not met</td></tr>
+          <tr><td>1</td><td>Usage error (unknown option, no command, <code>--quiet</code> with <code>status</code>/<code>emergency</code>, <code>--once</code> with anything but <code>monitor</code>)</td></tr>
+          <tr><td>3</td><td>Finished, but at least one deletion failed or a directory could not be listed</td></tr>
+          <tr><td>4</td><td>Finished, but lines of the configuration file were ignored (3 wins when both apply)</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <!-- ── UPDATER ─────────────────────────────────────────────────── -->
+    <hr>
+    <h2 id="updater">🔄 Version Manager</h2>
+    <p>
+      <strong><code>lyrebird-updater.sh</code></strong> switches a git checkout between releases and branches. An update
+      is a transaction: your local changes are stashed, the service is stopped and backed up, the checkout is switched and
+      verified, and everything is rolled back if a step fails. It needs Git 2.0+, Bash 4.0+ and <code>flock</code>.
+    </p>
+
+    <h3>Usage</h3>
+    <pre><code># Interactive menu
+./lyrebird-updater.sh
+
+# Current version, branch and sync status
+./lyrebird-updater.sh --status
+
+# Fetch and list available versions (needs the network)
+./lyrebird-updater.sh --list
+
+# Show past updates, rollbacks and unfinished updates (local, no network)
+./lyrebird-updater.sh --history
+
+# Go back to the version before the last update, or to a tag or commit already in the clone
+./lyrebird-updater.sh --rollback
+./lyrebird-updater.sh --rollback v1.3.0
+
+# Run post-update migrations manually
+sudo ./lyrebird-updater.sh --migrate</code></pre>
+    <p>
+      The menu offers: 1) the latest stable release (the newest tag), 2) the default branch, 3) a specific version or
+      branch, 4) check for updates, 5) detailed status, 6) discard local changes and reset. A switch that fails is
+      reported and the menu stays open; <code>Q</code> leaves with the status of the last switch or reset.
+    </p>
+
+    <h3>Exit Codes</h3>
+    <div class="table-wrapper">
+      <table>
+        <thead><tr><th>Code</th><th>Meaning</th></tr></thead>
+        <tbody>
+          <tr><td>0</td><td>Success</td></tr>
+          <tr><td>1</td><td>General error (a failed switch, an invalid version, an unknown option)</td></tr>
+          <tr><td>2</td><td>Prerequisites not met (git, awk, sed, grep, tput or flock missing; git or Bash too old)</td></tr>
           <tr><td>3</td><td>Not a git repository</td></tr>
-          <tr><td>5</td><td>Permission error</td></tr>
-          <tr><td>7</td><td>Locked (another instance running)</td></tr>
-          <tr><td>9</td><td>User aborted</td></tr>
+          <tr><td>4</td><td>Could not reach the remote (<code>--list</code> then shows cached data) or no remote configured</td></tr>
+          <tr><td>5</td><td>Permission: the repository is not writable or is owned by root, or the state directory or lock file cannot be written</td></tr>
+          <tr><td>6</td><td>The requested or previous version is not available in this clone (a rollback never uses the network)</td></tr>
+          <tr><td>7</td><td>Locked: another updater held the lock longer than <code>LYREBIRD_UPDATER_LOCK_WAIT</code> (default 30 s)</td></tr>
+          <tr><td>8</td><td>Unusable git state (merge or rebase in progress) or an unreadable update journal</td></tr>
+          <tr><td>9</td><td>Cancelled: a prompt was declined, or the run was interrupted</td></tr>
+          <tr><td>10</td><td>The switch is done, but your saved changes conflict with the new version and were not re-applied; they are in the git stash</td></tr>
+          <tr><td>11</td><td>The automatic rollback could not restore everything; the message names the <code>git checkout --force</code> command to run</td></tr>
+          <tr><td>12</td><td>Standard input ended at a menu prompt</td></tr>
         </tbody>
       </table>
     </div>
@@ -559,8 +766,9 @@ sudo ./lyrebird-updater.sh --migrate</code></pre>
     <hr>
     <h2 id="common">📚 Shared Library</h2>
     <p>
-      <strong><code>lyrebird-common.sh</code></strong> — Utility functions shared across all scripts
-      via sourcing. All scripts work with or without it (fallback definitions included).
+      <strong><code>lyrebird-common.sh</code></strong> holds the utility functions the scripts share. Most scripts fall
+      back to their own definitions when it is missing; the stream manager and the installer's <code>install</code> command
+      require it, because it holds the MediaMTX configuration generator and the atomic file writer.
     </p>
 
     <h3>Provided Functions</h3>
@@ -569,20 +777,13 @@ sudo ./lyrebird-updater.sh --migrate</code></pre>
         <thead><tr><th>Function</th><th>Purpose</th></tr></thead>
         <tbody>
           <tr><td><code>lyrebird_command_exists()</code></td><td>Check command availability (cached)</td></tr>
-          <tr><td><code>lyrebird_compute_hash()</code></td><td>Portable SHA256 hashing</td></tr>
-          <tr><td><code>log_debug() / log_info()</code></td><td>Logging with timestamps</td></tr>
-          <tr><td><code>log_warn() / log_error()</code></td><td>Warning and error logging</td></tr>
-          <tr><td><code>lyrebird_timestamp()</code></td><td>Formatted timestamp</td></tr>
+          <tr><td><code>lyrebird_compute_hash()</code></td><td>Portable SHA-256 hashing</td></tr>
+          <tr><td><code>log_debug() / log_info() / log_warn() / log_error()</code></td><td>Logging with timestamps</td></tr>
+          <tr><td><code>lyrebird_atomic_write DEST [MODE [OWNER_REF]]</code></td><td>Durable replace: temp file in the same directory, fsync, rename, fsync of the directory</td></tr>
+          <tr><td><code>lyrebird_render_mediamtx_config</code></td><td>The one MediaMTX configuration generator (used by the stream manager and the installer)</td></tr>
         </tbody>
       </table>
     </div>
-
-    <h3>Exit Code Constants</h3>
-    <pre><code>E_SUCCESS=0
-E_PERMISSION=2
-E_MISSING_DEPS=3
-E_CONFIG_ERROR=4
-E_LOCKED=5</code></pre>
 
   </main>
   <nav id="page-nav" class="page-nav"></nav>
