@@ -41,8 +41,10 @@ those found while checking, `DOC-` for documentation) are the ones in
   publish to and read every stream, as before. The new
   `RTSP_AUTH_MODE=local-only-publish` closes it without editing the file: this
   machine needs no password, and every other client must be a user listed in
-  `RTSP_USERS_FILE` and can only read. `lyrebird-stream-manager.sh help` shows
-  the file format; `docs/SECURITY-GUIDE.md` covers authentication. [LB-06]
+  `RTSP_USERS_FILE` and can only read. Publishers must then connect through a
+  loopback name (`MEDIAMTX_HOST` of `localhost`, `127.x` or `::1`; the manager
+  warns otherwise). `lyrebird-stream-manager.sh help` shows the file format;
+  `docs/SECURITY-GUIDE.md` covers authentication. [LB-06]
 - **A `mediamtx.yml` you edited is no longer overwritten.** The manager
   regenerated the file on every start, so a password, bind address or file
   mode you set was lost. Only a file whose first line is
@@ -97,7 +99,8 @@ those found while checking, `DOC-` for documentation) are the ones in
   devices to settle no longer counts an empty list as settled. The monitor
   starts the stream of each device that appears, restarts a multiplex stream
   when a device is added, and restarts a MediaMTX that is gone while the node
-  is meant to run (`start` was run and `stop` was not), within
+  is meant to run (`start` was run and `stop` was not, which the manager
+  records in `/run/lyrebird/desired-running`), within
   `CRON_RESTART_MAX_PER_HOUR`. [LB-07, X-03]
 - **Lifecycle commands never overlap, and no lock goes stale.** Locks are
   `flock`s on files that are never deleted or truncated; the kernel releases
@@ -109,14 +112,16 @@ those found while checking, `DOC-` for documentation) are the ones in
   the wrappers and FFmpeg no longer inherit the lock. [LB-05, X-02]
 - **Processes are found by identity, never by name.** The manager signals only
   processes recorded in its own PID files (checked against the process start
-  time) that are what it started. `stop` no longer kills other FFmpeg
+  time, which is kept in a `<pid file>.id` record beside each) that are what it
+  started. `stop` no longer kills other FFmpeg
   processes that read a stream, and `force-stop` kills only what this manager
   started. `force-stop --kill-all` prints what it would kill and exits 1;
   `force-stop --kill-all --yes` kills it: the only broad kill. The first
   signal is SIGTERM, then SIGKILL after the timeout. `stop` exits 1 when
   something could not be stopped. The installer stops MediaMTX through its
   owner (systemd or the manager) and, as a last resort, by executable path and
-  configuration file. [LB-10]
+  configuration file; its `status` no longer reports another installation's
+  MediaMTX as "Running (manual)". [LB-10]
 
 **Health checks and monitoring**
 
@@ -286,7 +291,8 @@ those found while checking, `DOC-` for documentation) are the ones in
 
 - **`--history` and `--rollback [VERSION]` exist** (the README described them
   before they existed). `--history` lists updates, rollbacks and
-  resets from a local log, and any update that did not finish. `--rollback`
+  resets from a local log (`<git-dir>/lyrebird-updater/history.log`), and any
+  update that did not finish. `--rollback`
   returns to the version the last update came from, or to a release tag or
   commit already in the clone; neither needs the network. [X-21]
 - **An update is a journalled transaction.** An update killed halfway (a
@@ -507,8 +513,11 @@ list; 8 and 9 are new, 5, 6 and 7 changed)
   `MEDIAMTX_API_BIND`, `MEDIAMTX_METRICS_BIND`, `RTSP_AUTH_MODE`,
   `RTSP_USERS_FILE`, `MEDIAMTX_CONFIG_BACKUPS`, `FFMPEG_LOG_KEEP`,
   `STREAM_MANAGER_LOG_FILE`, `AUDIO_LEVEL_*`, `AUDIO_SILENCE_*`,
-  `SILENCE_STATE_DIR`, `DEVICE_<NAME>_PCM`. `lyrebird-stream-manager.sh help`
-  lists them with their defaults.
+  `SILENCE_STATE_DIR`, `DEVICE_<NAME>_PCM`, and for `install`
+  `LYREBIRD_UNIT_MAX_STREAMS` (8: the number of streams the unit's timeouts are
+  sized for) and `LYREBIRD_UNIT_TEMPLATE`. The defaults are in the settings at
+  the top of `lyrebird-stream-manager.sh`; `lyrebird-stream-manager.sh help`
+  lists most of them.
 - **Updater**: `--history`, `--rollback [VERSION]`, exit codes 6, 10, 11 and
   12, and the settings `LYREBIRD_FETCH_TIMEOUT`, `LYREBIRD_FETCH_RETRIES`,
   `LYREBIRD_FETCH_RETRY_DELAY`, `LYREBIRD_REMOTE_PROBE_TIMEOUT`,
