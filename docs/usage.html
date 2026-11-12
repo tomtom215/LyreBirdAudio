@@ -264,14 +264,14 @@ sudo tail -f /var/log/lyrebird-stream-manager.log</code></pre>
     <p>What <code>install</code> writes:</p>
     <ul>
       <li><code>/etc/systemd/system/mediamtx-audio.service</code>, rendered from <code>config/mediamtx-audio.service</code>: <code>Restart=always</code>, a start limit of 10 starts in 20 minutes, <code>ExecReload</code> running <code>reload</code>, and <code>Conflicts=mediamtx.service</code>. There is no watchdog: the unit has no <code>WatchdogSec=</code> and the manager sends no systemd watchdog keep-alives</li>
-      <li><code>/etc/cron.d/mediamtx-monitor</code>: runs <code>monitor</code> every 5 minutes under <code>flock</code>; an exit status of 2 restarts the service, any other non-zero status is logged with <code>logger</code></li>
+      <li><code>/etc/cron.d/mediamtx-monitor</code>: runs <code>monitor</code> every 5 minutes under <code>flock</code>; an exit status of 2 restarts the service, any other non-zero status is logged with <code>logger</code>. It carries the stream mode, and the unit and the file both carry the ports, bind addresses, <code>RTSP_AUTH_MODE</code> and the other settings you gave <code>install</code> when they differ from the defaults (<a href="configuration.html#env-vars">Configuration</a>)</li>
       <li><code>/etc/logrotate.d/mediamtx</code> (when logrotate is installed): rotates the MediaMTX log, the manager log and the FFmpeg logs</li>
     </ul>
     <p>
       The unit writes the manager's output to <code>/var/log/lyrebird-stream-manager.log</code> (<code>StandardOutput=append:</code>),
       so that file is the log to read; <code>journalctl -u mediamtx-audio</code> shows systemd's own messages about the unit.
       <code>install</code> must be run from a checkout (it reads the unit template next to the script). To change the stream mode of an
-      installed service, run <code>install</code> again with the <code>-m/-f/-n</code> options; the cron job's mode changes with it.
+      installed service, run <code>install</code> again with the <code>-m/-f/-n</code> options; the cron job's mode changes with it. <code>install</code> writes what it is given and the defaults for the rest, so give it the options and the settings (<code>sudo env RTSP_AUTH_MODE=local-only-publish ./lyrebird-stream-manager.sh install</code>) every time.
     </p>
 
     <div class="callout tip">

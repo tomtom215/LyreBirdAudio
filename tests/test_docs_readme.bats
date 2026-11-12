@@ -297,9 +297,9 @@ _default_in() {
 }
 
 @test "every lyrebird-mic-check.sh option in README is in its usage text, and --json is not one [DOC-02]" {
-    # (the script needs /proc/asound even for --help, so its usage text is read from the source)
+    # (the real --help: it needs no /proc/asound and exits 0 since X-53)
     local usage line tok n=0
-    usage="$(awk '/^show_usage\(\) \{/ { f = 1 } f { print } f && /^EOF$/ { exit }' "$ROOT/lyrebird-mic-check.sh")"
+    usage="$(bash "$ROOT/lyrebird-mic-check.sh" --help 2>&1)"
     [ -n "$usage" ]
     while IFS= read -r line; do
         for tok in $line; do
@@ -320,10 +320,20 @@ _default_in() {
 
 @test "README states the Bash versions by what the code uses, and no ARMv6 or 4.0 promise [DOC-02]" {
     # the claims in the table, checked against the code
-    grep -qE '^\| `lyrebird-mic-check.sh` \| none \| 4\.3 ' "$README"
-    run grep -cE '\$\{[a-z_]+\[-[0-9]\]\}' "$ROOT/lyrebird-mic-check.sh"
-    [ "$output" -ge 1 ]
-    local f
+    local f negative
+    # negative array subscripts (${array[-1]}) need Bash 4.3: the mic-check row says 4.3 while the script has
+    # one, and 4.2 (declare -g, checked below) once it has none
+    negative="$(grep -cE '\$\{[a-z_]+\[-[0-9]\]\}' "$ROOT/lyrebird-mic-check.sh")" || negative=0
+    if [ "$negative" -ge 1 ]; then
+        grep -qE '^\| `lyrebird-mic-check.sh` \| none \| 4\.3 ' "$README" || { echo "mic-check has a negative subscript: its row must say 4.3"; false; }
+    else
+        grep -qE '^\| `lyrebird-mic-check.sh` \| none \| 4\.2 ' "$README" || { echo "mic-check has no negative subscript left: its row must say 4.2 (declare -g)"; false; }
+    fi
+    # nothing else in the suite uses a feature newer than 4.2 (namerefs, wait -n, ${var@Q}, $EPOCHSECONDS and so on)
+    for f in "$ROOT"/*.sh; do
+        run grep -nE '(local|declare|typeset)[[:space:]]+-[a-zA-Z]*n[a-zA-Z]*[[:space:]]|wait[[:space:]]+-[a-z]*[nfp]|\$\{[a-zA-Z_]+@[QPAaEKkUuL]\}|EPOCHSECONDS|EPOCHREALTIME|BASH_ARGV0|SRANDOM' "$f"
+        [ "$status" -eq 1 ] || { echo "${f##*/} uses a feature newer than 4.2: $output"; false; }
+    done
     for f in lyrebird-alerts.sh lyrebird-common.sh lyrebird-storage.sh lyrebird-stream-manager.sh lyrebird-mic-check.sh lyrebird-diagnostics.sh; do
         grep -qE '(declare|typeset)[[:space:]]+-[a-zA-Z]*g' "$ROOT/$f" || { echo "$f no longer uses declare -g: update the Bash table"; false; }
     done

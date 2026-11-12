@@ -51,10 +51,8 @@ git clone https://github.com/YOUR_USERNAME/LyreBirdAudio.git
 cd LyreBirdAudio
 
 # 2. Add upstream remote
-git remote add upstream https://github.com/tomtom215/LyreBirdAudio.git
-
-# 3. Make scripts executable
-chmod +x *.sh</code></pre>
+git remote add upstream https://github.com/tomtom215/LyreBirdAudio.git</code></pre>
+    <p>Every script is committed with the executable bit (<code>git ls-files -s '*.sh'</code> shows mode 100755 for all of them), so <code>./script.sh</code> works in a clone of <code>main</code> without a <code>chmod</code>.</p>
 
     <h3>Verify Development Setup</h3>
     <p>These are the gates CI runs on every script (a pull request has to pass all of them):</p>

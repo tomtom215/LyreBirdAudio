@@ -85,8 +85,8 @@ sudo apt install -y shellcheck bats # Developers only</code></pre>
 
     <h3>Option A: Main Branch</h3>
     <pre><code>git clone https://github.com/tomtom215/LyreBirdAudio.git
-cd LyreBirdAudio
-chmod +x *.sh</code></pre>
+cd LyreBirdAudio</code></pre>
+    <p>The scripts are committed executable: no <code>chmod</code> is needed on <code>main</code>.</p>
 
     <h3>Option B: A Tagged Release</h3>
     <pre><code>git clone https://github.com/tomtom215/LyreBirdAudio.git
@@ -95,8 +95,8 @@ cd LyreBirdAudio
 # See which tags contain everything that is on main
 git tag --contains origin/main
 
-git checkout vX.Y.Z    # a tag from that list
-chmod +x *.sh</code></pre>
+git checkout vX.Y.Z    # a tag from that list</code></pre>
+    <p>A tag made before the scripts were committed executable needs <code>chmod +x *.sh</code> after the checkout; <code>v1.3.0</code> is one (seven of its scripts are mode 100644).</p>
 
     <div class="callout warning">
       <span class="callout-icon">⚠️</span>

@@ -157,7 +157,7 @@ sudo ./lyrebird-mic-check.sh -V
           <tr>
             <td><code>/etc/cron.d/mediamtx-monitor</code></td>
             <td>cron</td>
-            <td>Runs <code>monitor</code> every 5 minutes; written by <code>install</code></td>
+            <td>Runs <code>monitor</code> every 5 minutes; written by <code>install</code>, with the stream mode and the listener and authentication settings the node was installed with</td>
           </tr>
           <tr>
             <td><code>/etc/lyrebird/alerts.conf</code></td>
@@ -199,14 +199,15 @@ sudo ./lyrebird-mic-check.sh -V
       reach the service or the monitor:
     </p>
     <ul>
-      <li><strong>Service:</strong> <code>sudo systemctl edit mediamtx-audio</code> and add <code>Environment="NAME=value"</code> lines. A drop-in survives <code>install</code>.</li>
-      <li><strong>Monitor:</strong> cron does not inherit the unit's environment. Add <code>NAME=value</code> lines above the job line of <code>/etc/cron.d/mediamtx-monitor</code>. <code>install</code> rewrites that file, so add them again afterwards.</li>
+      <li><strong>Service:</strong> run <code>install</code> with the setting if it is one of the nine settings <code>install</code> carries (below); for any other, <code>sudo systemctl edit mediamtx-audio</code> and add <code>Environment="NAME=value"</code> lines. A drop-in survives <code>install</code>.</li>
+      <li><strong>Monitor:</strong> cron does not inherit the unit's environment. <code>install</code> writes the nine settings it carries to <code>/etc/cron.d/mediamtx-monitor</code> itself; for any other, add <code>NAME=value</code> lines above the job line. <code>install</code> rewrites that file, so add those lines again afterwards.</li>
     </ul>
     <div class="callout warning">
       <span class="callout-icon">⚠️</span>
       <div class="callout-body">
-        <strong>Non-default ports must be set in both places</strong>
-        <p><code>install</code> passes the stream mode on (<code>STREAM_MODE</code>, <code>MULTIPLEX_FILTER_TYPE</code>, <code>MULTIPLEX_STREAM_NAME</code>) but not the port variables: the unit and the cron file it renders carry no port, even when you run <code>install</code> with one set. A monitor that restarts a stream without <code>MEDIAMTX_RTSP_PORT</code> in its environment publishes it to port 8554.</p>
+        <strong>Run <code>install</code> with the settings the node uses</strong>
+        <p><code>install</code> writes the stream mode (<code>-m</code>, <code>-f</code>, <code>-n</code>) and these nine settings into the unit (<code>Environment=</code>) and into the cron file, when they are set and differ from their defaults: <code>MEDIAMTX_RTSP_PORT</code>, <code>MEDIAMTX_API_PORT</code>, <code>MEDIAMTX_METRICS_PORT</code>, <code>MEDIAMTX_API_BIND</code>, <code>MEDIAMTX_METRICS_BIND</code>, <code>RTSP_AUTH_MODE</code>, <code>RTSP_USERS_FILE</code>, <code>MEDIAMTX_HOST</code> and <code>MEDIAMTX_BINARY</code>. Give them through <code>sudo env</code>, for example <code>sudo env RTSP_AUTH_MODE=local-only-publish MEDIAMTX_RTSP_PORT=31554 ./lyrebird-stream-manager.sh install</code>. A value the files cannot carry stops <code>install</code> with exit 4 and changes nothing. The cron file matters most: the monitor starts a MediaMTX that has died again by rendering <code>mediamtx.yml</code>, and without the settings it renders the defaults (port 8554, authentication <code>open</code>).</p>
+        <p><code>install</code> writes what it is given and the defaults for the rest; it does not read the files it replaces. The updater's service reinstall does, and passes the same settings on. It does not carry the path variables (<code>MEDIAMTX_CONFIG_DIR</code>, the PID, lock and log files, <code>MEDIAMTX_FFMPEG_DIR</code>) or the audio and policy settings: the unit's <code>PIDFile=</code> and <code>StandardOutput=append:</code> follow the path variables of the shell that ran <code>install</code>, but the service itself is never given them, so leave the paths at their defaults or set them for the service and the cron job by hand.</p>
       </div>
     </div>
 

@@ -8,7 +8,7 @@ directory has two tools for that:
 | Tool | Runs on | Measures |
 |---|---|---|
 | `lyrebird-soak.sh` | the node (root, systemd) | device names, stream liveness, services, resources; injects faults and times recovery |
-| `lyrebird-soak-observer.sh` | a second machine with ffmpeg (written for bash 3.2; run only on Linux) | audio actually arriving over RTSP, including through power cuts; can cut the node's power |
+| `lyrebird-soak-observer.sh` | a second machine with ffmpeg (written without Bash 4 features; run only on Linux, with Bash 5.2) | audio actually arriving over RTSP, including through power cuts; can cut the node's power |
 
 Use both. The node harness sees causes (which device, which process); the
 observer sees what a listener sees, including outages the node cannot record
@@ -92,8 +92,10 @@ writes (every 5 minutes):
   `grep 'DEAD MIC' /var/log/lyrebird-stream-manager.log`.
 - The settings are environment variables of the monitor process. Cron does not
   pass the unit's environment, so a non-default value must also be in
-  `/etc/cron.d/mediamtx-monitor`, which every `lyrebird-stream-manager.sh install`
-  rewrites.
+  `/etc/cron.d/mediamtx-monitor`. `lyrebird-stream-manager.sh install` does not
+  carry the `AUDIO_*` settings into that file (it carries the ports, the bind
+  addresses and a few others), and it rewrites the file, so add the lines again
+  after every `install`.
 
 What it does not catch:
 
@@ -177,9 +179,10 @@ undo itself when it starts again.
 
 ## Observer
 
-On a second machine with ffmpeg. The observer is written for bash 3.2 (the bash
-macOS ships) and for portable commands: its report formats times with GNU
-`date`, then with BSD `date`.
+On a second machine with ffmpeg. The observer is written to avoid Bash 4 features
+(a search of its script for them finds none), so that it can run under bash 3.2,
+the bash macOS ships, and it uses portable commands: its report formats times with
+GNU `date`, then with BSD `date`.
 
 What was run: `tests/test_soak_observer.bats` runs it on Linux under the `bash`
 on `PATH`. That is its report on synthetic logs always, and its reader against a

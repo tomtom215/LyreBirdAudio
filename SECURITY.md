@@ -67,6 +67,14 @@ by running the test suite (`bats tests/`):
   lower-case letters, digits, `_` and `-` (at most 64 characters) before they appear in
   the MediaMTX configuration, a wrapper script, a PID file name or a unit; ports must be
   integers from 1 to 65535; a value a systemd unit or a cron file cannot carry is refused.
+- **A restart by cron keeps the node's settings.** The monitor that cron runs starts a
+  MediaMTX that has died by rendering its configuration again. `install` writes the
+  ports, the bind addresses, `RTSP_AUTH_MODE`, `RTSP_USERS_FILE`, `MEDIAMTX_HOST` and
+  `MEDIAMTX_BINARY` it was given into both the service unit and the monitor's cron file, so
+  that restart keeps the authentication mode and the ports (without them it renders the
+  defaults). A node installed before this release has none of them in those files and must
+  run `install` again with them (see "Upgrading an existing node" in
+  [CHANGELOG.md](CHANGELOG.md)).
 - **Processes are signalled by identity.** The stream manager signals only PIDs it recorded
   itself, and only while the process start time still matches. The one broad kill is
   `force-stop --kill-all --yes`; without `--yes` that command only prints what it would kill.

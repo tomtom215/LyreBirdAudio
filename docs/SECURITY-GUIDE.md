@@ -64,6 +64,11 @@ answers `401` to a caller that is not on this machine, because its default polic
 only authorizes the API and metrics for loopback callers. RTSP always listens on
 every interface: neither the stream manager nor the installer has an option for that.
 
+The service and the cron monitor do not inherit your shell's environment: give the
+ports and the bind addresses to `lyrebird-stream-manager.sh install`, which writes them
+into the unit and the cron file (`sudo env MEDIAMTX_API_PORT=19997 ./lyrebird-stream-manager.sh install`,
+then restart the service). The authentication section below has the details.
+
 `lyrebird-metrics.sh serve` is a separate listener, only while you run it (see
 [Metrics and Alerts](#metrics-and-alerts)).
 
@@ -228,31 +233,47 @@ answers only on this machine.
    the manager warns.
 3. **The variable must reach every process that can start MediaMTX.** That is the
    service, and also the cron monitor, which starts MediaMTX again when it has
-   died. The unit and the cron file do **not** carry this variable. Set it in
-   both:
+   died by rendering the configuration again. `install` writes this setting into
+   both the unit (`Environment=`) and the cron file (a `NAME=value` line), so give
+   it to `install`:
 
    ```bash
-   # the service (a drop-in, kept when `install` runs again)
-   sudo systemctl edit mediamtx-audio
-   #   add:  [Service]
-   #         Environment="RTSP_AUTH_MODE=local-only-publish"
-   # the monitor (cron does not read the unit's environment)
-   sudo sed -i 's/^CRON=1$/&\nRTSP_AUTH_MODE=local-only-publish/' /etc/cron.d/mediamtx-monitor
+   sudo env RTSP_AUTH_MODE=local-only-publish ./lyrebird-stream-manager.sh install
+   # add -m, -f and -n on a multiplex node
    sudo systemctl restart mediamtx-audio
    ```
 
-   **`lyrebird-stream-manager.sh install` rewrites the cron file**, so repeat the
-   second command after running it. Without the variable in the cron file the
-   monitor renders an open configuration when it restarts MediaMTX, and the managed
-   file silently loses its users. Observed: after `kill -9` of MediaMTX the monitor
-   wrote a file without `authInternalUsers` and anonymous remote publishing worked
-   again. Check after a restart:
+   Check that both files carry it:
+
+   ```bash
+   grep -n RTSP_AUTH_MODE /etc/systemd/system/mediamtx-audio.service /etc/cron.d/mediamtx-monitor
+   ```
+
+   **`install` writes what it is given and the defaults for the rest.** Run it
+   again without the variable and both files silently go back to `open`: give it the
+   options and settings every time. The updater's service reinstall reads them from
+   the installed unit (or the cron file) and passes them on. A node installed before
+   this release has the setting in neither file: run the command above once. A
+   value other than `open` or `local-only-publish` stops `install` with exit 4 and
+   nothing is written. Without the variable in the cron file the monitor renders an
+   open configuration when it restarts MediaMTX, and the managed file silently loses
+   its users (that was the behaviour before `install` carried the setting: after
+   `kill -9` of MediaMTX the file had no `authInternalUsers` and anonymous remote
+   publishing worked again). The tests start the monitor with only the cron file's
+   assignments against a dead MediaMTX (a stand-in starts the process) and check that
+   the rendered file keeps `authInternalUsers` and the node's RTSP port; the `kill -9`
+   against a live MediaMTX was not repeated with `install` carrying the setting. Check
+   after a restart:
 
    ```bash
    grep -c authInternalUsers /etc/mediamtx/mediamtx.yml     # 1 = users are in the file
    ```
 
-   If you cannot keep both places in step, write the users into a file you own
+   The same applies to the ports and bind addresses (`MEDIAMTX_RTSP_PORT`,
+   `MEDIAMTX_API_PORT`, `MEDIAMTX_METRICS_PORT`, `MEDIAMTX_API_BIND`,
+   `MEDIAMTX_METRICS_BIND`), `RTSP_USERS_FILE`, `MEDIAMTX_HOST` and
+   `MEDIAMTX_BINARY`: `install` carries these nine settings and no others.
+   If you would rather not depend on this, write the users into a file you own
    (Option 1 below): a file you own is never rewritten, whatever the environment says.
 
 The mode applies at the next `start`, `restart` or `reload`. It has no effect on a
@@ -391,7 +412,8 @@ exercised through systemd.)
   and the placeholder did not; after it, neither worked.
 - After such a restart the account is locked until the variable is also in the cron
   file (`NAME=value` lines before the job line of `/etc/cron.d/mediamtx-monitor`,
-  rewritten by `install`). Option 3 has no such dependency.
+  which every `install` rewrites without carrying `MTX_` variables). Option 3 has no
+  such dependency.
 
 ### Option 3: Store a Hash Instead of the Password
 
@@ -628,8 +650,8 @@ credentials.
 
 ### API from another machine
 
-Nothing in LyreBirdAudio needs it. If you want it anyway, set `MEDIAMTX_API_BIND=`
-(empty) or an address, and in a file you own give a user with the `api` permission a
+Nothing in LyreBirdAudio needs it. If you want it anyway, run `install` with
+`MEDIAMTX_API_BIND=` (empty) or an address, and in a file you own give a user with the `api` permission a
 password and the networks it may come from:
 
 ```yaml
@@ -904,9 +926,8 @@ sha256sum lyrebird-common.sh | cut -d' ' -f1
 Checked: a wrong value stopped the manager with `lyrebird-common.sh integrity check
 failed!` and exit 1, the right value ran it. Only the stream manager has this check; the
 other scripts source the library without one. Update the value after every update of the
-library. Run the script as `./lyrebird-stream-manager.sh` (or with an absolute path): started
-as `bash lyrebird-stream-manager.sh` from its own directory it does not find the library
-at all.
+library. The check also runs when the script is started by its bare name from its own
+directory (`bash lyrebird-stream-manager.sh status`).
 
 ---
 
@@ -949,12 +970,15 @@ sudo mount /dev/mapper/logs /var/log
 ### Log rotation
 
 `lyrebird-stream-manager.sh install` writes `/etc/logrotate.d/mediamtx` for the manager's
-log, MediaMTX's output and the FFmpeg logs (when `logrotate` is installed). The file
-`config/lyrebird-logrotate.conf` lists the same two logs again plus the logs of the other
-scripts. **Do not install it next to the file `install` wrote**: checked with logrotate 3.21.0,
-both files together gave `duplicate log entry for /var/log/mediamtx.out` and logrotate skipped
-the file `install` wrote, so those logs were no longer rotated. Copy only the stanzas for
-`/var/log/lyrebird/*.log` and the orchestrator, updater and diagnostics logs.
+log, MediaMTX's output and the FFmpeg logs in `/var/lib/mediamtx-ffmpeg` (when `logrotate`
+is installed). The file `config/lyrebird-logrotate.conf` covers the other logs:
+`/var/log/lyrebird/*.log` (the alert log) and the orchestrator, updater, diagnostics and USB
+mapper logs. It lists none of the logs of the first file, so you can copy it to
+`/etc/logrotate.d/lyrebird` and each log still has one owner (the tests check that the two
+files name no log in common; `logrotate` itself was not run). logrotate refuses a log that two
+files list: checked with logrotate 3.21.0 on the earlier shipped file, both files together gave
+`duplicate log entry for /var/log/mediamtx.out` and logrotate skipped the file `install` wrote,
+so those logs were no longer rotated. Keep that in mind if you add stanzas of your own.
 
 ---
 
