@@ -2161,74 +2161,88 @@ In the stream manager `DEBUG=true` also prints a trace of every command; its `-d
 
 ## Security Hardening
 
+[docs/SECURITY-GUIDE.md](docs/SECURITY-GUIDE.md) has the full guide (authentication options with MediaMTX's own settings, which listeners exist, firewall examples). This section is the short version, and it states the defaults first.
+
 ### Default Security Posture
 
-LyreBirdAudio is designed with security in mind:
+**Who can do what, out of the box:**
 
-- **No Hardcoded Credentials**: All authentication is delegated to MediaMTX
-- **Restrictive Permissions**: Configuration files are mode 640, state directories 750
-- **Service User Isolation**: MediaMTX runs as dedicated `mediamtx` user
-- **systemd Hardening**: NoNewPrivileges, PrivateTmp, ProtectSystem enabled
-- **Input Validation**: All user inputs are sanitized to prevent injection
-- **Safe Temporary Files**: Uses `mktemp` for secure temp file creation
-- **Download Verification**: SHA256 checksums verify downloaded binaries
+| | Default |
+|---|---|
+| RTSP (TCP 8554, UDP 8000 and 8001) | Listens on **every interface**. **Anyone who can reach it can read any stream and publish to any path, with no password.** `RTSP_AUTH_MODE=local-only-publish` changes that (below) |
+| MediaMTX control API (9997) and metrics (9998) | Listen on `127.0.0.1` only (`MEDIAMTX_API_BIND`, `MEDIAMTX_METRICS_BIND`) |
+| SRT, RTMP, HLS, WebRTC, MoQ | Off in every generated configuration |
+| `lyrebird-metrics.sh serve` | `127.0.0.1`; `--bind` changes it; no authentication or TLS |
+| RTSP traffic | Not encrypted |
+
+The generated configuration is only as strict as these defaults. A configuration file that is not generated (an operator's file, or one written by an earlier installer) keeps whatever it says: check it ([Upgrading an Existing Node](#upgrading-an-existing-node), step 6).
+
+**What the code does for safety:**
+- **No hard-coded credentials.** Authentication is MediaMTX's own; the suite adds one helper (`RTSP_AUTH_MODE`) that writes MediaMTX's internal-user settings for you.
+- **Device configuration, `storage.conf` and `alerts.conf` are read as data, never run as shell.** Wrapper scripts are generated with every value quoted and syntax-checked before they are used; stream names are reduced to `a-z 0-9 _ -` and quoted in the YAML; the unit and cron file generators refuse paths and names they cannot carry safely.
+- **Processes are identified by executable, arguments and start time**, and only processes the manager started are signalled (the one broad kill, `force-stop --kill-all --yes`, shows its list first).
+- **Downloads are verified.** `install_mediamtx.sh` checks the SHA256 checksum published with the release; a mismatch is fatal. `tests/fetch_mediamtx.sh` and the CI tools are pinned to checksums.
+- **Atomic writes.** Configuration, unit and state files are replaced by write, `fsync`, rename.
+- **systemd sandboxing**, with different users: the standalone `mediamtx.service` runs as the unprivileged `mediamtx` user the installer creates (`NoNewPrivileges`, `ProtectSystem=strict`, `ProtectHome`, `PrivateTmp`, a memory limit). `mediamtx-audio.service` runs **as root** (the manager signals its processes and opens `/dev/snd`) with `NoNewPrivileges`, `ProtectSystem=strict`, `PrivateTmp` and other directives; FFmpeg therefore also runs as root there.
+
+**What it does not restrict:** `mediamtx.yml` is mode 0644 (0640 when it carries password hashes), `audio-devices.conf`, the manager log and `status.json` are 0644: any local user can read them. Webhook URLs in `/etc/lyrebird/alerts.conf` are secrets; keep that file readable by root only.
 
 ### Network Security
 
-**Default Configuration Warning**: By default, RTSP streams are accessible without authentication. For production deployments in sensitive environments:
+For production deployments in sensitive environments:
 
-**1. Enable MediaMTX Authentication:**
-```yaml
-# Edit /etc/mediamtx/mediamtx.yml
-authMethod: internal
-authInternalUsers:
-  - user: myuser
-    pass: mypassword
-    permissions:
-      - action: read
-        path: ""
-```
+**1. Require authentication for RTSP.** `RTSP_AUTH_MODE=local-only-publish` makes this machine (loopback) the only place that needs no password; every other client must be a user from `/etc/mediamtx/rtsp-users.conf`, with read-only access:
 
-**2. Firewall Configuration:**
 ```bash
-# Allow only specific IPs to access streams
+# One line per user: user:sha256:<base64 of the raw SHA-256 digest of the password>
+printf '%s:sha256:%s\n' viewer "$(printf '%s' 'the password' | openssl dgst -sha256 -binary | base64)" \
+  | sudo tee /etc/mediamtx/rtsp-users.conf >/dev/null
+# keep the file readable by root only: it holds password hashes
+```
+Then give the setting to the service and to the monitor ([Environment Variables](#environment-variables)): `RTSP_AUTH_MODE=local-only-publish` in a `systemctl edit mediamtx-audio` drop-in and as a line in `/etc/cron.d/mediamtx-monitor`, and restart the service. What to know:
+- A user name is `A-Za-z0-9._@-` up to 64 characters; `any` is reserved. A plaintext password, a bad hash or a duplicate stops `start` without echoing the line. A missing users file is a warning and leaves only this machine with access.
+- Publishers must connect from loopback, so `MEDIAMTX_HOST` must be `localhost`, `127.x` or `::1`; otherwise the manager warns that MediaMTX will refuse them.
+- It applies to a generated file only. For a file of your own, write MediaMTX's `authInternalUsers` yourself and **keep a password-less user restricted to `127.0.0.1` and `::1`** with publish, read, API and metrics permissions: the manager's own publishers and probes connect without credentials, and a configuration without that user stops them. [docs/SECURITY-GUIDE.md](docs/SECURITY-GUIDE.md) shows a verified example.
+- Verified against MediaMTX 1.15.0, 1.18.0, 1.19.0, 1.21.1, 1.21.2 and 1.21.3 on this machine's own non-loopback address; a client on a second host was not tested.
+- The stream manager's silence check (`AUDIO_LEVEL_CHECK_ENABLED`) reads each stream without credentials, so with read authentication on a path it logs a probe error on every run; there is no credential setting for it.
+
+**2. Firewall Configuration** (the API and the metrics endpoint are on loopback: do not open 9997 or 9998). The `ufw` lines are examples; they were not run here:
+```bash
+# Allow only your network to reach the streams
 sudo ufw allow from 192.168.1.0/24 to any port 8554 proto tcp
-sudo ufw allow from 192.168.1.0/24 to any port 9997 proto tcp
-
-# Or block external access entirely (local only)
-sudo ufw deny 8554
-sudo ufw deny 9997
+sudo ufw allow from 192.168.1.0/24 to any port 8000:8001 proto udp   # only for clients that use UDP
+sudo ufw deny 8554/tcp
 ```
 
-**3. Bind to Specific Interface:**
+**3. Bind RTSP to one interface.** The generator has no setting for the RTSP address, so this needs a configuration file of your own: delete the first line of `/etc/mediamtx/mediamtx.yml` ([Configuration ownership](#configuration-ownership)) and set
 ```yaml
-# In /etc/mediamtx/mediamtx.yml
-rtspAddress: 192.168.1.100:8554  # Instead of :8554 (all interfaces)
-apiAddress: 127.0.0.1:9997       # Localhost only for API
+rtspAddress: 192.168.1.100:8554   # instead of :8554 (every interface)
 ```
+Check the file with `mediamtx --validate-conf` (1.21.1 and later) before MediaMTX reads it. The manager's own publishers use `MEDIAMTX_HOST` (`localhost` by default), so they must still be able to reach that address: bind to one address and set `MEDIAMTX_HOST` to it for the service and the cron job.
 
 ### Library Integrity Verification
 
-For high-security deployments, enable library checksum verification:
+For high-security deployments the stream manager can refuse to run if `lyrebird-common.sh` has changed (the other scripts do not check it):
 
 ```bash
-# Generate hash of lyrebird-common.sh
-HASH=$(sha256sum lyrebird-common.sh | cut -d' ' -f1)
+# Generate the hash of lyrebird-common.sh
+sha256sum lyrebird-common.sh | cut -d' ' -f1
 
-# Set in environment or systemd service
-export LYREBIRD_COMMON_EXPECTED_HASH="$HASH"
-
-# Now sourcing will verify integrity before loading
-sudo ./lyrebird-stream-manager.sh start
+# Give it to the stream manager's environment, for example in the unit
+# (sudo systemctl edit mediamtx-audio):  Environment="LYREBIRD_COMMON_EXPECTED_HASH=<hash>"
+# and as a line in /etc/cron.d/mediamtx-monitor. After every update the hash changes.
+# Try it by hand: a wrong hash stops the manager with exit 1 and an integrity error
+sudo env LYREBIRD_COMMON_EXPECTED_HASH=<hash> ./lyrebird-stream-manager.sh status
 ```
+It guards one file, not the manager script itself.
 
 ### Recommendations for Field Deployments
 
-1. **Use VPN**: Connect remote devices through VPN rather than exposing RTSP directly
-2. **Disable API Access**: If not needed, disable the MediaMTX API endpoint
-3. **Audit Logs Regularly**: Check `/var/log/lyrebird/mediamtx-audio.log` for anomalies
-4. **Keep Updated**: Run `lyrebird-updater.sh` monthly to get security fixes
-5. **Physical Security**: Secure physical access to prevent USB device tampering
+1. **Use a VPN**: connect remote devices through a VPN rather than exposing RTSP directly
+2. **Keep the API on loopback.** Do not disable it: the stream manager reads stream state from it, and `start` waits for it
+3. **Audit logs regularly**: `/var/log/lyrebird-stream-manager.log` records starts, restarts and refusals
+4. **Keep updated**: see [Version Management](#version-management)
+5. **Physical security**: secure physical access to prevent USB device tampering
 
 ---
 
@@ -2238,13 +2252,13 @@ sudo ./lyrebird-stream-manager.sh start
 
 **Quick Recovery:**
 ```bash
-# Check service status
+# What the manager sees, and why each stream that is not publishing is not
 sudo ./lyrebird-stream-manager.sh status
 
-# Force restart
+# Restart everything
 sudo ./lyrebird-stream-manager.sh restart
 
-# If that fails, force stop and clean start
+# If that fails: stop the processes this manager started, then start cleanly
 sudo ./lyrebird-stream-manager.sh force-stop
 sudo ./lyrebird-stream-manager.sh start
 ```
@@ -2268,49 +2282,64 @@ ls -la /dev/sound/by-id/
 If the system is in an unknown state:
 
 ```bash
-# 1. Stop everything
+# 1. Stop everything the manager owns
 sudo systemctl stop mediamtx-audio 2>/dev/null || true
 sudo ./lyrebird-stream-manager.sh force-stop
 
-# 2. Clean up stale files
-sudo rm -f /run/mediamtx-audio.*
-sudo rm -f /var/lib/mediamtx-ffmpeg/*.pid
+# 2. If processes of this installation are still running, see what would be killed
+sudo ./lyrebird-stream-manager.sh force-stop --kill-all
+#    read the list; only if it is what you want:
+#    sudo ./lyrebird-stream-manager.sh force-stop --kill-all --yes
 
-# 3. Verify MediaMTX installation
-sudo ./install_mediamtx.sh status
-# If corrupted: sudo ./install_mediamtx.sh update
+# 3. Verify the MediaMTX installation
+sudo ./install_mediamtx.sh verify
+# If it is damaged: sudo ./install_mediamtx.sh -V v1.21.3 --force install
 
 # 4. Verify device mapping
-sudo ./usb-audio-mapper.sh --test
+./usb-audio-mapper.sh --list
 
 # 5. Run full diagnostics
 sudo ./lyrebird-diagnostics.sh full
 
 # 6. Fresh start
-sudo ./lyrebird-stream-manager.sh start
+sudo ./lyrebird-stream-manager.sh start      # or: sudo systemctl start mediamtx-audio
 ```
+
+**Which stop to use**
+
+- **`stop`** (or `systemctl stop mediamtx-audio`): the normal way. SIGTERM first, SIGKILL after a timeout, only for processes this manager started.
+- **`force-stop`**: SIGKILL at once to those same processes, and removes the PID files, the generated wrapper scripts and the markers. Use it when `stop` hangs or reports that it could not stop something.
+- **`force-stop --kill-all`**: the one broad kill. Use it only when something of this installation is left that the manager has no record of, for example a MediaMTX it refuses to take over (exit 8, "was not started by this script"), or an FFmpeg left by a wrapper that died. Without `--yes` it prints every process it would signal and why, and signals nothing. With `--yes` it sends SIGKILL to exactly that list. It matches by executable and by files in the wrapper directory, never by name, so another installation's MediaMTX or an unrelated FFmpeg is not on the list; but a MediaMTX that is `mediamtx.service`'s (same binary) is, so stop that unit with `systemctl` first.
+
+Do not delete `/run/mediamtx-audio.lock` or the PID files by hand: the lock is a kernel `flock` that the kernel releases when its holder dies, so there is never a stale lock to remove, and deleting the file out from under a running process gives the next process a different lock; `force-stop` removes the PID files properly. If `start`, `stop` or `restart` exit 5 ("Failed to acquire lock"), the message names the process holding it: wait for it or stop it.
 
 ### Rollback After Failed Update
 
 ```bash
-# List available versions
+# What was installed, and any update that did not finish
 ./lyrebird-updater.sh --history
 
-# Rollback to previous version
+# Back to the version before the last update
 ./lyrebird-updater.sh --rollback
 
-# Or rollback to specific version
+# Or to a release tag or commit that is already in the clone
 ./lyrebird-updater.sh --rollback v1.3.0
 ```
 
+`--history` lists past updates, rollbacks and resets; it does not list available versions (that is `--list`, which needs the network). `--rollback` needs no network when the version is already in the clone. `v1.3.0` is the newest tag but predates the fixes this README describes ([Version Management](#version-management)); prefer `--rollback` without an argument.
+
 ### Emergency Field Recovery (No Internet)
 
-If you're in the field without internet access:
+If you are in the field without internet access:
 
-1. **Use local backups**: Keep a USB drive with known-good configuration
-2. **Config backup location**: `/etc/mediamtx/audio-devices.conf.bak`
-3. **Restore config**: `sudo cp /etc/mediamtx/audio-devices.conf.bak /etc/mediamtx/audio-devices.conf`
-4. **Restart service**: `sudo systemctl restart mediamtx-audio`
+1. **Use local backups.** Keep a USB drive with a copy of `/etc/mediamtx/`, `/etc/lyrebird/` and the udev rules file.
+2. **Backups the software makes itself:**
+   - `/etc/mediamtx/mediamtx.yml.<UTC time>.<nn>.bak`: the stream manager saves the old file whenever it replaces a generated one (the newest `MEDIAMTX_CONFIG_BACKUPS`, default 5)
+   - `/etc/mediamtx/audio-devices.conf.backup.<YYYYmmdd_HHMMSS>`: `lyrebird-mic-check.sh -g` saves the old file first; `--list-backups` lists them, `--restore=<timestamp>` restores one
+   - `mediamtx.yml.backup.<time>` and `mediamtx.service.backup.<time>`, written by `install_mediamtx.sh` next to what it replaced; `/usr/local/bin/mediamtx.backup.<time>` (the last three) before an update
+3. **Restore a MediaMTX configuration:** `sudo cp /etc/mediamtx/mediamtx.yml.<time>.<nn>.bak /etc/mediamtx/mediamtx.yml`. A restored copy of a generated file still carries the managed marker, so the manager rewrites it again when its rendering differs; delete the first line if the restored file must stay as it is.
+4. **Restart the service:** `sudo systemctl restart mediamtx-audio`
+5. **Go back to a previous version:** `./lyrebird-updater.sh --rollback` and `--history` need no network. `install_mediamtx.sh update` does.
 
 ---
 
@@ -2322,81 +2351,76 @@ To completely remove LyreBirdAudio and all components:
 
 **1. Stop all streams and services:**
 ```bash
-# Stop streaming service
+# Streams started by hand
 sudo ./lyrebird-stream-manager.sh stop
 
-# Stop systemd service if enabled
-sudo systemctl stop mediamtx-audio
-sudo systemctl disable mediamtx-audio
+# The stream manager unit, if you installed it
+sudo systemctl disable --now mediamtx-audio
+
+# The standalone MediaMTX unit, if you use it
+sudo systemctl disable --now mediamtx
 ```
 
 **2. Uninstall MediaMTX:**
 ```bash
-# Uninstall MediaMTX server
 sudo ./install_mediamtx.sh uninstall
 
-# This removes:
-# - /usr/local/bin/mediamtx binary
-# - /etc/systemd/system/mediamtx.service (if using native MediaMTX service)
-# - Configuration files (with confirmation unless --force)
+# This stops MediaMTX through its owner (systemd or the stream manager) and removes:
+# - /usr/local/bin/mediamtx and its backups
+# - /etc/systemd/system/mediamtx.service
+# It asks before removing (--force removes without asking):
+# - /etc/mediamtx/ (all of it: mediamtx.yml, audio-devices.conf, rtsp-users.conf, backups)
+# - /var/lib/mediamtx/
+# - the mediamtx user
 ```
 
-**3. Remove systemd service and cron jobs:**
+**3. Remove the stream manager unit and the monitor cron job:**
 ```bash
-# Remove audio streaming service
-sudo systemctl stop mediamtx-audio
-sudo systemctl disable mediamtx-audio
 sudo rm -f /etc/systemd/system/mediamtx-audio.service
+sudo rm -rf /etc/systemd/system/mediamtx-audio.service.d    # only if you made a drop-in
 sudo systemctl daemon-reload
-
-# Remove monitoring cron job
 sudo rm -f /etc/cron.d/mediamtx-monitor
 ```
 
 **4. Remove USB device mappings:**
 ```bash
-# Remove udev rules
-sudo rm -f /etc/udev/rules.d/99-usb-soundcards.rules
+# One mapping at a time
+sudo ./usb-audio-mapper.sh --list
+sudo ./usb-audio-mapper.sh --remove NAME
 
-# Reload udev rules
+# Or remove the whole rules file and reload udev
+sudo rm -f /etc/udev/rules.d/99-usb-soundcards.rules
 sudo udevadm control --reload-rules
 sudo udevadm trigger
 ```
 
 **5. Remove configuration files:**
 ```bash
-# Remove MediaMTX configuration
+# MediaMTX configuration (step 2 asked about this already)
 sudo rm -rf /etc/mediamtx/
 
-# Remove configuration backup directory (if exists)
-sudo rm -rf /etc/mediamtx.backup.*
+# Optional alerts and storage configuration
+sudo rm -rf /etc/lyrebird/
 ```
 
-**6. Remove state and runtime files:**
+**6. Remove state files:**
 ```bash
-# Remove PID and lock files
-sudo rm -f /run/mediamtx-audio.pid
-sudo rm -f /run/mediamtx-audio.lock
-sudo rm -f /run/mediamtx-monitor.lock
-sudo rm -f /run/mediamtx-audio.restart
-sudo rm -f /run/mediamtx-audio.cleanup
-
-# Remove FFmpeg state directory
+# Per-stream wrapper scripts, PID files and FFmpeg logs
 sudo rm -rf /var/lib/mediamtx-ffmpeg/
 
-# Remove MediaMTX state directory (if exists)
-sudo rm -rf /var/lib/mediamtx/
+# MediaMTX state, alert state and updater migration markers
+sudo rm -rf /var/lib/mediamtx/ /var/lib/lyrebird/
 ```
+Everything under `/run` (`/run/mediamtx-*`, `/run/lyrebird/`) is in memory and disappears at the next reboot. Do not delete the lock files in it while anything that uses them is still running.
 
 **7. Remove log files:**
 ```bash
-# Remove logs
-sudo rm -f /var/log/mediamtx.out
-sudo rm -f /var/log/lyrebird-stream-manager.log
+sudo rm -f /var/log/mediamtx.out* /var/log/lyrebird-stream-manager.log* \
+  /var/log/lyrebird-orchestrator.log* /var/log/lyrebird-diagnostics.log*
 sudo rm -rf /var/log/lyrebird/
 
 # Remove logrotate configuration
-sudo rm -f /etc/logrotate.d/mediamtx
+sudo rm -f /etc/logrotate.d/mediamtx /etc/logrotate.d/lyrebird
 ```
 
 **8. Remove script directory:**
@@ -2417,7 +2441,6 @@ sudo ./lyrebird-stream-manager.sh stop
 
 # Remove only stream-related files
 sudo rm -rf /var/lib/mediamtx-ffmpeg/
-sudo rm -f /run/mediamtx-audio.*
 sudo rm -f /var/log/lyrebird-stream-manager.log
 ```
 
@@ -2429,7 +2452,7 @@ sudo udevadm control --reload-rules
 sudo udevadm trigger
 ```
 
-**Reset configuration only:**
+**Reset audio configuration only:**
 ```bash
 # Backup current configuration
 sudo cp /etc/mediamtx/audio-devices.conf /etc/mediamtx/audio-devices.conf.backup
@@ -2465,13 +2488,19 @@ ls -la /var/lib/mediamtx-ffmpeg/ 2>/dev/null || echo "State directory removed"
 
 **If processes won't stop:**
 ```bash
-# Force kill all related processes
-sudo pkill -9 mediamtx
-sudo pkill -9 ffmpeg
+# Stop through their owners
+sudo systemctl stop mediamtx mediamtx-audio
+sudo ./lyrebird-stream-manager.sh force-stop
 
-# Remove stale PID files
-sudo rm -f /run/mediamtx*.pid
+# Still running? See what the emergency kill would take (it signals nothing without --yes)
+sudo ./lyrebird-stream-manager.sh force-stop --kill-all
+
+# A MediaMTX or FFmpeg that is not on that list is not from this installation:
+# find it, then signal that one process id, not every process with the name
+ps -o pid,args -C mediamtx
+sudo kill <pid>
 ```
+Killing by name (`pkill`, `killall`) is not a recovery step: it stops every MediaMTX and every FFmpeg on the host, including other installations' and other programs'. `force-stop --kill-all --yes` is the identity-based broad kill ([Recovery Procedures](#complete-system-recovery)).
 
 **If service won't disable:**
 ```bash
@@ -2500,44 +2529,69 @@ For version history and release notes, see **[CHANGELOG.md](CHANGELOG.md)**.
 
 ### Code Standards
 
-- Bash 4.0+ required (associative arrays)
-- Pass `shellcheck` with minimal suppressions
+- Keep to the Bash versions in [System Requirements](#system-requirements): the suite runs on 5.2 only, so a newer feature fails for users on older Bash without any test noticing
+- Pass `shellcheck` (CI uses 0.11.0, `--severity=warning`) with minimal suppressions, each with a reason
 - Use `set -euo pipefail` for strict error handling
 - Document complex logic with comments
 - Implement proper signal handlers
 - Validate all user inputs
 - Use absolute paths for system commands
+- Never identify or signal a process by name; use the identity helpers the stream manager and installer use (executable, argument, start time)
+- Read configuration files as data; never `source` a file an operator or another program can write
 
-### Testing Requirements
+### Testing
 
-Test on:
-- Fresh installation
-- Upgrade from previous version
-- Multiple USB device configurations
-- Both Raspberry Pi and x86_64
+The tests are [bats](https://github.com/bats-core/bats-core) files in `tests/`. At the time of this README, `tests/` held **1732 tests in 85 files**, not counting the documentation checks in `tests/test_docs_*.bats` (`bats --count tests/` gives the current number including them). They run the real scripts: against fake `/proc/asound`, `/dev/snd` and sysfs trees, stand-ins for `systemctl`, `curl` and `arecord`, real `git` repositories with injected failures, real FFmpeg, and, in the live tests, real MediaMTX binaries.
 
-Before trusting a node in the field, soak-test it on the same hardware for
-weeks with faults injected: see [tools/soak/README.md](tools/soak/README.md).
+```bash
+bats tests/                                      # everything that does not need the live setup
+tests/check_tmp_leaks.sh                         # the same, and fails if the run leaves temporary files behind
+LYREBIRD_LEAK_CHECK_HOST=1 tests/check_tmp_leaks.sh   # also fails if the run changes host state (what CI's bats job does)
+```
 
-**Validation:**
+**Live tests.** The files that start real MediaMTX binaries are skipped unless `LYREBIRD_TEST_MEDIAMTX_BINS` names them:
+```bash
+LYREBIRD_TEST_MEDIAMTX_BINS="$(tests/fetch_mediamtx.sh)" bats tests/test_mediamtx_live.bats tests/test_soak_live.bats \
+    tests/test_soak_observer.bats tests/test_mediamtx_config_live.bats tests/test_mediamtx_api_live.bats \
+    tests/test_mediamtx_e2e_ports.bats tests/test_install_mediamtx_live.bats
+```
+`tests/fetch_mediamtx.sh` downloads MediaMTX 1.15.0, 1.18.0, 1.19.0, 1.21.1, 1.21.2 and 1.21.3 for linux/amd64 and checks each against a pinned SHA-256; with `latest` it fetches the newest upstream release and verifies it against the checksum file published with that release. The live tests need `ffmpeg`, `curl`, `jq`, `openssl` and `python3`. Some also need root or passwordless `sudo` for `unshare --net --pid --fork --mount-proc` and overlay mounts, and skip with a message without them. The two soak live files need the default ports 8554 and 9997 free and refuse to run while another MediaMTX or RTSP FFmpeg is running; the other live files take free ports (`LYREBIRD_TEST_PORT_BASE=N` pins them to `N`..`N+12`).
+
+**The host-state check.** `LYREBIRD_LEAK_CHECK_HOST=1` makes `tests/check_tmp_leaks.sh` record the LyreBird paths of the machine (`/var/log/lyrebird*`, `/var/log/mediamtx*`, `/var/lib/lyrebird`, `/var/lib/mediamtx-ffmpeg`, `/run/lyrebird*`, `/run/mediamtx*`, `/etc/lyrebird`, `/etc/mediamtx`, `/etc/cron.d/mediamtx*`, `/etc/systemd/system/mediamtx*`, `/etc/logrotate.d/*`, `/dev/shm/lyrebird*`, the repository working tree) before and after the run and fail with a diff if anything changed. It cannot tell the suite's writes from anyone else's, so use it on CI and disposable machines; it refuses to run (exit 2) where a LyreBird unit is active or the monitor cron job is installed. Any value other than unset, `0` or `1` is refused.
+
+**What the suite cannot prove:**
+- Real USB hardware: capture PCM layouts, hot-plug timing, a second open of a busy capture device, USB clock drift between microphones
+- A real systemd manager: boot ordering, `Conflicts=`, the start limit with a late USB hub, `StateDirectory=`, the sandbox directives (units are only checked with `systemd-analyze verify`)
+- Power cuts: the order of the durable-write steps is tested, not whether a medium honours them
+- Hardware watchdog drivers
+- RTSP from a separate host, IPv6, real webhook endpoints, FFmpeg 4.x at run time
+- ARM and ARMv6, Bash older than 5.2, macOS and BSD
+- Whether GitHub accepts and runs the workflow files as written; release signing and branch protection settings
+
+To find a node's own limits, soak-test it on the same hardware for weeks with faults injected: see [tools/soak/README.md](tools/soak/README.md).
+
+**CI.** `.github/workflows/bash-ci.yml` runs on every pull request to `main` or `master`, on every push to them, weekly, and on demand, with no path filter: `bash -n`, ShellCheck, shfmt (`-d -i 4 -bn -ci`), bashate (`--ignore E001,E006,E040,E042,E043`), actionlint, a heuristic security scan (it only warns), the bats suite with the host-state check, and one live job per pinned MediaMTX version. The job `CI Summary` fails unless every one of those succeeded, so it is the one check to require. An advisory canary runs the live tests against the newest upstream MediaMTX. Downloaded tools are checked against pinned hashes and every action is pinned to a commit SHA. The workflow files were checked statically and their steps run locally; whether the repository requires `CI Summary` is a repository setting this README cannot show.
+
+**Validation checklist for a change:**
 - [ ] `bash -n script.sh` (syntax check)
-- [ ] `shellcheck script.sh` (linting)
-- [ ] `tests/check_tmp_leaks.sh` (bats suite, no leaked temp files)
-- [ ] `LYREBIRD_TEST_MEDIAMTX_BINS="$(tests/fetch_mediamtx.sh)" bats tests/test_mediamtx_live.bats tests/test_soak_live.bats tests/test_soak_observer.bats` (real MediaMTX)
-- [ ] Backward compatibility maintained
-- [ ] Documentation updated
-- [ ] Exit codes documented
+- [ ] `shellcheck --severity=warning script.sh` (linting)
+- [ ] `shfmt -d -i 4 -bn -ci script.sh` and `bashate --ignore E001,E006,E040,E042,E043 script.sh`
+- [ ] `LYREBIRD_LEAK_CHECK_HOST=1 tests/check_tmp_leaks.sh` (the suite, no leaked temp files, no host changes)
+- [ ] `LYREBIRD_TEST_MEDIAMTX_BINS="$(tests/fetch_mediamtx.sh)" bats tests/test_mediamtx_live.bats ...` when you touched anything MediaMTX-facing (real MediaMTX)
+- [ ] Backward compatibility maintained, and upgrade from the previous release tried ([Upgrading an Existing Node](#upgrading-an-existing-node))
+- [ ] Documentation updated, exit codes documented
+- [ ] A test that fails without your change (revert the fix, watch the test fail, restore it)
 
 ### Development Setup
 
 ```bash
 # Enable debug mode
-export DEBUG=1
+export DEBUG=true
 
 # Run shellcheck on all scripts
 for script in *.sh; do
     echo "Checking $script..."
-    shellcheck "$script"
+    shellcheck --severity=warning "$script"
 done
 
 # Test syntax
@@ -2551,8 +2605,7 @@ chmod +x *.sh
 
 ### Code Style Guidelines
 
-- Use 4 spaces for indentation (no tabs)
-- Maximum line length: 100 characters
+- Use 4 spaces for indentation (no tabs); `shfmt -i 4 -bn -ci` decides formatting
 - Function names: lowercase with underscores
 - Variables: UPPERCASE for constants, lowercase for local
 - Always quote variables: `"${variable}"`
@@ -2575,20 +2628,17 @@ chmod +x *.sh
    ```
 
 3. **Make your changes following standards**
-   - All scripts must pass `bash -n` syntax check
-   - All scripts must pass `shellcheck` with no errors
-   - Use comprehensive error handling with try/catch patterns
+   - All scripts must pass `bash -n`, ShellCheck, `shfmt` and `bashate` (CI blocks on all four)
+   - Use comprehensive error handling
    - Add debug output for troubleshooting
    - Update relevant documentation
    - Follow the single-responsibility principle
    - Maintain backwards compatibility where possible
 
-4. **Test thoroughly on target platforms**
-   - Ubuntu 20.04+
-   - Debian 11+
-   - Raspberry Pi OS (if applicable)
-   - Test with multiple USB devices
-   - Verify all commands and menu options
+4. **Test**
+   - Run the suite (above) and add a test for what you changed
+   - Say which platforms you tried it on: the suite itself covers Linux x86_64 and Bash 5.2 only
+   - Test with real USB devices where the change touches them
 
 5. **Submit a pull request**
    - Provide clear description of changes
@@ -2600,9 +2650,9 @@ chmod +x *.sh
 
 Include:
 1. System info (`cat /etc/os-release`, `uname -a`)
-2. Script versions (from orchestrator menu)
-3. Diagnostics output (`./lyrebird-diagnostics.sh full`)
-4. Relevant logs (last 50 lines showing error)
+2. Script versions (from the orchestrator menu, or `grep -m1 VERSION= <script>`)
+3. Diagnostics output (`./lyrebird-diagnostics.sh full`) and `./lyrebird-stream-manager.sh status --json`
+4. Relevant logs (last 50 lines showing the error)
 5. Hardware info (`lsusb`, `./lyrebird-mic-check.sh`)
 
 **GitHub:** https://github.com/tomtom215/LyreBirdAudio/issues
@@ -2629,17 +2679,17 @@ limitations under the License.
 
 ### Original Inspiration
 
-This project was inspired by [cberge908's gist](https://gist.github.com/cberge908/ab7ddc1ac46fd63bb6935cd1f4341112) which provided the foundational concept for USB audio device streaming with MediaMTX. LyreBirdAudio extends this concept into a production-ready system with comprehensive error handling, persistent device management, and professional-grade reliability.
+This project was inspired by [cberge908's gist](https://gist.github.com/cberge908/ab7ddc1ac46fd63bb6935cd1f4341112) which provided the foundational concept for USB audio device streaming with MediaMTX. LyreBirdAudio extends this concept with error handling, persistent device naming and monitoring for unattended use.
 
 **Author:** Tom F (tomtom215)  
 **GitHub:** https://github.com/tomtom215/LyreBirdAudio
 
-**Acknowledgments:** Inspired by cberge908's original MediaMTX launcher script. The codebase has been completely rewritten for production reliability, but the original concept provided the foundation.
+**Acknowledgments:** Inspired by cberge908's original MediaMTX launcher script. The codebase has been rewritten since, but the original concept provided the foundation.
 
 ### Dependencies
 
-- **[MediaMTX](https://github.com/bluenviron/mediamtx)** - High-performance real-time media server by bluenviron
-- **[FFmpeg](https://ffmpeg.org/)** - Complete multimedia framework
+- **[MediaMTX](https://github.com/bluenviron/mediamtx)** - Real-time media server by bluenviron
+- **[FFmpeg](https://ffmpeg.org/)** - Multimedia framework
 - **Linux kernel udev** - Device management
 - **ALSA Project** - Linux audio subsystem
 
@@ -2660,4 +2710,4 @@ Special thanks to all contributors who have helped improve LyreBirdAudio.
 
 ---
 
-*LyreBirdAudio - Production-hardened RTSP audio streaming for 24/7 reliability*
+*LyreBirdAudio - RTSP audio streaming for USB microphones*
