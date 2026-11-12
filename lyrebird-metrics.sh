@@ -24,12 +24,14 @@
 # Integration with node_exporter:
 #   ./lyrebird-metrics.sh --file /var/lib/node_exporter/textfile_collector/lyrebird.prom
 #
-# Version: 1.3.0 - Valid-by-construction exposition, collector/scrape status,
-#                  atomic --file publishing, hardened --serve, heartbeat max age
+# Version: 1.4.0 - MediaMTX and stream liveness by process identity (no name
+#                  patterns, no kill -0), time-bounded MediaMTX API requests;
+#                  1.3.0: valid-by-construction exposition, collector/scrape
+#                  status, atomic --file publishing, hardened --serve
 
 set -euo pipefail
 
-readonly VERSION="1.3.0"
+readonly VERSION="1.4.0"
 SCRIPT_NAME="$(basename "${BASH_SOURCE[0]}")"
 readonly SCRIPT_NAME
 
@@ -1728,6 +1730,20 @@ Options:
 The HTTP server answers GET / and GET /metrics (200), any other path with 404 and
 any other method with 405, one connection at a time. It needs netcat (OpenBSD
 nc, ncat, traditional/GNU nc or BusyBox nc). SIGTERM or SIGINT stops it cleanly.
+
+Environment:
+  MEDIAMTX_BINARY, MEDIAMTX_CONFIG_FILE (else MEDIAMTX_CONFIG_DIR/mediamtx.yml)
+      MediaMTX is the process that runs that binary on that configuration, as for
+      the stream manager; a name or command line that merely contains
+      "mediamtx" is not MediaMTX
+  PID_FILE (else MEDIAMTX_PID_FILE)  the stream manager's PID file
+  LYREBIRD_API_TIMEOUT  seconds one scrape may spend on the MediaMTX API in all
+                        (default: 5)
+  LYREBIRD_HEARTBEAT_MAX_AGE  seconds a monitor heartbeat counts as recent
+                        (default: 900)
+Run as root for a complete scrape: another user's processes cannot be looked at
+closely enough (executable, descriptors); what cannot be read is left out of the
+document and its collector is reported failed.
 
 Exit status:
   0  every collector completed (the server: stopped by a signal)

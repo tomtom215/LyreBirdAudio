@@ -153,6 +153,15 @@ EOF
     ! grep -q 'unbound variable' "$TEST_SCRATCH/err" || false
 }
 
+@test "--help documents the settings that decide what is MediaMTX and how long the API may take [X-30]" {
+    run "$BASH" "$PROJECT_ROOT/lyrebird-metrics.sh" --help
+    [ "$status" -eq 0 ]
+    local name
+    for name in MEDIAMTX_BINARY MEDIAMTX_CONFIG_FILE MEDIAMTX_CONFIG_DIR PID_FILE MEDIAMTX_PID_FILE LYREBIRD_API_TIMEOUT LYREBIRD_HEARTBEAT_MAX_AGE; do
+        [[ "$output" == *"$name"* ]] || { echo "--help does not mention $name"; return 1; }
+    done
+}
+
 @test "LYREBIRD_API_TIMEOUT takes a positive whole number of seconds; anything else is ignored with a warning and 5 s is used [X-30]" {
     local v
     for v in 7 007 120; do
