@@ -169,9 +169,11 @@ teardown() {
 }
 
 @test "-n is canonicalised by the real command line: status finds the stream under the canonical name [LB-04]" {
-    # Stand-in: a live process the status command can find through its PID file
-    # (comm must be bash, as for a real wrapper)
-    bash -c 'sleep 60; :' 3>&- &
+    # Stand-in: a live process the status command can find through its PID file. status
+    # identifies a wrapper by what it runs (a bash whose first argument is the stream's
+    # script, <wrapper dir>/studio_mix.sh), not by its PID alone (X-36)
+    printf '#!/bin/bash\nsleep 60\n:\n' >"$SD/ff/studio_mix.sh"
+    bash "$SD/ff/studio_mix.sh" 3>&- &
     local pid=$!
     echo "$pid" >>"$SD_PIDS_FILE"
     echo "$pid" >"$SD/ff/studio_mix.pid"
