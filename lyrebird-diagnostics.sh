@@ -11,10 +11,16 @@
 # system components, USB audio devices, MediaMTX service, and streaming health.
 # Generates production-ready diagnostic bundles for GitHub issue submission.
 #
-# Version: 1.0.2
+# Version: 1.1.0
 # Requires: bash 4.4+, standard GNU/Linux utilities (no external dependencies)
-# Compatible: Ubuntu 20.04+, Debian 11+, Raspberry Pi OS
-# Note: Limited support for Alpine Linux (OpenRC) and macOS/BSD systems
+# Tested: Linux with Bash 5.2 only (the test suite); other distributions, Bash 4.x,
+# Alpine (OpenRC) and macOS/BSD are not tested here
+#
+# v1.1.0 - Remediation of the 2026-11 audit (docs/REMEDIATION-2026-11.md):
+#   - MediaMTX is found by identity (executable and argument), not by process name
+#   - the RTSP port is MEDIAMTX_RTSP_PORT (MEDIAMTX_PORT remains a fallback)
+#   - FFmpeg logs are looked for in MEDIAMTX_FFMPEG_DIR (default /var/lib/mediamtx-ffmpeg)
+#   - runs by bare name (bash lyrebird-diagnostics.sh); the library is found beside the script
 #
 # v1.0.2 Production Release:
 #   - FIXED: YAML validation now uses proper parser (python/yq/perl fallback)
@@ -53,7 +59,7 @@ fi
 unset _LYREBIRD_COMMON
 
 # Script metadata
-readonly SCRIPT_VERSION="1.0.2"
+readonly SCRIPT_VERSION="1.1.0"
 declare SCRIPT_NAME
 SCRIPT_NAME="$(basename "${BASH_SOURCE[0]}")"
 readonly SCRIPT_NAME

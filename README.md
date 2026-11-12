@@ -1475,7 +1475,7 @@ Versions are the values in the scripts (`grep -m1 VERSION= <script>`).
 | lyrebird-stream-manager.sh | 2.0.0 | Stream lifecycle management |
 | usb-audio-mapper.sh | 4.0.1 | USB device persistence via udev |
 | lyrebird-mic-check.sh | 1.0.2 | Hardware capability detection |
-| lyrebird-diagnostics.sh | 1.0.2 | System diagnostics |
+| lyrebird-diagnostics.sh | 1.1.0 | System diagnostics |
 | install_mediamtx.sh | 2.1.0 | MediaMTX installation/upgrade |
 | lyrebird-metrics.sh | 1.4.0 | Prometheus metrics export |
 | lyrebird-storage.sh | 1.3.0 | Storage management & cleanup |

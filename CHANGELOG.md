@@ -1263,7 +1263,7 @@ v1.3.0 and as it is in this tree, which is not released:
 | lyrebird-stream-manager.sh | 1.4.3 | 2.0.0 |
 | lyrebird-updater.sh | 1.6.0 | 1.8.0 |
 | usb-audio-mapper.sh | 1.2.1 | 4.0.1 |
-| lyrebird-diagnostics.sh | 1.0.2 | 1.0.2 |
+| lyrebird-diagnostics.sh | 1.0.2 | 1.1.0 |
 | install_mediamtx.sh | 2.0.1 | 2.1.0 |
 | lyrebird-mic-check.sh | 1.0.0 | 1.0.2 |
 | lyrebird-common.sh | 1.0.0 | 1.2.0 |
