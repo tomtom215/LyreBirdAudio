@@ -453,12 +453,16 @@ _wait_for_ffmpeg_args() {
 }
 
 @test "status shows the multiplex stream URL with the configured RTSP port [X-19]" {
-    : >"$D/ff/studio.pid"
+    # A running multiplex wrapper: a real process that runs the stream's wrapper script, which is what
+    # status identifies a wrapper by (a PID of some other program is not one)
+    printf '#!/bin/bash\nsleep 300\n:\n' >"$D/ff/studio.sh"
+    bash "$D/ff/studio.sh" >/dev/null 2>&1 3>&- &
+    HELD_PIDS+=("$!")
+    echo "$!" >"$D/ff/studio.pid"
     MULTIPLEX_STREAM_NAME=studio run bash -c '
         source "$1" >/dev/null 2>&1
         set +e
         detect_audio_devices() { echo "testmic:1"; }
-        read_pid_safe() { printf "%s" "$$"; }
         show_status' _ "$SM"
     [ "$status" -eq 0 ]
     [[ "$output" == *"Stream: rtsp://localhost:${P_RTSP}/studio"* ]]

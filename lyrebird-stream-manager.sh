@@ -7004,6 +7004,39 @@ stream_wrapper_alive() {
     ! pid_is_foreign_wrapper "$pid" "$1"
 }
 
+# What the wrapper recorded in PID file $1 for stream $2 is doing, for display:
+# WRAPPER_STATE is "running" (alive and provably this manager's wrapper), "stopped"
+# (no record, a dead process, or a PID that is another program) or "unknown" (the
+# process is there but /proc/<pid> cannot be read: another user's process seen by a
+# run without root; it is neither called dead nor signalled). WRAPPER_PID is the
+# recorded PID, empty when there is none. `kill -0` would answer EPERM for another
+# user's live wrapper, and a non-root `status` printed it as "Not running" (X-36).
+# Usage: stream_wrapper_state PID_FILE STREAM
+WRAPPER_STATE=""
+WRAPPER_PID=""
+stream_wrapper_state() {
+    local rc=0
+    WRAPPER_STATE=stopped
+    WRAPPER_PID="$(read_pid_safe "$1")"
+    [[ -n "$WRAPPER_PID" ]] || return 0
+    is_managed_wrapper_pid "$WRAPPER_PID" "$2" || rc=$?
+    case "$rc" in
+        0) WRAPPER_STATE=running ;;
+        1) WRAPPER_STATE=stopped ;;
+        *) WRAPPER_STATE=unknown ;;
+    esac
+}
+
+# Print the "Status:" line for a wrapper whose state stream_wrapper_state set
+# Usage: print_wrapper_status INDENT
+print_wrapper_status() {
+    case "$WRAPPER_STATE" in
+        running) echo -e "${1}Status: ${GREEN}Running${NC} (PID: ${WRAPPER_PID})" ;;
+        unknown) echo -e "${1}Status: ${YELLOW}Unknown${NC} (PID: ${WRAPPER_PID}; its /proc entry cannot be read, so it cannot be identified: run as root)" ;;
+        *) echo -e "${1}Status: ${RED}Not running${NC}" ;;
+    esac
+}
+
 # Record a stream wrapper that THIS run launched (not one that was already
 # running): it goes down again with a start that fails
 run_track_stream() {
@@ -8236,9 +8269,8 @@ show_status() {
     local is_multiplex_mode=false
 
     if [[ -f "$multiplex_pid_file" ]]; then
-        local multiplex_pid
-        multiplex_pid="$(read_pid_safe "$multiplex_pid_file")"
-        if [[ -n "$multiplex_pid" ]] && kill -0 "$multiplex_pid" 2>/dev/null; then
+        stream_wrapper_state "$multiplex_pid_file" "${MULTIPLEX_STREAM_NAME}"
+        if [[ "$WRAPPER_STATE" != "stopped" ]]; then
             is_multiplex_mode=true
         fi
     fi
@@ -8257,13 +8289,8 @@ show_status() {
             echo "  Settings: ${STREAM_SAMPLE_RATE} Hz, ${STREAM_CHANNELS} ch, ${STREAM_CODEC} ${STREAM_BITRATE}"
         fi
 
-        local multiplex_pid
-        multiplex_pid="$(read_pid_safe "$multiplex_pid_file")"
-        if [[ -n "$multiplex_pid" ]] && kill -0 "$multiplex_pid" 2>/dev/null; then
-            echo -e "  Status: ${GREEN}Running${NC} (PID: $multiplex_pid)"
-        else
-            echo -e "  Status: ${RED}Not running${NC}"
-        fi
+        stream_wrapper_state "$multiplex_pid_file" "${MULTIPLEX_STREAM_NAME}"
+        print_wrapper_status "  "
 
         echo
         echo "Source devices:"
@@ -8301,18 +8328,8 @@ show_status() {
                 resolve_stream_settings "$device_name" "$stream_path"
                 echo "    Settings: ${STREAM_SAMPLE_RATE} Hz, ${STREAM_CHANNELS} ch, ${STREAM_CODEC} ${STREAM_BITRATE}"
 
-                local pid_file="${FFMPEG_PID_DIR}/${stream_path}.pid"
-                if [[ -f "$pid_file" ]]; then
-                    local pid
-                    pid="$(read_pid_safe "$pid_file")"
-                    if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
-                        echo -e "    Status: ${GREEN}Running${NC} (PID: $pid)"
-                    else
-                        echo -e "    Status: ${RED}Not running${NC}"
-                    fi
-                else
-                    echo -e "    Status: ${RED}Not running${NC}"
-                fi
+                stream_wrapper_state "${FFMPEG_PID_DIR}/${stream_path}.pid" "$stream_path"
+                print_wrapper_status "    "
             done
         fi
     fi
