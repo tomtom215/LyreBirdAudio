@@ -593,3 +593,174 @@ EOF
     ! unit_lines "$ROOT/config/mediamtx-audio.service" | grep -q '^Group=' || { echo "the manager's unit sets Group="; return 1; }
     manager_help | grep -qE '^[[:space:]]+reload[[:space:]]'
 }
+
+# ---------------------------------------------------------------------------
+# CONTRIBUTING.md: the testing sections [CONTRIB]
+# ---------------------------------------------------------------------------
+
+@test "the gates CONTRIBUTING gives are the ones CI runs, with the tool versions CI pins [CONTRIB]" {
+    local ci="$ROOT/.github/workflows/bash-ci.yml" contrib="$DOCS/CONTRIBUTING.md" ignore
+    # the bashate ignore list, the shfmt flags and the ShellCheck flags are in both
+    ignore="$(grep -oE 'bashate --ignore [A-Z0-9,]+' "$ci" | head -n 1)"
+    [ -n "$ignore" ]
+    grep -qF -- "$ignore" "$contrib" || { echo "CONTRIBUTING does not have: $ignore"; return 1; }
+    grep -qF -- 'shfmt -d -i 4 -bn -ci' "$ci"
+    grep -qF -- 'shfmt -d -i 4 -bn -ci' "$contrib"
+    grep -qF -- 'shellcheck --format=gcc --severity=warning --external-sources --shell=bash' "$ci"
+    grep -qF -- 'shellcheck --severity=warning --external-sources --shell=bash' "$contrib"
+    grep -qF -- 'bash -n' "$contrib"
+    # CI checks every *.sh file of the repository, and only those
+    grep -qF -- "find . -name '*.sh' -type f" "$ci"
+    grep -qF -- "find . -name '*.sh' -type f" "$contrib"
+    # the pinned versions
+    local sc shf bash_v
+    sc="$(sed -n "s/^  SHELLCHECK_VERSION: 'v\([0-9.]*\)'.*/\1/p" "$ci")"
+    shf="$(sed -n "s/^  SHFMT_VERSION: 'v\([0-9.]*\)'.*/\1/p" "$ci")"
+    bash_v="$(sed -n 's/^bashate==\([0-9.]*\).*/\1/p' "$ROOT/.github/ci/requirements.txt")"
+    [ -n "$sc" ] && [ -n "$shf" ] && [ -n "$bash_v" ]
+    tr '\n' ' ' <"$contrib" | tr -s ' ' | grep -qF "ShellCheck $sc" || { echo "CONTRIBUTING does not name ShellCheck $sc"; return 1; }
+    tr '\n' ' ' <"$contrib" | tr -s ' ' | grep -qF "shfmt $shf" || { echo "CONTRIBUTING does not name shfmt $shf"; return 1; }
+    grep -qF -- "bashate==$bash_v" "$contrib" || { echo "CONTRIBUTING does not name bashate==$bash_v"; return 1; }
+}
+
+@test "every helper function CONTRIBUTING names exists, and everything scratch_setup exports is named [CONTRIB]" {
+    local contrib="$DOCS/CONTRIBUTING.md" name var missing=0
+    for name in scratch_setup scratch_teardown stage_setup stage_teardown device_add device_remove \
+        device_add_playback bad_card stage wait_until decoy_setup decoy_teardown orch_setup \
+        sd_setup sd_fake_card mtx_ports_setup; do
+        grep -qF -- "$name" "$contrib" || { echo "CONTRIBUTING does not name $name"; missing=1; }
+        grep -qE "^${name}\\(\\)" "$ROOT"/tests/*.bash || { echo "$name is not defined in tests/*.bash"; missing=1; }
+    done
+    # every variable scratch_setup exports (and TEST_SCRATCH) is in the text
+    for var in $(sed -nE 's/^[[:space:]]+export ([A-Z_]+)=.*/\1/p' "$ROOT/tests/scratch_tmpdir.bash") TEST_SCRATCH; do
+        grep -qF -- "$var" "$contrib" || { echo "CONTRIBUTING does not name $var, which scratch_setup sets"; missing=1; }
+    done
+    # the helper files it points at exist
+    for name in $(grep -oE 'tests/[A-Za-z0-9_./-]+\.(bash|bats|sh|py)' "$contrib" | sort -u); do
+        [ -e "$ROOT/$name" ] || { echo "CONTRIBUTING names $name, which does not exist"; missing=1; }
+    done
+    [ "$missing" -eq 0 ]
+}
+
+@test "the fake ALSA tree CONTRIBUTING describes is what the manager reads: the two roots, the PCM directories, the device nodes, arecord [CONTRIB]" {
+    local script="$ROOT/lyrebird-stream-manager.sh" contrib="$DOCS/CONTRIBUTING.md"
+    for term in ASOUND_PROC_ROOT DEV_SND_ROOT 'pcm0c' 'pcmC<N>D0c' 'arecord -l' detect_audio_devices; do
+        grep -qF -- "$term" "$contrib" || { echo "CONTRIBUTING does not mention $term"; return 1; }
+    done
+    # the roots default to the real paths
+    grep -qE '^readonly ASOUND_PROC_ROOT="\$\{ASOUND_PROC_ROOT:-/proc/asound\}"' "$script"
+    grep -qE '^readonly DEV_SND_ROOT="\$\{DEV_SND_ROOT:-/dev/snd\}"' "$script"
+    # capture PCMs are the card's pcm<N>c directories, the device node is pcmC<card>D<pcm>c
+    grep -qF '/card${card}"/pcm[0-9]*c' "$script"
+    grep -qF 'pcmC${card_num}D${pcm:-0}c' "$script"
+    # and the two functions CONTRIBUTING says read the real paths do, and do not use the roots
+    sed -n '/^detect_audio_devices()/,/^}/p' "$script" | grep -qF '/dev/snd/by-id'
+    ! sed -n '/^detect_audio_devices()/,/^}/p' "$script" | grep -qE 'ASOUND_PROC_ROOT|DEV_SND_ROOT' || { echo "detect_audio_devices uses a root now"; return 1; }
+    sed -n '/^device_node_exists()/,/^}/p' "$script" | grep -qF '/dev/snd/controlC'
+    # the stand-in the helper provides lists cards from ASOUND_PROC_ROOT
+    grep -qF 'ASOUND_PROC_ROOT' "$ROOT/tests/stream_definition_helper.bash"
+}
+
+@test "the leak check is documented as it behaves: every watched path is named, a bad value is refused with exit 2 [CONTRIB]" {
+    local contrib="$DOCS/CONTRIBUTING.md" pattern missing=0 flat
+    flat="$(tr '\n' ' ' <"$contrib" | tr -s ' ')"
+    grep -qF 'LYREBIRD_LEAK_CHECK_HOST=1' "$contrib"
+    grep -qF 'tests/check_tmp_leaks.sh' "$contrib"
+    # every path the check watches is in the text (a path added to the check must be added here)
+    while IFS= read -r pattern; do
+        grep -qF -- "$pattern" <<<"$flat" || { echo "CONTRIBUTING does not name the watched path $pattern"; missing=1; }
+    done < <(sed -n 's/^[[:space:]]*"\${host_root}\(\/[^"]*\)".*/\1/p' "$ROOT/tests/check_tmp_leaks.sh")
+    [ "$missing" -eq 0 ]
+    # a value other than 0 or 1 is refused before anything runs
+    run env LYREBIRD_LEAK_CHECK_HOST=yes "$ROOT/tests/check_tmp_leaks.sh" "$ROOT/tests/does-not-exist.bats"
+    [ "$status" -eq 2 ]
+    [[ "$output" == *"LYREBIRD_LEAK_CHECK_HOST must be 0 or 1"* ]]
+}
+
+@test "the live-test setup is documented as the scripts have it: pinned versions, the variable, the files, the ports [CONTRIB]" {
+    local contrib="$DOCS/CONTRIBUTING.md" flat v f missing=0
+    flat="$(tr '\n' ' ' <"$contrib" | tr -s ' ')"
+    # the pinned releases in fetch_mediamtx.sh are the ones listed
+    for v in $(sed -n 's/^    \["\(v[0-9.]*\)"\]=.*/\1/p' "$ROOT/tests/fetch_mediamtx.sh"); do
+        grep -qF -- "$v" <<<"$flat" || { echo "CONTRIBUTING does not list the pinned release $v"; missing=1; }
+    done
+    grep -qF 'LYREBIRD_TEST_MEDIAMTX_BINS' "$contrib"
+    grep -qF 'tests/fetch_mediamtx.sh' "$contrib"
+    # every file that has a live test is named, and the ones CI runs are the ones the live job lists
+    for f in $(grep -l 'LYREBIRD_TEST_MEDIAMTX_BINS' "$ROOT"/tests/test_*.bats | xargs -n1 basename | sed 's/\.bats$//'); do
+        [ "$f" = test_docs_release ] && continue
+        [ "$f" = test_ci_config ] && continue
+        grep -qF -- "$f" <<<"$flat" || { echo "CONTRIBUTING does not name $f, which has live tests"; missing=1; }
+    done
+    for f in test_mediamtx_live test_mediamtx_config_live test_mediamtx_api_live test_mediamtx_e2e_ports test_install_mediamtx_live test_soak_live test_soak_observer; do
+        grep -qF "tests/$f.bats" "$ROOT/.github/workflows/bash-ci.yml" || { echo "$f is not run by the live job any more"; missing=1; }
+    done
+    # test_stream_names has live tests that no CI job runs, as CONTRIBUTING says
+    ! grep -qF 'test_stream_names' "$ROOT/.github/workflows/bash-ci.yml" || { echo "CI runs test_stream_names now: update CONTRIBUTING"; missing=1; }
+    # the private-port rule: the two files that still bind default ports
+    grep -q '8554' "$ROOT/tests/test_soak_live.bats"
+    grep -q '8554' "$ROOT/tests/test_soak_observer.bats"
+    grep -qF 'mtx_ports_setup' "$contrib"
+    for v in 8554 8000 8001 9997 9998 9100; do
+        grep -qF -- "$v" <<<"$flat" || { echo "CONTRIBUTING does not list the default port $v"; missing=1; }
+    done
+    [ "$missing" -eq 0 ]
+}
+
+@test "what CONTRIBUTING says CI runs is what the workflow has: every job named, one runner, a security scan that only warns [CONTRIB]" {
+    local ci="$ROOT/.github/workflows/bash-ci.yml" contrib="$DOCS/CONTRIBUTING.md" flat name missing=0 scan
+    flat="$(tr '\n' ' ' <"$contrib" | tr -s ' ')"
+    # every job of bash-ci.yml is named in the text
+    while IFS= read -r name; do
+        name="${name%% \$\{\{*}"
+        grep -qF -- "$name" <<<"$flat" || { echo "CONTRIBUTING does not name the CI job: $name"; missing=1; }
+    done < <(sed -n 's/^    name: //p' "$ci")
+    # one runner, no macOS, no ARM
+    [ "$(grep -h 'runs-on:' "$ROOT"/.github/workflows/*.yml | sed 's/^ *//' | sort -u)" = "runs-on: ubuntu-latest" ] || { echo "a workflow runs on something other than ubuntu-latest"; missing=1; }
+    grep -qF 'ubuntu-latest' "$contrib"
+    # the security scan job has no exit and no ::error: it only warns
+    scan="$(awk '/^  security-scan:/ { on = 1; next } on && /^  [a-z0-9-]+:$/ { on = 0 } on' "$ci")"
+    [ -n "$scan" ]
+    ! grep -qE 'exit 1|::error' <<<"$scan" || { echo "the security scan can fail the run now: update CONTRIBUTING"; missing=1; }
+    grep -qF 'only warns' "$contrib"
+    # the advisory canary cannot fail the run, and the summary does not need it
+    grep -qE 'continue-on-error: true' "$ci"
+    grep -qF 'Advisory' "$contrib"
+    # triggers: pull requests and pushes to main or master, a weekly schedule
+    grep -qF "cron: '23 4 * * 1'" "$ci"
+    grep -qF 'Monday 04:23 UTC' "$contrib"
+    [ "$missing" -eq 0 ]
+}
+
+@test "CONTRIBUTING says how a release is cut, as release.yml reads it, and no longer promises what nothing checks [CONTRIB]" {
+    local contrib="$DOCS/CONTRIBUTING.md" flat
+    flat="$(tr '\n' ' ' <"$contrib" | tr -s ' ')"
+    # release notes come from the "## [X.Y.Z]" section of the CHANGELOG
+    grep -qF '## [Unreleased]' "$contrib"
+    grep -qF '## [X.Y.Z]' "$contrib"
+    grep -qF 'SHA256SUMS' "$contrib"
+    grep -qF 'CHANGELOG.md' "$ROOT/.github/workflows/release.yml"
+    grep -qF '^## \\[" ver "\\]' "$ROOT/.github/workflows/release.yml"
+    grep -qF 'sha256sum -c SHA256SUMS' "$ROOT/.github/workflows/release.yml"
+    # claims that were never true or never checked are gone
+    ! grep -qE 'Use TODO for future work' "$contrib" || { echo "CONTRIBUTING still says to use TODO"; return 1; }
+    [ "$(grep -c 'TODO' "$ROOT"/*.sh "$ROOT"/tools/soak/*.sh | grep -vc ':0$')" -eq 0 ] || { echo "a script has a TODO"; return 1; }
+    ! grep -qE 'Aim for 50%\+ coverage' "$contrib" || { echo "CONTRIBUTING still promises 50% coverage"; return 1; }
+    ! grep -qF 'Maximum 100 characters per line' "$contrib" || { echo "CONTRIBUTING still says 100 characters is a maximum"; return 1; }
+    ! grep -qF 'within 1-2 weeks' "$contrib" || { echo "CONTRIBUTING still promises a review time"; return 1; }
+    ! grep -qE '^[[:space:]]*cd tests && bats \*\.bats' "$contrib" || { echo "CONTRIBUTING still runs cd tests && bats *.bats"; return 1; }
+    ! grep -qE '^[[:space:]]*shellcheck (\*\.sh|script\.sh|your-script\.sh)$' "$contrib" || { echo "CONTRIBUTING still gives ShellCheck without its severity"; return 1; }
+    ! grep -qF 'brew install shellcheck bats-core' "$contrib" || { echo "CONTRIBUTING still lists macOS as a development platform"; return 1; }
+    # the Bash statement says what was run
+    grep -qF 'Bash 5.2' <<<"$flat"
+}
+
+@test "CONTRIBUTING says how many scripts are committed without the executable bit, and runs the commands it shows with bash [CONTRIB]" {
+    local contrib="$DOCS/CONTRIBUTING.md" n
+    git -C "$ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1 || skip "not a git checkout"
+    n="$(git -C "$ROOT" ls-files -s -- '*.sh' | awk '$1 == "100644"' | wc -l)"
+    [ "$n" -eq 6 ] || { echo "$n scripts are committed without the executable bit; CONTRIBUTING says six"; return 1; }
+    tr '\n' ' ' <"$contrib" | tr -s ' ' | grep -qF 'Six of the scripts are committed without the executable bit'
+    # the commands it shows for a clone are run with bash, not ./
+    ! grep -qE '^[[:space:]]+\./lyrebird-[a-z-]+\.sh' "$contrib" || { echo "CONTRIBUTING runs a script as ./script.sh"; return 1; }
+}

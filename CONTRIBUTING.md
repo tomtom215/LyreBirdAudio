@@ -26,10 +26,19 @@ This project follows a simple code of conduct:
 
 ### Prerequisites
 
-- Bash 4.0+ (check with `bash --version`)
+- Bash (check with `bash --version`). Most scripts refuse to start below 4.0,
+  but the test suite and CI have only run on Bash 5.2, so they cannot catch a
+  script that needs a newer Bash than it checks for (ADR-001 in `docs/ADR.md`
+  names one)
 - Git 2.0+
-- ShellCheck (for linting)
-- BATS (for testing, optional)
+- ShellCheck, shfmt and bashate, the linters CI runs (CI pins ShellCheck
+  0.11.0, shfmt 3.13.1 and bashate 2.1.1; other versions can report
+  differently)
+- BATS, `jq` and `python3`, to run the tests (some tests also need `ffmpeg`,
+  `curl`, `flock` and root; a test that cannot run on your machine skips)
+
+The scripts and the test suite are for Linux: they read `/proc` and `/sys` and
+use `flock`. Nothing in the repository runs them on macOS or BSD.
 
 ### Fork and Clone
 
@@ -39,6 +48,9 @@ This project follows a simple code of conduct:
    git clone https://github.com/YOUR_USERNAME/LyreBirdAudio.git
    cd LyreBirdAudio
    ```
+   Six of the scripts are committed without the executable bit, so run them as
+   `bash script.sh` in a clone (the README's `chmod +x` shows up in `git status`
+   as a mode change).
 3. Add upstream remote:
    ```bash
    git remote add upstream https://github.com/tomtom215/LyreBirdAudio.git
@@ -50,28 +62,38 @@ This project follows a simple code of conduct:
 
 ```bash
 # Ubuntu/Debian
-sudo apt-get install shellcheck
+sudo apt-get install shellcheck bats jq python3 ffmpeg curl
+pip install bashate==2.1.1
 
-# For running tests
-sudo apt-get install bats
-
-# macOS
-brew install shellcheck bats-core
+# shfmt: a release binary from https://github.com/mvdan/sh/releases
+# (CI uses v3.13.1; the packaged ShellCheck may be older than CI's 0.11.0)
 ```
 
 ### Verify Setup
 
+Run the four gates CI runs on every `*.sh` file (the scripts, `tools/soak/` and
+`tests/*.sh`; `.bats` and `.bash` files are not covered). Nothing is printed
+for a script that passes them all:
+
 ```bash
-# Check all scripts pass syntax validation
-for script in *.sh; do
-    bash -n "$script" && echo "[OK] $script"
+find . -name '*.sh' -type f -not -path './.git/*' | sort | while IFS= read -r script; do
+    bash -n "$script" || echo "[FAIL] bash -n $script"
+    shellcheck --severity=warning --external-sources --shell=bash "$script" || echo "[FAIL] shellcheck $script"
+    shfmt -d -i 4 -bn -ci "$script" || echo "[FAIL] shfmt $script"   # fix with: shfmt -w -i 4 -bn -ci "$script"
+    bashate --ignore E001,E006,E040,E042,E043 "$script" || echo "[FAIL] bashate $script"
 done
+```
 
-# Run ShellCheck on all scripts
-shellcheck *.sh
+The bashate rules left out are E001 (trailing whitespace, which shfmt handles),
+E006 (line length), E040 (syntax, which `bash -n` checks), and E042 and E043
+(patterns that are valid Bash).
 
-# Run tests (if BATS is installed)
-cd tests && bats *.bats
+Then run the tests of the file you work on (the whole suite is slow; see
+[Testing](#testing)):
+
+```bash
+bats --count tests/                      # how many tests there are
+bats tests/test_lyrebird_common.bats     # one file
 ```
 
 ## Coding Standards
@@ -234,7 +256,8 @@ MEDIAMTX_CONFIG_DIR=/etc/mediamtx
 #### Comments
 
 - Comment complex logic, not obvious code
-- Use TODO for future work
+- Do not leave `TODO` comments in delivered code (none of the scripts has
+  one); open an issue for future work
 - Explain regex patterns and complex commands
 - Use section headers to organize code:
 
@@ -256,10 +279,11 @@ readonly USB_PATH_PATTERN='^/sys/devices/.*/usb[0-9]+/[0-9]+-[0-9]+(/[0-9]+-[0-9
 
 ### ShellCheck Compliance
 
-All scripts must pass ShellCheck without errors:
+All scripts must pass ShellCheck at warning severity with no finding; this is
+the gate CI enforces on every `*.sh` file (see [Verify Setup](#verify-setup)):
 
 ```bash
-shellcheck script.sh
+shellcheck --severity=warning --external-sources --shell=bash script.sh
 ```
 
 If you must disable a warning, add a justification:
@@ -271,7 +295,8 @@ readonly LYREBIRD_COMMON_VERSION="1.0.0"
 
 ### Line Length
 
-- Maximum 100 characters per line
+- Aim for at most 100 characters per line. No check enforces it (bashate's
+  line-length rule E006 is ignored) and some existing lines are longer
 - Break long commands with backslashes
 
 ```bash
@@ -283,6 +308,9 @@ curl --silent \
 ```
 
 ## Testing
+
+The suite lives in `tests/`; `tests/README.md` lists its files and what each
+covers.
 
 ### Test Structure
 
@@ -328,17 +356,164 @@ Rules that keep tests honest:
   `TMPDIR`.
 - Never point a test at real system paths (`/var/lib/...`, `/var/log/...`):
   override the script's own path variables (for example `LYREBIRD_*_DIR`).
+  The next section lists the ones that matter.
+- Test the real code. Source the script (the main scripts run `main` only
+  when executed, not when sourced) and call its real functions, or run the
+  script. Do not define a function in the test file
+  and test that: the copy passes while the script is broken. Tests that did
+  this were converted to the real script or removed.
+- Never weaken a test, an assertion or a gate to get green.
+- End the name of a test with the ID of what it protects, in brackets
+  (`[LB-05]`). `docs/remediation-status.json` names tests by their exact
+  title, and `tests/test_remediation_status.bats` fails when an item marked
+  fixed names a test that does not exist.
+- A test that skips proves nothing. When a tool or a permission is missing
+  (`ffmpeg`, `jq`, `setpriv`, `unshare`, root, `LYREBIRD_TEST_MEDIAMTX_BINS`)
+  a test skips with a message instead of failing; read the `skip` lines of a
+  run before you trust it.
 
 ### Running Tests
 
 ```bash
-bats tests/                    # whole suite
-tests/check_tmp_leaks.sh       # whole suite, plus the temp-file leak check (as CI)
+bats --count tests/                                         # how many tests there are
+bats tests/test_lyrebird_storage.bats                       # one file
+tests/check_tmp_leaks.sh                                    # the whole suite plus the leak check, as CI runs it
+tests/check_tmp_leaks.sh tests/test_lyrebird_storage.bats   # arguments go to bats
 ```
 
-### Test Coverage Goals
+The whole suite is slow, because it starts real processes and, with MediaMTX
+binaries, real servers: run the files you changed and let CI run the rest.
 
-- Aim for 50%+ coverage of critical functions
+`tests/check_tmp_leaks.sh` runs bats with a fresh `TMPDIR` and fails (exit 1)
+if the run leaves anything in it. With `LYREBIRD_LEAK_CHECK_HOST=1` (CI sets
+it) it also records, before and after the run, the paths a test could write by
+mistake: `/var/log/lyrebird*` and `/var/log/mediamtx*`, `/var/lib/lyrebird`,
+`/var/lib/mediamtx-ffmpeg`, `/run/lyrebird*`, `/run/mediamtx*`,
+`/run/lock/mediamtx*`, `/etc/lyrebird`, `/etc/mediamtx`, `/etc/cron.d/mediamtx*`,
+`/etc/systemd/system/mediamtx*`, `/etc/logrotate.d/*` and `/dev/shm/lyrebird*`,
+the repository tree (except `.git`) and the current directory. Any difference
+is printed as `created`, `removed` or `changed` and fails the run. Any value
+other than `0` or `1` is refused (exit 2), and so is a machine that looks like
+a LyreBirdAudio node (a `mediamtx` or `mediamtx-audio` unit is active, or a
+`/etc/cron.d/mediamtx*` job exists), because the node's own writes would be
+blamed on the suite: run it on CI or a disposable machine.
+
+### Proving a Test
+
+A regression test is finished when you have seen it fail for the right reason:
+
+1. Write the test and make the fix.
+2. Revert only the production change, run the test and watch it fail.
+3. Restore the change and watch it pass.
+4. Put "mutation check" and what you saw in the commit message.
+
+A test that has never failed has not been shown to test anything. The same holds
+for a test of documentation: run it against the old text.
+
+### Fixtures and Helpers
+
+- **`scratch_setup` and `scratch_teardown`** (`tests/scratch_tmpdir.bash`). Call
+  `scratch_setup` first in `setup()` and `scratch_teardown` in `teardown()`. It
+  sets `TMPDIR` and `TEST_SCRATCH` to a private directory, and points the paths
+  the scripts write by default at it: `LYREBIRD_STATE_DIR`,
+  `STREAM_MANAGER_LOG_FILE`, `DIAGNOSTIC_LOG_FILE`, `LYREBIRD_ALERT_LOG`,
+  `LYREBIRD_ALERT_STATE_DIR`, and an empty `LYREBIRD_STORAGE_CONFIG` (no
+  `storage.conf`). Without it, a test that sources a script and runs one of its
+  functions writes the real `/var/log` or `/var/lib` of the machine. When a
+  script gains a log or state variable whose default is under `/var`, `/run` or
+  `/etc`, add it to `scratch_setup`: `tests/test_suite_hygiene.bats` sources the
+  real scripts and fails if a name there is not the one a script reads.
+- **Two log variables.** The manager's own log is `STREAM_MANAGER_LOG_FILE`;
+  `MEDIAMTX_LOG_FILE` is only where MediaMTX's output goes. A test that sets
+  `MEDIAMTX_LOG_FILE` must set `STREAM_MANAGER_LOG_FILE` too, or the manager
+  writes `/var/log/lyrebird-stream-manager.log` of the machine; the hygiene test
+  fails a file that sets the first and never mentions the second.
+- **A fake ALSA tree.** The manager reads a card's capture PCMs from
+  `ASOUND_PROC_ROOT` (default `/proc/asound`) and device nodes from
+  `DEV_SND_ROOT` (default `/dev/snd`). A card that counts as a microphone needs
+  a directory `ASOUND_PROC_ROOT/card<N>/pcm0c` and a file
+  `DEV_SND_ROOT/pcmC<N>D0c` (`pcm<M>c` and `pcmC<N>D<M>c` for capture PCM `M`; a
+  directory `pcm<M>p` is a playback PCM, and a card with no capture PCM is
+  skipped as playback-only). Where `arecord` is installed the check also runs
+  `arecord -l` and wants the card in its listing, so a test puts an `arecord`
+  stand-in first on `PATH`. Only the capture checks and the generated wrappers
+  use the two roots: `detect_audio_devices` and the control-node check
+  (`/dev/snd/controlC<N>`) read the real `/proc/asound` and `/dev/snd`, so a
+  test of `start`, `monitor` or `status` replaces those functions.
+  `sd_setup` and `sd_fake_card` in `tests/stream_definition_helper.bash` build
+  the tree, a card and the `arecord` stand-in, and `tests/manager_stage.bash`
+  shows the replacements.
+- **`tests/manager_stage.bash`**: a private, hardware-free installation of the
+  real stream manager for tests of `start`, `stop`, `monitor` and `status`. The
+  script, its wrappers, the lock, the PID files and the markers are real;
+  the device tree, MediaMTX (a copy of bash that waits, and a `curl` shim that
+  answers the API from files) and FFmpeg (a stub that "publishes" by keeping an
+  API file) are stand-ins. Call `scratch_setup` and `stage_setup` in `setup()`,
+  `stage_teardown` and `scratch_teardown` in `teardown()`; then `device_add NAME
+  CARD`, `device_remove`, `device_add_playback`, `bad_card`, `stage 'CODE'` and
+  `wait_until`.
+- **`tests/process_decoys.bash`**: for code that finds or stops processes. Start
+  real look-alike processes (copies of bash at a path the test chooses) with
+  `decoy_setup`, run the real function, and check which decoys survived and
+  which signals were sent. A guarded `kill` refuses any PID that is not a decoy,
+  and `pkill`, `pgrep` and `systemctl` are shims, so nothing outside the test can
+  be signalled. Call `decoy_teardown` in `teardown()`.
+- **The orchestrator** reads its menus from the terminal and gives every
+  delegated script `</dev/tty`, so its tests run it on a pseudo-terminal.
+  `tests/orchestrator_helper.bash` (`orch_setup`) puts stand-ins for the six
+  delegated scripts in place, steered by `STUB_RC_*` and `STUB_DOC_*`
+  variables, and `tests/helpers/pty_run.py --step REGEX TEXT -- COMMAND`
+  answers each prompt when it appears, without sleeps. These tests need
+  `python3` and `jq`.
+- **The updater tests** run real git repositories (`tests/updater_helper.bash`)
+  and fault-injection shims in `tests/helpers/updater/bin`. A shim signals the
+  outermost ancestor process whose command line names `lyrebird-updater.sh`, so
+  do not start these tests from a command line that names that file itself
+  (for example `bash -c 'bats tests/...; shellcheck lyrebird-updater.sh'`):
+  the shell that runs it is the ancestor.
+- Other helpers say what they do in their first lines:
+  `tests/stream_definition_helper.bash` (the manager sourced in a child shell),
+  `tests/storage_helper.bash`, `tests/installer_fixture.bash` (a local stand-in
+  for GitHub's release downloads), `tests/soak_helper.bash` (a fake node),
+  `tests/usb_audio_mapper_helper.bash` (a fake sysfs) and
+  `tests/prom_validate.bash` (a Prometheus exposition validator).
+
+### Live Tests Against Real MediaMTX
+
+Tests marked live run a real MediaMTX binary and skip unless
+`LYREBIRD_TEST_MEDIAMTX_BINS` names binaries (space-separated paths).
+`tests/fetch_mediamtx.sh [CACHE_DIR] [VERSION...]` downloads checksum-pinned
+Linux x86-64 releases (v1.15.0, v1.18.0, v1.19.0, v1.21.1, v1.21.2 and v1.21.3;
+default cache `.cache/mediamtx`) and prints the paths; `latest` fetches the
+newest upstream release, verified against that release's own checksum file:
+
+```bash
+LYREBIRD_TEST_MEDIAMTX_BINS="$(tests/fetch_mediamtx.sh)" \
+    tests/check_tmp_leaks.sh tests/test_mediamtx_api_live.bats
+```
+
+The files with live tests are `test_mediamtx_live`, `test_mediamtx_config_live`,
+`test_mediamtx_api_live`, `test_mediamtx_e2e_ports`, `test_install_mediamtx_live`,
+`test_soak_live` and `test_soak_observer`, which CI runs once per pinned version,
+and `test_stream_names`, four of whose tests are live and which no CI job runs
+with the variable set.
+
+The private-port rule: a new test must not bind a default port of MediaMTX or of
+the metrics server (8554, 8000, 8001, 9997, 9998, 9100, 8890 to 8893) on the
+machine it runs on. Allocate free ports with `mtx_ports_setup` from
+`tests/mediamtx_live_helper.bash`, which also moves every other MediaMTX
+listener to a spare port with MediaMTX's own `MTX_*` environment overrides, or
+run in a private network namespace (`unshare --net --pid --fork --mount-proc`,
+which needs root; the namespace tests skip where it is not permitted). Two files
+still break the rule: `tests/test_soak_live.bats` and
+`tests/test_soak_observer.bats` bind 8554 and 9997 on the host. The first also
+kills the `ffmpeg` and MediaMTX processes it finds, so it skips while one is
+running. Neither is for a node.
+
+### What a Good Test Covers
+
+No tool measures coverage here; this is the guide:
+
 - Test error conditions, not just happy paths
 - Test edge cases (empty input, special characters, etc.)
 
@@ -348,6 +523,48 @@ tests/check_tmp_leaks.sh       # whole suite, plus the temp-file leak check (as 
 2. **Error conditions** - Missing files, network failures, permission errors
 3. **Edge cases** - Zero, negative numbers, boundary conditions
 4. **Integration** - Script interactions when possible
+
+### What CI Runs, and What It Cannot Prove
+
+`.github/workflows/bash-ci.yml` runs on every pull request and every push to
+`main` or `master`, with no path filter; also weekly (Monday 04:23 UTC), on
+demand, and for a release tag (`release.yml` calls it). All jobs run on
+`ubuntu-latest`:
+
+- **Discover Scripts**, **Workflow Lint (actionlint)**, which also runs
+  ShellCheck over every `run:` step, **Bash Syntax Check**, **ShellCheck
+  Analysis** (0.11.0, warning severity), **Format Check (shfmt)** (3.13.1) and
+  **Style Check (bashate)** (2.1.1, with the rules left out above): the gates of
+  [Verify Setup](#verify-setup), on every `*.sh` file.
+- **Security Scan**: a pattern scan for risky constructs. It only warns; it
+  never fails the run.
+- **Bats Tests**: the whole suite through `tests/check_tmp_leaks.sh` with
+  `LYREBIRD_LEAK_CHECK_HOST=1`. The live tests skip here, because the variable
+  that names MediaMTX binaries is not set.
+- **Live MediaMTX vX.Y.Z**: one job per pinned MediaMTX release, each running
+  the seven live test files above against that release.
+- **Live MediaMTX newest upstream (advisory, non-blocking)**: the same files
+  against the newest upstream release, resolved at run time. Advisory: it cannot
+  fail the run.
+- **CI Summary**: passes only if every job above except the advisory one
+  succeeded; a failed, cancelled or skipped job fails it. It is the one check to
+  require before merging. Whether the repository's branch protection requires
+  it is a setting of the GitHub repository that no file here shows.
+
+Downloaded tools are checked against hashes pinned in the workflow, bashate is
+installed from the hashes in `.github/ci/requirements.txt`, and every Action is
+pinned to a commit. Dependabot proposes updates for the Actions and for
+bashate; ShellCheck, shfmt, actionlint and the MediaMTX releases in
+`tests/fetch_mediamtx.sh` are bumped by hand, each together with its hash.
+
+CI cannot prove anything that needs real hardware (USB microphones, how a real
+card lays out its PCMs, a real power cut), a real systemd manager (the units
+are checked with `systemd-analyze verify` and a namespace emulation, never
+started), ARM, macOS or BSD, a Bash older than the runner's, an FFmpeg other
+than the runner's, an RTSP client on another host, or that GitHub runs the
+workflows as designed (the suite lints them and runs their steps locally).
+`docs/REMEDIATION-2026-11.md`, "Validation that cannot be done in CI", keeps the
+list.
 
 ## Submitting Changes
 
@@ -381,6 +598,26 @@ Format:
 - Blank line
 - Body: Detailed explanation (wrap at 72 chars)
 - Reference issues when applicable
+- For a fix: the reproducer, the mutation check (see
+  [Proving a Test](#proving-a-test)) and which tests you ran
+
+### Changelog and Releases
+
+- Add a line under `## [Unreleased]` in `CHANGELOG.md` for every change a user
+  of an existing node would notice, in plain language, with the register ID in
+  brackets at the end of the line when the change has one.
+  `docs/changelog.html` is a copy of the file: edit both.
+  `tests/test_docs_release.bats` checks that they say the same words, that
+  every ID cited is in `docs/remediation-status.json` and that the version table
+  gives the version each script says.
+- A release is a `vX.Y.Z` tag. `release.yml` runs the whole CI pipeline on the
+  tagged commit, then publishes a release with a source tarball and
+  `SHA256SUMS`. Its notes are the `## [X.Y.Z]` section of `CHANGELOG.md`, so
+  before tagging rename `## [Unreleased]` to `## [X.Y.Z] - DATE` (without that
+  section GitHub generates the notes) and update the version table.
+  `sha256sum -c SHA256SUMS`, in the directory with the tarball, shows that a
+  download is the published file; releases are not signed, so it does not show
+  who published it.
 
 ### Pull Request Process
 
@@ -399,14 +636,14 @@ Format:
 
 4. **Test your changes**:
    ```bash
-   # Syntax check
+   # The gates (see Verify Setup), at least for the scripts you changed
    bash -n your-script.sh
+   shellcheck --severity=warning --external-sources --shell=bash your-script.sh
+   shfmt -d -i 4 -bn -ci your-script.sh
+   bashate --ignore E001,E006,E040,E042,E043 your-script.sh
 
-   # Lint
-   shellcheck your-script.sh
-
-   # Run tests
-   cd tests && bats *.bats
+   # The tests of what you changed (see Running Tests)
+   bats tests/test_<script>.bats
    ```
 
 5. **Commit and push**:
@@ -423,10 +660,11 @@ Format:
 
 ### Review Process
 
-- Maintainers will review within 1-2 weeks
+- Maintainers review pull requests as time allows
 - Address feedback promptly
 - Be open to suggestions and changes
-- PRs must pass CI checks before merge
+- PRs must pass the `CI Summary` check, which fails unless every CI job
+  succeeded (see [What CI Runs](#what-ci-runs-and-what-it-cannot-prove))
 
 ## Reporting Bugs
 
@@ -449,7 +687,9 @@ Include the following in your bug report:
 
 2. **Script Versions**:
    ```bash
-   ./lyrebird-orchestrator.sh  # Check version in menu
+   git describe --tags               # the release your checkout is based on
+   bash lyrebird-orchestrator.sh --version
+   bash lyrebird-stream-manager.sh help | head -n 1
    ```
 
 3. **Diagnostic Output**:
