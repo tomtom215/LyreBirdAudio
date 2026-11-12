@@ -6544,8 +6544,15 @@ WRAPPER_LOGIC
         return 0
     else
         log ERROR "Stream $stream_path failed validation"
-        kill "$pid" 2>/dev/null || true
-        rm -f "$pid_file"
+        # Stop it the way `stop` does: by identity, waiting for the wrapper and its FFmpeg to
+        # go (SIGTERM, then SIGKILL), and with its PID file, the start-time record beside it
+        # and the wrapper script removed. A bare `kill` returned at once, left the wrapper
+        # (and its FFmpeg) running for as long as its signal handler took, and left the
+        # record behind. A wrapper that cannot be stopped keeps its PID file: the next
+        # stop or cleanup must still find it.
+        if ! stop_ffmpeg_stream "$stream_path"; then
+            log ERROR "The wrapper of $stream_path (PID $pid) could not be stopped after the failed validation; its PID file is kept"
+        fi
         return 1
     fi
 }
