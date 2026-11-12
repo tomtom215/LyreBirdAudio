@@ -692,6 +692,34 @@ install_lifecycle_traps() {
     trap 'on_terminate_signal QUIT 3' QUIT
 }
 
+# Succeeds when THIS process holds the lifecycle lock, that is, is in the middle of a
+# start, stop, restart, reload, force-stop or monitor cycle
+lifecycle_lock_held_here() {
+    [[ ${MAIN_LOCK_FD} -gt 2 ]] && [[ "/proc/self/fd/${MAIN_LOCK_FD}" -ef "${LOCK_FILE}" ]]
+}
+
+# SIGHUP of a run that is not under systemd (installed below): reload the MediaMTX
+# configuration, as the `reload` command does, without stopping or restarting anything.
+# The handler used to run a full restart_mediamtx under the comment "reload", so a
+# terminal hang-up (a dropped SSH session during an interactive `start`) stopped every
+# stream. While this process is itself running a lifecycle command the signal is logged
+# and ignored: a nested start of the streams could launch a second wrapper for a stream
+# whose first one is not recorded yet, and the command in progress applies the current
+# configuration anyway.
+on_sighup() {
+    local rc=0
+    if lifecycle_lock_held_here; then
+        log INFO "Received SIGHUP while a lifecycle command is running in this process; not reloading (that command applies the current configuration)"
+        return 0
+    fi
+    log INFO "Received SIGHUP, reloading the MediaMTX configuration (nothing is restarted)"
+    reload_mediamtx || rc=$?
+    if ((rc != 0)); then
+        log WARN "Reload after SIGHUP failed (exit ${rc}); nothing was stopped"
+    fi
+    return 0
+}
+
 # Set trap for cleanup only in main script
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]] && [[ $$ -eq $BASHPID ]]; then
     # Comprehensive signal handling for production reliability
@@ -704,8 +732,8 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]] && [[ $$ -eq $BASHPID ]]; then
     # Only set custom handlers when NOT running under systemd
     if ! lyrebird_under_systemd; then
         # Not running under systemd - safe to use custom handlers
-        # SIGHUP: Reload configuration without full restart
-        trap 'log INFO "Received SIGHUP, reloading configuration"; restart_mediamtx' HUP
+        # SIGHUP: reload the configuration without a restart (on_sighup)
+        trap on_sighup HUP
         # SIGUSR1: Dump status for debugging
         trap 'log INFO "Received SIGUSR1, dumping status"; show_status >/dev/null 2>&1 || log INFO "Status dump completed"' USR1
     fi
@@ -736,7 +764,7 @@ exit_critical_section() {
     CRITICAL_SECTION_ACTIVE=false
     # Restore signal handlers (only when not running under systemd)
     if ! lyrebird_under_systemd; then
-        trap 'log INFO "Received SIGHUP, reloading configuration"; restart_mediamtx' HUP
+        trap on_sighup HUP
         trap 'log INFO "Received SIGUSR1, dumping status"; show_status >/dev/null 2>&1 || log INFO "Status dump completed"' USR1
     fi
 }
@@ -3617,6 +3645,27 @@ monitor_card_available() {
     return 1
 }
 
+# The same check for the multiplex stream: it can be started when at least one of its
+# devices can be opened (the start leaves out the cards that cannot). Run before the
+# restart budget is charged, as monitor_card_available is for the individual streams: the
+# multiplex branches of monitor_streams charged CRON_RESTART_MAX_PER_HOUR before any ALSA
+# check, so a detected card that could not be opened used up the budget without a restart
+# attempt (X-04, multiplex).
+# Usage: monitor_multiplex_cards_available STREAM_PATH DEVICE...  (DEVICE is "name:card")
+monitor_multiplex_cards_available() {
+    local stream_path="$1" device_info card_num cards=""
+    shift
+    for device_info in "$@"; do
+        card_num="${device_info#*:}"
+        if check_alsa_device_available "$card_num"; then
+            return 0
+        fi
+        cards+="${cards:+, }${card_num}"
+    done
+    log WARN "Multiplex stream $stream_path: ALSA device not available (card ${cards}), skipping restart"
+    return 1
+}
+
 # --- Deep health probe (H9) --------------------------------------------------
 # Ask the MediaMTX control API whether a path is actually publishing.
 # Returns: 0 = ready, 1 = not ready (MediaMTX has the path and it is not
@@ -3793,14 +3842,28 @@ monitor_streams() {
     fi
 
     # Get current devices
-    local devices=()
-    readarray -t devices < <(detect_audio_devices)
+    local detected=() devices=() device_info
+    readarray -t detected < <(detect_audio_devices)
+
+    # A card without a capture PCM (a USB speaker) is not a stream (X-34): there is
+    # nothing of it to restart, so it costs no restart budget and is not a failure
+    split_capture_devices ${detected[@]+"${detected[@]}"}
+    for device_info in ${CAPTURE_DEVICES[@]+"${CAPTURE_DEVICES[@]}"}; do
+        devices+=("$device_info")
+    done
+    for device_info in ${SKIPPED_DEVICES[@]+"${SKIPPED_DEVICES[@]}"}; do
+        log DEBUG "Card ${device_info#*:} (${device_info%%:*}): ${NO_CAPTURE_REASON}; nothing to monitor"
+    done
 
     if [[ ${#devices[@]} -eq 0 ]]; then
         # A node without devices is waiting for them (D5): a stream is started
         # for each one that appears, by the checks below on a later cycle
         if allow_empty_start; then
-            log INFO "No USB audio devices detected; waiting for devices"
+            if ((${#detected[@]} == 0)); then
+                log INFO "No USB audio devices detected; waiting for devices"
+            else
+                log INFO "No USB audio device that can capture (${#detected[@]} playback-only card(s) skipped); waiting for devices"
+            fi
             return 0
         fi
         log WARN "No USB audio devices detected"
@@ -3823,7 +3886,9 @@ monitor_streams() {
 
         # Check if PID file exists
         if [[ ! -f "$pid_file" ]]; then
-            if should_restart_stream "$stream_path"; then
+            if ! monitor_multiplex_cards_available "$stream_path" "${devices[@]}"; then
+                ((streams_failed++)) || true
+            elif should_restart_stream "$stream_path"; then
                 log WARN "Multiplex stream $stream_path has no PID file - restarting"
                 if start_multiplex_stream "${devices[@]}"; then
                     ((streams_restarted++)) || true
@@ -3842,7 +3907,9 @@ monitor_streams() {
             pid="$(read_pid_safe "$pid_file")"
 
             if [[ -z "$pid" ]]; then
-                if should_restart_stream "$stream_path"; then
+                if ! monitor_multiplex_cards_available "$stream_path" "${devices[@]}"; then
+                    ((streams_failed++)) || true
+                elif should_restart_stream "$stream_path"; then
                     log WARN "Multiplex stream $stream_path PID is invalid - restarting"
                     if start_multiplex_stream "${devices[@]}"; then
                         ((streams_restarted++)) || true
@@ -3856,7 +3923,9 @@ monitor_streams() {
                     log WARN "Multiplex stream $stream_path PID is invalid (cron mode: not restarting)"
                 fi
             elif pid_is_foreign_wrapper "$pid" "$stream_path"; then
-                if should_restart_stream "$stream_path"; then
+                if ! monitor_multiplex_cards_available "$stream_path" "${devices[@]}"; then
+                    ((streams_failed++)) || true
+                elif should_restart_stream "$stream_path"; then
                     log WARN "Multiplex stream $stream_path PID $pid is stale - restarting"
                     rm -f "$pid_file"
                     if start_multiplex_stream "${devices[@]}"; then
@@ -3873,7 +3942,9 @@ monitor_streams() {
             elif deep_stream_unhealthy "$stream_path"; then
                 # Wrapper alive but the path has been continuously not-ready:
                 # a hung FFmpeg or endless backoff. Restart within the budget.
-                if should_restart_stream "$stream_path"; then
+                if ! monitor_multiplex_cards_available "$stream_path" "${devices[@]}"; then
+                    ((streams_failed++)) || true
+                elif should_restart_stream "$stream_path"; then
                     log WARN "Multiplex stream $stream_path wrapper is alive but path is not ready - restarting"
                     terminate_process_group "$pid" 5 || true
                     rm -f "$pid_file"
@@ -3892,7 +3963,9 @@ monitor_streams() {
                 # A device appeared (a vanished one ends the wrapper itself): the
                 # wrapper captures the devices it was started with, so the stream
                 # is started again to include the new one
-                if should_restart_stream "$stream_path"; then
+                if ! monitor_multiplex_cards_available "$stream_path" "${devices[@]}"; then
+                    ((streams_failed++)) || true
+                elif should_restart_stream "$stream_path"; then
                     log WARN "Multiplex stream $stream_path: the set of devices changed - restarting"
                     terminate_process_group "$pid" 5 || true
                     rm -f "$pid_file"
@@ -4812,11 +4885,17 @@ resolve_stream_settings() {
     return 0
 }
 
+# Write the default device configuration template to DEVICE_CONFIG_FILE: through
+# lyrebird_atomic_write (D14, LB-23), so the file is either absent or complete, also
+# after a power cut (temp file in the same directory, fsync, rename, fsync of the
+# directory). The file is mode 0644 and belongs to whoever runs this, as before.
+# Returns 1, with an error in the log and nothing written, when that is not possible.
 save_device_config() {
-    local tmp_config
-    tmp_config="$(mktemp -p "$(dirname "${DEVICE_CONFIG_FILE}")" "$(basename "${DEVICE_CONFIG_FILE}").XXXXXX")"
-
-    cat >"$tmp_config" <<'EOF'
+    if ! declare -F lyrebird_atomic_write >/dev/null; then
+        log ERROR "lyrebird-common.sh with lyrebird_atomic_write is required next to ${SCRIPT_NAME}"
+        return 1
+    fi
+    if ! lyrebird_atomic_write "${DEVICE_CONFIG_FILE}" 0644 <<'EOF'; then
 # Audio device configuration
 # Format: DEVICE_<name>_<setting>=value, one per line
 #
@@ -4856,9 +4935,9 @@ save_device_config() {
 # DEVICE_BLUE_YETI_BITRATE=256k
 # DEVICE_BLUE_YETI_PCM=1
 EOF
-
-    mv -f "$tmp_config" "${DEVICE_CONFIG_FILE}"
-    chmod 644 "${DEVICE_CONFIG_FILE}"
+        log ERROR "Failed to write the default device configuration ${DEVICE_CONFIG_FILE}"
+        return 1
+    fi
 }
 
 sanitize_device_name() {
@@ -5181,6 +5260,41 @@ first_capture_pcm() {
     printf '%s' "${pcms[0]-}"
 }
 
+# Succeeds when CARD has at least one capture PCM. A USB speaker or DAC (a playback-only
+# card) has none: it is detected as a USB audio card but is not a microphone, so it gets
+# no stream and does not count for the start policy, the status or the monitor (X-34).
+# Usage: card_has_capture_pcm CARD
+NO_CAPTURE_REASON="no capture PCM (playback-only card)"
+card_has_capture_pcm() {
+    [[ -n "$(first_capture_pcm "$1")" ]]
+}
+
+# Split the devices ("name:card" each) into CAPTURE_DEVICES, the cards that can capture,
+# and SKIPPED_DEVICES, the ones that cannot (X-34). With "log" as the first argument one
+# INFO line per skipped card says so and why.
+# Usage: split_capture_devices [log] DEVICE...
+declare -ga CAPTURE_DEVICES=() SKIPPED_DEVICES=()
+split_capture_devices() {
+    local do_log=false device_info device_name card_num
+    if [[ "${1:-}" == "log" ]]; then
+        do_log=true
+        shift
+    fi
+    CAPTURE_DEVICES=()
+    SKIPPED_DEVICES=()
+    for device_info in "$@"; do
+        IFS=':' read -r device_name card_num <<<"$device_info"
+        if [[ -z "$device_name" || -z "$card_num" ]] || card_has_capture_pcm "$card_num"; then
+            CAPTURE_DEVICES+=("$device_info")
+        else
+            SKIPPED_DEVICES+=("$device_info")
+            if [[ "$do_log" == "true" ]]; then
+                log INFO "Not streaming ${device_name} (card ${card_num}): ${NO_CAPTURE_REASON}; it is not counted for the start policy"
+            fi
+        fi
+    done
+}
+
 # Choose the capture PCM of CARD for one stream and put it in STREAM_PCM: the
 # DEVICE_<NAME>_PCM setting when it names a capture PCM of the card, otherwise the
 # first capture PCM the card has. A setting that names a PCM the card does not
@@ -5473,6 +5587,48 @@ check_multiplex_encoding() {
     else
         log ERROR "Use CODEC=aac, or a CHANNELS value that ${codec} can encode"
     fi
+    return 1
+}
+
+# Can this FFmpeg encode what an individual stream feeds its encoder: CHANNELS channels
+# as CODEC? Which channel counts an encoder takes is up to FFmpeg (with FFmpeg 6.1.1 libopus
+# refuses 4 channels and 9 or more, aac 9 or more), and a wrapper whose FFmpeg cannot do it
+# only fails, restarts and fails again with the reason buried in its log. As
+# check_multiplex_encoding does for the multiplex graph, the question
+# is put to FFmpeg itself before the wrapper is written: the encoder arguments the wrapper
+# will use (multiplex_encoder_args gives the same words as the wrapper's codec arms) and its
+# `-af` filter, run for a tenth of a second over a silent lavfi source with CHANNELS channels
+# (the wrapper's input is an ALSA device with that layout), written to the null muxer.
+# Returns 0 when FFmpeg accepts it, and also when the check cannot be made (no ffmpeg or
+# timeout, no lavfi, a timeout of 20 s): the stream then starts as it did before. Returns 1,
+# with an error that names the channels and the codec, when FFmpeg refuses it.
+# Usage: check_individual_encoding STREAM_PATH CHANNELS SAMPLE_RATE CODEC BITRATE
+check_individual_encoding() {
+    local stream_path="$1" channels="$2" rate="$3" codec="$4" bitrate="$5" out rc=0 reason
+    # The settings were checked when they were resolved (resolve_stream_settings), so these
+    # cannot happen; a question that cannot even be put is a check that cannot be made, and the
+    # wrapper generator has its own defences for such values
+    if [[ ! "$channels" =~ ^[0-9]+$ ]] || [[ ! "$rate" =~ ^[0-9]+$ ]] || ! multiplex_encoder_args "$codec" "$bitrate"; then
+        log DEBUG "Cannot check the encoding of $stream_path: channels, sample rate or codec is not usable here"
+        return 0
+    fi
+    if ! command_exists ffmpeg || ! command_exists timeout; then
+        log DEBUG "Cannot check the encoding of $stream_path (ffmpeg or timeout missing)"
+        return 0
+    fi
+    out="$(timeout 20 ffmpeg -nostdin -hide_banner -loglevel error \
+        -f lavfi -t 0.1 -i "anullsrc=channel_layout=$(_default_channel_layout "$channels"):sample_rate=${rate}" \
+        -af "aresample=async=1:first_pts=0" "${MULTIPLEX_ENCODER_ARGS[@]}" -f null - 2>&1)" || rc=$?
+    if ((rc == 0)); then
+        return 0
+    fi
+    if ((rc == 124)) || [[ "$out" == *"Unknown input format"* ]] || [[ "$out" == *"No such filter"* ]] || [[ "$out" == *"Filter anullsrc not found"* ]]; then
+        log WARN "Could not check whether FFmpeg can encode ${channels} channels as ${codec} for ${stream_path} (rc=${rc}); starting it anyway"
+        return 0
+    fi
+    reason="$(printf '%s\n' "$out" | grep -v '^[[:space:]]*$' | head -n 1)"
+    log ERROR "Stream $stream_path not started: FFmpeg cannot encode ${channels} channels as ${codec} (${bitrate}): $(visible_text "$reason" 160)"
+    log ERROR "Set the channel count of this device (DEVICE_<NAME>_CHANNELS) to one that ${codec} can encode, or its codec (DEVICE_<NAME>_CODEC) to aac"
     return 1
 }
 
@@ -5987,6 +6143,33 @@ WRAPPER_LOGIC
     return 0
 }
 
+# Escape directory DIR for the filename part of a tee muxer slave whose muxer is
+# `segment` (X-33): the directory of the recording slave of the tee argument. Measured with
+# FFmpeg 6.1.1, four characters of the path change where the segments go:
+#   |   ends the slave: what follows is a second, different output
+#   \ and '   are escapes and quotes of the tee argument and are consumed (a path
+#       with one records into a different directory or fails)
+#   %   starts a pattern of the segment filename ("%03d"): "Invalid segment
+#       filename template"
+# Each is escaped (a backslash before | \ and ', the % doubled). [ ] : and blanks need
+# nothing: the slave's options end at the first "]" before the filename starts. A
+# relative path gets "./": FFmpeg reads "word:" at the start of a name as a protocol
+# ("rtmp:x/y" would open an RTMP connection).
+# Usage: tee_segment_dir DIR
+tee_segment_dir() {
+    local dir="$1" out="" ch i
+    [[ "$dir" == /* || "$dir" == ./* ]] || dir="./${dir}"
+    for ((i = 0; i < ${#dir}; i++)); do
+        ch="${dir:i:1}"
+        case "$ch" in
+            '\' | "'" | '|') out+="\\${ch}" ;;
+            '%') out+='%%' ;;
+            *) out+="$ch" ;;
+        esac
+    done
+    printf '%s' "$out"
+}
+
 # Start FFmpeg stream
 start_ffmpeg_stream() {
     local device_name="$1"
@@ -6028,6 +6211,11 @@ start_ffmpeg_stream() {
     codec="$STREAM_CODEC"
     bitrate="$STREAM_BITRATE"
     thread_queue="$STREAM_THREAD_QUEUE"
+
+    # A channel count the codec cannot encode would only make the wrapper fail in a loop
+    if ! check_individual_encoding "$stream_path" "$channels" "$sample_rate" "$codec" "$bitrate"; then
+        return 1
+    fi
 
     log INFO "Starting FFmpeg for $stream_path (device: $device_name, card: $card_num)"
 
@@ -6085,6 +6273,7 @@ WRAPPER_START
         AUDIO_RTBUFSIZE "${AUDIO_RTBUFSIZE}" \
         AUDIO_LOCAL_RECORDING "${AUDIO_LOCAL_RECORDING}" \
         AUDIO_RECORDING_PATH "${AUDIO_RECORDING_PATH}" \
+        RECORDING_TEE_DIR "$(tee_segment_dir "${AUDIO_RECORDING_PATH}/${stream_path}")" \
         AUDIO_RECORDING_SEGMENT_TIME "${AUDIO_RECORDING_SEGMENT_TIME}" \
         AUDIO_RECORDING_SEGMENTS "${AUDIO_RECORDING_SEGMENTS}" \
         FFMPEG_PID "" || {
@@ -6206,12 +6395,13 @@ run_ffmpeg() {
         # Create recording directory (defaults to /dev/shm which is tmpfs/RAM)
         mkdir -p "${AUDIO_RECORDING_PATH}/${STREAM_PATH}" 2>/dev/null || true
 
-        # Use tee muxer for simultaneous streaming and recording
+        # Use tee muxer for simultaneous streaming and recording. RECORDING_TEE_DIR is the
+        # same directory, escaped for the tee muxer's argument (X-33).
         ffmpeg_cmd+=("${codec_opts[@]}")
         ffmpeg_cmd+=(
             -f tee
             -map 0:a
-            "[f=rtsp:rtsp_transport=tcp]rtsp://${MEDIAMTX_HOST}:${MEDIAMTX_RTSP_PORT}/${STREAM_PATH}|[f=segment:segment_time=${AUDIO_RECORDING_SEGMENT_TIME}:segment_wrap=${AUDIO_RECORDING_SEGMENTS}:strftime=0]${AUDIO_RECORDING_PATH}/${STREAM_PATH}/audio_%03d.${CODEC}"
+            "[f=rtsp:rtsp_transport=tcp]rtsp://${MEDIAMTX_HOST}:${MEDIAMTX_RTSP_PORT}/${STREAM_PATH}|[f=segment:segment_time=${AUDIO_RECORDING_SEGMENT_TIME}:segment_wrap=${AUDIO_RECORDING_SEGMENTS}:strftime=0]${RECORDING_TEE_DIR}/audio_%03d.${CODEC}"
         )
         log_message "Local recording enabled: ${AUDIO_RECORDING_PATH}/${STREAM_PATH} (${AUDIO_RECORDING_SEGMENTS} x ${AUDIO_RECORDING_SEGMENT_TIME}s segments)"
     else
@@ -6432,8 +6622,15 @@ WRAPPER_LOGIC
         return 0
     else
         log ERROR "Stream $stream_path failed validation"
-        kill "$pid" 2>/dev/null || true
-        rm -f "$pid_file"
+        # Stop it the way `stop` does: by identity, waiting for the wrapper and its FFmpeg to
+        # go (SIGTERM, then SIGKILL), and with its PID file, the start-time record beside it
+        # and the wrapper script removed. A bare `kill` returned at once, left the wrapper
+        # (and its FFmpeg) running for as long as its signal handler took, and left the
+        # record behind. A wrapper that cannot be stopped keeps its PID file: the next
+        # stop or cleanup must still find it.
+        if ! stop_ffmpeg_stream "$stream_path"; then
+            log ERROR "The wrapper of $stream_path (PID $pid) could not be stopped after the failed validation; its PID file is kept"
+        fi
         return 1
     fi
 }
@@ -6673,6 +6870,25 @@ mediamtx_config_is_managed() {
     [[ "$first" == "${LYREBIRD_MEDIAMTX_CONFIG_MARKER:-# Managed by LyreBirdAudio}" ]]
 }
 
+# The first line of the configuration an EARLIER release of this script wrote. That
+# release regenerated the file on every start, so no edit an operator made to it ever
+# survived: the file is the manager's, not the operator's, and after an upgrade it is
+# adopted (replaced by the current rendering, after the usual backup) instead of being
+# treated as operator-owned for ever, which kept the API and the metrics listening on
+# every interface and warned on every start (X-38). Exactly this line: the file
+# install_mediamtx.sh writes starts with another line and is edited by operators, so
+# it is never adopted.
+LEGACY_MEDIAMTX_CONFIG_FIRST_LINE="# MediaMTX Configuration - Audio Streams"
+
+# Is the first line of $1 the one an earlier release's generator wrote? (Trailing
+# blanks and the CR of a CRLF line ending do not count, as for the marker.)
+mediamtx_config_is_legacy_generated() {
+    local first=""
+    IFS= read -r first <"$1" || [[ -n "$first" ]] || return 1
+    first="${first%"${first##*[![:space:]]}"}"
+    [[ "$first" == "${LEGACY_MEDIAMTX_CONFIG_FIRST_LINE}" ]]
+}
+
 # Save a timestamped copy of ${CONFIG_FILE} next to it (same mode and owner)
 # and keep only the newest MEDIAMTX_CONFIG_BACKUPS of them. Prints the path.
 # Returns: 0 = saved, 1 = could not save (the caller must not replace the file)
@@ -6717,7 +6933,8 @@ generate_mediamtx_config() {
     log INFO "Generating MediaMTX configuration"
 
     if [[ ! -f "${DEVICE_CONFIG_FILE}" ]]; then
-        save_device_config
+        # Only a template of comments: without it every setting keeps its default
+        save_device_config || log WARN "The default device configuration could not be written; every setting uses its default"
     fi
 
     load_device_config
@@ -6744,10 +6961,11 @@ generate_mediamtx_config() {
 # Bring ${CONFIG_FILE} to the rendered configuration, under the config lock.
 #
 # Ownership (D10): the file is rewritten only when it does not exist or its
-# first line is the "# Managed by LyreBirdAudio" marker. Any other file belongs
-# to the operator: it is validated and used as it is, never rewritten (one
-# warning says how to hand it over: --regenerate-config, which saves a
-# timestamped backup first). A rendered configuration identical to the file
+# first line is the "# Managed by LyreBirdAudio" marker, or exactly the first line
+# an earlier release's generator wrote (adopted once, X-38, see
+# LEGACY_MEDIAMTX_CONFIG_FIRST_LINE). Any other file belongs to the operator: it is
+# validated and used as it is, never rewritten (one warning says how to hand it
+# over: --regenerate-config, which saves a timestamped backup first). A rendered configuration identical to the file
 # leaves the file untouched (no new mtime); a different one is validated by
 # MediaMTX first, the old file is backed up, and the replacement is atomic and
 # durable (lyrebird_atomic_write, D14). The mode and owner of an existing file
@@ -6760,6 +6978,10 @@ mediamtx_config_apply() {
     if [[ -s "${CONFIG_FILE}" ]]; then
         if mediamtx_config_is_managed "${CONFIG_FILE}"; then
             state=managed
+        elif mediamtx_config_is_legacy_generated "${CONFIG_FILE}"; then
+            # Managed like a marked file from here on: backup, then the current rendering
+            state=managed
+            log INFO "MediaMTX configuration ${CONFIG_FILE} was written by an earlier release of ${SCRIPT_NAME} (first line '${LEGACY_MEDIAMTX_CONFIG_FIRST_LINE}'), which regenerated it on every start (no edit of yours could have survived it): replacing it with the current rendering (API and metrics on the loopback address by default), after a timestamped backup"
         elif [[ "${REGENERATE_CONFIG}" == "true" ]]; then
             state=takeover
         else
@@ -6770,11 +6992,7 @@ mediamtx_config_apply() {
     fi
 
     if [[ "$state" == operator ]]; then
-        local origin=""
-        if [[ "$(head -n 1 "${CONFIG_FILE}" 2>/dev/null)" == "# MediaMTX Configuration - Audio Streams" ]]; then
-            origin=" (it looks like the file an earlier release of this script wrote: its API and metrics listen on every interface)"
-        fi
-        log WARN "MediaMTX configuration ${CONFIG_FILE} does not start with the line '${LYREBIRD_MEDIAMTX_CONFIG_MARKER:-# Managed by LyreBirdAudio}'${origin}: it is treated as yours and used as it is, never rewritten. To let ${SCRIPT_NAME} manage it, run '${SCRIPT_NAME} --regenerate-config start' (a timestamped backup is saved first)"
+        log WARN "MediaMTX configuration ${CONFIG_FILE} does not start with the line '${LYREBIRD_MEDIAMTX_CONFIG_MARKER:-# Managed by LyreBirdAudio}': it is treated as yours and used as it is, never rewritten. To let ${SCRIPT_NAME} manage it, run '${SCRIPT_NAME} --regenerate-config start' (a timestamped backup is saved first)"
         if [[ "${RTSP_AUTH_MODE}" != "open" ]]; then
             log WARN "RTSP_AUTH_MODE=${RTSP_AUTH_MODE} has no effect on a configuration you manage yourself"
         fi
@@ -6955,6 +7173,39 @@ stream_wrapper_alive() {
     ! pid_is_foreign_wrapper "$pid" "$1"
 }
 
+# What the wrapper recorded in PID file $1 for stream $2 is doing, for display:
+# WRAPPER_STATE is "running" (alive and provably this manager's wrapper), "stopped"
+# (no record, a dead process, or a PID that is another program) or "unknown" (the
+# process is there but /proc/<pid> cannot be read: another user's process seen by a
+# run without root; it is neither called dead nor signalled). WRAPPER_PID is the
+# recorded PID, empty when there is none. `kill -0` would answer EPERM for another
+# user's live wrapper, and a non-root `status` printed it as "Not running" (X-36).
+# Usage: stream_wrapper_state PID_FILE STREAM
+WRAPPER_STATE=""
+WRAPPER_PID=""
+stream_wrapper_state() {
+    local rc=0
+    WRAPPER_STATE=stopped
+    WRAPPER_PID="$(read_pid_safe "$1")"
+    [[ -n "$WRAPPER_PID" ]] || return 0
+    is_managed_wrapper_pid "$WRAPPER_PID" "$2" || rc=$?
+    case "$rc" in
+        0) WRAPPER_STATE=running ;;
+        1) WRAPPER_STATE=stopped ;;
+        *) WRAPPER_STATE=unknown ;;
+    esac
+}
+
+# Print the "Status:" line for a wrapper whose state stream_wrapper_state set
+# Usage: print_wrapper_status INDENT
+print_wrapper_status() {
+    case "$WRAPPER_STATE" in
+        running) echo -e "${1}Status: ${GREEN}Running${NC} (PID: ${WRAPPER_PID})" ;;
+        unknown) echo -e "${1}Status: ${YELLOW}Unknown${NC} (PID: ${WRAPPER_PID}; its /proc entry cannot be read, so it cannot be identified: run as root)" ;;
+        *) echo -e "${1}Status: ${RED}Not running${NC}" ;;
+    esac
+}
+
 # Record a stream wrapper that THIS run launched (not one that was already
 # running): it goes down again with a start that fails
 run_track_stream() {
@@ -7006,6 +7257,9 @@ rollback_failed_start() {
 declare -ga OUTCOME_PATHS=()
 declare -gA OUTCOME_DEVICE=() OUTCOME_CARD=() OUTCOME_CONFIGURED=() OUTCOME_ALIVE=()
 declare -gA OUTCOME_READY=() OUTCOME_FLOWING=() OUTCOME_ERROR=()
+# A card that cannot capture (no capture PCM: a USB speaker) is listed, with the reason,
+# but is not a stream: the policy and the overall state do not count it (X-34)
+declare -gA OUTCOME_SKIPPED=()
 # Why a stream is not publishing, recorded by the code that found out (a failed
 # launch, a skipped device). It wins over what is derived from the state.
 declare -gA STREAM_LAST_ERROR=()
@@ -7069,6 +7323,7 @@ stream_outcome_reset() {
     OUTCOME_READY=()
     OUTCOME_FLOWING=()
     OUTCOME_ERROR=()
+    OUTCOME_SKIPPED=()
 }
 
 # stream_outcome_add PATH DEVICE CARD
@@ -7081,6 +7336,14 @@ stream_outcome_add() {
     OUTCOME_READY[$1]=false
     OUTCOME_FLOWING[$1]=false
     OUTCOME_ERROR[$1]=""
+    OUTCOME_SKIPPED[$1]=false
+}
+
+# stream_outcome_skip PATH DEVICE CARD: list a card that cannot capture, with the reason
+stream_outcome_skip() {
+    stream_outcome_add "$1" "$2" "$3"
+    OUTCOME_SKIPPED[$1]=true
+    OUTCOME_ERROR[$1]="${NO_CAPTURE_REASON}"
 }
 
 # The streams that DEVICES ("name:card" each) call for: one per device, or the
@@ -7090,28 +7353,36 @@ stream_outcome_expect() {
     local -a names=() cards=()
     stream_outcome_reset
     (($# > 0)) || return 0
+    # A card without a capture PCM is no stream (X-34): it is listed as skipped, after
+    # the streams, and the multiplex stream is made of the cards that can capture
+    split_capture_devices "$@"
     if [[ "$(effective_stream_mode)" == "multiplex" ]]; then
-        for device_info in "$@"; do
+        for device_info in ${CAPTURE_DEVICES[@]+"${CAPTURE_DEVICES[@]}"}; do
             IFS=':' read -r device_name card_num <<<"$device_info"
             [[ -n "$device_name" && -n "$card_num" ]] || continue
             names+=("$device_name")
             cards+=("$card_num")
         done
-        ((${#names[@]} > 0)) || return 0
-        stream_outcome_add "$(multiplex_stream_path)" "$(
-            IFS=,
-            printf '%s' "${names[*]}"
-        )" "$(
-            IFS=,
-            printf '%s' "${cards[*]}"
-        )"
+        if ((${#names[@]} > 0)); then
+            stream_outcome_add "$(multiplex_stream_path)" "$(
+                IFS=,
+                printf '%s' "${names[*]}"
+            )" "$(
+                IFS=,
+                printf '%s' "${cards[*]}"
+            )"
+        fi
     else
-        for device_info in "$@"; do
+        for device_info in ${CAPTURE_DEVICES[@]+"${CAPTURE_DEVICES[@]}"}; do
             IFS=':' read -r device_name card_num <<<"$device_info"
             [[ -n "$device_name" && -n "$card_num" ]] || continue
             stream_outcome_add "$(generate_stream_path "$device_name" "$card_num")" "$device_name" "$card_num"
         done
     fi
+    for device_info in ${SKIPPED_DEVICES[@]+"${SKIPPED_DEVICES[@]}"}; do
+        IFS=':' read -r device_name card_num <<<"$device_info"
+        stream_outcome_skip "$(generate_stream_path "$device_name" "$card_num")" "$device_name" "$card_num"
+    done
 }
 
 # Succeeds when the sound card's control node exists (a card that is listed but
@@ -7150,6 +7421,8 @@ stream_outcome_probe() {
     fi
 
     for path in ${OUTCOME_PATHS[@]+"${OUTCOME_PATHS[@]}"}; do
+        # A card that cannot capture has no stream to establish (X-34)
+        [[ "${OUTCOME_SKIPPED[$path]}" != "true" ]] || continue
         if [[ -f "${FFMPEG_PID_DIR}/${path}.sh" && -f "${FFMPEG_PID_DIR}/${path}.pid" ]]; then
             OUTCOME_CONFIGURED[$path]=true
         fi
@@ -7202,6 +7475,7 @@ stream_outcome_probe() {
     fi
 
     for path in ${OUTCOME_PATHS[@]+"${OUTCOME_PATHS[@]}"}; do
+        [[ "${OUTCOME_SKIPPED[$path]}" != "true" ]] || continue
         OUTCOME_ERROR[$path]=""
         if [[ "${OUTCOME_READY[$path]}" == "true" ]]; then
             if [[ "${OUTCOME_FLOWING[$path]}" == "false" ]]; then
@@ -7246,7 +7520,7 @@ stream_outcome_collect() {
 # to be running), waiting_for_devices (MediaMTX is up and no device is detected)
 # or stopped (down on purpose). $1 = whether MediaMTX is running.
 outcome_overall() {
-    local path ready=0 total=${#OUTCOME_PATHS[@]}
+    local path ready=0 total=0
     if [[ "$1" != "true" ]]; then
         if desired_present; then
             printf 'failed'
@@ -7255,15 +7529,18 @@ outcome_overall() {
         fi
         return 0
     fi
-    if ((total == 0)); then
-        printf 'waiting_for_devices'
-        return 0
-    fi
-    for path in "${OUTCOME_PATHS[@]}"; do
+    # Only streams count: a card that cannot capture is not one (X-34)
+    for path in ${OUTCOME_PATHS[@]+"${OUTCOME_PATHS[@]}"}; do
+        [[ "${OUTCOME_SKIPPED[$path]}" != "true" ]] || continue
+        ((total++)) || true
         if [[ "${OUTCOME_READY[$path]}" == "true" ]]; then
             ((ready++)) || true
         fi
     done
+    if ((total == 0)); then
+        printf 'waiting_for_devices'
+        return 0
+    fi
     if ((ready == total)); then
         printf 'ok'
     elif ((ready > 0)); then
@@ -7307,10 +7584,16 @@ status_document() {
     overall="$(outcome_overall "$running")"
     policy="$(start_policy)" || policy="invalid"
     for path in ${OUTCOME_PATHS[@]+"${OUTCOME_PATHS[@]}"}; do
-        items+=("$(printf '{"device":%s,"card":%s,"path":%s,"configured":%s,"process_alive":%s,"path_ready":%s,"bytes_flowing":%s,"last_error":%s}' \
+        # "skipped":true only on a card that cannot capture (X-34), which is listed
+        # but is not a stream and is not counted in "overall"
+        local skipped_key=""
+        if [[ "${OUTCOME_SKIPPED[$path]}" == "true" ]]; then
+            skipped_key=',"skipped":true'
+        fi
+        items+=("$(printf '{"device":%s,"card":%s,"path":%s,"configured":%s,"process_alive":%s,"path_ready":%s,"bytes_flowing":%s,"last_error":%s%s}' \
             "$(json_string "${OUTCOME_DEVICE[$path]}")" "$(json_string "${OUTCOME_CARD[$path]}")" "$(json_string "$path")" \
             "${OUTCOME_CONFIGURED[$path]}" "${OUTCOME_ALIVE[$path]}" "${OUTCOME_READY[$path]}" "${OUTCOME_FLOWING[$path]}" \
-            "$(json_string_or_null "${OUTCOME_ERROR[$path]}")")")
+            "$(json_string_or_null "${OUTCOME_ERROR[$path]}")" "$skipped_key")")
     done
     printf '{"schema_version":1,"timestamp":"%s","timestamp_epoch":%s,"command":%s,"overall":"%s","policy":"%s","stream_mode":"%s","mediamtx":{"running":%s,"pid":%s},"streams":[%s]}\n' \
         "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$(date +%s)" "$(json_string "$command")" "$overall" "$policy" \
@@ -7561,20 +7844,38 @@ start_streams_and_report() {
     local devices=("$@")
     local policy path total=0 ready=0 note=""
 
-    if [[ ${#devices[@]} -eq 0 ]]; then
-        # No device: MediaMTX is up and waits for them (D5); the monitor starts
-        # a stream for each one that appears
+    # A card without a capture PCM (a USB speaker) is not a stream (X-34): one INFO
+    # line each, and it is left out of everything below, the policy included
+    split_capture_devices log ${devices[@]+"${devices[@]}"}
+    local -a capture_devices=()
+    local device_info
+    for device_info in ${CAPTURE_DEVICES[@]+"${CAPTURE_DEVICES[@]}"}; do
+        capture_devices+=("$device_info")
+    done
+
+    if [[ ${#capture_devices[@]} -eq 0 ]]; then
+        # No device that can capture: MediaMTX is up and waits for one (D5); the
+        # monitor starts a stream for each one that appears
         if ! allow_empty_start; then
-            log ERROR "No USB audio devices detected"
+            if ((${#devices[@]} == 0)); then
+                log ERROR "No USB audio devices detected"
+            else
+                log ERROR "No USB audio device that can capture (${#devices[@]} playback-only card(s) skipped)"
+            fi
             rollback_failed_start || true
             return "${E_USB_NO_DEVICES}"
         fi
-        log INFO "No USB audio devices detected; MediaMTX is running and waiting for devices"
-        echo "No USB audio devices detected: MediaMTX is running and waiting for devices."
+        if ((${#devices[@]} == 0)); then
+            log INFO "No USB audio devices detected; MediaMTX is running and waiting for devices"
+            echo "No USB audio devices detected: MediaMTX is running and waiting for devices."
+        else
+            log INFO "No USB audio device that can capture (${#devices[@]} playback-only card(s) skipped); MediaMTX is running and waiting for devices"
+            echo "No USB audio device that can capture: MediaMTX is running and waiting for devices."
+        fi
         RUN_STARTED_STREAMS=()
         RUN_STARTED_MEDIAMTX=""
         RUN_DIRTY=false
-        stream_outcome_collect
+        stream_outcome_collect ${devices[@]+"${devices[@]}"}
         status_publish start
         return 0
     fi
@@ -7585,12 +7886,12 @@ start_streams_and_report() {
         local multiplex_path was_running=false
         multiplex_path="$(multiplex_stream_path)"
         log INFO "Multiplex mode - starting single multiplexed stream to ${multiplex_path}"
-        echo "Starting multiplexed stream (${#devices[@]} devices): ${multiplex_path}..."
+        echo "Starting multiplexed stream (${#capture_devices[@]} devices): ${multiplex_path}..."
         if stream_wrapper_alive "$multiplex_path"; then
             was_running=true
         fi
         # Start single multiplex stream with all devices
-        if start_multiplex_stream "${devices[@]}"; then
+        if start_multiplex_stream "${capture_devices[@]}"; then
             unset 'STREAM_LAST_ERROR[$multiplex_path]'
             if [[ "$was_running" != "true" ]]; then
                 run_track_stream "$multiplex_path"
@@ -7602,13 +7903,14 @@ start_streams_and_report() {
     else
         log INFO "Individual stream mode - starting separate streams"
         # Pass the stable device list to start function
-        start_all_ffmpeg_streams "${devices[@]}"
+        start_all_ffmpeg_streams "${capture_devices[@]}"
     fi
 
     # What counts is what is publishing: wait for each stream that was launched
     # to show up in MediaMTX, then establish the facts
     stream_outcome_expect "${devices[@]}"
     for path in ${OUTCOME_PATHS[@]+"${OUTCOME_PATHS[@]}"}; do
+        [[ "${OUTCOME_SKIPPED[$path]}" != "true" ]] || continue
         if [[ -z "${STREAM_LAST_ERROR[$path]:-}" ]]; then
             wait_path_ready "$path" || true
         fi
@@ -7619,10 +7921,14 @@ start_streams_and_report() {
     echo
     echo -e "${GREEN}=== Available RTSP Streams ===${NC}"
     for path in ${OUTCOME_PATHS[@]+"${OUTCOME_PATHS[@]}"}; do
+        if [[ "${OUTCOME_SKIPPED[$path]}" == "true" ]]; then
+            echo -e "${YELLOW}[SKIP]${NC} ${OUTCOME_DEVICE[$path]} (card ${OUTCOME_CARD[$path]}): ${OUTCOME_ERROR[$path]}"
+            continue
+        fi
         total=$((total + 1))
         note=""
         if [[ "$(effective_stream_mode)" == "multiplex" ]]; then
-            note=" (multiplexed from ${#devices[@]} devices)"
+            note=" (multiplexed from ${#capture_devices[@]} devices)"
         fi
         if [[ "${OUTCOME_READY[$path]}" == "true" ]]; then
             ready=$((ready + 1))
@@ -7633,7 +7939,8 @@ start_streams_and_report() {
     done
     echo
 
-    # The policy decides whether this is a start (D4)
+    # The policy decides whether this is a start (D4). Only streams are counted:
+    # a skipped card is neither a success nor a failure.
     local satisfied=true
     if [[ "$policy" == "strict" ]]; then
         ((ready == total)) || satisfied=false
@@ -7645,7 +7952,7 @@ start_streams_and_report() {
         if ((ready < total)); then
             log WARN "Started in degraded mode: ${ready} of ${total} streams are publishing (policy ${policy})"
             for path in ${OUTCOME_PATHS[@]+"${OUTCOME_PATHS[@]}"}; do
-                if [[ "${OUTCOME_READY[$path]}" != "true" ]]; then
+                if [[ "${OUTCOME_SKIPPED[$path]}" != "true" && "${OUTCOME_READY[$path]}" != "true" ]]; then
                     log WARN "  ${path}: ${OUTCOME_ERROR[$path]}"
                 fi
             done
@@ -7662,6 +7969,7 @@ start_streams_and_report() {
 
     log ERROR "Start failed: ${ready} of ${total} streams are publishing (policy ${policy})"
     for path in ${OUTCOME_PATHS[@]+"${OUTCOME_PATHS[@]}"}; do
+        [[ "${OUTCOME_SKIPPED[$path]}" != "true" ]] || continue
         if [[ "${OUTCOME_READY[$path]}" == "true" ]]; then
             STREAM_LAST_ERROR[$path]="was publishing; stopped again because the start failed under policy '${policy}'"
         else
@@ -8058,10 +8366,18 @@ status_print_summary() {
     echo
     if [[ "$running" == "true" ]]; then
         echo "Streams (as MediaMTX sees them):"
-        if ((${#OUTCOME_PATHS[@]} == 0)); then
+        local listed=0
+        for path in ${OUTCOME_PATHS[@]+"${OUTCOME_PATHS[@]}"}; do
+            [[ "${OUTCOME_SKIPPED[$path]}" == "true" ]] || listed=$((listed + 1))
+        done
+        if ((listed == 0)); then
             echo "  none: waiting for devices"
         fi
         for path in ${OUTCOME_PATHS[@]+"${OUTCOME_PATHS[@]}"}; do
+            if [[ "${OUTCOME_SKIPPED[$path]}" == "true" ]]; then
+                echo "  ${OUTCOME_DEVICE[$path]}: skipped (${OUTCOME_ERROR[$path]})"
+                continue
+            fi
             case "${OUTCOME_READY[$path]}" in
                 true) state="${GREEN}ready${NC}" ;;
                 null) state="${YELLOW}unknown${NC}" ;;
@@ -8122,9 +8438,8 @@ show_status() {
     local is_multiplex_mode=false
 
     if [[ -f "$multiplex_pid_file" ]]; then
-        local multiplex_pid
-        multiplex_pid="$(read_pid_safe "$multiplex_pid_file")"
-        if [[ -n "$multiplex_pid" ]] && kill -0 "$multiplex_pid" 2>/dev/null; then
+        stream_wrapper_state "$multiplex_pid_file" "${MULTIPLEX_STREAM_NAME}"
+        if [[ "$WRAPPER_STATE" != "stopped" ]]; then
             is_multiplex_mode=true
         fi
     fi
@@ -8134,21 +8449,17 @@ show_status() {
 
     if [[ "$is_multiplex_mode" == "true" ]]; then
         # Multiplex mode is active
-        echo "Multiplex stream (combining ${#devices[@]} devices):"
+        split_capture_devices ${devices[@]+"${devices[@]}"}
+        echo "Multiplex stream (combining ${#CAPTURE_DEVICES[@]} devices):"
         echo "  Stream: rtsp://${MEDIAMTX_HOST}:${MEDIAMTX_RTSP_PORT}/${MULTIPLEX_STREAM_NAME}"
-        if [[ ${#devices[@]} -gt 0 ]]; then
-            IFS=':' read -r device_name _ <<<"${devices[0]}"
+        if [[ ${#CAPTURE_DEVICES[@]} -gt 0 ]]; then
+            IFS=':' read -r device_name _ <<<"${CAPTURE_DEVICES[0]}"
             resolve_stream_settings "$device_name" "${MULTIPLEX_STREAM_NAME}"
             echo "  Settings: ${STREAM_SAMPLE_RATE} Hz, ${STREAM_CHANNELS} ch, ${STREAM_CODEC} ${STREAM_BITRATE}"
         fi
 
-        local multiplex_pid
-        multiplex_pid="$(read_pid_safe "$multiplex_pid_file")"
-        if [[ -n "$multiplex_pid" ]] && kill -0 "$multiplex_pid" 2>/dev/null; then
-            echo -e "  Status: ${GREEN}Running${NC} (PID: $multiplex_pid)"
-        else
-            echo -e "  Status: ${RED}Not running${NC}"
-        fi
+        stream_wrapper_state "$multiplex_pid_file" "${MULTIPLEX_STREAM_NAME}"
+        print_wrapper_status "  "
 
         echo
         echo "Source devices:"
@@ -8157,7 +8468,11 @@ show_status() {
         else
             for device_info in "${devices[@]}"; do
                 IFS=':' read -r device_name card_num <<<"$device_info"
-                echo "  - $device_name (card $card_num)"
+                if card_has_capture_pcm "$card_num"; then
+                    echo "  - $device_name (card $card_num)"
+                else
+                    echo "  - $device_name (card $card_num): skipped, ${NO_CAPTURE_REASON}"
+                fi
             done
         fi
     else
@@ -8173,22 +8488,17 @@ show_status() {
                 stream_path="$(generate_stream_path "$device_name" "$card_num")"
 
                 echo "  - $device_name (card $card_num)"
+                if ! card_has_capture_pcm "$card_num"; then
+                    # A speaker or DAC: detected, but not a microphone and not a stream (X-34)
+                    echo -e "    Status: ${YELLOW}Skipped${NC} (${NO_CAPTURE_REASON})"
+                    continue
+                fi
                 echo "    Stream: rtsp://${MEDIAMTX_HOST}:${MEDIAMTX_RTSP_PORT}/$stream_path"
                 resolve_stream_settings "$device_name" "$stream_path"
                 echo "    Settings: ${STREAM_SAMPLE_RATE} Hz, ${STREAM_CHANNELS} ch, ${STREAM_CODEC} ${STREAM_BITRATE}"
 
-                local pid_file="${FFMPEG_PID_DIR}/${stream_path}.pid"
-                if [[ -f "$pid_file" ]]; then
-                    local pid
-                    pid="$(read_pid_safe "$pid_file")"
-                    if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
-                        echo -e "    Status: ${GREEN}Running${NC} (PID: $pid)"
-                    else
-                        echo -e "    Status: ${RED}Not running${NC}"
-                    fi
-                else
-                    echo -e "    Status: ${RED}Not running${NC}"
-                fi
+                stream_wrapper_state "${FFMPEG_PID_DIR}/${stream_path}.pid" "$stream_path"
+                print_wrapper_status "    "
             done
         fi
     fi
@@ -8204,7 +8514,7 @@ show_config() {
 
     if [[ ! -f "${DEVICE_CONFIG_FILE}" ]]; then
         echo "Creating default configuration..."
-        save_device_config
+        save_device_config || return 1
     fi
 
     cat "${DEVICE_CONFIG_FILE}"

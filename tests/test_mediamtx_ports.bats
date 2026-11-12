@@ -31,6 +31,10 @@ setup() {
     export MEDIAMTX_HOST=localhost
     export MEDIAMTX_RTSP_PORT="$P_RTSP" MEDIAMTX_API_PORT="$P_API" MEDIAMTX_METRICS_PORT="$P_METRICS"
     export LOCK_ACQUISITION_TIMEOUT=2 STOP_LOCK_TIMEOUT=1
+    # The stood-in cards ("testmic" on card 1 and 2) are microphones: each has a capture
+    # PCM in a fake ALSA tree. A card without one is a speaker, which the manager skips (X-34).
+    mkdir -p "$D/asound/card1/pcm0c" "$D/asound/card2/pcm0c"
+    export ASOUND_PROC_ROOT="$D/asound"
 
     # Nothing of the host may be touched: process lookups and kills are PATH
     # shims that find nothing
@@ -449,12 +453,16 @@ _wait_for_ffmpeg_args() {
 }
 
 @test "status shows the multiplex stream URL with the configured RTSP port [X-19]" {
-    : >"$D/ff/studio.pid"
+    # A running multiplex wrapper: a real process that runs the stream's wrapper script, which is what
+    # status identifies a wrapper by (a PID of some other program is not one)
+    printf '#!/bin/bash\nsleep 300\n:\n' >"$D/ff/studio.sh"
+    bash "$D/ff/studio.sh" >/dev/null 2>&1 3>&- &
+    HELD_PIDS+=("$!")
+    echo "$!" >"$D/ff/studio.pid"
     MULTIPLEX_STREAM_NAME=studio run bash -c '
         source "$1" >/dev/null 2>&1
         set +e
         detect_audio_devices() { echo "testmic:1"; }
-        read_pid_safe() { printf "%s" "$$"; }
         show_status' _ "$SM"
     [ "$status" -eq 0 ]
     [[ "$output" == *"Stream: rtsp://localhost:${P_RTSP}/studio"* ]]

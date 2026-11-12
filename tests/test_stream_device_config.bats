@@ -609,6 +609,8 @@ _start_live_mediamtx_standin() {
 
 @test "status shows the settings in use for each device, from the config file [D3]" {
     _conf 'DEVICE_MIC1_SAMPLE_RATE=96000' 'DEVICE_MIC1_CODEC=aac' 'DEVICE_MIC1_BITRATE=192k'
+    # a microphone: a card without a capture PCM is a speaker, which status lists as skipped (X-34)
+    sd_fake_card 98 0c
     run smq '
         detect_audio_devices() { printf "mic1:98\n"; }
         show_status'

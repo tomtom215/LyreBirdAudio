@@ -564,7 +564,10 @@ cron_monitor_calls() { # cron_monitor_calls CRONFILE: prints "individual:<name>"
     : >"$UN/calls"
     rm -rf "$UN/ff" "$UN/cronstate"
     mkdir -p "$UN/ff"
-    env -i "${assigns[@]}" HOME=/root ISCRIPT="$ISCRIPT" UN="$UN" MEDIAMTX_PID_FILE="$UN/mtx.pid" MEDIAMTX_FFMPEG_DIR="$UN/ff" \
+    # the two stood-in cards are microphones: each has a capture PCM (a card without one is a
+    # speaker, which the monitor skips, X-34)
+    mkdir -p "$UN/asound/card1/pcm0c" "$UN/asound/card2/pcm0c"
+    env -i "${assigns[@]}" HOME=/root ISCRIPT="$ISCRIPT" UN="$UN" ASOUND_PROC_ROOT="$UN/asound" MEDIAMTX_PID_FILE="$UN/mtx.pid" MEDIAMTX_FFMPEG_DIR="$UN/ff" \
         MEDIAMTX_CONFIG_DIR="$UN/cfg" MEDIAMTX_LOG_FILE="$UN/sm.log" STREAM_MANAGER_LOG_FILE="$UN/sm.log" MEDIAMTX_LOCK_FILE="$UN/run.lock" \
         CRON_RESTART_STATE_DIR="$UN/cronstate" DEEP_HEALTH_STATE_DIR="$UN/deep" MEDIAMTX_HOST=cron.invalid \
         bash -c '
@@ -627,4 +630,90 @@ cron_monitor_calls() { # cron_monitor_calls CRONFILE: prints "individual:<name>"
         detect_service_customizations
         echo "customized=${SERVICE_STATE[has_customizations]} count=${#SERVICE_CUSTOM_ENV[@]}"' _ "$PROJECT_ROOT/lyrebird-updater.sh"
     [ "$output" = "customized=true count=1" ]
+}
+
+# ---------------------------------------------------------------------------
+# X-11 closure: one hostile multiplex name, three outputs
+# ---------------------------------------------------------------------------
+
+# Run `install` (the real main, with the real name resolution) for the multiplex name $1, with root
+# stood in for, and leave the unit and the cron file it wrote in $UN/out-$2
+install_for_name() {
+    local tag="$2"
+    rm -rf "$UN/root/etc/systemd/system/"* "$UN/root/etc/cron.d/"*
+    run env PATH="$UN/shim:$PATH" bash -c '
+        source "$ISCRIPT" >/dev/null 2>&1
+        check_root() { :; }
+        main -m multiplex -n "$1" install' _ "$1"
+    [ "$status" -eq 0 ] || {
+        echo "install for $tag: $output"
+        false
+    }
+    mkdir -p "$UN/out-$tag"
+    cp "$UN/root/etc/systemd/system/mediamtx-audio.service" "$UN/out-$tag/unit"
+    cp "$UN/root/etc/cron.d/mediamtx-monitor" "$UN/out-$tag/cron"
+}
+
+@test "a hostile multiplex name cannot add a systemd directive, a cron line or a YAML key: it is made canonical once and the unit, the cron file and the MediaMTX config carry that one name [X-11]" {
+    make_install
+    install_shims
+    local hostile=$'s\nExecStartPre=/bin/x\n[Install]\nWantedBy=evil\n  runOnInit: x'
+    local canonical
+    canonical="$(bash -c 'source "$1" >/dev/null 2>&1; canonical_stream_name "$2"' _ "$ISCRIPT" "$hostile")"
+    [ -n "$canonical" ]
+    [[ "$canonical" =~ ^[a-z0-9_-]+$ ]]
+
+    install_for_name studio benign
+    install_for_name "$hostile" hostile
+
+    # systemd unit: no injected directive; the two units differ in the one Environment= line, and
+    # that line carries the canonical name and nothing else
+    ! grep -q '/bin/x' "$UN/out-hostile/unit"
+    ! grep -q 'WantedBy=evil' "$UN/out-hostile/unit"
+    [ "$(grep -c '^ExecStartPre=' "$UN/out-hostile/unit")" -eq "$(grep -c '^ExecStartPre=' "$UN/out-benign/unit")" ]
+    [ "$(grep -c '^\[Install\]' "$UN/out-hostile/unit")" -eq 1 ]
+    run diff "$UN/out-benign/unit" "$UN/out-hostile/unit"
+    [ "$(grep -c '^[<>]' <<<"$output")" -eq 2 ]
+    [[ "$output" == *"> Environment=\"MULTIPLEX_STREAM_NAME=${canonical}\""* ]]
+
+    # cron file: the same, one assignment line with the canonical name
+    ! grep -q '/bin/x' "$UN/out-hostile/cron"
+    run diff "$UN/out-benign/cron" "$UN/out-hostile/cron"
+    [ "$(grep -c '^[<>]' <<<"$output")" -eq 2 ]
+    [[ "$output" == *"> MULTIPLEX_STREAM_NAME=${canonical}"* ]]
+    run grep -vE '^(#.*|[A-Z_][A-Z0-9_]*=[A-Za-z0-9_/:.-]*|\*/5 .*|)$' "$UN/out-hostile/cron"
+    [ -z "$output" ]
+
+    # and systemd's own parser finds nothing wrong with the unit
+    if command -v systemd-analyze >/dev/null 2>&1; then
+        cp "$UN/out-hostile/unit" "$UN/out-hostile/mediamtx-audio.service"
+        run systemd-analyze verify "$UN/out-hostile/mediamtx-audio.service"
+        [ -z "$output" ] || {
+            echo "$output"
+            false
+        }
+    fi
+
+    # a name that is too long to be a stream name is refused with exit 4, and install changes nothing
+    run env PATH="$UN/shim:$PATH" bash -c '
+        source "$ISCRIPT" >/dev/null 2>&1
+        check_root() { :; }
+        main -m multiplex -n "$1" install' _ $'studio\nExecStartPre=/bin/touch /tmp/pwned\n[Install]\nWantedBy=evil.target\n  runOnInit: touch /tmp/pwned'
+    [ "$status" -eq 4 ]
+    cmp "$UN/root/etc/systemd/system/mediamtx-audio.service" "$UN/out-hostile/unit"
+    cmp "$UN/root/etc/cron.d/mediamtx-monitor" "$UN/out-hostile/cron"
+
+    # the MediaMTX configuration rendered for the same name: one path, no extra key
+    run env MEDIAMTX_BINARY="$UN/no-mediamtx" bash -c '
+        source "$ISCRIPT" >/dev/null 2>&1
+        set +e
+        STREAM_MODE=multiplex
+        MULTIPLEX_STREAM_NAME="$1"
+        resolve_multiplex_stream_name
+        generate_mediamtx_config >/dev/null 2>&1
+        echo "generate rc=$?"' _ "$hostile"
+    [[ "$output" == *"generate rc=0"* ]]
+    [ "$(sed -n '/^paths:/,$p' "$UN/cfg/mediamtx.yml" | grep -cE '^  [^ ]')" -eq 1 ]
+    grep -qxF "  '${canonical}':" "$UN/cfg/mediamtx.yml"
+    ! grep -qE 'runOnInit: |/bin/x|WantedBy' "$UN/cfg/mediamtx.yml"
 }

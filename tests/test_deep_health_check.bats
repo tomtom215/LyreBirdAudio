@@ -13,6 +13,9 @@ setup() {
     PROJECT_ROOT="$( cd "$TEST_DIR/.." && pwd )"
     DH_TMP="$(mktemp -d)"
     mkdir -p "$DH_TMP/bin" "$DH_TMP/pids" "$DH_TMP/strikes" "$DH_TMP/cron"
+    # The stood-in card "mic1" (card 0) is a microphone: it has a capture PCM in a fake
+    # ALSA tree. A card without one is a speaker, which the manager skips (X-34).
+    mkdir -p "$DH_TMP/asound/card0/pcm0c"
 
     # A fake "MediaMTX" process and a fake live wrapper process. It must be a
     # bash process (read_pid_safe's PID-recycle guard rejects other comms) and
@@ -64,6 +67,7 @@ _run_monitor() {
         STREAM_MANAGER_LOG_FILE="$DH_TMP/manager.log" \
         MEDIAMTX_LOG_FILE="$DH_TMP/mediamtx.out" \
         MEDIAMTX_API_VERSION=v3 \
+        ASOUND_PROC_ROOT="$DH_TMP/asound" \
         DEEP_HEALTH_STATE_DIR="$DH_TMP/strikes" \
         DEEP_HEALTH_MAX_STRIKES=3 \
         CRON_RESTART_STATE_DIR="$DH_TMP/cron" \

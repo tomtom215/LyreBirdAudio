@@ -108,6 +108,24 @@ _LYREBIRD_COMMON="${BASH_SOURCE[0]%/*}/lyrebird-common.sh"
 [[ -f "$_LYREBIRD_COMMON" ]] && source "$_LYREBIRD_COMMON" || true
 unset _LYREBIRD_COMMON
 
+# The device configuration is replaced atomically and durably (LB-23, decision D14):
+# temp file in the same directory, fsync, rename, fsync of the directory
+# (lyrebird_atomic_write). If the common library is missing, or is an older copy without
+# it, fall back to the temp file + rename part (no fsync; the owner reference is ignored)
+# so that a reader still never sees a half-written file.
+if ! declare -F lyrebird_atomic_write >/dev/null 2>&1; then
+    lyrebird_atomic_write() {
+        local dest="${1:?lyrebird_atomic_write: destination required}"
+        local mode="${2:-0644}"
+        local tmp
+        tmp="$(mktemp "$(dirname -- "$dest")/.$(basename -- "$dest").XXXXXX")" || return 1
+        if ! cat >"$tmp" || ! chmod "$mode" -- "$tmp" || ! mv -f -- "$tmp" "$dest"; then
+            rm -f -- "$tmp"
+            return 1
+        fi
+    }
+fi
+
 # Version
 readonly VERSION="1.0.1"
 SCRIPT_NAME="$(basename "${BASH_SOURCE[0]}")"
@@ -1511,23 +1529,11 @@ restore_config_backup() {
         fi
     fi
 
-    # Perform restore using temp file for atomic operation
-    local temp_restore
-    temp_restore=$(mktemp "${CONFIG_FILE}.restore.XXXXXXXXXX" 2>/dev/null) || {
-        log_error "Failed to create temporary file"
-        return 2
-    }
-
-    # Copy backup to temp file
-    if ! cp -p "$selected_backup" "$temp_restore"; then
-        rm -f "$temp_restore"
-        log_error "Failed to copy backup file"
-        return 2
-    fi
-
-    # Atomic move
-    if ! mv -f "$temp_restore" "$CONFIG_FILE"; then
-        rm -f "$temp_restore"
+    # Replace the live file atomically and durably (LB-23) with the backup's content, mode
+    # and owner (what cp -p gave it); a failure leaves the live file as it was
+    local backup_mode
+    backup_mode="$(stat -c %a "$selected_backup" 2>/dev/null)" || backup_mode=644
+    if ! lyrebird_atomic_write "$CONFIG_FILE" "$backup_mode" "$selected_backup" <"$selected_backup"; then
         log_error "Failed to restore configuration"
         return 2
     fi
@@ -1855,18 +1861,17 @@ EOF
         return 2
     fi
 
-    # Atomic move to final location
-    if ! mv -f "$TEMP_CONFIG_FILE" "$CONFIG_FILE"; then
+    # Replace the live file atomically and durably, mode 0644 from the start: a failed
+    # write leaves the old file as it was (LB-23)
+    if ! lyrebird_atomic_write "$CONFIG_FILE" 0644 <"$TEMP_CONFIG_FILE"; then
         rm -f "$TEMP_CONFIG_FILE"
         TEMP_CONFIG_FILE=""
         log_error "Failed to write configuration file: $CONFIG_FILE"
         return 2
     fi
 
+    rm -f "$TEMP_CONFIG_FILE"
     TEMP_CONFIG_FILE=""
-
-    # Set permissions
-    chmod 644 "$CONFIG_FILE" 2>/dev/null || log_warn "Could not set permissions on config file"
 
     log_info ""
     log_info "Configuration generated successfully: $CONFIG_FILE"

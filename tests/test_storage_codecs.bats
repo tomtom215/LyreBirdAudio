@@ -131,6 +131,9 @@ manager_codecs() {
         [ -n "$opts_line" ] || { echo "no codec_opts for $codec in the manager"; return 1; }
         local codec_opts=() BITRATE=64k AUDIO_RECORDING_PATH="$ST_REC" STREAM_PATH=s1 CODEC="$codec"
         local AUDIO_RECORDING_SEGMENT_TIME=1 AUDIO_RECORDING_SEGMENTS=12
+        # the segment spec names the recording directory as the wrapper receives it, escaped for the
+        # tee muxer (X-33); for this plain path that is the path itself
+        local RECORDING_TEE_DIR="$ST_REC/s1"
         eval "$opts_line"
         # Skip a codec whose encoder this ffmpeg build lacks (checked by trying it).
         ffmpeg -hide_banner -loglevel error -nostdin -f lavfi -i "sine=duration=0.2" "${codec_opts[@]}" \
