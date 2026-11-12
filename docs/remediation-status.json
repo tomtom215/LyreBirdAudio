@@ -1528,6 +1528,20 @@
         "the help says update is a verified download with rollback and does not claim a built-in upgrade [supply chain]"
       ],
       "note": "update always takes the verified install path; a checksum mismatch is fatal even with --force; MIN_UPGRADE_VERSION=1.15.0 was also wrong (--upgrade appears in 1.18.0)"
+    },
+    {
+      "id": "X-44",
+      "title": "metrics serve tests failed 1 run in 5 under load: they sent the next request after a fixed pause or retried, while the previous netcat still held its listening socket",
+      "severity": "P3",
+      "phase": 6,
+      "status": "fixed",
+      "tests": [
+        "serve: GET / and GET /metrics are 200, other paths 404, other methods 405, malformed requests 400 [LB-18]",
+        "serve: requests that follow each other are all answered, each by a freshly armed listener [LB-18]",
+        "--help says the server is made for a poller: a client that connects while another is served can be reset [X-44]",
+        "serve: a client that half-closes and one that sends a huge or endless request do not wedge the server [LB-18]"
+      ],
+      "note": "the tests now wait for the server to be idle (one listening socket, no live connection); the cause is netcat keeping its listening socket until it exits (SO_REUSEPORT), reproduced with two ncs, so a client that connects while another is served can be reset: documented in --help, wontfix without a different server (python3 or ncat), a maintainer decision"
     }
   ]
 }

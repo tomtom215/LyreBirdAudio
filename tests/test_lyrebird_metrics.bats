@@ -1132,6 +1132,37 @@ _probe_field() {
     grep "^$1=" "$TEST_SCRATCH/probe" | head -1 | cut -d= -f2-
 }
 
+# The server's own sockets on PORT, from /proc/net/tcp*: "L A" = L listening
+# sockets and A sockets in a connection that has not ended (TIME_WAIT and
+# CLOSE are over). A server serves one connection with one nc and arms the next
+# nc while it does; the nc of a served connection keeps its listening socket
+# until it exits, and a client that connects in that time can be given to it and
+# reset (SO_REUSEPORT: the kernel splits new connections between listening
+# sockets of the same port). So a client that comes right after another is only
+# promised an answer once the server is idle again, which is exactly one
+# listening socket (the armed nc) and no connection.
+_server_sockets() {
+    awk -v port="$(printf '%04X' "$1")" '
+        { split($2, a, ":") }
+        a[2] == port && $4 == "0A" { l++ }
+        a[2] == port && $4 ~ /^(01|02|03|04|05|08|09|0B)$/ { c++ }
+        END { printf "%d %d\n", l, c }' $(ls /proc/net/tcp /proc/net/tcp6 2>/dev/null) || true
+}
+
+# Wait until the server on PORT is idle (see _server_sockets), at most ~10 s.
+# This is what "ready for the next request" means: a fixed pause is not (how
+# long the previous nc takes to exit depends on the machine's load).
+_wait_idle() {
+    local i sockets=""
+    for ((i = 0; i < 200; i++)); do
+        sockets="$(_server_sockets "$1")"
+        [ "$sockets" = "1 0" ] && return 0
+        sleep 0.05
+    done
+    echo "the server on port $1 did not become idle (listening sockets, live connections): $sockets"
+    return 1
+}
+
 # A launcher that sources the real script, applies SNIPPET and runs the real main.
 _server_launcher() {
     _make_launcher "$1" "$2"
@@ -1262,14 +1293,9 @@ _stop_server_term_ok() {
     for case_ in "${cases[@]}"; do
         request="${case_%|*}"
         want="${case_##*|}"
-        got=none
-        local attempt
-        for attempt in 1 2 3; do
-            _probe "$port" "$request"
-            got="$(_probe_field status)"
-            [ "$got" != "none" ] && break
-            sleep 0.1
-        done
+        _wait_idle "$port"
+        _probe "$port" "$request"
+        got="$(_probe_field status)"
         [ "$got" = "$want" ] || { echo "$request -> $got, want $want"; cat "$TEST_SCRATCH/probe"; return 1; }
         [ "$(_probe_field head_crlf)" = "1" ]
         [ "$(_probe_field content_length_ok)" = "1" ]
@@ -1370,9 +1396,10 @@ _stop_server_term_ok() {
     _start_server --serve "$port"
     _wait_listening || { cat "$TEST_SCRATCH/server.err"; return 1; }
     for ((i = 0; i < 12; i++)); do
+        # each request is answered by a listener armed while the previous one was served
+        _wait_idle "$port"
         _probe "$port" 'GET /metrics HTTP/1.1\r\n\r\n'
         [ "$(_probe_field status)" = "200" ] || { echo "request $i: $(cat "$TEST_SCRATCH/probe")"; return 1; }
-        sleep 0.03
     done
     _stop_server_term_ok
 }
@@ -1420,6 +1447,15 @@ _stop_server_term_ok() {
     DECOY_PID=""
 }
 
+@test "--help says the server is made for a poller: a client that connects while another is served can be reset [X-44]" {
+    # netcat keeps its listening socket until it exits (see _server_sockets), so this is
+    # the server's limit, and the help must not promise more than "one connection at a time"
+    run "$BASH" "$PROJECT_ROOT/lyrebird-metrics.sh" --help
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"one connection at a time"* ]]
+    [[ "$output" == *"made for a poller"* && "$output" == *"can be reset and has to try again"* ]]
+}
+
 @test "serve: a client that half-closes and one that sends a huge or endless request do not wedge the server [LB-18]" {
     local port i
     port="$(_serve_port)"
@@ -1429,17 +1465,16 @@ _stop_server_term_ok() {
     # a client that shuts down its sending side before the response (OpenBSD nc closes the socket then)
     _probe "$port" 'GET /metrics HTTP/1.0\r\n\r\n' 20 half-close
     # a request line far beyond any sane length
+    _wait_idle "$port"
     _probe "$port" "GET /$(printf 'a%.0s' $(seq 1 12000)) HTTP/1.1\\r\\n\\r\\n"
     [ "$(_probe_field status)" = "400" ] || { cat "$TEST_SCRATCH/probe"; return 1; }
     # an endless header section
+    _wait_idle "$port"
     _probe "$port" "GET / HTTP/1.1\\r\\n$(printf 'X: y\\r\\n%.0s' $(seq 1 150))\\r\\n"
     [ "$(_probe_field status)" = "400" ] || { cat "$TEST_SCRATCH/probe"; return 1; }
     # and the server still answers
-    for i in 1 2 3; do
-        _probe "$port" 'GET /metrics HTTP/1.1\r\n\r\n'
-        [ "$(_probe_field status)" = "200" ] && break
-        sleep 0.2
-    done
+    _wait_idle "$port"
+    _probe "$port" 'GET /metrics HTTP/1.1\r\n\r\n'
     [ "$(_probe_field status)" = "200" ]
     kill -0 "$SERVER_PID"
     _stop_server_term_ok

@@ -1730,6 +1730,10 @@ Options:
 The HTTP server answers GET / and GET /metrics (200), any other path with 404 and
 any other method with 405, one connection at a time. It needs netcat (OpenBSD
 nc, ncat, traditional/GNU nc or BusyBox nc). SIGTERM or SIGINT stops it cleanly.
+It is made for a poller (Prometheus scrapes every few seconds): each connection is
+served by its own nc, and the nc of a connection keeps its listening socket until it
+exits, so a client that connects while another is being served, or within a few
+milliseconds after it, can be reset and has to try again.
 
 Environment:
   MEDIAMTX_BINARY, MEDIAMTX_CONFIG_FILE (else MEDIAMTX_CONFIG_DIR/mediamtx.yml)
