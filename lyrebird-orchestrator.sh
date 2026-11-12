@@ -893,6 +893,374 @@ report_installer_result() {
 }
 
 # ============================================================================
+# Stream Outcome
+# What the stream manager says about the node after a start or restart, read
+# from its status document (`status --json`, or the file every start, restart,
+# stop and monitor run writes; schema_version 1, see
+# docs/remediation/notes/stream-outcome.md) instead of inferred from a process
+# list taken before the command ran. Everything here degrades: without jq, a
+# readable document or an answer from the manager the callers still have the
+# exit status, and nothing in this section can fail the orchestrator.
+# ============================================================================
+
+# At most this many streams are listed (the rest are counted): a status document
+# is data from outside this script
+readonly OUTCOME_MAX_STREAMS=100
+
+# jq program: one "H" line (overall, policy, command, MediaMTX running) and one
+# "S" line per stream (path, path_ready, bytes_flowing, last_error), fields
+# separated by the unit separator (not whitespace, so empty fields survive
+# `read`); null becomes an empty field. Prints nothing for anything that is not
+# a schema_version 1 document.
+readonly STATUS_JQ_FILTER='def s: if . == null then "" else tostring end;
+def hline: ["H", .overall, (.policy | s), (.command | s), (.mediamtx.running | s)] | join("\u001f");
+def sline: ["S", (.path | s), (.path_ready | s), (.bytes_flowing | s), (.last_error | s)] | join("\u001f");
+select(type == "object" and .schema_version == 1 and (.overall | type) == "string" and (.streams | type) == "array")
+| hline, (.streams[] | sline)'
+
+# The monitor job that starts a stream for a microphone that appears later
+# (lyrebird-stream-manager.sh install writes it)
+MONITOR_CRON_FILE="/etc/cron.d/mediamtx-monitor"
+
+OUTCOME_SOURCE=""   # "status file", "status --json", or "" when nothing was readable
+OUTCOME_PROBLEM=""  # why nothing was readable
+OUTCOME_OVERALL=""  # ok | degraded | failed | waiting_for_devices | stopped | unknown
+OUTCOME_POLICY=""   # degraded | strict | unknown
+OUTCOME_MEDIAMTX="" # true | false | unknown
+OUTCOME_TOTAL=0     # streams in the document
+OUTCOME_READY=0     # of those, with path_ready true
+OUTCOME_OMITTED=0   # streams beyond OUTCOME_MAX_STREAMS: counted, not listed
+declare -a OUTCOME_S_PATH=() OUTCOME_S_READY=() OUTCOME_S_FLOW=() OUTCOME_S_ERROR=()
+LIFECYCLE_RC=""      # exit status of the last start/restart ("" = it did not run)
+LIFECYCLE_VERDICT="" # classify_lifecycle
+
+reset_outcome() {
+    OUTCOME_SOURCE=""
+    OUTCOME_PROBLEM=""
+    OUTCOME_OVERALL=""
+    OUTCOME_POLICY=""
+    OUTCOME_MEDIAMTX=""
+    OUTCOME_TOTAL=0
+    OUTCOME_READY=0
+    OUTCOME_OMITTED=0
+    OUTCOME_S_PATH=()
+    OUTCOME_S_READY=()
+    OUTCOME_S_FLOW=()
+    OUTCOME_S_ERROR=()
+}
+
+# Where the stream manager records its status (the same variables, same
+# precedence as the manager: LYREBIRD_STATUS_FILE, else LYREBIRD_STATE_DIR/status.json)
+status_file_path() {
+    printf '%s' "${LYREBIRD_STATUS_FILE:-${LYREBIRD_STATE_DIR:-/run/lyrebird}/status.json}"
+}
+
+# The status file's text; nothing when it is absent or unreadable
+status_file_content() {
+    local file
+    file="$(status_file_path)"
+    if [[ -f "$file" && -r "$file" ]]; then
+        head -c 1048576 -- "$file" 2>/dev/null || true
+    fi
+    return 0
+}
+
+# Parse the status document DOC into the OUTCOME_* variables. Returns 1 and sets
+# OUTCOME_PROBLEM when it cannot be used. Control characters are dropped from
+# everything that is later printed.
+parse_status_document() {
+    local doc="$1" parsed="" tag f1 f2 f3 f4
+
+    OUTCOME_OVERALL=""
+    OUTCOME_POLICY=""
+    OUTCOME_MEDIAMTX=""
+    OUTCOME_TOTAL=0
+    OUTCOME_READY=0
+    OUTCOME_OMITTED=0
+    OUTCOME_S_PATH=()
+    OUTCOME_S_READY=()
+    OUTCOME_S_FLOW=()
+    OUTCOME_S_ERROR=()
+
+    if ! command_exists jq; then
+        OUTCOME_PROBLEM="jq is not installed"
+        return 1
+    fi
+    if ! parsed="$(printf '%s\n' "$doc" | jq -r "$STATUS_JQ_FILTER" 2>/dev/null)" || [[ "$parsed" != H* ]]; then
+        OUTCOME_PROBLEM="the status document is not valid, or is not a schema_version 1 document"
+        return 1
+    fi
+    parsed="$(printf '%s' "$parsed" | LC_ALL=C tr -d '\000-\010\013-\036\177')"
+
+    while IFS=$'\x1f' read -r tag f1 f2 f3 f4 || [[ -n "$tag" ]]; do
+        case "$tag" in
+            H)
+                OUTCOME_OVERALL="$f1"
+                OUTCOME_POLICY="$f2"
+                OUTCOME_MEDIAMTX="$f4"
+                ;;
+            S)
+                OUTCOME_TOTAL=$((OUTCOME_TOTAL + 1))
+                if [[ "$f2" == "true" ]]; then
+                    OUTCOME_READY=$((OUTCOME_READY + 1))
+                fi
+                if ((${#OUTCOME_S_PATH[@]} < OUTCOME_MAX_STREAMS)); then
+                    OUTCOME_S_PATH+=("$f1")
+                    OUTCOME_S_READY+=("$f2")
+                    OUTCOME_S_FLOW+=("$f3")
+                    OUTCOME_S_ERROR+=("$f4")
+                else
+                    OUTCOME_OMITTED=$((OUTCOME_OMITTED + 1))
+                fi
+                ;;
+            *) ;;
+        esac
+    done <<<"$parsed"
+
+    case "$OUTCOME_OVERALL" in
+        ok | degraded | failed | waiting_for_devices | stopped) ;;
+        *) OUTCOME_OVERALL="unknown" ;;
+    esac
+    case "$OUTCOME_POLICY" in
+        degraded | strict) ;;
+        *) OUTCOME_POLICY="unknown" ;;
+    esac
+    case "$OUTCOME_MEDIAMTX" in
+        true | false) ;;
+        *) OUTCOME_MEDIAMTX="unknown" ;;
+    esac
+    return 0
+}
+
+# Ask the stream manager for its live state: `status --json`, with no terminal
+# and for at most a minute (it samples every ready stream's byte counter, a few
+# seconds, and asks the MediaMTX API once per stream)
+query_status_document() {
+    local script_path="${SCRIPT_PATHS[stream_manager]:-}" doc="" rc=0
+
+    if [[ -z "$script_path" || ! -x "$script_path" ]]; then
+        OUTCOME_PROBLEM="the stream manager script is not available"
+        return 1
+    fi
+    if ! verify_script_integrity "stream_manager"; then
+        OUTCOME_PROBLEM="the stream manager script was modified since it was validated"
+        return 1
+    fi
+    if command_exists timeout; then
+        doc="$(timeout 60 "$script_path" status --json </dev/null 2>/dev/null)" || rc=$?
+    else
+        doc="$("$script_path" status --json </dev/null 2>/dev/null)" || rc=$?
+    fi
+    if ((rc != 0)); then
+        OUTCOME_PROBLEM="status --json exited with status ${rc}"
+        return 1
+    fi
+    parse_status_document "$doc"
+}
+
+# Read what a start or restart (exit status RC) left behind. BEFORE is the status
+# file's text from before the command: the file counts only if the command, or
+# something after it, wrote it (a command that was refused writes nothing, and
+# the file then describes an earlier moment). When a command that reported
+# success left no usable status, the live state is asked for instead.
+collect_lifecycle_outcome() {
+    local before="$1" rc="$2" after=""
+
+    after="$(status_file_content)"
+    if [[ -n "$after" && "$after" != "$before" ]]; then
+        if parse_status_document "$after"; then
+            OUTCOME_SOURCE="status file"
+            return 0
+        fi
+    else
+        OUTCOME_PROBLEM="the command recorded no new status"
+    fi
+    if [[ "$rc" != "0" ]]; then
+        return 1
+    fi
+    info "No usable status was recorded; asking the stream manager for the live state..."
+    if query_status_document; then
+        OUTCOME_SOURCE="status --json"
+        OUTCOME_PROBLEM=""
+        return 0
+    fi
+    return 1
+}
+
+# How one stream is doing, from path_ready and bytes_flowing (true, false or "" = not known)
+describe_stream_state() {
+    case "$1:$2" in
+        true:true) printf '%s' "publishing, bytes flowing" ;;
+        true:false) printf '%s' "path ready, but no bytes are flowing" ;;
+        true:*) printf '%s' "publishing (byte flow not measured)" ;;
+        false:*) printf '%s' "not publishing" ;;
+        *) printf '%s' "state unknown (the MediaMTX API did not answer)" ;;
+    esac
+}
+
+# One line per stream of the document that was read, with the reason the manager
+# gives for each stream that is not publishing. The values come from a file: they
+# are printed with %s, never interpreted.
+print_outcome_streams() {
+    local i marker state
+
+    for ((i = 0; i < ${#OUTCOME_S_PATH[@]}; i++)); do
+        state="$(describe_stream_state "${OUTCOME_S_READY[i]}" "${OUTCOME_S_FLOW[i]}")"
+        if [[ "${OUTCOME_S_READY[i]}" == "true" && "${OUTCOME_S_FLOW[i]}" != "false" ]]; then
+            marker="${GREEN}[OK]${NC}"
+        elif [[ "${OUTCOME_S_READY[i]}" == "false" ]]; then
+            marker="${RED}[FAIL]${NC}"
+        else
+            marker="${YELLOW}[!]${NC}"
+        fi
+        printf '  %b %s: %s%s\n' "$marker" "${OUTCOME_S_PATH[i]}" "$state" \
+            "${OUTCOME_S_ERROR[i]:+ - ${OUTCOME_S_ERROR[i]}}"
+    done
+    if ((OUTCOME_OMITTED > 0)); then
+        echo "  ... and ${OUTCOME_OMITTED} more"
+    fi
+}
+
+# Classify a start or restart that exited with status RC ("" = it was not run),
+# given the outcome read after it (reset_outcome and collect_lifecycle_outcome):
+#   ok              exit 0, every stream publishes
+#   degraded        exit 0, some streams publish
+#   waiting         exit 0, MediaMTX is up and no device is detected (empty start)
+#   inconsistent    exit 0, but the status says the node is failed, stopped or unknown
+#   unconfirmed     exit 0, and the status could not be read
+#   streams_failed  exit 9: the start policy was not met
+#   failed          any other exit status
+#   not_run         the script was not run
+classify_lifecycle() {
+    local rc="$1"
+
+    if [[ -z "$rc" ]]; then
+        LIFECYCLE_VERDICT="not_run"
+    elif [[ "$rc" == "9" ]]; then
+        LIFECYCLE_VERDICT="streams_failed"
+    elif [[ "$rc" != "0" ]]; then
+        LIFECYCLE_VERDICT="failed"
+    elif [[ -z "$OUTCOME_SOURCE" ]]; then
+        LIFECYCLE_VERDICT="unconfirmed"
+    else
+        case "$OUTCOME_OVERALL" in
+            ok) LIFECYCLE_VERDICT="ok" ;;
+            degraded) LIFECYCLE_VERDICT="degraded" ;;
+            waiting_for_devices) LIFECYCLE_VERDICT="waiting" ;;
+            *) LIFECYCLE_VERDICT="inconsistent" ;;
+        esac
+    fi
+}
+
+# What to do next, for the verdict of the last start or restart
+print_lifecycle_next_steps() {
+    case "$LIFECYCLE_VERDICT" in
+        ok | not_run) ;;
+        waiting)
+            echo
+            info "Next steps:"
+            info "  * Plug in a USB microphone."
+            if [[ -f "$MONITOR_CRON_FILE" ]]; then
+                info "  * The monitor (cron job ${MONITOR_CRON_FILE}, every 5 minutes as shipped) starts its stream on its next run."
+            else
+                info "  * No monitor cron job is installed (${MONITOR_CRON_FILE} not found), so nothing will start the stream by itself."
+            fi
+            info "  * To start it right away: Audio Streaming Control -> Start All Streams."
+            ;;
+        failed)
+            echo
+            info "Next steps:"
+            case "$LIFECYCLE_RC" in
+                3) info "  * Install what is missing (ffmpeg, jq, arecord, curl) or MediaMTX: Main Menu -> MediaMTX Installation & Updates." ;;
+                4) info "  * Check the configuration: USB Device Management -> Validate Device Configuration; the stream manager log has the details." ;;
+                5) info "  * Wait for the other start, stop or restart to finish, then try again." ;;
+                6) info "  * Plug in a USB microphone, then start again." ;;
+                8) info "  * Stop the other MediaMTX first (for example: sudo systemctl stop mediamtx.service), then start again." ;;
+                *) info "  * Read the stream manager log: Logs & Status -> View Stream Manager Log." ;;
+            esac
+            ;;
+        unconfirmed)
+            echo
+            info "Next steps:"
+            info "  * Check what is publishing: Audio Streaming Control -> View Stream Status."
+            ;;
+        *)
+            echo
+            info "Next steps:"
+            info "  * Check that each microphone is connected: USB Device Management -> Detect Device Capabilities."
+            info "  * Read the logs: Logs & Status -> View Stream Manager Log, View Stream Logs (FFmpeg)."
+            info "  * Start again: Audio Streaming Control -> Start All Streams (a repeated start only starts what is missing)."
+            if [[ -f "$MONITOR_CRON_FILE" ]]; then
+                info "  * The monitor (cron job ${MONITOR_CRON_FILE}) also retries streams that are not publishing on each run."
+            fi
+            ;;
+    esac
+}
+
+# Tell the user what the last start or restart (COMMAND) really did: the outcome
+# the stream manager recorded, stream by stream, with the reason for each stream
+# that is not publishing; and what to do about it.
+report_lifecycle() {
+    local command="$1"
+
+    echo
+    case "$LIFECYCLE_VERDICT" in
+        ok)
+            success "All ${OUTCOME_TOTAL} stream(s) are publishing"
+            ;;
+        degraded)
+            warning "Degraded: ${OUTCOME_READY} of ${OUTCOME_TOTAL} streams are publishing"
+            ;;
+        waiting)
+            info "MediaMTX is running and waiting for devices: no USB microphone is detected, so no stream is publishing yet"
+            ;;
+        streams_failed)
+            if [[ -z "$OUTCOME_SOURCE" ]]; then
+                error "The ${command} did not meet its start policy: no stream is publishing (exit code 9)"
+            elif [[ "$OUTCOME_POLICY" == "strict" ]]; then
+                error "Not every stream is publishing, and the start policy 'strict' requires every stream: what the ${command} started was stopped again"
+            elif [[ "$OUTCOME_MEDIAMTX" == "true" ]]; then
+                error "MediaMTX is up but no stream is publishing"
+            else
+                error "No stream is publishing, and MediaMTX was stopped again: a failed ${command} takes down what it started"
+            fi
+            ;;
+        inconsistent)
+            warning "The ${command} reported success, but the stream manager now reports the node as '${OUTCOME_OVERALL}'"
+            ;;
+        unconfirmed)
+            warning "The ${command} reported success (exit code 0), but the stream state could not be read (${OUTCOME_PROBLEM}); whether streams are publishing is not confirmed here"
+            ;;
+        *) ;;
+    esac
+    if [[ -n "$OUTCOME_SOURCE" ]] && ((OUTCOME_TOTAL > 0)); then
+        print_outcome_streams
+    fi
+    print_lifecycle_next_steps
+}
+
+# Run `stream_manager start` or `restart` and report what it really did. The
+# failure itself is already shown, with its meaning, by execute_script, so the
+# `|| true` here discards nothing the user has not been told; the exit status
+# (LIFECYCLE_RC) and the outcome are read right after the command, never from the
+# state captured before it.
+run_stream_lifecycle() {
+    local command="$1" before=""
+
+    before="$(status_file_content)"
+    execute_script "stream_manager" "$command" || true
+    LIFECYCLE_RC="$LAST_EXIT_CODE"
+    reset_outcome
+    if [[ -n "$LIFECYCLE_RC" ]]; then
+        collect_lifecycle_outcome "$before" "$LIFECYCLE_RC" || true
+    fi
+    classify_lifecycle "$LIFECYCLE_RC"
+    log "INFO" "stream manager ${command}: exit status ${LIFECYCLE_RC:-none}, verdict ${LIFECYCLE_VERDICT}, state ${OUTCOME_OVERALL:-not read} (${OUTCOME_SOURCE:-no source}${OUTCOME_PROBLEM:+: ${OUTCOME_PROBLEM}})"
+    report_lifecycle "$command"
+    return 0
+}
+
+# ============================================================================
 # Display Functions
 # ============================================================================
 
@@ -1602,7 +1970,7 @@ menu_streaming() {
             1)
                 echo
                 info "Starting audio streams..."
-                execute_script "stream_manager" start || true
+                run_stream_lifecycle start
                 echo
                 refresh_system_state
                 pause
@@ -1632,7 +2000,7 @@ menu_streaming() {
             3)
                 echo
                 info "Restarting audio streams..."
-                execute_script "stream_manager" restart || true
+                run_stream_lifecycle restart
                 echo
                 refresh_system_state
                 pause

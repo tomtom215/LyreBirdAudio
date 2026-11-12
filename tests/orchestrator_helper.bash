@@ -114,8 +114,9 @@ PGREP_EOF
 
 # orch_doc FILE OVERALL MTX_RUNNING [PATH|READY|FLOWING|ERROR]...
 # Write a status document in the manager's schema (version 1). READY and FLOWING
-# are true, false or null; ERROR empty means null. Every document is unique
-# (timestamp_epoch in nanoseconds), as no two real ones are.
+# are true, false or null; ERROR empty means null; the policy is $ORCH_DOC_POLICY
+# (default degraded). Every document is unique (timestamp_epoch in nanoseconds),
+# as no two real ones are.
 orch_doc() {
     local file="$1" overall="$2" running="$3" streams="[]" spec path ready flowing err
     shift 3
@@ -127,9 +128,9 @@ orch_doc() {
                    last_error: (if $e == "" then null else $e end)}]' <<<"$streams")"
     done
     jq -n --arg overall "$overall" --argjson running "$running" --argjson streams "$streams" \
-        --argjson epoch "$(date +%s%N)" \
+        --argjson epoch "$(date +%s%N)" --arg policy "${ORCH_DOC_POLICY:-degraded}" \
         '{schema_version: 1, timestamp: "2026-11-12T10:00:00Z", timestamp_epoch: $epoch,
-          command: "start", overall: $overall, policy: "degraded", stream_mode: "individual",
+          command: "start", overall: $overall, policy: $policy, stream_mode: "individual",
           mediamtx: {running: $running, pid: (if $running then 4242 else null end)},
           streams: $streams}' >"$file"
 }
