@@ -122,7 +122,10 @@ readonly MEDIAMTX_CONFIG_DIR="${MEDIAMTX_CONFIG_DIR:-/etc/mediamtx}"
 readonly MEDIAMTX_CONFIG_FILE="${MEDIAMTX_CONFIG_FILE:-${MEDIAMTX_CONFIG_DIR}/mediamtx.yml}"
 readonly MEDIAMTX_DEVICE_CONFIG="${MEDIAMTX_DEVICE_CONFIG:-${MEDIAMTX_CONFIG_DIR}/audio-devices.conf}"
 readonly MEDIAMTX_LOG_FILE="${MEDIAMTX_LOG_FILE:-/var/log/mediamtx.out}"
-readonly FFMPEG_LOG_DIR="${FFMPEG_LOG_DIR:-/var/log/lyrebird}"
+# The per-stream FFmpeg logs (<stream>.log) are written by the stream manager next to its
+# wrapper scripts and PID files: MEDIAMTX_FFMPEG_DIR, /var/lib/mediamtx-ffmpeg by default
+# (X-51). FFMPEG_LOG_DIR remains an explicit override of this script's view.
+readonly FFMPEG_LOG_DIR="${FFMPEG_LOG_DIR:-${MEDIAMTX_FFMPEG_DIR:-/var/lib/mediamtx-ffmpeg}}"
 readonly MEDIAMTX_BINARY="${MEDIAMTX_BINARY:-/usr/local/bin/mediamtx}"
 readonly MEDIAMTX_HOST="${MEDIAMTX_HOST:-localhost}"
 readonly MEDIAMTX_PORT="${MEDIAMTX_PORT:-8554}"
@@ -651,7 +654,9 @@ get_mediamtx_version() {
 
 # Get stream manager status (adapted for init system)
 get_stream_manager_status() {
-    local stream_manager_log="${FFMPEG_LOG_DIR}/stream-manager.log"
+    # the manager's own log (STREAM_MANAGER_LOG_FILE, the variable the manager reads); the
+    # FFmpeg log directory never held a stream-manager.log
+    local stream_manager_log="${STREAM_MANAGER_LOG_FILE:-/var/log/lyrebird-stream-manager.log}"
 
     # Check based on init system
     if [[ "${INIT_SYSTEM}" == "systemd" ]]; then

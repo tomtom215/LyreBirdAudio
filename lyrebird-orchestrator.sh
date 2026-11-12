@@ -215,6 +215,20 @@ validate_log_path() {
     return 0
 }
 
+# Validate a directory that is only listed (never written) to the same safety rules as a
+# log path, anywhere on the file system. Always succeeds: an unusable value is the default.
+validate_dir_path() {
+    local path="$1"
+    local default="$2"
+
+    if [[ -n "$path" && "$path" == /* && "$path" != *".."* && "$path" =~ ^/[a-zA-Z0-9_./-]+$ ]]; then
+        echo "$path"
+    else
+        echo "$default"
+    fi
+    return 0
+}
+
 # External script paths
 declare -A EXTERNAL_SCRIPTS=(
     ["installer"]="install_mediamtx.sh"
@@ -232,7 +246,10 @@ readonly UDEV_RULES="/etc/udev/rules.d/99-usb-soundcards.rules"
 MEDIAMTX_LOG_FILE=$(validate_log_path "${MEDIAMTX_LOG_FILE:-}" "/var/log/mediamtx.out")
 readonly MEDIAMTX_LOG_FILE
 
-FFMPEG_LOG_DIR=$(validate_log_path "${FFMPEG_LOG_DIR:-}" "/var/log/lyrebird")
+# The per-stream FFmpeg logs (<stream>.log) are written by the stream manager next to its
+# wrapper scripts and PID files: MEDIAMTX_FFMPEG_DIR, /var/lib/mediamtx-ffmpeg by default
+# (X-51). FFMPEG_LOG_DIR remains an explicit override.
+FFMPEG_LOG_DIR=$(validate_dir_path "${FFMPEG_LOG_DIR:-${MEDIAMTX_FFMPEG_DIR:-}}" "/var/lib/mediamtx-ffmpeg")
 readonly FFMPEG_LOG_DIR
 
 # Log file (initialized in initialize_logging() with fallback handling)
