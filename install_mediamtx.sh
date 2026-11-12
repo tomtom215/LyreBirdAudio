@@ -1332,7 +1332,8 @@ create_config() {
     rendered=$(mktemp) || fatal "Cannot create a temporary file for the configuration" 1
     CLEANUP_FILES+=("${rendered}")
     render_mediamtx_config "${rendered}" "${version}" || fatal "Not writing ${config_file}" 10
-    mediamtx_accepts_config "${INSTALL_DIR}/mediamtx" "${rendered}" || fatal "Not writing ${config_file}" 7
+    # (exit 9, not 7: the orchestrator's setup wizard reads 7 as "already installed" and carries on)
+    mediamtx_accepts_config "${INSTALL_DIR}/mediamtx" "${rendered}" || fatal "Not writing ${config_file}" 9
 
     [[ -d "${CONFIG_DIR}" ]] || mkdir -p "${CONFIG_DIR}"
 

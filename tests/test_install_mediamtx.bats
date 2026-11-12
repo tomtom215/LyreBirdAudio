@@ -1456,7 +1456,8 @@ render_expected() {
     cp "$CONFIG_DIR/mediamtx.yml" "$DECOY_DIR/before.yml"
     export MEDIAMTX_RTSP_PORT=31031 FAKE_REJECT='json: unknown field "moq"'
     run_strict create_config
-    [ "$status" -eq 7 ]
+    # (not 7: the orchestrator's setup wizard reads the installer's exit 7 as "already installed" and carries on)
+    [ "$status" -eq 9 ]
     [[ "$output" == *'MediaMTX rejects the generated configuration'* && "$output" == *'unknown field "moq"'* ]]
     cmp "$DECOY_DIR/before.yml" "$CONFIG_DIR/mediamtx.yml"
     [ "$(ls -A "$CONFIG_DIR")" = "mediamtx.yml" ]
@@ -1962,4 +1963,32 @@ OLD
     PREAMBLE="$(update_preamble 'sleep() { :; }')" run_strict update_mediamtx
     [ "$status" -eq 0 ]
     [[ "$output" == *"Updated to version: v1.21.3"* && "$output" != *"$moq_warning"* ]]
+}
+
+@test "the stream manager takes the installer's file as its own: for the same settings the two generators agree, so a manager start leaves it untouched [LB-22 installer, D10]" {
+    installer_env
+    fake_mediamtx "$INSTALL_DIR/mediamtx" v1.21.3
+    export MEDIAMTX_RTSP_PORT=31021 MEDIAMTX_API_PORT=31022 MEDIAMTX_METRICS_PORT=31023
+    run_strict create_config
+    [ "$status" -eq 0 ]
+    touch -d '2020-01-01 00:00:00' "$CONFIG_DIR/mediamtx.yml"
+    local inode mtime
+    inode="$(stat -c %i "$CONFIG_DIR/mediamtx.yml")"
+    mtime="$(stat -c %Y "$CONFIG_DIR/mediamtx.yml")"
+    # the stream manager's own generator, on the same directory and ports, in a process of its own
+    mkdir -p "$DECOY_DIR/ff"
+    run env MEDIAMTX_CONFIG_DIR="$CONFIG_DIR" MEDIAMTX_BINARY="$INSTALL_DIR/mediamtx" MEDIAMTX_HOST=localhost \
+        MEDIAMTX_FFMPEG_DIR="$DECOY_DIR/ff" MEDIAMTX_LOG_FILE="$DECOY_DIR/sm.log" STREAM_MANAGER_LOG_FILE="$DECOY_DIR/sm.log" \
+        MEDIAMTX_LOCK_FILE="$DECOY_DIR/run.lock" MEDIAMTX_RESTART_MARKER="$DECOY_DIR/restart.marker" \
+        MEDIAMTX_CLEANUP_MARKER="$DECOY_DIR/cleanup.marker" LYREBIRD_STATE_DIR="$DECOY_DIR/state" \
+        bash -c 'source "$1" >/dev/null 2>&1; generate_mediamtx_config' _ "$PROJECT_ROOT/lyrebird-stream-manager.sh"
+    [ "$status" -eq 0 ] || {
+        echo "$output"
+        cat "$DECOY_DIR/sm.log"
+        false
+    }
+    grep -q "left untouched" "$DECOY_DIR/sm.log"
+    [ "$(stat -c %i "$CONFIG_DIR/mediamtx.yml")" = "$inode" ]
+    [ "$(stat -c %Y "$CONFIG_DIR/mediamtx.yml")" = "$mtime" ]
+    [ -z "$(compgen -G "$CONFIG_DIR/mediamtx.yml.*" || true)" ]
 }
