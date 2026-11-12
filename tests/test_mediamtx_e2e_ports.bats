@@ -59,6 +59,14 @@ manager_env() {
     export DEEP_HEALTH_STATE_DIR="$D/strikes" CRON_RESTART_STATE_DIR="$D/cron"
     export STREAM_STARTUP_DELAY=0 STREAM_VALIDATION_DELAY=1 STREAM_VALIDATION_ATTEMPTS=8 MEDIAMTX_API_TIMEOUT=20
     export LOCK_ACQUISITION_TIMEOUT=2 STOP_LOCK_TIMEOUT=2
+    # A capture PCM for the stand-in card: the manager reads a card's capture
+    # PCMs from ASOUND_PROC_ROOT and checks the nodes under DEV_SND_ROOT, and the
+    # wrapper carries both roots (a card without one is skipped as playback-only)
+    export ASOUND_PROC_ROOT="$D/asound" DEV_SND_ROOT="$D/dev-snd"
+    mkdir -p "$ASOUND_PROC_ROOT/card1/pcm0c" "$DEV_SND_ROOT"
+    echo "0d8c:0014" >"$ASOUND_PROC_ROOT/card1/usbid"
+    : >"$DEV_SND_ROOT/controlC1"
+    : >"$DEV_SND_ROOT/pcmC1D0c"
 }
 
 # `bash` and `ffmpeg` shims (see the header of this file)
@@ -68,11 +76,13 @@ install_hardware_stand_ins() {
 if [[ "${1:-}" == "$MEDIAMTX_FFMPEG_DIR/"*.sh ]]; then
     script="$1"
     shift
-    sed -e 's#/dev/snd/pcmC${card_num}D0c#/dev/null#' \
-        -e 's#/dev/snd/pcmC${CARD_NUM}D0c#/dev/null#' \
-        -e 's#export PATH="/usr/local/sbin#export PATH="'"$STAND_IN_BIN"':/usr/local/sbin#' \
-        "$script" >"${script%.sh}.standin"
-    exec /bin/bash "${script%.sh}.standin" "$@"
+    # Rewritten in place, so the process still runs `bash <wrapper dir>/<stream>.sh`:
+    # the manager only stops a process that is exactly the wrapper it started
+    sed -e 's#export PATH="/usr/local/sbin#export PATH="'"$STAND_IN_BIN"':/usr/local/sbin#' \
+        "$script" >"$script.rewritten"
+    cat "$script.rewritten" >"$script"
+    rm -f "$script.rewritten"
+    exec /bin/bash "$script" "$@"
 fi
 exec /bin/bash "$@"
 SHIM
@@ -190,5 +200,13 @@ start_manager() {
     run bash -c 'source "$1" >/dev/null 2>&1; set +e; stop_mediamtx' _ "$SM"
     [ "$status" -eq 0 ]
     [ ! -e "$D/mtx.pid" ]
-    ! kill -0 "$mtx_pid" 2>/dev/null
+    # gone: not running (a process that has exited but is not yet reaped is a
+    # zombie, which kill -0 would still report as there)
+    local i state
+    for ((i = 0; i < 50; i++)); do
+        state="$(awk '{print $3}' "/proc/$mtx_pid/stat" 2>/dev/null || true)"
+        [[ "$state" == [RSDT] ]] || break
+        sleep 0.1
+    done
+    [[ "$state" != [RSDT] ]]
 }
