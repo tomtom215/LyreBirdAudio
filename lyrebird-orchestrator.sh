@@ -2113,10 +2113,11 @@ menu_streaming() {
                 echo
                 echo "Stream URLs:"
                 echo "================================================================"
-                local primary_ip
+                local primary_ip rtsp_port="${MEDIAMTX_RTSP_PORT:-8554}"
                 primary_ip="$(get_primary_ip)"
+                [[ "$rtsp_port" =~ ^[0-9]{1,5}$ ]] || rtsp_port=8554
                 echo
-                info "Base URL: rtsp://${primary_ip}:8554/"
+                info "Base URL: rtsp://${primary_ip}:${rtsp_port}/"
                 echo
                 info "Your streams are available at:"
                 echo

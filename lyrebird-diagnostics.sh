@@ -128,7 +128,9 @@ readonly MEDIAMTX_LOG_FILE="${MEDIAMTX_LOG_FILE:-/var/log/mediamtx.out}"
 readonly FFMPEG_LOG_DIR="${FFMPEG_LOG_DIR:-${MEDIAMTX_FFMPEG_DIR:-/var/lib/mediamtx-ffmpeg}}"
 readonly MEDIAMTX_BINARY="${MEDIAMTX_BINARY:-/usr/local/bin/mediamtx}"
 readonly MEDIAMTX_HOST="${MEDIAMTX_HOST:-localhost}"
-readonly MEDIAMTX_PORT="${MEDIAMTX_PORT:-8554}"
+# The RTSP port is MEDIAMTX_RTSP_PORT, the variable the stream manager, the installer and the
+# orchestrator read (D15, X-55); MEDIAMTX_PORT, which only this script read, stays as the fallback
+readonly MEDIAMTX_PORT="${MEDIAMTX_RTSP_PORT:-${MEDIAMTX_PORT:-8554}}"
 
 # Diagnostic configuration with validation
 readonly DIAGNOSTIC_LOG_FILE="${DIAGNOSTIC_LOG_FILE:-/var/log/lyrebird-diagnostics.log}"
