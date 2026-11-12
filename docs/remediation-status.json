@@ -31,21 +31,31 @@
       "status": "open",
       "tests": [
         "help documents exit code 8 and the idempotent start [LB-02, LB-01]",
+        "restart is refused with exit 8 before anything is stopped or marked while mediamtx.service owns MediaMTX [LB-02]",
+        "start is idempotent against a real MediaMTX and real FFmpeg, a dead wrapper is reconciled, stop leaves nothing and another owner is refused [LB-01, LB-02, LB-10]",
         "start is refused with exit 8 while mediamtx.service is active, touching nothing [LB-02]",
         "start is refused with exit 8, and signals nothing, when a MediaMTX this manager did not start runs on its configuration [LB-02]",
-        "the refusal names the unit that runs the other MediaMTX when systemd says it is active [LB-02]",
-        "restart is refused with exit 8 before anything is stopped or marked while mediamtx.service owns MediaMTX [LB-02]",
-        "start is idempotent against a real MediaMTX and real FFmpeg, a dead wrapper is reconciled, stop leaves nothing and another owner is refused [LB-01, LB-02, LB-10]"
+        "the refusal names the unit that runs the other MediaMTX when systemd says it is active [LB-02]"
       ],
-      "note": "manager side fixed and verified (E_OWNERSHIP=8, never signals a process it did not start); config/mediamtx-audio.service still declares Wants/PartOf=mediamtx.service until the unit template phase"
+      "note": "manager and unit template fixed (E_OWNERSHIP, Conflicts=mediamtx.service, no Wants/PartOf); the unit text written by install_mediamtx.sh is installer pass 2"
     },
     {
       "id": "LB-03",
       "title": "start reports success when streams fail",
       "severity": "P1",
       "phase": 3,
-      "status": "open",
-      "tests": []
+      "status": "fixed",
+      "tests": [
+        "a failed command leaves no cleanup marker and the wrappers of the running stack keep running [new defect, LB-03]",
+        "a failed start leaves a healthy stack that was already running untouched: same PIDs, still publishing, no marker [LB-03, LB-01, D4]",
+        "an FFmpeg that runs but never reaches MediaMTX no longer counts as 'started': exit 9, not 'Successfully started all 1/1' [LB-03]",
+        "multiplex mode follows the policy too: a stream that never publishes exits 9 and stops MediaMTX; a good one exits 0 [LB-03]",
+        "policy matrix, every stream publishes: degraded and strict both exit 0, state ok [LB-03, D4]",
+        "policy matrix, no device: degraded and strict both exit 0, state waiting_for_devices [LB-03, D5]",
+        "policy matrix, no stream publishes: degraded and strict both exit 9, everything this run started is stopped [LB-03, D4]",
+        "policy matrix, one stream publishes and one does not: degraded exits 0 with state degraded and names the failure; strict exits 9 and stops everything [LB-03, D4]",
+        "start reports what publishes: policy exit codes and status.json, hot-plug through the monitor, a MediaMTX that is gone, and the inbound byte counter, against each real MediaMTX [LB-03, LB-07, D4, D5]"
+      ]
     },
     {
       "id": "LB-04",
@@ -75,26 +85,32 @@
       "title": "flock lock is unlinked/judged stale while live",
       "severity": "P1",
       "phase": 2,
-      "status": "open",
+      "status": "fixed",
       "tests": [
+        "a MediaMTX that is gone is not started again by the monitor while a start holds the lock [LB-05, D5]",
+        "a force-stop started while another command holds the lock waits for it, then goes ahead [LB-05]",
         "a held lock is not granted to a second process [LB-05, bash invocation]",
         "a held lock is not granted to a second process [LB-05, direct execution]",
         "a live owner is never judged stale because the lock file is old [LB-05, bash invocation]",
         "a live owner is never judged stale because the lock file is old [LB-05, direct execution]",
+        "a monitor cycle in progress holds the lock: a stop that arrives meanwhile is refused (exit 5) instead of overlapping, and goes through afterwards [LB-05]",
         "a process waiting for the lock never truncates the owner record [LB-05, bash invocation]",
         "a process waiting for the lock never truncates the owner record [LB-05, direct execution]",
+        "a start that cannot get the lock leaves no cleanup marker behind [LB-05]",
+        "cleanup_stale_processes removes neither lock file [LB-05]",
+        "force_stop_mediamtx takes the lock when it is free, cleans up and leaves the lock file in place [LB-05]",
+        "force_stop_mediamtx waits for the lock and refuses, touching nothing, while another process holds it [LB-05]",
+        "monitor_streams keeps errexit on when the monitor runs it under the lock, as it had before: a failing command still ends it [LB-05]",
         "owner plus two openers: exactly one holder at a time [LB-05, bash invocation]",
         "owner plus two openers: exactly one holder at a time [LB-05, direct execution]",
+        "stop_mediamtx refuses, touching nothing, while another process holds the lock [LB-05]",
+        "stress: 6 processes x 20 locked increments lose no update [LB-05, bash invocation]",
+        "stress: 8 processes x 25 locked increments lose no update [LB-05, direct execution]",
+        "the lock is released before the status refresh, which samples the streams for seconds, so a stop never waits for it [LB-05]",
         "the lock is released when its holder is SIGKILLed; the next acquire reuses the same file [LB-05, bash invocation]",
         "the lock is released when its holder is SIGKILLed; the next acquire reuses the same file [LB-05, direct execution]",
-        "stress: 8 processes x 25 locked increments lose no update [LB-05, direct execution]",
-        "stress: 6 processes x 20 locked increments lose no update [LB-05, bash invocation]",
-        "cleanup_stale_processes removes neither lock file [LB-05]",
-        "force_stop_mediamtx waits for the lock and refuses, touching nothing, while another process holds it [LB-05]",
-        "force_stop_mediamtx takes the lock when it is free, cleans up and leaves the lock file in place [LB-05]",
-        "a force-stop started while another command holds the lock waits for it, then goes ahead [LB-05]",
-        "stop_mediamtx refuses, touching nothing, while another process holds the lock [LB-05]",
-        "a start that cannot get the lock leaves no cleanup marker behind [LB-05]"
+        "the monitor never removes or replaces the lock file, and a monitor run by the cron line's own lock still takes the lifecycle lock [LB-05, D2]",
+        "while a lifecycle command holds the lock the monitor logs that it is busy and skips its cycle with exit 0, touching nothing [LB-05]"
       ],
       "note": "lifecycle commands (start/stop/restart/force-stop/config lock) covered and verified; monitor does not yet take the lifecycle lock (owned by the lifecycle phase); mark fixed once it does"
     },
@@ -133,8 +149,16 @@
       "title": "late/zero USB devices at boot exhaust retries and never recover",
       "severity": "P1",
       "phase": 3,
-      "status": "open",
-      "tests": []
+      "status": "documented-hw",
+      "tests": [
+        "MediaMTX killed while the node is meant to run: the monitor starts it again, its stream publishes again [LB-07, D5]",
+        "a repeated start on a running MediaMTX with no device exits 0, or 6 when empty start is disabled [LB-07, D5]",
+        "start reports what publishes: policy exit codes and status.json, hot-plug through the monitor, a MediaMTX that is gone, and the inbound byte counter, against each real MediaMTX [LB-03, LB-07, D4, D5]",
+        "start with no USB audio device starts MediaMTX, reports that it is waiting for devices and exits 0 [LB-07, D5]",
+        "start with no device and LYREBIRD_ALLOW_EMPTY_START=false keeps the old refusal: exit 6, MediaMTX not started [LB-07, D5]",
+        "the monitor reconciles 0 -> 1 -> N: a node that started empty gets a stream for each device that appears, nothing running is restarted [LB-07, D5]"
+      ],
+      "note": "empty start and monitor reconcile (0->1->N, killed MediaMTX within a budget) verified with real MediaMTX and RTSP readers; real USB hot-plug, a busy card and systemd start-limit timing with a late hub need hardware or a real systemd manager"
     },
     {
       "id": "LB-08",
@@ -239,16 +263,61 @@
       "title": "sample unit: invalid reload, incomplete writable paths, missing workdir",
       "severity": "P1",
       "phase": 5,
-      "status": "open",
-      "tests": []
+      "status": "documented-hw",
+      "tests": [
+        "ReadWritePaths: the defaults, the directories of configured paths, and a recording path off tmpfs that may be absent [LB-11]",
+        "TimeoutStartSec and TimeoutStopSec: the template's numbers are the manager's worst case for 8 streams, and follow the configured timeouts [LB-11]",
+        "a cron monitor on a multiplex node restarts the multiplex stream and never starts per-device streams; on an individual node the reverse [LB-11, X-11]",
+        "a reload with an invalid device configuration is refused before anything is generated [LB-11]",
+        "every command the units run is one main implements, and no unit reloads by sending a signal MediaMTX does not handle [LB-11, X-12]",
+        "every path the manager writes by default is writable under the unit: audited on a real run, then run under an emulation of ProtectSystem=strict that opens only the unit's paths; the sample unit this replaces fails the same run [LB-11, D12]",
+        "help lists the reload command and what it does and does not do [LB-11]",
+        "install is repeatable and replaces the unit atomically; a value it cannot carry stops it with exit 4 and changes nothing [LB-11, X-11]",
+        "install writes the unit, the monitor cron file and the logrotate file under LYREBIRD_SYSROOT, exactly what the renderers print, without asking systemd to reload [LB-11, D12]",
+        "lyrebird_under_systemd: the unit's LYREBIRD_UNDER_SYSTEMD, or systemd's own INVOCATION_ID, and nothing else [LB-11]",
+        "mediamtx_changed_keys: identical texts, comments and blank lines change nothing [LB-11]",
+        "mediamtx_changed_keys: names changed, added and removed keys, and a changed block under paths [LB-11]",
+        "mediamtx_reload_effect: says per key whether publishers stay, which of them are disconnected, and when it is not known [LB-11, X-12]",
+        "no code and no shipped unit sets INVOCATION_ID by hand; the logrotate guard asks lyrebird_under_systemd [LB-11]",
+        "reload against a real MediaMTX and real FFmpeg: nothing is restarted, a changed key is reported with its measured effect, a dead wrapper is started, a stopped or foreign MediaMTX is refused [LB-11, X-12]",
+        "reload never calls stop, restart or a process signal, on any path [LB-11, D1]",
+        "reload: a MediaMTX that does not answer after the change is an error and the start path is not run [LB-11]",
+        "reload: a changed configuration is reported key by key with its effect, MediaMTX is waited for and never stopped or restarted [LB-11, X-12]",
+        "reload: a configuration that cannot be generated is E_CONFIG_ERROR (4) with MediaMTX and the streams left alone [LB-11]",
+        "reload: an unchanged configuration leaves MediaMTX alone, says so, and only reconciles the streams through the start path [LB-11]",
+        "reload: not running is E_MEDIAMTX_DOWN (7) and starts nothing, another owner is E_OWNERSHIP (8) and touches nothing, the lock is E_LOCK_FAILED (5) [LB-11]",
+        "reload: the exit status of the start path is the status of reload [LB-11]",
+        "render_systemd_unit refuses what the unit file cannot carry and prints no unit: a newline in the name, a bad mode or filter, a path with a space [LB-11, X-11]",
+        "render_systemd_unit with the default settings is the template, with only the script path replaced [LB-11, D12: no drift]",
+        "render_systemd_unit: stream mode, filter and name reach the unit, the name escaped for systemd (round trip) [LB-11, X-11]",
+        "the constants of the timeout derivation are the ones the code uses: 5 s per cleaned process, 10 s per wrapper stop, 30 s for MediaMTX, the settle sleep and the validation attempts [LB-11]",
+        "the cron file carries only values that need no quoting: the name is limited to letters, digits, _ and - [LB-11, X-11]",
+        "the cron file sets the stream mode, the filter and the multiplex name, and keeps its restart policy: only exit status 2 restarts the service [LB-11, X-11]",
+        "the install command is wired: main runs check_root then create_systemd_service and passes its status on [LB-11]",
+        "the manager installs its HUP/USR1 handlers only when it is not run by systemd, and sets no USR2 handler [LB-11, LB-15]",
+        "the manager unit conflicts with mediamtx.service and has no Wants=, Requires=, BindsTo= or PartOf= on it; After= is ordering only [LB-11, D1]",
+        "the reload command exists: main runs check_root, check_dependencies, setup_directories, validate_config and reload_mediamtx, and passes its status on [LB-11, X-12]",
+        "the rendered unit is accepted by systemd with zero findings when ExecStart names an existing executable script [LB-11, LB-12]",
+        "the sandbox is as strict as the manager allows and sets nothing that would block USB audio or hotplug [LB-11]",
+        "the template and the standalone unit load without a finding, together without an ordering cycle [LB-11, LB-12, D12]",
+        "the template has Type=forking with a PIDFile, no WatchdogSec, User=root and no User=mediamtx hint [LB-11]",
+        "the template is found next to the script, LYREBIRD_UNIT_TEMPLATE overrides it, and a missing one is an error that says what to do [LB-11, D12]",
+        "the unit install writes is one the updater sees as unmodified: no customizations are detected, and a real one still is [LB-11]"
+      ],
+      "note": "one unit template, real reload, sandbox audited under a ProtectSystem=strict mount-namespace emulation and systemd-analyze verify clean; StateDirectory/ConfigurationDirectory creation order and boot-time Conflicts=/After= need a real systemd manager; the installer-generated unit is installer pass 2"
     },
     {
       "id": "LB-12",
       "title": "start-limit keys under [Service] (non-canonical placement)",
       "severity": "P3",
       "phase": 5,
-      "status": "open",
-      "tests": []
+      "status": "documented-hw",
+      "tests": [
+        "StartLimitIntervalSec and StartLimitBurst are in [Unit] and nowhere else, in both units [LB-12]",
+        "the rendered unit is accepted by systemd with zero findings when ExecStart names an existing executable script [LB-11, LB-12]",
+        "the template and the standalone unit load without a finding, together without an ordering cycle [LB-11, LB-12, D12]"
+      ],
+      "note": "StartLimit keys are in [Unit] (canonical); start-limit timing with a late hub needs a real systemd manager"
     },
     {
       "id": "LB-13",
@@ -294,24 +363,69 @@
       "title": "silence detection configured but never run",
       "severity": "P2",
       "phase": 5,
-      "status": "open",
-      "tests": []
+      "status": "fixed",
+      "tests": [
+        "audio level signals against a real MediaMTX and real publishers: a tone is ok, silence is silent, one DEAD MIC per episode that ends with the tone, an unpublished stream is unreachable and a failing probe tool is never silence [LB-14, X-05, D6]",
+        "monitor_signals survives a failing tool and an unwritable state directory under set -euo pipefail and returns 0 [LB-14]",
+        "monitor_signals: AUDIO_LEVEL_CHECK_ENABLED=false runs no probe [LB-14]",
+        "monitor_signals: at most one probe per stream and run, skipped inside AUDIO_LEVEL_CHECK_INTERVAL [LB-14]",
+        "monitor_signals: one DEAD MIC per silence episode, raised after AUDIO_SILENCE_WARN_DURATION, cleared by recovery [LB-14, X-05]",
+        "monitor_signals: only streams MediaMTX reports ready and whose wrapper is alive are probed [LB-14]",
+        "monitor_signals: unreachable, no_audio_data and probe_error neither start, extend, end nor alert an episode [LB-14, X-05]",
+        "monitor_signals: with the default settings a ready stream is probed (the setting is no longer a no-op) [LB-14, X-05]",
+        "probe_stream_level reads the published stream over RTSP at 127.0.0.1 on MEDIAMTX_RTSP_PORT and opens no ALSA device [LB-14, D6]",
+        "probe_stream_level: -inf is silent and a decimal comma is read [LB-14]",
+        "probe_stream_level: a hanging ffmpeg is killed after the sample plus the grace period, never waited for [LB-14]",
+        "probe_stream_level: a stream that opened but delivered no samples is no_audio_data [LB-14]",
+        "probe_stream_level: a tone read from the stream is ok and carries max and mean [LB-14]",
+        "probe_stream_level: an unusable path is probe_error and nothing is run [LB-14]",
+        "probe_stream_level: digital silence (-91.0 dB) is silent [LB-14]",
+        "probe_stream_level: ffmpeg exiting 0 with no report at all is probe_error, not silence and not an abort [LB-14, ported from check_audio_level]",
+        "probe_stream_level: garbage from a failing ffmpeg is probe_error, and a failing ffmpeg's numbers are never believed as silence [LB-14]",
+        "probe_stream_level: max_volume at the threshold is silent, one tenth above it is ok [LB-14]",
+        "probe_stream_level: not published, nothing listening and a stuck connect are unreachable; credentials wanted is probe_error [LB-14]",
+        "probe_stream_level: the last volumedetect block counts, an earlier n_samples: 0 block carries nothing [LB-14]",
+        "probe_stream_level: without ffmpeg or without timeout it is probe_error and nothing is run [LB-14]",
+        "silence state from another clock scale (a start in the future) begins a new episode instead of never alerting [LB-14]",
+        "silence tracking does not fire a false DEAD MIC after a forward wall-clock jump [LB-14, ported from check_audio_level; D3 of the July review]",
+        "the level-signal functions never refer to an ALSA device, and the old ALSA-opening probe is gone [LB-14, D6]",
+        "the monitor command calls monitor_signals once, after the resource check and before the stream check [LB-14, X-05]",
+        "the monitor command still ends with monitor_streams' status, whatever monitor_signals returns, and skips the signals on a critical resource state [LB-14]"
+      ]
     },
     {
       "id": "LB-15",
       "title": "heartbeat/hardware watchdog have no owner and are advertised",
       "severity": "P2",
       "phase": 5,
-      "status": "open",
-      "tests": []
+      "status": "fixed",
+      "tests": [
+        "SIGUSR2 no longer writes the heartbeat: only a monitor run does [LB-15, X-13, D7]",
+        "no executable line of the manager opens a watchdog device or talks to systemd's notify socket [LB-15, D7]",
+        "no shipped unit sets or mentions the LYREBIRD_WATCHDOG_* variables no code reads [LB-15]",
+        "the heartbeat the monitor writes is healthy for lyrebird-metrics, and one older than LYREBIRD_HEARTBEAT_MAX_AGE is not [LB-15, X-13]",
+        "the manager installs its HUP/USR1 handlers only when it is not run by systemd, and sets no USR2 handler [LB-11, LB-15]",
+        "the monitor command writes the heartbeat exactly once per run, also while MediaMTX is down [LB-15, X-13]",
+        "the removed settings in the environment are named once per run, with their replacement; unset, nothing is said [LB-15, D7]",
+        "the removed-settings warning is logged once even when the function runs twice in a process [LB-15, D7]",
+        "the watchdog and heartbeat-interval settings and functions no longer exist [LB-15, D7]",
+        "update_heartbeat creates the directory, rewrites an older heartbeat and reports an unwritable one without failing [LB-15, X-13]",
+        "update_heartbeat writes one line, the Unix time of the call, atomically [LB-15, X-13]",
+        "with the old watchdog settings in the environment the monitor path never opens the configured device [LB-15, D7]"
+      ]
     },
     {
       "id": "LB-16",
       "title": "AUDIO_DISK_PERSIST does not persist",
       "severity": "P2",
       "phase": 5,
-      "status": "open",
-      "tests": []
+      "status": "fixed",
+      "tests": [
+        "AUDIO_DISK_PERSIST and AUDIO_DISK_PATH are no longer read or handled by any executable line [LB-16, D8]",
+        "recording stays RAM-only by default: the default path is tmpfs and no wrapper code names a disk path [LB-16, D8]",
+        "setup_directories creates the recording directory and never AUDIO_DISK_PATH, with AUDIO_DISK_PERSIST=true [LB-16, D8]",
+        "the removed disk-persistence settings are named once per run, with where durable recording goes [LB-16, D8]"
+      ]
     },
     {
       "id": "LB-17",
@@ -571,24 +685,36 @@
       "title": "empty device list counted as stable",
       "severity": "P1",
       "phase": 3,
-      "status": "open",
-      "tests": []
+      "status": "fixed",
+      "tests": [
+        "a device that appears during the USB wait is waited for and counted [X-03]",
+        "an empty device list is not stable: the USB wait lasts until its deadline and fails when empty start is disabled [X-03]",
+        "with empty start allowed the USB wait still waits for the first device up to its deadline, then proceeds with none [X-03, D5]"
+      ]
     },
     {
       "id": "X-04",
       "title": "cron restart budget charged before ALSA availability check",
       "severity": "P1",
       "phase": 3,
-      "status": "open",
-      "tests": []
+      "status": "fixed",
+      "tests": [
+        "a detected card that ALSA cannot open does not use up the cron restart budget; the restart goes ahead once it can [X-04]"
+      ]
     },
     {
       "id": "X-05",
       "title": "check_all_audio_levels counts probe failure as silence",
       "severity": "P2",
       "phase": 5,
-      "status": "open",
-      "tests": []
+      "status": "fixed",
+      "tests": [
+        "audio level signals against a real MediaMTX and real publishers: a tone is ok, silence is silent, one DEAD MIC per episode that ends with the tone, an unpublished stream is unreachable and a failing probe tool is never silence [LB-14, X-05, D6]",
+        "monitor_signals: one DEAD MIC per silence episode, raised after AUDIO_SILENCE_WARN_DURATION, cleared by recovery [LB-14, X-05]",
+        "monitor_signals: unreachable, no_audio_data and probe_error neither start, extend, end nor alert an episode [LB-14, X-05]",
+        "monitor_signals: with the default settings a ready stream is probed (the setting is no longer a no-op) [LB-14, X-05]",
+        "the monitor command calls monitor_signals once, after the resource check and before the stream check [LB-14, X-05]"
+      ]
     },
     {
       "id": "X-06",
@@ -646,22 +772,34 @@
       "title": "unit reload signals not handled by MediaMTX",
       "severity": "P2",
       "phase": 5,
-      "status": "open",
-      "tests": []
+      "status": "documented-hw",
+      "tests": [
+        "every command the units run is one main implements, and no unit reloads by sending a signal MediaMTX does not handle [LB-11, X-12]",
+        "mediamtx_reload_effect: says per key whether publishers stay, which of them are disconnected, and when it is not known [LB-11, X-12]",
+        "reload against a real MediaMTX and real FFmpeg: nothing is restarted, a changed key is reported with its measured effect, a dead wrapper is started, a stopped or foreign MediaMTX is refused [LB-11, X-12]",
+        "reload: a changed configuration is reported key by key with its effect, MediaMTX is waited for and never stopped or restarted [LB-11, X-12]",
+        "the reload command exists: main runs check_root, check_dependencies, setup_directories, validate_config and reload_mediamtx, and passes its status on [LB-11, X-12]"
+      ],
+      "note": "no unit sends a signal MediaMTX does not handle (verified on real binaries: HUP kills, USR1/USR2 ignored); real systemctl reload of a Type=forking unit needs a real systemd manager"
     },
     {
       "id": "X-13",
       "title": "heartbeat_healthy threshold vs 5-minute writer",
       "severity": "P2",
       "phase": 6,
-      "status": "open",
+      "status": "fixed",
       "tests": [
-        "heartbeat_healthy is 1 at 59, 299 and 899 s and 0 at 901 s with the default 900 s maximum [X-13]",
         "LYREBIRD_HEARTBEAT_MAX_AGE sets the heartbeat threshold [X-13]",
-        "the heartbeat HELP text says what it proves and names the threshold in force [X-13]",
+        "SIGUSR2 no longer writes the heartbeat: only a monitor run does [LB-15, X-13, D7]",
         "an invalid LYREBIRD_HEARTBEAT_MAX_AGE is ignored with a warning and 900 s is used [X-13]",
+        "an unreadable heartbeat file is left out and fails the collector instead of reading as stale [X-13]",
         "heartbeat edge cases: no file, a timestamp from the future, a corrupt file, leading zeros [X-13]",
-        "an unreadable heartbeat file is left out and fails the collector instead of reading as stale [X-13]"
+        "heartbeat_healthy is 1 at 59, 299 and 899 s and 0 at 901 s with the default 900 s maximum [X-13]",
+        "the heartbeat HELP text says what it proves and names the threshold in force [X-13]",
+        "the heartbeat the monitor writes is healthy for lyrebird-metrics, and one older than LYREBIRD_HEARTBEAT_MAX_AGE is not [LB-15, X-13]",
+        "the monitor command writes the heartbeat exactly once per run, also while MediaMTX is down [LB-15, X-13]",
+        "update_heartbeat creates the directory, rewrites an older heartbeat and reports an unwritable one without failing [LB-15, X-13]",
+        "update_heartbeat writes one line, the Unix time of the call, atomically [LB-15, X-13]"
       ],
       "note": "metrics side fixed and verified (threshold, HELP text); the manager side (heartbeat written while MediaMTX is down; semantics per D7) belongs to the monitoring phase"
     },
@@ -985,8 +1123,10 @@
       "title": "devices without controlC silently skipped",
       "severity": "P3",
       "phase": 3,
-      "status": "open",
-      "tests": []
+      "status": "fixed",
+      "tests": [
+        "a device whose /dev/snd control node is missing is reported, not silently skipped: warning, failed stream, last_error [X-27]"
+      ]
     },
     {
       "id": "DOC-01",
@@ -1077,8 +1217,10 @@
       "title": "generated cron line runs monitor without STREAM_MODE/MULTIPLEX_* (and non-default port) environment: a multiplex node's cron monitor starts per-device streams",
       "severity": "P1",
       "phase": 5,
-      "status": "open",
-      "tests": []
+      "status": "fixed",
+      "tests": [
+        "a cron monitor on a multiplex node restarts the multiplex stream and never starts per-device streams; on an individual node the reverse [LB-11, X-11]"
+      ]
     },
     {
       "id": "X-33",
