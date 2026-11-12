@@ -181,15 +181,32 @@ binary, exits 0 and prints the command; started again with it, the new binary lo
 configuration (checked on 1.15.0 ... 1.21.3). With a new binary that does not run, exit 7 and the real
 old binary is back byte for byte and starts.
 
-**New (found by this pass, R): an update across 1.19 re-opens MoQ.** `install` of 1.18.0 then `update`
-to 1.21.3 leaves a configuration without `moq: no` (1.18 rejects the key) and MediaMTX 1.21.3 on it
-listens on MoQ (8892 tcp and udp, 8893 udp, every interface;
-`scratchpad/inst2/repro/update_across_moq.sh`). `update` does not rewrite configuration files (it
-never did); it now **warns** (for a generated file without the key, versions 1.19 and later, modes
-other than the stream manager's, which renders its file at every start): `MediaMTX vX starts a MoQ
-server ... unless its configuration says 'moq: no', and <file> ... does not. Add the line 'moq: no'
-(after 'srt: no'); the file stays a generated one.` Whether `update` should insert the line itself (the
-renderer would then produce the same file) is a decision for the lead; it is not done.
+**New (found by this pass, R): an update across 1.19 re-opened MoQ; fixed by the lead after the merge.**
+`install` of 1.18.0 then `update` to 1.21.3 left a configuration without `moq: no` (1.18 rejects the
+key) and MediaMTX 1.21.3 on it listens on MoQ (8892 tcp and udp, 8893 udp, every interface;
+`scratchpad/inst2/repro/update_across_moq.sh`). The worker only warned. Now `ensure_moq_off` (modes
+other than the stream manager's, which renders its file at every start) adds the one line `moq: no`
+after `srt: no` to a file whose first line is the managed marker, when the new binary is 1.19 or
+later and the file has no `moq:` key. It does not render the file again (that could reset ports the
+install was given through variables this run does not have), keeps the previous file as
+`mediamtx.yml.backup.<time>`, validates the result with `--validate-conf` where the binary has it, and a
+rolled-back update puts the previous file back (the older binary rejects the key). A file that is not ours,
+or one MediaMTX rejects with the line added, is left alone, with a warning for the second case. Tests:
+"update adds moq: no to a generated configuration when it crosses MediaMTX 1.19, and stays quiet when
+there is nothing to add [LB-06 installer]", "update leaves a generated configuration as it is, and says
+so, when MediaMTX rejects it with moq: no added [LB-06 installer]", "a rolled-back update puts the
+generated configuration back: the older binary rejects the moq key it had added [LB-06 installer, N-1]";
+all three fail with `ensure_moq_off` reduced to a no-op, and the first and third fail without the
+backup.
+
+**Changed by the lead after the merge: `update` downloads and verifies before it stops MediaMTX.** The
+worker found MediaMTX was down for the whole download (the order was stop, back up, download). Now the
+verified download (and the checksum check) comes first; a failed download or a mismatch leaves MediaMTX
+running, untouched and not restarted (the rollback restarts only what the update stopped). Test:
+"update downloads and verifies before it stops MediaMTX: a failed download or a wrong checksum leaves it
+running, untouched and not restarted [availability]" (fails with the old order). The pass 1 test "update_mediamtx leaves the installed binary alone and stops when
+MediaMTX cannot be stopped [LB-10 installer]" asserted that nothing was downloaded; its other assertions
+(binary unchanged, no backup, no signal) are kept and it now asserts that the download came first.
 
 ## Documentation consequences
 
@@ -247,7 +264,7 @@ Suggested, by finding (test names exact; all in `tests/test_install_mediamtx.bat
   "through the installed configuration a publisher without credentials publishes and a client without credentials reads, from this machine [LB-06 installer]",
   "the API and the metrics endpoint of the installed configuration cannot be reached from a remote address, and answer on this machine's loopback address [LB-06 installer, D9]",
   and "create_config leaves the moq key to the installed binary's version, and says so when it cannot tell [LB-06 installer]",
-  "update says so when it crosses MediaMTX 1.19 with a generated configuration that cannot switch MoQ off, and stays quiet when there is nothing to say [LB-06 installer]".
+  "update adds moq: no to a generated configuration when it crosses MediaMTX 1.19, and stays quiet when there is nothing to add [LB-06 installer]".
   Residual: nodes installed with an earlier installer keep their file until replaced (see above).
 - **LB-02**: the unit the installer writes now conflicts with the manager's unit. Tests:
   "the rendered unit conflicts with the stream manager's unit, has the start limit in [Unit] and no ExecReload or signal, and the script writes no unit text of its own [LB-02 installer, X-12, LB-12]",

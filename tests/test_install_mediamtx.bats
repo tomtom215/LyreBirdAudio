@@ -973,12 +973,13 @@ assert_decoys_alive() {
     decoy_fail stop
     local before
     before="$(sha256sum "$INSTALL_DIR/mediamtx")"
-    PREAMBLE='get_release_info() { RELEASE_VERSION=v99.0.0; }; download_mediamtx() { : >"$DECOY_DIR/download.called"; return 1; }' \
+    PREAMBLE='get_release_info() { RELEASE_VERSION=v99.0.0; }; download_mediamtx() { : >"$DECOY_DIR/download.called"; }' \
         run_strict update_mediamtx
     [ "$status" -eq 7 ]
     [[ "$output" == *"Could not stop MediaMTX"* ]]
-    # nothing was backed up, replaced or downloaded, and nothing was signalled
-    [ ! -e "$DECOY_DIR/download.called" ]
+    # the verified download comes first (the next test); nothing was backed up
+    # or replaced, and nothing was signalled
+    [ -e "$DECOY_DIR/download.called" ]
     [ "$(sha256sum "$INSTALL_DIR/mediamtx")" = "$before" ]
     run bash -c 'compgen -G "$1/mediamtx.backup.*" >/dev/null' _ "$INSTALL_DIR"
     [ "$status" -ne 0 ]
@@ -1781,6 +1782,41 @@ update_preamble() {
     [ "$(sha256sum <"$INSTALL_DIR/mediamtx")" = "$before" ]
 }
 
+@test "update downloads and verifies before it stops MediaMTX: a failed download or a wrong checksum leaves it running, untouched and not restarted [availability]" {
+    installer_env
+    fleet_up
+    decoy_unit_active mediamtx
+    local before kind
+    before="$(sha256sum <"$INSTALL_DIR/mediamtx")"
+    # a wrong published checksum (6), and a release with no tarball to download
+    for kind in bad-checksum no-asset; do
+        update_fixture good
+        if [[ "$kind" == bad-checksum ]]; then
+            update_fixture bad-checksum
+        else
+            rm -f "$FIXTURE_DIR"/mediamtx_*.tar.gz
+        fi
+        PREAMBLE="$(update_preamble)" run_strict update_mediamtx
+        [ "$status" -ne 0 ] || {
+            echo "$kind: $output"
+            false
+        }
+        # MediaMTX was never stopped, and the failure did not restart it either
+        # (the rollback restarts only what the update had stopped)
+        ! grep -qE '^systemctl (stop|start|restart)' "$SYSTEMCTL_LOG" || {
+            echo "$kind: systemctl was asked to change the unit:"
+            cat "$SYSTEMCTL_LOG"
+            false
+        }
+        [ -e "$SHIM_STATE/active.mediamtx" ]
+        [ -z "$(decoy_signals)" ]
+        assert_decoys_alive M A B C D
+        [ "$(sha256sum <"$INSTALL_DIR/mediamtx")" = "$before" ]
+        run bash -c 'compgen -G "$1/mediamtx.backup.*" >/dev/null' _ "$INSTALL_DIR"
+        [ "$status" -ne 0 ]
+    done
+}
+
 @test "update with a wrong published checksum is fatal, exit 6, and leaves the previous binary installed; --force does not accept a mismatch [supply chain]" {
     installer_env
     printf '#!/bin/bash\necho v1.20.0\n' >"$INSTALL_DIR/mediamtx"
@@ -1910,9 +1946,9 @@ OLD
     [[ "$output" != *"uses built-in --upgrade"* && "$output" != *"built-in upgrade support"* ]]
 }
 
-@test "update says so when it crosses MediaMTX 1.19 with a generated configuration that cannot switch MoQ off, and stays quiet when there is nothing to say [LB-06 installer]" {
+@test "update adds moq: no to a generated configuration when it crosses MediaMTX 1.19, and stays quiet when there is nothing to add [LB-06 installer]" {
     installer_env
-    local moq_warning="starts a MoQ server"
+    local moq_warning="the line could not be added"
     # a configuration the installer generated for MediaMTX 1.18, which rejects the moq key
     fake_mediamtx "$INSTALL_DIR/mediamtx" v1.18.0
     run_strict create_config
@@ -1923,10 +1959,24 @@ OLD
     update_fixture good v1.21.3
     PREAMBLE="$(update_preamble)" run_strict update_mediamtx
     [ "$status" -eq 0 ]
-    [[ "$output" == *"$moq_warning"* && "$output" == *"$CONFIG_DIR/mediamtx.yml"* && "$output" == *"moq: no"* ]]
-    # it only says so: the configuration is not rewritten by an update
-    cmp "$DECOY_DIR/generated.yml" "$CONFIG_DIR/mediamtx.yml"
-    [ "$(ls -A "$CONFIG_DIR")" = "mediamtx.yml" ]
+    [[ "$output" == *"added 'moq: no' to $CONFIG_DIR/mediamtx.yml"* && "$output" != *"$moq_warning"* ]]
+    # exactly one line was added, after "srt: no" where the generator puts it;
+    # the marker, the ports and everything else are as they were
+    [ "$(diff "$DECOY_DIR/generated.yml" "$CONFIG_DIR/mediamtx.yml" | grep -c '^[<>]')" -eq 1 ]
+    [ "$(grep -A1 -x 'srt: no' "$CONFIG_DIR/mediamtx.yml" | tail -n 1)" = "moq: no" ]
+    [ "$(head -n 1 "$CONFIG_DIR/mediamtx.yml")" = "# Managed by LyreBirdAudio" ]
+    # the previous file is kept, and the new one is what a new generation would write
+    [ "$(ls -A "$CONFIG_DIR" | grep -c '^mediamtx.yml.backup\.')" -eq 1 ]
+    cmp "$DECOY_DIR/generated.yml" "$CONFIG_DIR"/mediamtx.yml.backup.*
+    render_expected --mediamtx-version v1.21.3 >"$DECOY_DIR/fresh.yml"
+    cmp "$DECOY_DIR/fresh.yml" "$CONFIG_DIR/mediamtx.yml"
+    # a second update to the same version has nothing left to add
+    fake_mediamtx "$INSTALL_DIR/mediamtx" v1.21.2
+    PREAMBLE="$(update_preamble)" run_strict update_mediamtx
+    [ "$status" -eq 0 ]
+    [[ "$output" != *"added 'moq: no'"* ]]
+    [ "$(ls -A "$CONFIG_DIR" | grep -c '^mediamtx.yml.backup\.')" -eq 1 ]
+    rm -f "$CONFIG_DIR"/mediamtx.yml.backup.*
     # quiet: the file already switches MoQ off (generated for a version that has the key)
     fake_mediamtx "$INSTALL_DIR/mediamtx" v1.21.3
     rm -f "$CONFIG_DIR/mediamtx.yml"
@@ -1963,6 +2013,45 @@ OLD
     PREAMBLE="$(update_preamble 'sleep() { :; }')" run_strict update_mediamtx
     [ "$status" -eq 0 ]
     [[ "$output" == *"Updated to version: v1.21.3"* && "$output" != *"$moq_warning"* ]]
+}
+
+@test "update leaves a generated configuration as it is, and says so, when MediaMTX rejects it with moq: no added [LB-06 installer]" {
+    installer_env
+    fake_mediamtx "$INSTALL_DIR/mediamtx" v1.18.0
+    run_strict create_config
+    [ "$status" -eq 0 ]
+    cp "$CONFIG_DIR/mediamtx.yml" "$DECOY_DIR/generated.yml"
+    update_fixture good v1.21.3
+    # the new binary can validate configurations, and rejects this one
+    fake_mediamtx "$NEW_BINARY" v1.21.3 validate
+    installer_release_fixture "$FIXTURE_DIR" v1.21.3 "$NEW_BINARY"
+    export FAKE_REJECT='json: unknown field "moq"'
+    PREAMBLE="$(update_preamble)" run_strict update_mediamtx
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"the line could not be added"* && "$output" == *"moq: no"* ]]
+    cmp "$DECOY_DIR/generated.yml" "$CONFIG_DIR/mediamtx.yml"
+    [ "$(ls -A "$CONFIG_DIR")" = "mediamtx.yml" ]
+}
+
+@test "a rolled-back update puts the generated configuration back: the older binary rejects the moq key it had added [LB-06 installer, N-1]" {
+    installer_env
+    fake_mediamtx "$INSTALL_DIR/mediamtx" v1.18.0
+    run_strict create_config
+    [ "$status" -eq 0 ]
+    cp "$CONFIG_DIR/mediamtx.yml" "$DECOY_DIR/generated.yml"
+    local binary_before
+    binary_before="$(sha256sum <"$INSTALL_DIR/mediamtx")"
+    update_fixture good v1.21.3
+    # a systemd unit that is stopped, and does not come back up
+    decoy_unit_active mediamtx
+    decoy_fail start
+    PREAMBLE="$(update_preamble 'sleep() { :; }')" run_strict update_mediamtx
+    [ "$status" -eq 7 ]
+    [[ "$output" == *"added 'moq: no'"* && "$output" == *"did not come back up"* && "$output" == *"Restoring config backup"* ]]
+    # the previous binary and the previous configuration, no leftovers
+    [ "$(sha256sum <"$INSTALL_DIR/mediamtx")" = "$binary_before" ]
+    cmp "$DECOY_DIR/generated.yml" "$CONFIG_DIR/mediamtx.yml"
+    [ "$(ls -A "$CONFIG_DIR")" = "mediamtx.yml" ]
 }
 
 @test "the stream manager takes the installer's file as its own: for the same settings the two generators agree, so a manager start leaves it untouched [LB-22 installer, D10]" {

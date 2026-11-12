@@ -28,16 +28,22 @@
       "title": "two MediaMTX ownership models (manager vs mediamtx.service)",
       "severity": "P1",
       "phase": 3,
-      "status": "open",
+      "status": "fixed",
       "tests": [
         "help documents exit code 8 and the idempotent start [LB-02, LB-01]",
         "restart is refused with exit 8 before anything is stopped or marked while mediamtx.service owns MediaMTX [LB-02]",
         "start is idempotent against a real MediaMTX and real FFmpeg, a dead wrapper is reconciled, stop leaves nothing and another owner is refused [LB-01, LB-02, LB-10]",
         "start is refused with exit 8 while mediamtx.service is active, touching nothing [LB-02]",
         "start is refused with exit 8, and signals nothing, when a MediaMTX this manager did not start runs on its configuration [LB-02]",
-        "the refusal names the unit that runs the other MediaMTX when systemd says it is active [LB-02]"
+        "the refusal names the unit that runs the other MediaMTX when systemd says it is active [LB-02]",
+        "the unit with the default settings is the template, with only the lines its header lists replaced [LB-02 installer, D12: no drift]",
+        "the rendered unit conflicts with the stream manager's unit, has the start limit in [Unit] and no ExecReload or signal, and the script writes no unit text of its own [LB-02 installer, X-12, LB-12]",
+        "systemd accepts the rendered unit with no finding, alone and together with the stream manager's unit [LB-02 installer, LB-12, D12]",
+        "a value the unit file cannot carry stops create_service before anything is written: a path with a space, an account name with a newline [LB-02 installer, D12]",
+        "create_service writes the rendered unit atomically with mode 0644, reloads systemd, and keeps a copy of the unit it replaces [LB-02 installer, D14]",
+        "install checks the unit template and the values it carries before it downloads or writes anything; --no-service skips the check [LB-02 installer, D12]"
       ],
-      "note": "manager and unit template fixed (E_OWNERSHIP, Conflicts=mediamtx.service, no Wants/PartOf); the unit text written by install_mediamtx.sh is installer pass 2"
+      "note": "manager and installer both write the one unit template (Conflicts=, StartLimit in [Unit], no signal reload); E_OWNERSHIP in the manager; the Conflicts=/After= transaction at boot needs a real systemd manager (tracked under LB-11)"
     },
     {
       "id": "LB-03",
@@ -119,7 +125,7 @@
       "title": "default listeners and open RTSP; installer leaves SRT/MoQ on",
       "severity": "P1",
       "phase": 4,
-      "status": "open",
+      "status": "fixed",
       "tests": [
         "RTSP is open by default: an anonymous remote client can publish and read. Asserted so that a change is deliberate [LB-06]",
         "RTSP_AUTH_MODE=local-only-publish: the manager's own readiness and stream probes keep working on every version, with no credentials [LB-06, LB-13]",
@@ -140,9 +146,17 @@
         "the API and the metrics endpoint cannot be reached from a remote address; bound to every interface they answer 401 there, 200 here [LB-06, D9]",
         "the default configuration starts on every MediaMTX version and opens exactly the sockets it names, no SRT, MoQ, RTMP, HLS or WebRTC [LB-06]",
         "the default users file is rtsp-users.conf in the MediaMTX configuration directory [LB-06]",
-        "the warning says when the operator-owned file is the one an earlier release wrote, whose API is on every interface [LB-06]"
+        "the warning says when the operator-owned file is the one an earlier release wrote, whose API is on every interface [LB-06]",
+        "create_config leaves the moq key to the installed binary's version, and says so when it cannot tell [LB-06 installer]",
+        "the file an earlier release of this installer wrote is recognised as such, kept without --force and replaced with it [LB-06 installer, LB-22 installer]",
+        "update adds moq: no to a generated configuration when it crosses MediaMTX 1.19, and stays quiet when there is nothing to add [LB-06 installer]",
+        "update leaves a generated configuration as it is, and says so, when MediaMTX rejects it with moq: no added [LB-06 installer]",
+        "a rolled-back update puts the generated configuration back: the older binary rejects the moq key it had added [LB-06 installer, N-1]",
+        "install writes a configuration every MediaMTX version accepts and opens exactly the sockets it names: no SRT, MoQ, RTMP, HLS or WebRTC [LB-06 installer, LB-22 installer]",
+        "through the installed configuration a publisher without credentials publishes and a client without credentials reads, from this machine [LB-06 installer]",
+        "the API and the metrics endpoint of the installed configuration cannot be reached from a remote address, and answer on this machine's loopback address [LB-06 installer, D9]"
       ],
-      "note": "manager side fixed and verified on six real MediaMTX versions (loopback API/metrics, quoted stream name, optional local-only-publish auth); installer config (SRT/MoQ, all-interface API/metrics) is installer pass 2"
+      "note": "manager and installer render the same loopback-API/metrics configuration with SRT/MoQ off, verified on six real MediaMTX versions; nodes installed by an earlier installer keep their file until install --force; the SECURITY-GUIDE text is a phase 7 gate"
     },
     {
       "id": "LB-07",
@@ -583,7 +597,7 @@
       "title": "manager rewrites MediaMTX config every start without backup",
       "severity": "P1",
       "phase": 4,
-      "status": "open",
+      "status": "fixed",
       "tests": [
         "MEDIAMTX_CONFIG_BACKUPS sets the number of backups, and at least one is always kept [LB-22]",
         "a backup that cannot be saved stops the replacement and the file stays as it was [LB-22]",
@@ -607,9 +621,21 @@
         "the mode of a managed file the operator changed is kept when it is replaced, and the backup has it too [LB-22]",
         "two replacements in the same second never overwrite each other's backup [LB-22]",
         "where MediaMTX has --validate-conf, its verdict decides about an operator-owned file, and its message is logged [LB-22]",
-        "with the clock standing still the retention still removes the oldest backups, never the newest [LB-22]"
+        "with the clock standing still the retention still removes the oldest backups, never the newest [LB-22]",
+        "create_config writes the shared generator's configuration for the installed binary, byte for byte, marker first [LB-22 installer, LB-06 installer]",
+        "install without --no-config stops at once, exit 4, when lyrebird-common.sh is not beside the installer [LB-22 installer]",
+        "create_config on a new installation writes a 0644 file with no backup and no temporary file left [LB-22 installer]",
+        "create_config writes through lyrebird_atomic_write, and a write that fails leaves the old file as it was [LB-22 installer]",
+        "a managed file whose rendering is unchanged is left untouched: same inode, same mtime, no backup [LB-22 installer]",
+        "a managed file whose rendering changes is replaced after a timestamped backup of the old one [LB-22 installer]",
+        "an operator-owned file is not overwritten without --force: bytes, mode and inode survive, and the message says how to replace it [LB-22 installer]",
+        "--force replaces an operator-owned file after saving a backup with its mode, and says it is doing so [LB-22 installer]",
+        "an empty file, what a power cut during the old non-durable write leaves, is replaced and not treated as the operator's [LB-22 installer]",
+        "two replacements in the same second keep both backups [LB-22 installer]",
+        "the generated configuration is validated by the binary that will run it, before the file is replaced [LB-22 installer]",
+        "the stream manager takes the installer's file as its own: for the same settings the two generators agree, so a manager start leaves it untouched [LB-22 installer, D10]"
       ],
-      "note": "manager side fixed (managed marker, backups, atomic durable write, order after port check); the installer still has its own generator until pass 2, and X-38 covers upgrade from files written by the old manager"
+      "note": "one generator (lyrebird_render_mediamtx_config) for the manager and the installer, managed marker, timestamped backups, atomic durable write; the two generators agree byte for byte. A file written by the old manager is adopted by X-38 (manager residuals)"
     },
     {
       "id": "LB-23",
@@ -1261,6 +1287,72 @@
       "phase": 4,
       "status": "open",
       "tests": []
+    },
+    {
+      "id": "X-43",
+      "title": "installer: a port variable that is not 1-65535, or two equal, produced an invalid configuration (called N-2 in the tests)",
+      "severity": "P2",
+      "phase": 6,
+      "status": "fixed",
+      "tests": [
+        "a port that is not an integer from 1 to 65535 stops create_config with a message that names the variable, and nothing is written [N-2]",
+        "install checks the ports and the generator before it downloads or writes anything [N-2, LB-22 installer]",
+        "ports with leading zeros are read as decimal, and an empty variable means the default [N-2, X-19 installer]"
+      ],
+      "note": "exit 10, naming the variable, before anything is downloaded or written"
+    },
+    {
+      "id": "X-42",
+      "title": "installer update of a MediaMTX started by hand always ended rolled back (exit 7) (called N-1 in the tests)",
+      "severity": "P2",
+      "phase": 6,
+      "status": "fixed",
+      "tests": [
+        "update in manual mode ends successfully with the new binary in place, MediaMTX stopped, and says how to start it, instead of rolling back [N-1]",
+        "update rolls back, restoring the previous binary, when the new binary does not run: with MediaMTX stopped by hand, and with nothing running [N-1]",
+        "update in service modes still verifies that the service came back: success when it is active, rollback with the previous binary when it is not [N-1, unchanged verification]",
+        "update in stream-manager mode still verifies by identity that MediaMTX came back, and rolls back when it did not [N-1, unchanged verification]",
+        "update in manual mode on a real MediaMTX stops it by identity, installs the verified binary, exits 0 and says how to start it; the new binary loads the old configuration [N-1]",
+        "update in manual mode on a real MediaMTX restores the previous binary, exit 7, when the new one does not run [N-1]"
+      ],
+      "note": "manual mode ends with exit 0, the new binary installed, MediaMTX stopped and the start command printed; a binary that does not run still rolls back"
+    },
+    {
+      "id": "X-39",
+      "title": "update across MediaMTX 1.19 left a generated configuration without moq: no, so MoQ listened on every interface",
+      "severity": "P2",
+      "phase": 6,
+      "status": "fixed",
+      "tests": [
+        "update adds moq: no to a generated configuration when it crosses MediaMTX 1.19, and stays quiet when there is nothing to add [LB-06 installer]",
+        "a rolled-back update puts the generated configuration back: the older binary rejects the moq key it had added [LB-06 installer, N-1]",
+        "update leaves a generated configuration as it is, and says so, when MediaMTX rejects it with moq: no added [LB-06 installer]"
+      ],
+      "note": "found by the installer worker, fixed by the lead: one line added after srt: no to a managed file, backed up, restored on rollback"
+    },
+    {
+      "id": "X-40",
+      "title": "installer update stopped MediaMTX before it downloaded the release",
+      "severity": "P3",
+      "phase": 6,
+      "status": "fixed",
+      "tests": [
+        "update downloads and verifies before it stops MediaMTX: a failed download or a wrong checksum leaves it running, untouched and not restarted [availability]"
+      ],
+      "note": "the verified download now comes first; a failed download or a checksum mismatch leaves MediaMTX running and is not rolled back"
+    },
+    {
+      "id": "X-41",
+      "title": "installer update ran MediaMTX's own --upgrade: no checksum, the newest tag rather than the release, applied before any check",
+      "severity": "P2",
+      "phase": 6,
+      "status": "fixed",
+      "tests": [
+        "update with a wrong published checksum is fatal, exit 6, and leaves the previous binary installed; --force does not accept a mismatch [supply chain]",
+        "update never runs the installed MediaMTX's own --upgrade: the binary that ends up installed is the one from the verified tarball [supply chain]",
+        "the help says update is a verified download with rollback and does not claim a built-in upgrade [supply chain]"
+      ],
+      "note": "update always takes the verified install path; a checksum mismatch is fatal even with --force; MIN_UPGRADE_VERSION=1.15.0 was also wrong (--upgrade appears in 1.18.0)"
     }
   ]
 }

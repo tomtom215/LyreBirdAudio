@@ -1642,19 +1642,49 @@ install_mediamtx() {
 # MediaMTX 1.19 and later start a MoQ server (8892 tcp+udp, 8893 udp, every
 # interface) unless the configuration says "moq: no", a key older versions
 # reject: the file generated for such a version cannot carry it. After an update
-# across 1.19 the generated file is therefore missing a line it now needs, and
-# this says so. (The stream manager renders its file again at every start, with the
-# version of the binary, so it is not concerned.)
-#   warn_if_moq_listens VERSION
-warn_if_moq_listens() {
+# across 1.19 the generated file is therefore missing a line it now needs. For a
+# file this installer generated (first line is the marker) that one line is added,
+# after "srt: no" where the generator puts it; everything else in the file, its
+# ports included, stays as it is (the update does not render the file again: it may
+# have been generated with port variables this run does not have). The previous file
+# is kept next to it, and execute_rollback puts it back if the update is rolled
+# back, because the older binary rejects the key. A file that is not ours, or
+# that MediaMTX rejects with the line added, is left alone and the operator is told.
+# (The stream manager renders its file again at every start, with the version of
+# the binary, so it is not concerned.)
+#   ensure_moq_off VERSION
+ensure_moq_off() {
     local version="$1" config_file="${CONFIG_DIR}/${CONFIG_NAME}" parts="" major=0 minor=0
     declare -F lyrebird_mediamtx_version_parts >/dev/null 2>&1 || return 0
     [[ -f "${config_file}" ]] || return 0
     config_is_managed "${config_file}" || return 0
     parts=$(lyrebird_mediamtx_version_parts "${version}") || return 0
     read -r major minor _ <<<"${parts}"
-    if ((major > 1 || (major == 1 && minor >= 19))) && ! grep -q '^moq:' "${config_file}"; then
-        log_warn "MediaMTX ${version} starts a MoQ server (8892 tcp and udp, 8893 udp) on every interface unless its configuration says 'moq: no', and ${config_file}, generated for an older MediaMTX, does not. Add the line 'moq: no' (after 'srt: no'); the file stays a generated one."
+    ((major > 1 || (major == 1 && minor >= 19))) || return 0
+    ! grep -q '^moq:' "${config_file}" || return 0
+
+    local fixed="" ok=false
+    fixed=$(mktemp) || {
+        log_warn "MediaMTX ${version} starts a MoQ server on every interface unless ${config_file} says 'moq: no', and it does not: add that line (after 'srt: no'); the file stays a generated one."
+        return 0
+    }
+    CLEANUP_FILES+=("${fixed}")
+    if grep -q '^srt: no[[:space:]]*$' "${config_file}"; then
+        awk '{ print } /^srt: no[ \t]*$/ && !done { print "moq: no"; done = 1 }' "${config_file}" >"${fixed}"
+    else
+        { cat "${config_file}" && printf 'moq: no\n'; } >"${fixed}"
+    fi
+    if declare -F lyrebird_atomic_write >/dev/null 2>&1 \
+        && mediamtx_accepts_config "${INSTALL_DIR}/mediamtx" "${fixed}" \
+        && backup_config_file "${config_file}" \
+        && lyrebird_atomic_write "${config_file}" 0644 <"${fixed}"; then
+        ok=true
+    fi
+    rm -f "${fixed}"
+    if [[ "${ok}" == "true" ]]; then
+        log_info "MediaMTX ${version} starts a MoQ server unless the configuration switches it off: added 'moq: no' to ${config_file} (the previous file is kept as ${CONFIG_BACKUP})"
+    else
+        log_warn "MediaMTX ${version} starts a MoQ server (8892 tcp and udp, 8893 udp) on every interface unless ${config_file} says 'moq: no', and it does not; the line could not be added. Add it (after 'srt: no'); the file stays a generated one."
     fi
     return 0
 }
@@ -1687,6 +1717,19 @@ update_mediamtx() {
         return 0
     fi
 
+    # The update goes through the same verified download as install: the release
+    # tarball, checked against the checksums.sha256 published with it (a mismatch is
+    # fatal even with --force), extracted, then installed atomically. MediaMTX's own
+    # `--upgrade` is not used: it downloads "the latest" tag over HTTPS and replaces
+    # the executable in place with no checksum or signature check (upstream
+    # internal/upgrade, selfupdate.Apply with empty Options), whatever --force or
+    # a pinned target says.
+    # This happens BEFORE MediaMTX is stopped: a slow or failed download, or a
+    # checksum mismatch, then costs the recording nothing (it is not down for the
+    # length of the download, and there is nothing to roll back or restart).
+    log_info "Downloading and verifying MediaMTX ${RELEASE_VERSION}..."
+    download_mediamtx "${RELEASE_VERSION}" "${PLATFORM_OS}" "${PLATFORM_ARCH}"
+
     # Detect management mode. Recorded module-level (not as locals) so that
     # execute_rollback can restart the service on any failure after this point.
     MANAGEMENT_MODE=$(detect_management_mode)
@@ -1701,16 +1744,6 @@ update_mediamtx() {
     BINARY_BACKUP="${INSTALL_DIR}/mediamtx.backup.$(date +%Y%m%d-%H%M%S)"
     cp "${INSTALL_DIR}/mediamtx" "${BINARY_BACKUP}"
     log_info "Current binary backed up to: ${BINARY_BACKUP}"
-
-    # The update goes through the same verified download as install: the release
-    # tarball, checked against the checksums.sha256 published with it (a mismatch is
-    # fatal even with --force), extracted, then installed atomically. MediaMTX's own
-    # `--upgrade` is not used: it downloads "the latest" tag over HTTPS and replaces
-    # the executable in place with no checksum or signature check (upstream
-    # internal/upgrade, selfupdate.Apply with empty Options), whatever --force or
-    # a pinned target says.
-    log_info "Downloading and verifying MediaMTX ${RELEASE_VERSION}..."
-    download_mediamtx "${RELEASE_VERSION}" "${PLATFORM_OS}" "${PLATFORM_ARCH}"
 
     # Atomic binary replacement with cleanup on failure
     local temp_binary="${INSTALL_DIR}/mediamtx.new.$$"
@@ -1731,7 +1764,7 @@ update_mediamtx() {
     log_info "Updated to version: ${new_version}"
     case "${MANAGEMENT_MODE}" in
         stream-manager | stream-manager-service) ;;
-        *) warn_if_moq_listens "${new_version}" ;;
+        *) ensure_moq_off "${new_version}" ;;
     esac
 
     # FIX 1.5: Clean up old backup files
