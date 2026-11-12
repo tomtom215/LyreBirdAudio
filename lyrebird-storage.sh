@@ -602,11 +602,18 @@ cleanup_recordings() {
     # itself, and if the recorder does not recreate it on the next write, every
     # subsequent recording silently fails — permanent data loss on an
     # unattended box.
-    local sweep_rc=0
-    find -H "$RECORDING_DIR" -ignore_readdir_race -mindepth 1 -type d -empty -delete || sweep_rc=$?
-    if ((sweep_rc != 0)); then
-        ((++SCAN_FAILURES))
-        log_error "Cannot sweep the empty directories of ${RECORDING_DIR} completely: find exited with status ${sweep_rc} (its message is above)"
+    if [[ "$DRY_RUN" == "true" ]]; then
+        # a dry run removes nothing, directories included
+        while _next_record file; do
+            log_info "[DRY RUN] Would remove empty directory: $file"
+        done < <(_find0 "$RECORDING_DIR" -mindepth 1 -type d -empty -print0)
+    else
+        local sweep_rc=0
+        find -H "$RECORDING_DIR" -ignore_readdir_race -mindepth 1 -type d -empty -delete || sweep_rc=$?
+        if ((sweep_rc != 0)); then
+            ((++SCAN_FAILURES))
+            log_error "Cannot sweep the empty directories of ${RECORDING_DIR} completely: find exited with status ${sweep_rc} (its message is above)"
+        fi
     fi
 
     if [[ $empty_removed -gt 0 ]]; then

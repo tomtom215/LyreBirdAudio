@@ -296,6 +296,24 @@ EOF
     ST_ENV=(PATH="$ST_ROOT/bin:$PATH")
 }
 
+@test "a dry run keeps the empty directories of the recording tree and lists them (it used to remove them, stream directories included) [X-29]" {
+    mkdir -p "$ST_REC/stream1/empty" "$ST_REC/stream2"
+    echo data >"$ST_REC/stream2/new.opus"
+    ST_ENV=(DRY_RUN=true)
+    run storage_run cmd_cleanup
+    [ "$status" -eq 0 ]
+    [ -d "$ST_REC/stream1/empty" ]
+    [ -d "$ST_REC/stream1" ]
+    [[ "$output" == *"[DRY RUN] Would remove empty directory: $ST_REC/stream1/empty"* ]]
+    # and a real run does remove them, the recording directory itself never
+    ST_ENV=()
+    run storage_run cmd_cleanup
+    [ "$status" -eq 0 ]
+    [ ! -e "$ST_REC/stream1" ]
+    [ -d "$ST_REC/stream2" ]
+    [ -d "$ST_REC" ]
+}
+
 @test "a dry run leaves the stale temp files alone and lists them (it used to delete them) [X-29]" {
     echo data >"$ST_LOGS/mediamtx-stale.tmp"
     echo data >"$ST_LOGS/other-stale.tmp"
