@@ -57,6 +57,7 @@ storage_run() {
             LYREBIRD_TEMP_DIR="$ST_TEMP" \
             LYREBIRD_BUFFER_DIR="$ST_BUF" \
             MEDIAMTX_LOG="$ST_LOGS/mediamtx.out" \
+            LYREBIRD_STORAGE_CONFIG= \
             DRY_RUN=false \
             ${ST_ENV[@]+"${ST_ENV[@]}"} \
             bash -c 'set -euo pipefail; source "$PROJECT_ROOT/lyrebird-storage.sh"; "$@" 2>&1' _ "$@"
@@ -65,6 +66,6 @@ storage_run() {
 
 # Value of a variable after sourcing the real script (arrays: one element per line).
 storage_value() {
-    env PROJECT_ROOT="$PROJECT_ROOT" LYREBIRD_BUFFER_DIR="${ST_BUF:-/tmp}" \
+    env PROJECT_ROOT="$PROJECT_ROOT" LYREBIRD_BUFFER_DIR="${ST_BUF:-/tmp}" LYREBIRD_STORAGE_CONFIG= \
         bash -c 'source "$PROJECT_ROOT/lyrebird-storage.sh"; trap - EXIT; v="$1[@]"; printf "%s\n" "${!v}"' _ "$1"
 }

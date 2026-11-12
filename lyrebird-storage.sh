@@ -38,6 +38,233 @@ readonly SCRIPT_NAME
 # Configuration
 # ============================================================================
 
+# Configuration file. /etc/lyrebird/storage.conf (README, docs/components.html),
+# or the file LYREBIRD_STORAGE_CONFIG names; set to the empty string it means "no
+# file". The file is DATA: it is read line by line and never sourced, so nothing
+# in it runs and no variable of this script (PATH, IFS, DRY_RUN, ...) can be
+# set from it. Each line is KEY=VALUE, a blank line or a # comment; the value is
+# bare, 'single-quoted' or "double-quoted" and is taken literally (no expansion);
+# a # comment may follow it. KEY must be one of the settings below: the names the
+# environment variables have, and RECORDING_DIR and LOG_DIR, which the
+# documentation uses, as aliases of LYREBIRD_RECORDING_DIR and LYREBIRD_LOG_DIR
+# (the aliases are read from this file only: a variable called LOG_DIR in the
+# environment of some other program is not an instruction to delete there). The
+# environment wins over the file; a line that cannot be accepted is reported with
+# its file and line number, ignored, and makes the run's exit status 4.
+# A file that is writable by everyone or owned by another user than root (or the
+# user running this) is not read: it decides what gets deleted.
+readonly STORAGE_CONFIG_PATH="${LYREBIRD_STORAGE_CONFIG-/etc/lyrebird/storage.conf}"
+readonly STORAGE_CONFIG_MAX_BYTES=65536
+readonly STORAGE_CONFIG_MAX_LINE=4096
+readonly STORAGE_CONFIG_MAX_PROBLEMS=100
+readonly STORAGE_CONFIG_KEYS="LYREBIRD_RECORDING_DIR (alias RECORDING_DIR), LYREBIRD_LOG_DIR (alias LOG_DIR), LYREBIRD_TEMP_DIR, LYREBIRD_BUFFER_DIR, MEDIAMTX_LOG, RECORDING_RETENTION_DAYS, LOG_RETENTION_DAYS, TEMP_RETENTION_HOURS, DISK_WARNING_PERCENT, DISK_CRITICAL_PERCENT, DISK_EMERGENCY_PERCENT, MIN_FREE_SPACE_MB, MAX_LOG_SIZE, LYREBIRD_CLOCK_SANE_EPOCH, LYREBIRD_ACTIVE_SEGMENT_SECONDS"
+readonly EXIT_CONFIG=4
+
+# Problems found in the configuration file, and the file when it was read
+CONFIG_PROBLEMS=0
+CONFIG_FILE_USED=""
+
+# The settings: key -> kind of value
+declare -gA _CONF_KIND=(
+    [LYREBIRD_RECORDING_DIR]=path [RECORDING_DIR]=path
+    [LYREBIRD_LOG_DIR]=path [LOG_DIR]=path
+    [LYREBIRD_TEMP_DIR]=path [LYREBIRD_BUFFER_DIR]=path [MEDIAMTX_LOG]=path
+    [RECORDING_RETENTION_DAYS]=uint [LOG_RETENTION_DAYS]=uint [TEMP_RETENTION_HOURS]=uint
+    [DISK_WARNING_PERCENT]=uint [DISK_CRITICAL_PERCENT]=uint [DISK_EMERGENCY_PERCENT]=uint
+    [MIN_FREE_SPACE_MB]=uint [MAX_LOG_SIZE]=uint
+    [LYREBIRD_CLOCK_SANE_EPOCH]=uint [LYREBIRD_ACTIVE_SEGMENT_SECONDS]=uint
+)
+declare -gA _CONF_ALIAS_OF=([RECORDING_DIR]=LYREBIRD_RECORDING_DIR [LOG_DIR]=LYREBIRD_LOG_DIR)
+# What the file set, by setting; the alias spellings are kept apart so that the
+# LYREBIRD_ spelling wins whatever the order of the lines
+declare -gA _CONF_VALUE=()
+declare -gA _CONF_ALIAS_VALUE=()
+declare -gA _CONF_LINE=()
+
+# These run before the logging functions below exist
+_conf_log() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [$1] ${*:2}" >&2
+}
+
+# _conf_problem FILE LINE KEY TEXT [EXPECTED]: an error, counted
+_conf_problem() {
+    local where="$1" key="$3" text="$4" expected="${5-}"
+    if (($2 > 0)); then
+        where="${1}:${2}"
+    fi
+    CONFIG_PROBLEMS=$((CONFIG_PROBLEMS + 1))
+    _conf_log ERROR "${where}: ${key:+${key}: }${text}${expected:+ (expected: ${expected})}"
+}
+
+# Read FILE into _CONF_VALUE / _CONF_ALIAS_VALUE. $2 is "yes" when the file was
+# asked for by name (LYREBIRD_STORAGE_CONFIG): then a missing file is a problem.
+_load_config_file() {
+    local file="$1" explicit="$2"
+    # character classes mean ASCII, whatever the locale
+    local LC_ALL=C
+    local line lineno=0 rest key kind canon value body tail st owner mode size
+    local re_expansion='[$`\\]'
+
+    if [[ ! -e "$file" ]]; then
+        if [[ "$explicit" == "yes" ]]; then
+            _conf_problem "$file" 0 "" "does not exist" "the file LYREBIRD_STORAGE_CONFIG names"
+        fi
+        return 0
+    fi
+    if [[ ! -f "$file" ]]; then
+        _conf_problem "$file" 0 "" "is not a regular file" "a regular file with KEY=value lines"
+        return 0
+    fi
+    if [[ ! -r "$file" ]]; then
+        _conf_problem "$file" 0 "" "cannot be read" "a readable file"
+        return 0
+    fi
+    st="$(stat -c '%u %a %s' -- "$file" 2>/dev/null)" || st=""
+    read -r owner mode size <<<"$st"
+    if [[ ! "$owner" =~ ^[0-9]+$ || ! "$mode" =~ ^[0-7]+$ || ! "$size" =~ ^[0-9]+$ ]]; then
+        _conf_problem "$file" 0 "" "its owner and mode cannot be determined, so it is not read"
+        return 0
+    fi
+    if ((8#$mode & 8#002)); then
+        _conf_problem "$file" 0 "" "is writable by everyone (mode ${mode}), so it is not read: it decides what is deleted" "a file only root can write"
+        return 0
+    fi
+    if ((owner != 0 && owner != EUID)); then
+        _conf_problem "$file" 0 "" "belongs to user ${owner}, so it is not read: it decides what is deleted" "a file owned by root"
+        return 0
+    fi
+    if ((size > STORAGE_CONFIG_MAX_BYTES)); then
+        _conf_problem "$file" 0 "" "is ${size} bytes long, more than the ${STORAGE_CONFIG_MAX_BYTES} byte limit" "a short list of KEY=value lines"
+        return 0
+    fi
+
+    CONFIG_FILE_USED="$file"
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        lineno=$((lineno + 1))
+        if ((CONFIG_PROBLEMS >= STORAGE_CONFIG_MAX_PROBLEMS)); then
+            _conf_log ERROR "${file}:${lineno}: stopped reading after ${STORAGE_CONFIG_MAX_PROBLEMS} problems; this line and the rest of the file were not read"
+            break
+        fi
+        # the length is checked before anything else touches the line
+        if ((${#line} > STORAGE_CONFIG_MAX_LINE)); then
+            if [[ "$line" != "#"* ]]; then
+                _conf_problem "$file" "$lineno" "" "line is ${#line} characters long, more than the ${STORAGE_CONFIG_MAX_LINE} character limit"
+            fi
+            continue
+        fi
+        if ((lineno == 1)); then
+            line="${line#$'\xef\xbb\xbf'}"
+        fi
+        line="${line%$'\r'}"
+        line="${line//$'\t'/ }"
+        line="${line#"${line%%[![:space:]]*}"}"
+        if [[ -z "$line" || "$line" == "#"* ]]; then
+            continue
+        fi
+        if [[ ! "$line" =~ ^([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]]; then
+            _conf_problem "$file" "$lineno" "" "not a KEY=value line (shell commands are not run): '${line:0:40}'" "KEY=value"
+            continue
+        fi
+        key="${BASH_REMATCH[1]}"
+        rest="${BASH_REMATCH[2]}"
+        kind="${_CONF_KIND[$key]-}"
+        if [[ -z "$kind" ]]; then
+            _conf_problem "$file" "$lineno" "$key" "unknown setting" "one of ${STORAGE_CONFIG_KEYS}"
+            continue
+        fi
+
+        # the value: bare, 'single-quoted' or "double-quoted", then at most a comment
+        case "$rest" in
+            "'"*)
+                body="${rest:1}"
+                if [[ "$body" != *"'"* ]]; then
+                    _conf_problem "$file" "$lineno" "$key" "unterminated single quote" "a value in matching quotes"
+                    continue
+                fi
+                value="${body%%"'"*}"
+                tail="${body#*"'"}"
+                ;;
+            '"'*)
+                body="${rest:1}"
+                if [[ "$body" != *'"'* ]]; then
+                    _conf_problem "$file" "$lineno" "$key" "unterminated double quote" "a value in matching quotes"
+                    continue
+                fi
+                value="${body%%'"'*}"
+                tail="${body#*'"'}"
+                if [[ "$value" =~ $re_expansion ]]; then
+                    _conf_problem "$file" "$lineno" "$key" "\$, backticks and backslashes are not interpreted in a value" "a plain value, or one in single quotes"
+                    continue
+                fi
+                ;;
+            *)
+                value="${rest%%[[:space:]]*}"
+                tail="${rest#"$value"}"
+                if [[ ! "$value" =~ ^[A-Za-z0-9._+:/@%,=-]*$ ]]; then
+                    _conf_problem "$file" "$lineno" "$key" "shell syntax is not accepted in a value: '${value:0:40}'" "a plain value, or one in quotes"
+                    continue
+                fi
+                ;;
+        esac
+        tail="${tail#"${tail%%[![:space:]]*}"}"
+        if [[ -n "$tail" && "$tail" != "#"* ]]; then
+            _conf_problem "$file" "$lineno" "$key" "unexpected text after the value: '${tail:0:40}'" "one value, optionally followed by a # comment"
+            continue
+        fi
+
+        case "$kind" in
+            uint)
+                if [[ ! "$value" =~ ^[0-9]{1,12}$ ]]; then
+                    _conf_problem "$file" "$lineno" "$key" "not a whole number: '${value:0:40}'" "digits only, for example 30"
+                    continue
+                fi
+                ;;
+            path)
+                if [[ "$value" != /* ]]; then
+                    _conf_problem "$file" "$lineno" "$key" "not an absolute path: '${value:0:40}'" "a path that starts with /"
+                    continue
+                fi
+                ;;
+        esac
+
+        canon="${_CONF_ALIAS_OF[$key]-}"
+        if [[ -n "$canon" ]]; then
+            _CONF_ALIAS_VALUE[$canon]="$value"
+        else
+            canon="$key"
+            if [[ -n "${_CONF_VALUE[$canon]+x}" ]]; then
+                _conf_log WARN "${file}:${lineno}: ${key}: overrides the value on line ${_CONF_LINE[$canon]}"
+            fi
+            _CONF_VALUE[$canon]="$value"
+            _CONF_LINE[$canon]="$lineno"
+        fi
+    done <"$file"
+    return 0
+}
+
+# Make what the file set the value of each setting that the environment does not
+# set, so that the defaults below ("${NAME:-default}") see it.
+_apply_config_file() {
+    local key value
+    for key in "${!_CONF_KIND[@]}"; do
+        [[ -z "${_CONF_ALIAS_OF[$key]-}" ]] || continue
+        value="${_CONF_VALUE[$key]-}"
+        [[ -n "$value" ]] || value="${_CONF_ALIAS_VALUE[$key]-}"
+        [[ -n "$value" ]] || continue
+        [[ -z "${!key:-}" ]] || continue
+        printf -v "$key" '%s' "$value"
+    done
+}
+
+if [[ -n "$STORAGE_CONFIG_PATH" ]]; then
+    if [[ -n "${LYREBIRD_STORAGE_CONFIG+x}" ]]; then
+        _load_config_file "$STORAGE_CONFIG_PATH" yes
+    else
+        _load_config_file "$STORAGE_CONFIG_PATH" no
+    fi
+    _apply_config_file
+fi
+
 # Paths. Each is made absolute here, once: a relative value is taken relative to
 # the directory the script was started in. `find` reads an argument that starts
 # with "-" as part of its expression, not as a directory, so a relative
@@ -887,6 +1114,7 @@ cmd_status() {
 
     # Configuration
     echo "Configuration:"
+    printf "  Config file: %s\n" "${CONFIG_FILE_USED:-none}"
     printf "  Retention (recordings): %d days\n" "$RECORDING_RETENTION_DAYS"
     printf "  Retention (logs): %d days\n" "$LOG_RETENTION_DAYS"
     printf "  Warning threshold: %d%%\n" "$DISK_WARNING_PERCENT"
@@ -1036,11 +1264,25 @@ Environment Variables:
 
 Recordings are files ending in: ${RECORDING_EXTENSIONS[*]}
 
+Configuration file:
+  ${STORAGE_CONFIG_PATH:-(none)} is read when it exists; LYREBIRD_STORAGE_CONFIG=FILE names another one
+  and LYREBIRD_STORAGE_CONFIG= (empty) none. It is data, never run: KEY=value lines,
+  # comments, values bare or in '...' / "..." and taken literally. Keys are the
+  names of the environment variables above (and LYREBIRD_TEMP_DIR,
+  LYREBIRD_BUFFER_DIR, MEDIAMTX_LOG, TEMP_RETENTION_HOURS, MAX_LOG_SIZE,
+  LYREBIRD_CLOCK_SANE_EPOCH); RECORDING_DIR and LOG_DIR are accepted as other names
+  of LYREBIRD_RECORDING_DIR and LYREBIRD_LOG_DIR in the file (not in the
+  environment). A variable in the environment wins over the file. Directories in
+  the file must be absolute. A file that anyone can write, or that belongs to a
+  user other than root, is not read.
+
 Exit status:
   0  success
   1  usage error
   3  finished, but at least one deletion failed (see the ERROR lines), or a
      directory could not be listed (find's message and an ERROR line say which)
+  4  finished, but lines of the configuration file were not accepted and ignored
+     (each is reported with its line number)
 
 Examples:
   ${SCRIPT_NAME} status
@@ -1112,20 +1354,28 @@ main() {
     fi
     QUIET="$quiet"
 
+    local rc=0
     case "$command" in
         status)
-            cmd_status
+            cmd_status || rc=$?
             ;;
         cleanup)
-            cmd_cleanup
+            cmd_cleanup || rc=$?
             ;;
         monitor)
-            cmd_monitor
+            cmd_monitor || rc=$?
             ;;
         emergency)
-            cmd_emergency
+            cmd_emergency || rc=$?
             ;;
     esac
+    # A configuration file whose lines were ignored is not a clean run (a failed
+    # deletion or listing, status 3, is the more specific news and keeps its code)
+    if ((rc == 0 && CONFIG_PROBLEMS > 0)); then
+        log_error "Finished, but ${CONFIG_PROBLEMS} line(s) of ${STORAGE_CONFIG_PATH} were not accepted and ignored (listed above)"
+        rc="$EXIT_CONFIG"
+    fi
+    return "$rc"
 }
 
 # Only execute when run directly, not when sourced (e.g. by the test suite)

@@ -18,6 +18,10 @@ scratch_setup() {
     # by default; a test that runs its start/stop/monitor paths must not touch
     # the host's (a test that sets its own location overrides this)
     export LYREBIRD_STATE_DIR="$TEST_SCRATCH/lyrebird-state"
+    # lyrebird-storage.sh reads /etc/lyrebird/storage.conf when it exists; a test
+    # must not depend on, or be changed by, the file of the machine it runs on
+    # (the empty value means "no configuration file"; a test of the file sets it)
+    export LYREBIRD_STORAGE_CONFIG=""
 }
 
 scratch_teardown() {
