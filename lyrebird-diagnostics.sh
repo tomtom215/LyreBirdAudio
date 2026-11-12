@@ -32,7 +32,22 @@ set -euo pipefail
 # Source shared library if available (backward compatible)
 # Provides: colors, logging, command_exists, compute_hash, exit codes
 # Falls back gracefully if library not present - all functions defined locally below
-_LYREBIRD_COMMON="${BASH_SOURCE[0]%/*}/lyrebird-common.sh"
+# Where the library is: beside the path this script was started by (a bare name, run
+# from its own directory, has no slash: that directory is "."), else, when that path is
+# a symlink, beside the file it points at
+_LYREBIRD_COMMON="${BASH_SOURCE[0]}"
+if [[ "$_LYREBIRD_COMMON" == */* ]]; then
+    _LYREBIRD_COMMON="${_LYREBIRD_COMMON%/*}/lyrebird-common.sh"
+else
+    _LYREBIRD_COMMON="./lyrebird-common.sh"
+fi
+if [[ ! -f "$_LYREBIRD_COMMON" && -L "${BASH_SOURCE[0]}" ]]; then
+    _LYREBIRD_REAL="$(readlink -f -- "${BASH_SOURCE[0]}" 2>/dev/null || true)"
+    if [[ "$_LYREBIRD_REAL" == */* ]]; then
+        _LYREBIRD_COMMON="${_LYREBIRD_REAL%/*}/lyrebird-common.sh"
+    fi
+    unset _LYREBIRD_REAL
+fi
 # shellcheck source=lyrebird-common.sh
 [[ -f "$_LYREBIRD_COMMON" ]] && source "$_LYREBIRD_COMMON" || true
 unset _LYREBIRD_COMMON
@@ -107,10 +122,15 @@ readonly MEDIAMTX_CONFIG_DIR="${MEDIAMTX_CONFIG_DIR:-/etc/mediamtx}"
 readonly MEDIAMTX_CONFIG_FILE="${MEDIAMTX_CONFIG_FILE:-${MEDIAMTX_CONFIG_DIR}/mediamtx.yml}"
 readonly MEDIAMTX_DEVICE_CONFIG="${MEDIAMTX_DEVICE_CONFIG:-${MEDIAMTX_CONFIG_DIR}/audio-devices.conf}"
 readonly MEDIAMTX_LOG_FILE="${MEDIAMTX_LOG_FILE:-/var/log/mediamtx.out}"
-readonly FFMPEG_LOG_DIR="${FFMPEG_LOG_DIR:-/var/log/lyrebird}"
+# The per-stream FFmpeg logs (<stream>.log) are written by the stream manager next to its
+# wrapper scripts and PID files: MEDIAMTX_FFMPEG_DIR, /var/lib/mediamtx-ffmpeg by default
+# (X-51). FFMPEG_LOG_DIR remains an explicit override of this script's view.
+readonly FFMPEG_LOG_DIR="${FFMPEG_LOG_DIR:-${MEDIAMTX_FFMPEG_DIR:-/var/lib/mediamtx-ffmpeg}}"
 readonly MEDIAMTX_BINARY="${MEDIAMTX_BINARY:-/usr/local/bin/mediamtx}"
 readonly MEDIAMTX_HOST="${MEDIAMTX_HOST:-localhost}"
-readonly MEDIAMTX_PORT="${MEDIAMTX_PORT:-8554}"
+# The RTSP port is MEDIAMTX_RTSP_PORT, the variable the stream manager, the installer and the
+# orchestrator read (D15, X-55); MEDIAMTX_PORT, which only this script read, stays as the fallback
+readonly MEDIAMTX_PORT="${MEDIAMTX_RTSP_PORT:-${MEDIAMTX_PORT:-8554}}"
 
 # Diagnostic configuration with validation
 readonly DIAGNOSTIC_LOG_FILE="${DIAGNOSTIC_LOG_FILE:-/var/log/lyrebird-diagnostics.log}"
@@ -617,7 +637,8 @@ get_script_version() {
     echo "${version:-unknown}"
 }
 
-# Get MediaMTX version from running process or binary
+# Get the MediaMTX version from the binary (the command line of a running MediaMTX
+# never carries one, so the process is not consulted)
 get_mediamtx_version() {
     local version=""
 
@@ -625,18 +646,14 @@ get_mediamtx_version() {
         version=$("${MEDIAMTX_BINARY}" --version 2>/dev/null | head -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' || echo "")
     fi
 
-    if [[ -z "${version}" ]] && command -v pgrep >/dev/null 2>&1; then
-        if pgrep -f "${MEDIAMTX_BINARY}" >/dev/null 2>&1; then
-            version=$(pgrep -af "${MEDIAMTX_BINARY}" | head -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' || echo "")
-        fi
-    fi
-
     echo "${version:-unknown}"
 }
 
 # Get stream manager status (adapted for init system)
 get_stream_manager_status() {
-    local stream_manager_log="${FFMPEG_LOG_DIR}/stream-manager.log"
+    # the manager's own log (STREAM_MANAGER_LOG_FILE, the variable the manager reads); the
+    # FFmpeg log directory never held a stream-manager.log
+    local stream_manager_log="${STREAM_MANAGER_LOG_FILE:-/var/log/lyrebird-stream-manager.log}"
 
     # Check based on init system
     if [[ "${INIT_SYSTEM}" == "systemd" ]]; then
@@ -651,12 +668,14 @@ get_stream_manager_status() {
         fi
     fi
 
-    # Fallback: check if process is running (works for all init systems)
-    if command -v pgrep >/dev/null 2>&1; then
-        if pgrep -f "lyrebird-stream-manager.sh" >/dev/null 2>&1; then
-            echo "running"
-            return
-        fi
+    # Fallback (any init system): the manager's `start` returns once MediaMTX and the
+    # stream wrappers run in the background, so the node is running when this
+    # installation's MediaMTX is, found by identity and not by a name in a command line
+    # (X-54, D11)
+    if declare -F lyrebird_mediamtx_pids >/dev/null 2>&1 \
+        && lyrebird_mediamtx_pids "${MEDIAMTX_BINARY}" "${MEDIAMTX_CONFIG_FILE}" >/dev/null; then
+        echo "running"
+        return
     fi
 
     # Check for log file as indicator of previous installation
@@ -3147,6 +3166,17 @@ parse_arguments() {
     done
 }
 
+# Set MEDIAMTX_PID to this installation's MediaMTX by identity (the program at
+# MEDIAMTX_BINARY running MEDIAMTX_CONFIG_FILE), empty when there is none. Never a process
+# whose command line merely contains the binary's path: an editor on the configuration,
+# this script's own arguments, another installation's (X-54, decision D11)
+cache_mediamtx_pid() {
+    MEDIAMTX_PID=""
+    if declare -F lyrebird_mediamtx_pids >/dev/null 2>&1; then
+        MEDIAMTX_PID="$(lyrebird_mediamtx_pids "${MEDIAMTX_BINARY}" "${MEDIAMTX_CONFIG_FILE}" | head -n 1 || true)"
+    fi
+}
+
 # Main execution
 main() {
     detect_colors
@@ -3156,9 +3186,7 @@ main() {
     log INFO "Diagnostic started from ${SCRIPT_DIR} (version ${SCRIPT_VERSION}, mode: ${COMMAND}, init: ${INIT_SYSTEM})"
 
     # Cache MediaMTX PID once at startup
-    if command -v pgrep >/dev/null 2>&1; then
-        MEDIAMTX_PID="$(pgrep -f "${MEDIAMTX_BINARY}" | grep -v "^$$\$" | head -1 || echo "")"
-    fi
+    cache_mediamtx_pid
     log DEBUG "Cached MediaMTX PID: ${MEDIAMTX_PID}"
 
     if [[ "${QUIET}" != "true" ]]; then

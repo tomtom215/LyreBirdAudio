@@ -105,7 +105,22 @@ set -euo pipefail
 # Source shared library if available (backward compatible)
 # Provides: colors, logging, command_exists, compute_hash, exit codes
 # Falls back gracefully if library not present - all functions defined locally below
-_LYREBIRD_COMMON="${BASH_SOURCE[0]%/*}/lyrebird-common.sh"
+# Where the library is: beside the path this script was started by (a bare name, run
+# from its own directory, has no slash: that directory is "."), else, when that path is
+# a symlink, beside the file it points at
+_LYREBIRD_COMMON="${BASH_SOURCE[0]}"
+if [[ "$_LYREBIRD_COMMON" == */* ]]; then
+    _LYREBIRD_COMMON="${_LYREBIRD_COMMON%/*}/lyrebird-common.sh"
+else
+    _LYREBIRD_COMMON="./lyrebird-common.sh"
+fi
+if [[ ! -f "$_LYREBIRD_COMMON" && -L "${BASH_SOURCE[0]}" ]]; then
+    _LYREBIRD_REAL="$(readlink -f -- "${BASH_SOURCE[0]}" 2>/dev/null || true)"
+    if [[ "$_LYREBIRD_REAL" == */* ]]; then
+        _LYREBIRD_COMMON="${_LYREBIRD_REAL%/*}/lyrebird-common.sh"
+    fi
+    unset _LYREBIRD_REAL
+fi
 # shellcheck source=lyrebird-common.sh
 [[ -f "$_LYREBIRD_COMMON" ]] && source "$_LYREBIRD_COMMON" || true
 unset _LYREBIRD_COMMON
@@ -2172,13 +2187,11 @@ parse_arguments() {
                 ;;
             --restore)
                 MODE_RESTORE=true
-                # Optional argument for timestamp
-                if [[ -n "$2" ]] && [[ "$2" != "--" ]]; then
-                    RESTORE_TIMESTAMP="$2"
-                    shift 2
-                else
-                    shift
-                fi
+                # getopt always puts one word after an option whose argument is optional:
+                # the value of --restore=VALUE, or an empty word. Taking only the option
+                # (and leaving the empty word) made the bare --restore an "internal error"
+                RESTORE_TIMESTAMP="$2"
+                shift 2
                 ;;
             --quality)
                 QUALITY_TIER="$2"
@@ -2194,6 +2207,15 @@ parse_arguments() {
                 ;;
         esac
     done
+
+    # `--restore VALUE`, the form the help shows: the option's argument is optional, which for
+    # getopt means it is taken only as --restore=VALUE, so a separate VALUE arrives here as the
+    # one operand. With --restore an operand cannot be a card number (that combination is an
+    # error below), so it is the timestamp.
+    if [[ "$MODE_RESTORE" = true ]] && [[ -z "$RESTORE_TIMESTAMP" ]] && [[ $# -eq 1 ]]; then
+        RESTORE_TIMESTAMP="$1"
+        shift
+    fi
 
     # Remaining argument is card number (optional)
     if [[ $# -gt 0 ]]; then
@@ -2358,17 +2380,23 @@ output_json() {
 # MAIN EXECUTION
 # ============================================================================
 
+# Is the ALSA proc filesystem there? (A container, or a kernel without ALSA, has none.)
+alsa_proc_available() {
+    [[ -d "/proc/asound" ]]
+}
+
 main() {
-    # Check if ALSA proc filesystem is available
-    if [[ ! -d "/proc/asound" ]]; then
-        log_error "ALSA proc filesystem not found at /proc/asound"
-        log_error "Is ALSA support enabled in your kernel?"
-        log_info "Check: lsmod | grep snd"
+    # Parse arguments first: --help and --version answer without touching the hardware
+    # (they used to exit 1 on a machine without /proc/asound, where help is just as useful)
+    if ! parse_arguments "$@"; then
         exit 1
     fi
 
-    # Parse arguments
-    if ! parse_arguments "$@"; then
+    # Everything below reads the hardware, or the directory it is listed in
+    if ! alsa_proc_available; then
+        log_error "ALSA proc filesystem not found at /proc/asound"
+        log_error "Is ALSA support enabled in your kernel?"
+        log_info "Check: lsmod | grep snd"
         exit 1
     fi
 

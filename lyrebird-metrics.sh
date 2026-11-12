@@ -39,12 +39,15 @@ readonly SCRIPT_NAME
 readonly MEDIAMTX_API_HOST="${MEDIAMTX_HOST:-localhost}"
 readonly MEDIAMTX_API_PORT="${MEDIAMTX_API_PORT:-9997}"
 # shellcheck disable=SC2034  # Exported for use by install_mediamtx.sh and external scripts
-readonly MEDIAMTX_RTSP_PORT="${MEDIAMTX_PORT:-8554}"
+# the RTSP port is MEDIAMTX_RTSP_PORT everywhere else (D15, X-55); MEDIAMTX_PORT is the fallback
+readonly MEDIAMTX_RTSP_PORT="${MEDIAMTX_RTSP_PORT:-${MEDIAMTX_PORT:-8554}}"
 readonly HEARTBEAT_FILE="${HEARTBEAT_FILE:-/run/mediamtx-audio.heartbeat}"
 # The PID file of the stream manager's MediaMTX: PID_FILE, else the variable the
 # manager itself reads (MEDIAMTX_PID_FILE)
 readonly PID_FILE="${PID_FILE:-${MEDIAMTX_PID_FILE:-/run/mediamtx-audio.pid}}"
-readonly FFMPEG_PID_DIR="${FFMPEG_PID_DIR:-/var/lib/mediamtx-ffmpeg}"
+# The directory of the manager's PID files and wrapper scripts is MEDIAMTX_FFMPEG_DIR, the variable the
+# manager reads (X-55); FFMPEG_PID_DIR, which only this script read, stays as the fallback
+readonly FFMPEG_PID_DIR="${MEDIAMTX_FFMPEG_DIR:-${FFMPEG_PID_DIR:-/var/lib/mediamtx-ffmpeg}}"
 readonly CONFIG_DIR="${MEDIAMTX_CONFIG_DIR:-/etc/mediamtx}"
 readonly DEVICE_CONFIG="${CONFIG_DIR}/audio-devices.conf"
 # The MediaMTX this installation runs, named by the variables the stream manager

@@ -103,7 +103,22 @@ fi
 # Source shared library if available (backward compatible)
 # Provides: colors, logging, command_exists, compute_hash, exit codes
 # Falls back gracefully if library not present - all functions defined locally below
-_LYREBIRD_COMMON="${BASH_SOURCE[0]%/*}/lyrebird-common.sh"
+# Where the library is: beside the path this script was started by (a bare name, run
+# from its own directory, has no slash: that directory is "."), else, when that path is
+# a symlink, beside the file it points at
+_LYREBIRD_COMMON="${BASH_SOURCE[0]}"
+if [[ "$_LYREBIRD_COMMON" == */* ]]; then
+    _LYREBIRD_COMMON="${_LYREBIRD_COMMON%/*}/lyrebird-common.sh"
+else
+    _LYREBIRD_COMMON="./lyrebird-common.sh"
+fi
+if [[ ! -f "$_LYREBIRD_COMMON" && -L "${BASH_SOURCE[0]}" ]]; then
+    _LYREBIRD_REAL="$(readlink -f -- "${BASH_SOURCE[0]}" 2>/dev/null || true)"
+    if [[ "$_LYREBIRD_REAL" == */* ]]; then
+        _LYREBIRD_COMMON="${_LYREBIRD_REAL%/*}/lyrebird-common.sh"
+    fi
+    unset _LYREBIRD_REAL
+fi
 # shellcheck source=lyrebird-common.sh
 [[ -f "$_LYREBIRD_COMMON" ]] && source "$_LYREBIRD_COMMON" || true
 unset _LYREBIRD_COMMON
@@ -200,6 +215,20 @@ validate_log_path() {
     return 0
 }
 
+# Validate a directory that is only listed (never written) to the same safety rules as a
+# log path, anywhere on the file system. Always succeeds: an unusable value is the default.
+validate_dir_path() {
+    local path="$1"
+    local default="$2"
+
+    if [[ -n "$path" && "$path" == /* && "$path" != *".."* && "$path" =~ ^/[a-zA-Z0-9_./-]+$ ]]; then
+        echo "$path"
+    else
+        echo "$default"
+    fi
+    return 0
+}
+
 # External script paths
 declare -A EXTERNAL_SCRIPTS=(
     ["installer"]="install_mediamtx.sh"
@@ -217,7 +246,10 @@ readonly UDEV_RULES="/etc/udev/rules.d/99-usb-soundcards.rules"
 MEDIAMTX_LOG_FILE=$(validate_log_path "${MEDIAMTX_LOG_FILE:-}" "/var/log/mediamtx.out")
 readonly MEDIAMTX_LOG_FILE
 
-FFMPEG_LOG_DIR=$(validate_log_path "${FFMPEG_LOG_DIR:-}" "/var/log/lyrebird")
+# The per-stream FFmpeg logs (<stream>.log) are written by the stream manager next to its
+# wrapper scripts and PID files: MEDIAMTX_FFMPEG_DIR, /var/lib/mediamtx-ffmpeg by default
+# (X-51). FFMPEG_LOG_DIR remains an explicit override.
+FFMPEG_LOG_DIR=$(validate_dir_path "${FFMPEG_LOG_DIR:-${MEDIAMTX_FFMPEG_DIR:-}}" "/var/lib/mediamtx-ffmpeg")
 readonly FFMPEG_LOG_DIR
 
 # Log file (initialized in initialize_logging() with fallback handling)
@@ -393,7 +425,8 @@ check_terminal() {
 
 check_dependencies() {
     local missing=()
-    local deps=("pgrep" "grep" "awk" "sed")
+    # (pgrep is no longer needed: processes are found by identity, in /proc, X-54)
+    local deps=("grep" "awk" "sed")
 
     for cmd in "${deps[@]}"; do
         if ! command_exists "$cmd"; then
@@ -605,49 +638,37 @@ refresh_system_state() {
         MEDIAMTX_VERSION="not installed"
     fi
 
-    # Check if MediaMTX is running
-    if pgrep -x mediamtx >/dev/null 2>&1; then
+    # Is MediaMTX running? This installation's MediaMTX by identity: the program at
+    # MEDIAMTX_BINARY running the manager's configuration file. Never "a process called
+    # mediamtx": a decoy, an editor on the configuration and another installation's MediaMTX
+    # all carry that name (X-54, decision D11)
+    MEDIAMTX_RUNNING=false
+    if declare -F lyrebird_mediamtx_pids >/dev/null 2>&1 \
+        && lyrebird_mediamtx_pids "${MEDIAMTX_BINARY:-/usr/local/bin/mediamtx}" \
+            "${MEDIAMTX_CONFIG_FILE:-${MEDIAMTX_CONFIG_DIR:-/etc/mediamtx}/mediamtx.yml}" >/dev/null 2>&1; then
         MEDIAMTX_RUNNING=true
-    else
-        MEDIAMTX_RUNNING=false
     fi
 
-    # Count active streams with DoS prevention (limit to reasonable maximum)
+    # Count active streams: the stream manager's wrapper processes (one per stream, found
+    # by identity in the manager's FFmpeg directory), not every FFmpeg on the host
     ACTIVE_STREAMS=0
-
-    if pgrep -x ffmpeg >/dev/null 2>&1; then
-        local raw_count
-
-        # Use efficient pgrep -c if available, otherwise limit output before counting
-        if command_exists pgrep && pgrep --help 2>&1 | grep -q -- '-c'; then
-            # Modern pgrep supports -c for efficient counting. Use `|| true`, not
-            # `|| echo 0`: `pgrep -c` already prints "0" when there is no match
-            # (and exits 1), so `|| echo 0` would append a SECOND 0, yielding the
-            # two-line "0\n0" that fails the numeric guard below and logs a false
-            # "invalid stream count" warning.
-            raw_count=$(pgrep -c -x ffmpeg 2>/dev/null || true)
-            raw_count="${raw_count:-0}"
-        else
-            # Fallback: limit output before counting to prevent DoS
-            # head -n 1001 ensures we never process more than 1001 PIDs
-            raw_count=$(pgrep -x ffmpeg 2>/dev/null | head -n 1001 | wc -l) || true
-        fi
-
-        # Validate count with overflow protection
-        # First check string length to prevent overflow in arithmetic operations
-        if [[ ! "$raw_count" =~ ^[0-9]{1,7}$ ]]; then
-            # Not a valid number or too large (>9,999,999) - could cause overflow
-            log "WARN" "Invalid or oversized stream count: '${raw_count:0:20}'"
-            ACTIVE_STREAMS=0
-        elif ((raw_count > 0 && raw_count <= 1000)); then
-            ACTIVE_STREAMS=$raw_count
-        elif ((raw_count > 1000)); then
-            log "ERROR" "Excessive stream count detected: $raw_count (capping at 1000)"
-            log "ERROR" "System may be under attack or experiencing runaway processes"
-            ACTIVE_STREAMS=1000 # Cap at reasonable limit for display
-        else
-            ACTIVE_STREAMS=0
-        fi
+    local raw_count=""
+    if declare -F lyrebird_stream_wrapper_pids >/dev/null 2>&1; then
+        raw_count="$(lyrebird_stream_wrapper_pids "${MEDIAMTX_FFMPEG_DIR:-/var/lib/mediamtx-ffmpeg}" 2>/dev/null | head -n 1001 | wc -l)" || true
+    fi
+    raw_count="${raw_count//[[:space:]]/}"
+    raw_count="${raw_count:-0}"
+    # Validate the count with overflow protection: first the string length, so that
+    # arithmetic never sees a huge value
+    if [[ ! "$raw_count" =~ ^[0-9]{1,7}$ ]]; then
+        log "WARN" "Invalid or oversized stream count: '${raw_count:0:20}'"
+        ACTIVE_STREAMS=0
+    elif ((raw_count > 1000)); then
+        log "ERROR" "Excessive stream count detected: $raw_count (capping at 1000)"
+        log "ERROR" "System may be under attack or experiencing runaway processes"
+        ACTIVE_STREAMS=1000 # Cap at reasonable limit for display
+    else
+        ACTIVE_STREAMS=$((10#$raw_count))
     fi
 
     # Check if USB devices are mapped
@@ -898,8 +919,9 @@ execute_script() {
 # Say how an installer action ended. execute_script prints nothing for the
 # installer (the wizard treats its exit status 7 as data), so a failure would
 # otherwise reach the user only as "Last Error" in the next menu redraw.
-# Exit status 7 is overloaded in the installer: "already installed", but also
-# several failed install steps; its own message, printed just before, says which.
+# Exit status 7 of the installer is "already installed" (install), "not installed"
+# (update, uninstall) or "could not stop MediaMTX"; the binary steps that failed
+# (extract, put in place) are 11 (X-57). Its own message, printed just before, says which.
 report_installer_result() {
     local action="$1"
 
@@ -907,7 +929,9 @@ report_installer_result() {
         return 0
     fi
     if [[ "$LAST_EXIT_CODE" == "7" ]]; then
-        warning "The installer exited with code 7: MediaMTX is already installed (use Update or Reinstall), or an install step failed; the installer's message above says which"
+        warning "The installer exited with code 7: MediaMTX is already installed (use Update or Reinstall), is not installed, or could not be stopped; the installer's message above says which"
+    elif [[ "$LAST_EXIT_CODE" == "11" ]]; then
+        error "MediaMTX ${action} failed (installer exit code: 11 - the MediaMTX binary could not be extracted or installed); see the installer's message above"
     else
         error "MediaMTX ${action} failed (installer exit code: ${LAST_EXIT_CODE}); see the installer's message above"
     fi
@@ -2092,10 +2116,11 @@ menu_streaming() {
                 echo
                 echo "Stream URLs:"
                 echo "================================================================"
-                local primary_ip
+                local primary_ip rtsp_port="${MEDIAMTX_RTSP_PORT:-8554}"
                 primary_ip="$(get_primary_ip)"
+                [[ "$rtsp_port" =~ ^[0-9]{1,5}$ ]] || rtsp_port=8554
                 echo
-                info "Base URL: rtsp://${primary_ip}:8554/"
+                info "Base URL: rtsp://${primary_ip}:${rtsp_port}/"
                 echo
                 info "Your streams are available at:"
                 echo

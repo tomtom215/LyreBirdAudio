@@ -212,7 +212,9 @@ SUDO_EOF
     orch_run --step 'Select option: ' '1\n' --step 'Press Enter to continue' '\n' --step 'Select option: ' '0\n' 'menu_mediamtx'
     echo "$output"
     [ "$status" -eq 0 ]
-    [[ "$output" == *"The installer exited with code 7: MediaMTX is already installed (use Update or Reinstall), or an install step failed"* ]]
+    [[ "$output" == *"The installer exited with code 7: MediaMTX is already installed (use Update or Reinstall)"* ]]
+    # 7 is no longer "or an install step failed": those exit 11 (X-57)
+    [[ "$output" != *"an install step failed"* ]]
     export STUB_RC_installer_install=0
     orch_run --step 'Select option: ' '1\n' --step 'Press Enter to continue' '\n' --step 'Select option: ' '0\n' 'menu_mediamtx'
     [ "$status" -eq 0 ]

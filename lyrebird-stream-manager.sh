@@ -177,7 +177,22 @@ fi
 # Source shared library if available (backward compatible)
 # Provides: colors, logging, command_exists, compute_hash, exit codes
 # Falls back gracefully if library not present - all functions defined locally below
-_LYREBIRD_COMMON="${BASH_SOURCE[0]%/*}/lyrebird-common.sh"
+# Where the library is: beside the path this script was started by (a bare name, run
+# from its own directory, has no slash: that directory is "."), else, when that path is
+# a symlink, beside the file it points at
+_LYREBIRD_COMMON="${BASH_SOURCE[0]}"
+if [[ "$_LYREBIRD_COMMON" == */* ]]; then
+    _LYREBIRD_COMMON="${_LYREBIRD_COMMON%/*}/lyrebird-common.sh"
+else
+    _LYREBIRD_COMMON="./lyrebird-common.sh"
+fi
+if [[ ! -f "$_LYREBIRD_COMMON" && -L "${BASH_SOURCE[0]}" ]]; then
+    _LYREBIRD_REAL="$(readlink -f -- "${BASH_SOURCE[0]}" 2>/dev/null || true)"
+    if [[ "$_LYREBIRD_REAL" == */* ]]; then
+        _LYREBIRD_COMMON="${_LYREBIRD_REAL%/*}/lyrebird-common.sh"
+    fi
+    unset _LYREBIRD_REAL
+fi
 
 # v1.4.2: Verify library integrity before sourcing (security hardening)
 # Set LYREBIRD_COMMON_EXPECTED_HASH to enable verification
@@ -8679,6 +8694,89 @@ unit_read_write_paths() {
     printf '%s' "${result[*]}"
 }
 
+# The settings `install` carries into the unit (Environment=) and the monitor's cron file
+# (X-58, decision D15): everything that decides where MediaMTX listens, what the manager
+# renders into its configuration, and how the manager reaches it. The service and the cron
+# monitor are processes of their own, started by systemd and by cron: they do not inherit
+# the environment `install` ran in. Without them a node installed with
+# RTSP_AUTH_MODE=local-only-publish or MEDIAMTX_RTSP_PORT=31554 ran on the defaults under
+# systemd, and the cron monitor, which brings a MediaMTX that died back and renders its
+# configuration again, rewrote the managed file with the defaults: authentication gone,
+# ports back on 8554/9997/9998. A setting that equals its default is not written, so the
+# unit and the cron file of an installation that sets none of them are what they always were.
+# lyrebird-updater.sh passes the same names to `install` when it reinstalls the service
+# (INSTALL_SETTING_VARS there; tests/test_install_settings.bats keeps the two lists equal).
+# Not carried: the paths (MEDIAMTX_CONFIG_DIR, the PID, lock and log files, ...), which the
+# unit's own directives follow, and the audio settings.
+readonly UNIT_CARRIED_SETTINGS=(MEDIAMTX_RTSP_PORT MEDIAMTX_API_PORT MEDIAMTX_METRICS_PORT
+    MEDIAMTX_API_BIND MEDIAMTX_METRICS_BIND RTSP_AUTH_MODE RTSP_USERS_FILE MEDIAMTX_HOST MEDIAMTX_BINARY)
+
+# Print the NAME=VALUE line of every UNIT_CARRIED_SETTINGS entry that differs from its
+# default. Fails (nothing printed, the reason logged) for a value that must never reach a
+# unit file or a cron line: not a port, not a bind address, not a known authentication
+# mode, not a host name or an address, not a path of safe characters.
+unit_carried_settings() {
+    local name var value default
+    for name in "${UNIT_CARRIED_SETTINGS[@]}"; do
+        var="$name"
+        case "$name" in
+            MEDIAMTX_RTSP_PORT) default=8554 ;;
+            MEDIAMTX_API_PORT) default=9997 ;;
+            MEDIAMTX_METRICS_PORT) default=9998 ;;
+            MEDIAMTX_API_BIND | MEDIAMTX_METRICS_BIND) default=127.0.0.1 ;;
+            RTSP_AUTH_MODE) default=open ;;
+            RTSP_USERS_FILE) default="${CONFIG_DIR}/rtsp-users.conf" ;;
+            MEDIAMTX_HOST) default=localhost ;;
+            MEDIAMTX_BINARY)
+                var=MEDIAMTX_BIN
+                default=/usr/local/bin/mediamtx
+                ;;
+            *) return 1 ;;
+        esac
+        value="${!var}"
+        if [[ "$value" == "$default" ]]; then
+            continue
+        fi
+        case "$name" in
+            *_PORT)
+                if [[ ! "$value" =~ ^[0-9]{1,5}$ ]]; then
+                    log ERROR "Cannot write the unit: ${name} '${value}' is not a port"
+                    return 1
+                fi
+                ;;
+            *_BIND)
+                if ! declare -F lyrebird_is_valid_bind_address >/dev/null 2>&1; then
+                    log ERROR "Cannot write the unit: ${name} is set, and checking it needs lyrebird-common.sh next to ${SCRIPT_NAME}"
+                    return 1
+                fi
+                if ! lyrebird_is_valid_bind_address "$value"; then
+                    log ERROR "Cannot write the unit: ${name} '${value}' is neither empty nor an IPv4 or IPv6 address"
+                    return 1
+                fi
+                ;;
+            RTSP_AUTH_MODE)
+                if [[ "$value" != local-only-publish ]]; then
+                    log ERROR "Cannot write the unit: RTSP_AUTH_MODE '${value}' is neither open nor local-only-publish"
+                    return 1
+                fi
+                ;;
+            MEDIAMTX_HOST)
+                if [[ ! "$value" =~ ^[A-Za-z0-9._:-]+$ ]]; then
+                    log ERROR "Cannot write the unit: MEDIAMTX_HOST '${value}' has characters outside A-Z a-z 0-9 . _ : - that a unit and a cron environment line cannot carry"
+                    return 1
+                fi
+                ;;
+            *)
+                if ! _unit_safe_path "$value"; then
+                    log ERROR "Cannot write the unit: ${name} '${value}' is not an absolute path of letters, digits and _ . / + - only"
+                    return 1
+                fi
+                ;;
+        esac
+        printf '%s=%s\n' "$name" "$value"
+    done
+}
+
 # Render the unit to stdout: the template with the lines the header of the
 # template lists replaced by this installation's values. Everything else, the
 # comments included, is copied unchanged, so with the default settings the
@@ -8718,6 +8816,18 @@ render_systemd_unit() {
         log ERROR "Cannot write the unit: MULTIPLEX_STREAM_NAME is empty or contains a control character"
         return 1
     fi
+    # the listener settings that differ from the defaults (none: nothing is added)
+    local carried_text carried_line escaped_value
+    local -a carried_env=()
+    carried_text="$(unit_carried_settings)" || return 1
+    while IFS= read -r carried_line; do
+        [[ -n "$carried_line" ]] || continue
+        if ! escaped_value="$(systemd_escape_env_value "${carried_line#*=}")"; then
+            log ERROR "Cannot write the unit: ${carried_line%%=*} contains a control character"
+            return 1
+        fi
+        carried_env+=("Environment=\"${carried_line%%=*}=${escaped_value}\"")
+    done <<<"$carried_text"
 
     local -a lines=()
     mapfile -t lines <"$template"
@@ -8750,6 +8860,20 @@ render_systemd_unit() {
     local rw_paths=""
     rw_paths="$(unit_read_write_paths "$template")" || return 1
 
+    # the carried settings go after the last Environment= line of the template
+    local last_env=-1 index=0
+    for line in ${lines[@]+"${lines[@]}"}; do
+        if [[ "$line" == Environment=* ]]; then
+            last_env=$index
+        fi
+        index=$((index + 1))
+    done
+    if ((${#carried_env[@]} > 0 && last_env < 0)); then
+        log ERROR "The unit template ${template} has no Environment= line to add the listener settings after"
+        return 1
+    fi
+
+    index=0
     for line in ${lines[@]+"${lines[@]}"}; do
         case "$line" in
             ExecStart=* | ExecStop=* | ExecReload=*)
@@ -8767,6 +8891,12 @@ render_systemd_unit() {
             *) ;;
         esac
         printf '%s\n' "$line"
+        if ((index == last_env)); then
+            for carried_line in ${carried_env[@]+"${carried_env[@]}"}; do
+                printf '%s\n' "$carried_line"
+            done
+        fi
+        index=$((index + 1))
     done
 }
 
@@ -8803,6 +8933,13 @@ render_monitor_cron() {
         log ERROR "Cannot write the cron file: '${script}' is not an absolute path of letters, digits and _ . / + - only"
         return 1
     fi
+    # the listener settings that differ from the defaults (X-58): ports are digits and bind
+    # addresses are hex digits, dots and colons, which need no quoting; none: no lines
+    local carried_text carried_lines=""
+    carried_text="$(unit_carried_settings)" || return 1
+    if [[ -n "$carried_text" ]]; then
+        carried_lines=$'\n'"${carried_text}"
+    fi
     cat <<EOF
 # Monitor MediaMTX resource usage and stream health every 5 minutes
 # Conservative restart policy (only on critical resource failure):
@@ -8821,7 +8958,7 @@ PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 CRON=1
 STREAM_MODE=${stream_mode}
 MULTIPLEX_FILTER_TYPE=${multiplex_filter}
-MULTIPLEX_STREAM_NAME=${multiplex_name}
+MULTIPLEX_STREAM_NAME=${multiplex_name}${carried_lines}
 
 */5 * * * * root flock -n /run/mediamtx-monitor.lock -c '${script} monitor; EXIT=\$?; if [ \$EXIT -eq 2 ]; then systemctl restart mediamtx-audio; elif [ \$EXIT -ne 0 ]; then logger -t mediamtx-monitor "Non-critical exit code \$EXIT (no restart)"; fi' || logger -t mediamtx-monitor "Monitor already running or locked"
 EOF
@@ -8994,6 +9131,14 @@ Environment Variables:
                              needs no password, everybody else must be listed in
                              RTSP_USERS_FILE [default: ${CONFIG_DIR}/rtsp-users.conf]
                              as "user:sha256:<base64 of the SHA-256 of the password>"
+    MEDIAMTX_HOST            Host the streams publish to and the manager asks
+                             [default: localhost]
+    MEDIAMTX_BINARY          The MediaMTX program [default: /usr/local/bin/mediamtx]
+                             install writes the nine settings from MEDIAMTX_RTSP_PORT
+                             to here into the systemd unit and the monitor's cron file
+                             when they differ from their defaults: the service and the
+                             monitor do not inherit your shell's environment. Run
+                             install again, with the settings, to change them.
     MEDIAMTX_CONFIG_BACKUPS  Timestamped backups of the MediaMTX configuration
                              kept when it changes [default: 5]
     LYREBIRD_START_POLICY    What start requires [default: degraded]

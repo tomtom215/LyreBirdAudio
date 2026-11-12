@@ -96,7 +96,22 @@ set -o errtrace # Inherit ERR trap in functions
 # Source shared library if available (backward compatible)
 # Provides: colors, logging, command_exists, compute_hash, exit codes
 # Falls back gracefully if library not present - all functions defined locally below
-_LYREBIRD_COMMON="${BASH_SOURCE[0]%/*}/lyrebird-common.sh"
+# Where the library is: beside the path this script was started by (a bare name, run
+# from its own directory, has no slash: that directory is "."), else, when that path is
+# a symlink, beside the file it points at
+_LYREBIRD_COMMON="${BASH_SOURCE[0]}"
+if [[ "$_LYREBIRD_COMMON" == */* ]]; then
+    _LYREBIRD_COMMON="${_LYREBIRD_COMMON%/*}/lyrebird-common.sh"
+else
+    _LYREBIRD_COMMON="./lyrebird-common.sh"
+fi
+if [[ ! -f "$_LYREBIRD_COMMON" && -L "${BASH_SOURCE[0]}" ]]; then
+    _LYREBIRD_REAL="$(readlink -f -- "${BASH_SOURCE[0]}" 2>/dev/null || true)"
+    if [[ "$_LYREBIRD_REAL" == */* ]]; then
+        _LYREBIRD_COMMON="${_LYREBIRD_REAL%/*}/lyrebird-common.sh"
+    fi
+    unset _LYREBIRD_REAL
+fi
 # shellcheck source=lyrebird-common.sh
 [[ -f "$_LYREBIRD_COMMON" ]] && source "$_LYREBIRD_COMMON" || true
 unset _LYREBIRD_COMMON
@@ -318,6 +333,21 @@ declare -A SERVICE_STATE=(
 
 # Custom environment variables from service file
 declare -a SERVICE_CUSTOM_ENV=()
+
+# The settings the stream manager's `install` writes into the service unit and the monitor's
+# cron file: the stream mode, filter and name, and (UNIT_CARRIED_SETTINGS in
+# lyrebird-stream-manager.sh) the listener, authentication and endpoint settings.
+# `install` writes what it is given, and the defaults for the rest, so a reinstall that
+# passes none of them would turn a multiplex node into an individual one and put every
+# port and the authentication back on the defaults (X-52, X-58). The service is reinstalled
+# with the values the installed unit, or else the cron file, carries now
+# (tests/test_install_settings.bats keeps this list equal to the manager's).
+readonly INSTALL_SETTING_VARS=(STREAM_MODE MULTIPLEX_FILTER_TYPE MULTIPLEX_STREAM_NAME
+    MEDIAMTX_RTSP_PORT MEDIAMTX_API_PORT MEDIAMTX_METRICS_PORT MEDIAMTX_API_BIND MEDIAMTX_METRICS_BIND
+    RTSP_AUTH_MODE RTSP_USERS_FILE MEDIAMTX_HOST MEDIAMTX_BINARY)
+
+# NAME=VALUE of each INSTALL_SETTING_VARS entry the installed service sets, for `install`
+declare -a SERVICE_INSTALL_ENV=()
 
 ################################################################################
 # Logging Functions
@@ -942,6 +972,81 @@ stop_service_safe() {
     return 0
 }
 
+# Undo systemd_escape_env_value of the stream manager: \\ and \" are the character after
+# the backslash, %% is a percent sign
+_unit_unescape_value() {
+    local in="$1" out="" c
+    while [[ -n "$in" ]]; do
+        c="${in:0:1}"
+        if [[ "$c" == '\' && ${#in} -gt 1 ]]; then
+            out+="${in:1:1}"
+            in="${in:2}"
+        elif [[ "$c" == '%' && "${in:1:1}" == '%' ]]; then
+            out+='%'
+            in="${in:2}"
+        else
+            out+="$c"
+            in="${in:1}"
+        fi
+    done
+    printf '%s' "$out"
+}
+
+# Fill SERVICE_INSTALL_ENV: the INSTALL_SETTING_VARS the installed unit sets in an
+# Environment= line (the last assignment wins, as in systemd), and for the ones it does not
+# set the value in the monitor's cron file. A variable neither file sets is left out: the
+# manager's default applies, as it does to the service now.
+read_installed_service_settings() {
+    SERVICE_INSTALL_ENV=()
+    local -A found=()
+    local line rest word name value quoted_re='^"(([^"\\]|\\.)*)"(.*)$'
+    local known=" ${INSTALL_SETTING_VARS[*]} "
+
+    if [[ -f "$SERVICE_FILE" ]]; then
+        while IFS= read -r line; do
+            [[ "$line" == Environment=* ]] || continue
+            rest="${line#Environment=}"
+            while :; do
+                rest="${rest#"${rest%%[![:space:]]*}"}"
+                [[ -n "$rest" ]] || break
+                if [[ "$rest" == \"* ]]; then
+                    if [[ "$rest" =~ $quoted_re ]]; then
+                        word="$(_unit_unescape_value "${BASH_REMATCH[1]}")"
+                        rest="${BASH_REMATCH[3]}"
+                    else
+                        break
+                    fi
+                else
+                    word="${rest%%[[:space:]]*}"
+                    rest="${rest#"$word"}"
+                fi
+                [[ "$word" == *=* ]] || continue
+                name="${word%%=*}"
+                if [[ "$known" == *" ${name} "* ]]; then
+                    found[$name]="${word#*=}"
+                fi
+            done
+        done <"$SERVICE_FILE"
+    fi
+
+    if [[ -f "$SERVICE_CRON_FILE" ]]; then
+        while IFS= read -r line; do
+            [[ "$line" =~ ^([A-Z_][A-Z0-9_]*)=(.*)$ ]] || continue
+            name="${BASH_REMATCH[1]}"
+            value="${BASH_REMATCH[2]}"
+            if [[ "$known" == *" ${name} "* && -z "${found[$name]+set}" ]]; then
+                found[$name]="$value"
+            fi
+        done <"$SERVICE_CRON_FILE"
+    fi
+
+    for name in "${INSTALL_SETTING_VARS[@]}"; do
+        if [[ -n "${found[$name]+set}" ]]; then
+            SERVICE_INSTALL_ENV+=("${name}=${found[$name]}")
+        fi
+    done
+}
+
 # Reinstall service definition while preserving customizations
 reinstall_service_with_customizations() {
     local script_path="$1"
@@ -963,9 +1068,12 @@ reinstall_service_with_customizations() {
     fi
 
     # Call install command to regenerate service file
-    # Capture output but suppress expected informational messages
+    # Capture output but suppress expected informational messages. The settings of the
+    # installed service go to `install` as environment: it writes the unit AND the
+    # monitor's cron file, and rewrites both from what it is given
+    read_installed_service_settings
     local install_output
-    if ! install_output=$(run_unlocked "$script_path" install 2>&1); then
+    if ! install_output=$(run_unlocked env ${SERVICE_INSTALL_ENV[@]+"${SERVICE_INSTALL_ENV[@]}"} "$script_path" install 2>&1); then
         log_error "Failed to reinstall service definition"
         if [[ -n "$install_output" ]]; then
             log_debug "Install output: $install_output"
@@ -975,16 +1083,24 @@ reinstall_service_with_customizations() {
 
     log_success "Service definition reinstalled"
 
-    # If there were customizations, merge them back in
+    # If there were customizations, merge back those the new unit does not carry already
+    # (the settings `install` was given above are in it)
+    local -a restore_env=()
     if [[ "${SERVICE_STATE[has_customizations]}" == "true" ]]; then
-        log_step "Restoring custom environment variables..."
-
-        local service_file="${SERVICE_STATE[service_file]}"
+        local service_file="${SERVICE_STATE[service_file]}" custom_env
 
         if [[ ! -f "$service_file" ]]; then
             log_error "Service file not found after reinstall: $service_file"
             return 1
         fi
+        for custom_env in "${SERVICE_CUSTOM_ENV[@]}"; do
+            if ! grep -qxF -- "$custom_env" "$service_file"; then
+                restore_env+=("$custom_env")
+            fi
+        done
+    fi
+    if [[ ${#restore_env[@]} -gt 0 ]]; then
+        log_step "Restoring custom environment variables..."
 
         # Create temporary file for merging
         local temp_service
@@ -1003,7 +1119,7 @@ reinstall_service_with_customizations() {
             if [[ -n "$working_dir_line" ]]; then
                 # Insert after WorkingDirectory
                 head -n "$working_dir_line" "$service_file" >"$temp_service"
-                for custom_env in "${SERVICE_CUSTOM_ENV[@]}"; do
+                for custom_env in "${restore_env[@]}"; do
                     echo "$custom_env" >>"$temp_service"
                     log_debug "Restored: $custom_env"
                 done
@@ -1015,7 +1131,7 @@ reinstall_service_with_customizations() {
         else
             # Insert after last Environment= line
             head -n "$last_env_line_num" "$service_file" >"$temp_service"
-            for custom_env in "${SERVICE_CUSTOM_ENV[@]}"; do
+            for custom_env in "${restore_env[@]}"; do
                 echo "$custom_env" >>"$temp_service"
                 log_debug "Restored: $custom_env"
             done
@@ -1029,7 +1145,7 @@ reinstall_service_with_customizations() {
             return 1
         fi
 
-        log_success "Custom environment variables restored (${#SERVICE_CUSTOM_ENV[@]} variable(s))"
+        log_success "Custom environment variables restored (${#restore_env[@]} variable(s))"
     fi
 
     return 0
@@ -1633,9 +1749,9 @@ git_worktree() {
 # Git Configuration Management
 ################################################################################
 
-# core.fileMode is switched off for the length of a run: the scripts are
-# tracked as 644 but made executable on disk, which git would otherwise report
-# as local modifications. The value it had is written to GIT_CONFIG_SAVED_FILE
+# core.fileMode is switched off for the length of a run: the scripts of older tags
+# are tracked as 644 (the current ones as 755, X-56) but made executable on disk,
+# which git would otherwise report as local modifications. The value it had is written to GIT_CONFIG_SAVED_FILE
 # BEFORE the change, so a run that is killed (or exec'd into the new updater,
 # which skips the EXIT trap) cannot leave "false" behind for good: whoever
 # starts next restores the saved value first.
@@ -3343,7 +3459,7 @@ set_script_permissions() {
 
     # The known scripts plus every shell script the repository tracks. git
     # writes a changed file with the mode recorded in the repository (644 for
-    # most of the scripts) and core.fileMode is off while the updater runs, so
+    # most of the scripts of older tags) and core.fileMode is off while the updater runs, so
     # after a switch or a rollback whatever is not marked here is no longer
     # executable -- the diagnostics and mic-check scripts were not on the old
     # list of five.
