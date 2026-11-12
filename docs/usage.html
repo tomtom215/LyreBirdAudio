@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Basic Usage - LyreBirdAudio Docs</title>
-  <meta name="description" content="How to manage streams, access audio, and use the Orchestrator.">
+  <meta name="description" content="Managing streams, accessing audio over RTSP, multiplex mode and the systemd service.">
   <link rel="stylesheet" href="css/style.css">
 </head>
 <body>
@@ -19,7 +19,7 @@
     <div class="page-header">
       <span class="page-label">User Guide</span>
       <h1 class="page-title">Basic Usage</h1>
-      <p class="page-subtitle">Manage streams, access audio over RTSP, and use the Orchestrator for all management tasks.</p>
+      <p class="page-subtitle">Manage streams, access audio over RTSP, and use the Orchestrator for management tasks.</p>
     </div>
 
     <div class="toc">
@@ -36,8 +36,8 @@
 
     <h2 id="orchestrator">Using the Orchestrator</h2>
     <p>
-      The Orchestrator is the recommended entry point for all management tasks. It provides a
-      menu-driven interface that delegates to the individual specialized scripts.
+      The Orchestrator is a menu-driven interface that runs the individual scripts for you and explains their results.
+      Everything it does can also be done with the scripts directly.
     </p>
     <pre><code>sudo ./lyrebird-orchestrator.sh</code></pre>
 
@@ -46,86 +46,109 @@
       <table>
         <thead><tr><th>Option</th><th>Action</th></tr></thead>
         <tbody>
-          <tr><td>1. Quick Setup Wizard</td><td>Guided first-time setup (install, map, configure, start)</td></tr>
-          <tr><td>2. MediaMTX Installation &amp; Updates</td><td>Install, update, or check MediaMTX version</td></tr>
-          <tr><td>3. USB Device Management</td><td>Map devices, detect capabilities, validate configuration</td></tr>
-          <tr><td>4. Audio Streaming Control</td><td>Start, stop, restart streams; view status</td></tr>
-          <tr><td>5. System Diagnostics</td><td>Run quick, full, or debug health checks</td></tr>
-          <tr><td>6. Version Management</td><td>Update scripts, check versions, rollback</td></tr>
-          <tr><td>7. Logs &amp; Status</td><td>View stream logs, system logs, service status</td></tr>
+          <tr><td>1. Quick Setup Wizard</td><td>Four steps: install MediaMTX, map USB devices, start streams, quick diagnostics (it does not generate a configuration; see <a href="quick-start.html#wizard">Quick Start</a>)</td></tr>
+          <tr><td>2. MediaMTX Installation &amp; Updates</td><td>Install, update, reinstall, uninstall, installation status</td></tr>
+          <tr><td>3. USB Device Management</td><td>Map devices, detect capabilities, generate and validate the device configuration</td></tr>
+          <tr><td>4. Audio Streaming Control</td><td>Start, stop, restart (each reports the outcome per stream), status, stream URLs, monitor health</td></tr>
+          <tr><td>5. System Diagnostics</td><td>Quick, full or verbose checks; export a report</td></tr>
+          <tr><td>6. Version Management</td><td>Launch the updater, show component versions, show update history, roll back</td></tr>
+          <tr><td>7. Logs &amp; Status</td><td>View MediaMTX, orchestrator, stream manager and stream logs; quick health check</td></tr>
         </tbody>
       </table>
     </div>
 
     <h2 id="managing-streams">Managing Streams</h2>
     <p>
-      The Stream Manager handles all FFmpeg process lifecycle. You can use it directly or
-      through the Orchestrator.
+      The stream manager starts MediaMTX and one FFmpeg wrapper per microphone, and reports whether each stream is publishing.
+      You can use it directly or through the Orchestrator. Every command except <code>status</code>, <code>config</code>
+      and <code>validate</code> needs root.
     </p>
 
     <div class="command-ref">
       <div class="command-ref-header">Stream Manager Commands</div>
       <div class="command-row">
         <span class="command-name">start</span>
-        <span class="command-desc">Detect USB devices, configure, and start all streams</span>
+        <span class="command-desc">Detect USB devices and start MediaMTX and the streams. Exit 0 when the start policy is met, 9 when not. Safe to repeat</span>
       </div>
       <div class="command-row">
         <span class="command-name">stop</span>
-        <span class="command-desc">Gracefully stop all running streams</span>
+        <span class="command-desc">Stop the streams and the MediaMTX this manager started</span>
       </div>
       <div class="command-row">
         <span class="command-name">restart</span>
-        <span class="command-desc">Stop then start all streams</span>
+        <span class="command-desc">Stop, then start (interrupts running streams)</span>
       </div>
       <div class="command-row">
-        <span class="command-name">status</span>
-        <span class="command-desc">Show status of all active streams and processes</span>
+        <span class="command-name">reload</span>
+        <span class="command-desc">Apply a changed MediaMTX configuration without stopping healthy streams</span>
+      </div>
+      <div class="command-row">
+        <span class="command-name">status [--json]</span>
+        <span class="command-desc">Each stream (path ready, bytes flowing, last error) and the overall state; no root needed</span>
       </div>
       <div class="command-row">
         <span class="command-name">monitor</span>
-        <span class="command-desc">Check health and restart any failed streams (used by cron)</span>
+        <span class="command-desc">One health check; restarts what needs it (cron runs this)</span>
       </div>
       <div class="command-row">
         <span class="command-name">config</span>
-        <span class="command-desc">Display current stream configuration</span>
+        <span class="command-desc">Show the device configuration file</span>
+      </div>
+      <div class="command-row">
+        <span class="command-name">validate</span>
+        <span class="command-desc">Check the device configuration file</span>
       </div>
       <div class="command-row">
         <span class="command-name">force-stop</span>
-        <span class="command-desc">Force kill all streams and clean up stale files</span>
+        <span class="command-desc">SIGKILL the processes this manager started and remove its PID files</span>
       </div>
       <div class="command-row">
         <span class="command-name">install</span>
-        <span class="command-desc">Install as systemd service with cron health monitoring</span>
+        <span class="command-desc">Write the systemd unit and the monitor cron job</span>
       </div>
     </div>
 
     <pre><code># Start all streams
 sudo ./lyrebird-stream-manager.sh start
 
-# Check status
+# Check status (no root needed)
 ./lyrebird-stream-manager.sh status
 
 # Stop all streams
 sudo ./lyrebird-stream-manager.sh stop
 
-# Restart after configuration change
+# Restart after a change to a per-device setting (a running stream keeps the settings it started with)
 sudo ./lyrebird-stream-manager.sh restart
 
-# Force cleanup (use when graceful stop fails)
+# Apply a changed MediaMTX configuration without an outage
+sudo ./lyrebird-stream-manager.sh reload
+
+# When a graceful stop fails: kill what this manager started, then start again
 sudo ./lyrebird-stream-manager.sh force-stop
 sudo ./lyrebird-stream-manager.sh start</code></pre>
 
+    <div class="callout info">
+      <span class="callout-icon">ℹ️</span>
+      <div class="callout-body">
+        <strong>What a successful start means</strong>
+        <p>A stream counts as started when MediaMTX reports its path as ready, not when FFmpeg is running. With the default <code>LYREBIRD_START_POLICY=degraded</code>, <code>start</code> exits 0 when at least one stream publishes; with <code>strict</code> it needs all of them; otherwise it exits 9 and stops what it started. With no USB audio device it starts MediaMTX, reports <code>waiting_for_devices</code> and exits 0. Details: <a href="components.html#start-outcome">Component Reference</a>.</p>
+      </div>
+    </div>
+
     <h2 id="accessing-streams">Accessing Streams</h2>
-    <p>Streams are served over RTSP on port <strong>8554</strong>. The stream path matches the device's friendly name.</p>
+    <p>
+      Streams are served over RTSP on port <strong>8554</strong> (<code>MEDIAMTX_RTSP_PORT</code>). In individual mode the stream
+      path is the name you gave the microphone with the USB mapper (its ALSA card id); a card with no such name is published
+      under a name derived from the device name.
+    </p>
 
     <h3>Stream URLs</h3>
     <pre><code># Default pattern
-rtsp://your-server-ip:8554/Device_1
-rtsp://your-server-ip:8554/Device_2
+rtsp://your-server-ip:8554/mic-left
+rtsp://your-server-ip:8554/mic-right
 
-# With custom device names (from udev mapping)
-rtsp://192.168.1.100:8554/front-mic
-rtsp://192.168.1.100:8554/rear-mic</code></pre>
+# status prints the URL of every stream
+./lyrebird-stream-manager.sh status</code></pre>
 
     <h3>RTSP Clients</h3>
     <div class="table-wrapper">
@@ -134,15 +157,15 @@ rtsp://192.168.1.100:8554/rear-mic</code></pre>
         <tbody>
           <tr>
             <td><strong>ffplay</strong></td>
-            <td><code>ffplay rtsp://localhost:8554/Device_1</code></td>
+            <td><code>ffplay rtsp://localhost:8554/mic-left</code></td>
           </tr>
           <tr>
             <td><strong>VLC</strong></td>
-            <td><code>vlc rtsp://localhost:8554/Device_1</code></td>
+            <td><code>vlc rtsp://localhost:8554/mic-left</code></td>
           </tr>
           <tr>
             <td><strong>FFmpeg (record)</strong></td>
-            <td><code>ffmpeg -i rtsp://ip:8554/Device_1 -c copy out.mkv</code></td>
+            <td><code>ffmpeg -i rtsp://ip:8554/mic-left -c copy out.mkv</code></td>
           </tr>
           <tr>
             <td><strong>OBS Studio</strong></td>
@@ -156,29 +179,49 @@ rtsp://192.168.1.100:8554/rear-mic</code></pre>
       </table>
     </div>
 
-    <h3>WebRTC Streaming</h3>
-    <p>MediaMTX also provides WebRTC access via a built-in web player at:</p>
-    <pre><code>http://your-server-ip:8889/Device_1</code></pre>
+    <div class="callout info">
+      <span class="callout-icon">ℹ️</span>
+      <div class="callout-body">
+        <strong>RTSP only</strong>
+        <p>The generated MediaMTX configuration turns WebRTC, HLS, RTMP and SRT off, so there is no browser player or HLS URL. Only RTSP is served. See <a href="configuration.html#mediamtx">Configuration</a>.</p>
+      </div>
+    </div>
 
     <h2 id="multiplex">Multiplex Streaming</h2>
     <p>
-      Multiplex mode combines multiple USB microphones into a single RTSP stream using FFmpeg audio filters.
-      This is useful for recording all microphones as one feed or for centralized monitoring.
+      Multiplex mode combines all detected USB microphones into one RTSP stream using an FFmpeg audio filter.
+      This is useful for recording all microphones as one feed or for centralized monitoring. The settings of the first
+      device apply to the whole stream, and every microphone that has a capture PCM is included.
     </p>
 
     <h3>amix — Audio Mixing</h3>
-    <p>Mixes all device inputs into a single stereo stream. All inputs are combined with equal weight.</p>
+    <p>
+      Mixes all inputs into one stream with the channel count of one input (two stereo microphones give a stereo stream).
+      With FFmpeg 4.4 or newer the manager sets <code>normalize=0</code>, so the inputs are summed at full weight: two equal
+      inputs come out about 6 dB louder than FFmpeg's default amix, and loud inputs can clip. FFmpeg 4.2 and 4.3 have no
+      such option, so there the mix is normalized; the manager detects which applies.
+    </p>
     <pre><code>sudo ./lyrebird-stream-manager.sh -m multiplex -f amix start
 # Output: rtsp://host:8554/all_mics</code></pre>
 
     <h3>amerge — Channel Merging</h3>
-    <p>Concatenates inputs preserving separate channels. 3 stereo mics → 6-channel stream.</p>
+    <p>
+      Puts the channels of every input side by side: 3 stereo microphones give a 6-channel stream. The codec must be able
+      to encode that many channels. With the default codec, opus, FFmpeg refuses the 4 channels of two stereo microphones;
+      the manager says so and does not start the stream. Use <code>amix</code>, or set <code>CODEC</code> to <code>aac</code>.
+    </p>
     <pre><code>sudo ./lyrebird-stream-manager.sh -m multiplex -f amerge start
 # Output: rtsp://host:8554/all_mics</code></pre>
 
     <h3>Custom Stream Name</h3>
     <pre><code>sudo ./lyrebird-stream-manager.sh -m multiplex -n studio start
 # Output: rtsp://host:8554/studio</code></pre>
+    <p>
+      The name is lower-case letters, digits, <code>_</code> and <code>-</code>, at most 64 characters. Anything else is replaced by
+      <code>_</code> and the result is logged (<code>Studio Mix</code> becomes <code>studio_mix</code>); a name with no letter or digit,
+      a reserved word (<code>control</code>, <code>stats</code>, <code>api</code>, <code>metrics</code>, <code>health</code>,
+      <code>all</code>, <code>all_others</code>) or more than 64 characters stops the command with exit 4.
+    </p>
 
     <div class="table-wrapper">
       <table>
@@ -186,19 +229,23 @@ rtsp://192.168.1.100:8554/rear-mic</code></pre>
           <tr><th>Feature</th><th>amix (Mixing)</th><th>amerge (Merging)</th></tr>
         </thead>
         <tbody>
-          <tr><td>Output channels</td><td>Fixed (typically 2)</td><td>Sum of all inputs</td></tr>
-          <tr><td>Channel separation</td><td>Lost (mixed together)</td><td>Preserved per-device</td></tr>
-          <tr><td>Bandwidth</td><td>Lower</td><td>Higher</td></tr>
-          <tr><td>Post-processing</td><td>Limited</td><td>Full per-channel access</td></tr>
-          <tr><td>Best for</td><td>Monitoring, simple recording</td><td>Professional audio, forensics</td></tr>
+          <tr><td>Output channels</td><td>Same as one input</td><td>Sum of all inputs</td></tr>
+          <tr><td>Channel separation</td><td>Lost (mixed together)</td><td>Kept: one channel per input channel</td></tr>
+          <tr><td>Loudness</td><td>Sum of the inputs (FFmpeg 4.4+), or normalized (4.2, 4.3)</td><td>Unchanged per channel</td></tr>
+          <tr><td>Limit</td><td>None beyond the codec's</td><td>The codec must encode the total channel count</td></tr>
         </tbody>
       </table>
     </div>
+    <p>
+      A microphone that is added while the multiplex stream runs makes the monitor restart the stream, because the wrapper
+      captures only the devices it was started with. When a microphone disappears the wrapper ends, and the monitor restarts
+      it with the remaining ones.
+    </p>
 
     <h2 id="systemd-service">Systemd Service (Recommended for Production)</h2>
     <p>
-      For 24/7 operation, the stream manager must be installed as a systemd service. Without it,
-      streams stop when the terminal session ends or the system reboots.
+      For 24/7 operation, install the stream manager as a systemd service. Without it, nothing starts the streams again
+      after a reboot.
     </p>
     <pre><code># Install and enable the service
 sudo ./lyrebird-stream-manager.sh install
@@ -208,20 +255,29 @@ sudo systemctl start mediamtx-audio
 # Service management
 sudo systemctl status mediamtx-audio
 sudo systemctl restart mediamtx-audio
-sudo journalctl -u mediamtx-audio -f    # Follow live logs</code></pre>
+sudo systemctl reload mediamtx-audio    # runs "reload": no outage for healthy streams
 
-    <p>The systemd installation also:</p>
+# Follow the manager's log
+sudo tail -f /var/log/lyrebird-stream-manager.log</code></pre>
+
+    <p>What <code>install</code> writes:</p>
     <ul>
-      <li>Creates a cron job at <code>/etc/cron.d/mediamtx-monitor</code> for health checks every 5 minutes</li>
-      <li>Enables systemd watchdog integration for process supervision</li>
-      <li>Configures graceful shutdown ordering</li>
+      <li><code>/etc/systemd/system/mediamtx-audio.service</code>, rendered from <code>config/mediamtx-audio.service</code>: <code>Restart=always</code>, a start limit of 10 starts in 20 minutes, <code>ExecReload</code> running <code>reload</code>, and <code>Conflicts=mediamtx.service</code>. There is no watchdog: the unit has no <code>WatchdogSec=</code> and the manager sends no systemd watchdog keep-alives</li>
+      <li><code>/etc/cron.d/mediamtx-monitor</code>: runs <code>monitor</code> every 5 minutes under <code>flock</code>; an exit status of 2 restarts the service, any other non-zero status is logged with <code>logger</code></li>
+      <li><code>/etc/logrotate.d/mediamtx</code> (when logrotate is installed): rotates the MediaMTX log, the manager log and the FFmpeg logs</li>
     </ul>
+    <p>
+      The unit writes the manager's output to <code>/var/log/lyrebird-stream-manager.log</code> (<code>StandardOutput=append:</code>),
+      so that file is the log to read; <code>journalctl -u mediamtx-audio</code> shows systemd's own messages about the unit.
+      <code>install</code> must be run from a checkout (it reads the unit template next to the script). To change the stream mode of an
+      installed service, run <code>install</code> again with the <code>-m/-f/-n</code> options; the cron job's mode changes with it.
+    </p>
 
     <div class="callout tip">
       <span class="callout-icon">💡</span>
       <div class="callout-body">
         <strong>When Direct Script Execution is OK</strong>
-        <p>Running the script directly (without systemd) is fine for: one-time testing, development, debugging, or short manual recording sessions. For anything running continuously, use the systemd service.</p>
+        <p>Running the script directly (without systemd) is fine for one-time testing, development, debugging, or short manual sessions. For anything running continuously, use the systemd service. The project's tests do not run the service under a real systemd manager; the unit is checked with <code>systemd-analyze verify</code> only.</p>
       </div>
     </div>
 
@@ -232,12 +288,15 @@ sudo ./lyrebird-diagnostics.sh quick
 # Full diagnostics (run weekly)
 sudo ./lyrebird-diagnostics.sh full
 
-# Monitor stream resources
-./lyrebird-stream-manager.sh monitor
+# One health check of the streams (needs root; this is what cron runs)
+sudo ./lyrebird-stream-manager.sh monitor
+
+# Machine-readable state
+./lyrebird-stream-manager.sh status --json
 
 # View live logs
 sudo tail -f /var/log/lyrebird-stream-manager.log
-sudo tail -f /var/log/lyrebird/*.log</code></pre>
+sudo tail -f /var/lib/mediamtx-ffmpeg/mic-left.log</code></pre>
 
     <p>See the <a href="monitoring.html">Diagnostics &amp; Monitoring</a> page for full details.</p>
 
