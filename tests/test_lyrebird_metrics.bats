@@ -1480,6 +1480,46 @@ _stop_server_term_ok() {
     _stop_server_term_ok
 }
 
+@test "serve: SIGTERM during a timed wait still stops it cleanly with status 0 when the cleanup is slow: no bash abort, the temp directory is removed [X-44]" {
+    # bash 5.2 leaves the timer of an interrupted `read -t` armed when an exit trap
+    # unwinds out of it; the cleanup's first command substitution (the log line's date)
+    # then finds that timer expired and longjmps into the read's dead stack frame:
+    # "longjmp causes uninitialized stack frame", status 134, and no cleanup at all.
+    # The server waits in `read -t` (0.5 s) here, in the back-off after finding its
+    # port taken, so the signal is certain to land inside a timed read; a slow date
+    # makes the cleanup outlast that read's timer.
+    local port holder i
+    port="$(_serve_port)"
+    _stub_curl "$TEST_SCRATCH/bin"
+    cat >"$TEST_SCRATCH/bin/date" <<'SHIM'
+#!/bin/bash
+[[ -e "$SLOW_DATE_MARKER" ]] && sleep 0.8
+exec /bin/date "$@"
+SHIM
+    chmod +x "$TEST_SCRATCH/bin/date"
+    python3 -I "$PROJECT_ROOT/tests/helpers/port_holder.py" "$port" 30 3>&- &
+    holder=$!
+    DECOY_PID="$holder"
+    sleep 0.5
+    SERVER_ENV=(SLOW_DATE_MARKER="$TEST_SCRATCH/slow-date")
+    _start_server --serve "$port"
+    for ((i = 0; i < 100; i++)); do
+        grep -q 'retrying' "$TEST_SCRATCH/server.err" 2>/dev/null && break
+        sleep 0.02
+    done
+    grep -q 'retrying' "$TEST_SCRATCH/server.err"
+    : >"$TEST_SCRATCH/slow-date"
+    kill -TERM "$SERVER_PID"
+    _wait_exit 100
+    [ "$SERVER_RC" -eq 0 ] || { echo "server exit status $SERVER_RC"; cat "$TEST_SCRATCH/server.err"; return 1; }
+    ! grep -q 'longjmp' "$TEST_SCRATCH/server.err" || false
+    # the cleanup ran: the server says so, and its private directory is gone
+    grep -q 'Shutting down metrics server' "$TEST_SCRATCH/server.err"
+    [ -z "$(find "$TEST_SCRATCH" -maxdepth 1 -name 'tmp.*' 2>/dev/null)" ] || ls -la "$TEST_SCRATCH"
+    kill "$holder" 2>/dev/null || true
+    DECOY_PID=""
+}
+
 @test "serve: an idle listener is recycled, which frees the port from a client that connected and never sent anything [LB-18]" {
     local port launcher
     port="$(_serve_port)"

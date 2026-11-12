@@ -1563,9 +1563,10 @@
         "serve: GET / and GET /metrics are 200, other paths 404, other methods 405, malformed requests 400 [LB-18]",
         "serve: requests that follow each other are all answered, each by a freshly armed listener [LB-18]",
         "--help says the server is made for a poller: a client that connects while another is served can be reset [X-44]",
-        "serve: a client that half-closes and one that sends a huge or endless request do not wedge the server [LB-18]"
+        "serve: a client that half-closes and one that sends a huge or endless request do not wedge the server [LB-18]",
+        "serve: SIGTERM during a timed wait still stops it cleanly with status 0 when the cleanup is slow: no bash abort, the temp directory is removed [X-44]"
       ],
-      "note": "the tests now wait for the server to be idle (one listening socket, no live connection); the cause is netcat keeping its listening socket until it exits (SO_REUSEPORT), reproduced with two ncs, so a client that connects while another is served can be reset: documented in --help, wontfix without a different server (python3 or ncat), a maintainer decision"
+      "note": "two causes. (1) the tests sent the next request after a fixed pause while the previous netcat still held its listening socket (SO_REUSEPORT: a connection given to it is reset when it exits): they now wait for an idle server, and --help states that limit; fixing it in the server needs a server that is not nc (python3 or ncat), a maintainer decision. (2) a real abort: bash 5.2.21 leaves its read -t timer armed when the exit trap unwinds out of a timed read, and the cleanup's next command substitution jumps into the dead frame (status 134, no cleanup; 6 in 480 shutdowns under load, a 10-line script reproduces it every time); srv_cleanup now starts with a timed read that completes, which disarms the timer"
     },
     {
       "id": "X-45",

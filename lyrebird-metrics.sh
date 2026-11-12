@@ -1570,6 +1570,16 @@ finish_connection() {
 
 # Exit trap of the server: stop our nc processes and remove the private directory.
 srv_cleanup() {
+    # FIRST: clear the timer of the `read -t` a signal may have interrupted. The signal
+    # usually arrives while the server waits in a timed read, and the trap's `exit` then
+    # unwinds out of that read without disarming bash 5.2's read timer. The next command
+    # substitution (the log line's `date`) looks at that stale timer when it reads its
+    # output; if the timer has expired by then (a short wait, a slow `date`), bash jumps
+    # into the abandoned read's stack frame: "longjmp causes uninitialized stack frame",
+    # status 134, and the rest of this cleanup never runs (seen in about 1 shutdown in
+    # 100 under load; a 10-line script reproduces it every time). A timed read that
+    # completes disarms the timer; this one has its input ready.
+    read -r -t 1 _ <<<"" || true
     log "Shutting down metrics server..."
     stop_listener 0
     stop_listener 1
