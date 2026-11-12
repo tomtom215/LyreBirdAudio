@@ -17,7 +17,7 @@ setup() {
     BG_PIDS=()
     export PROJECT_ROOT RF
     export MEDIAMTX_CONFIG_DIR="$RF/cfg" MEDIAMTX_FFMPEG_DIR="$RF/ff" MEDIAMTX_PID_FILE="$RF/mtx.pid"
-    export MEDIAMTX_LOCK_FILE="$RF/run.lock" MEDIAMTX_LOG_FILE="$RF/sm.log"
+    export MEDIAMTX_LOCK_FILE="$RF/run.lock" MEDIAMTX_LOG_FILE="$RF/sm.log" STREAM_MANAGER_LOG_FILE="$RF/sm.log"
     export MEDIAMTX_RESTART_MARKER="$RF/restart.marker" MEDIAMTX_CLEANUP_MARKER="$RF/cleanup.marker"
     export CRON_RESTART_STATE_DIR="$RF/cron" DEEP_HEALTH_STATE_DIR="$RF/deep" SILENCE_STATE_DIR="$RF/silence"
     export MEM_SAMPLE_FILE="$RF/ff/.mem_samples" NETWORK_CHECK_ENABLED=false
@@ -241,7 +241,7 @@ SHIM
 
 @test "setup_directories creates the recording directory and never AUDIO_DISK_PATH, with AUDIO_DISK_PERSIST=true [LB-16, D8]" {
     run env AUDIO_LOCAL_RECORDING=true AUDIO_RECORDING_PATH="$RF/recording" AUDIO_DISK_PERSIST=true AUDIO_DISK_PATH="$RF/disk-recordings" \
-        MEDIAMTX_LOG_FILE="$RF/logs/sm.log" bash -c '
+        MEDIAMTX_LOG_FILE="$RF/logs/sm.log" STREAM_MANAGER_LOG_FILE="$RF/logs/sm.log" bash -c '
         source "$1" >/dev/null 2>&1
         setup_mediamtx_logrotate() { :; }   # would write /etc/logrotate.d on a host that has logrotate
         setup_directories

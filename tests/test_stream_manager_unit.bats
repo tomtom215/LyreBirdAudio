@@ -18,7 +18,7 @@ setup() {
     mkdir -p "$UN"
     BG_PIDS=()
     export PROJECT_ROOT UN
-    export MEDIAMTX_LOG_FILE="$UN/sm.log" MEDIAMTX_CONFIG_DIR="$UN/cfg" MEDIAMTX_FFMPEG_DIR="$UN/ff"
+    export MEDIAMTX_LOG_FILE="$UN/sm.log" STREAM_MANAGER_LOG_FILE="$UN/sm.log" MEDIAMTX_CONFIG_DIR="$UN/cfg" MEDIAMTX_FFMPEG_DIR="$UN/ff"
     export MEDIAMTX_PID_FILE="$UN/mtx.pid" MEDIAMTX_LOCK_FILE="$UN/run.lock"
     SCRIPT="$PROJECT_ROOT/lyrebird-stream-manager.sh"
     TEMPLATE="$PROJECT_ROOT/config/mediamtx-audio.service"
@@ -117,7 +117,7 @@ inst() {
 }
 
 # The manager's configured paths unset: its defaults (the setup points them at a scratch directory)
-DEFAULT_PATHS=(-u MEDIAMTX_LOG_FILE -u MEDIAMTX_CONFIG_DIR -u MEDIAMTX_FFMPEG_DIR -u MEDIAMTX_PID_FILE -u MEDIAMTX_LOCK_FILE
+DEFAULT_PATHS=(-u MEDIAMTX_LOG_FILE -u STREAM_MANAGER_LOG_FILE -u MEDIAMTX_CONFIG_DIR -u MEDIAMTX_FFMPEG_DIR -u MEDIAMTX_PID_FILE -u MEDIAMTX_LOCK_FILE
     -u STREAM_MODE -u MULTIPLEX_FILTER_TYPE -u MULTIPLEX_STREAM_NAME -u AUDIO_LOCAL_RECORDING -u AUDIO_RECORDING_PATH)
 
 # The value of the first KEY= line of SECTION in FILE
@@ -329,7 +329,7 @@ PY
     run env MEDIAMTX_PID_FILE="/run/my pid.pid" bash -c 'source "$ISCRIPT" >/dev/null 2>&1; render_systemd_unit' _
     [ "$status" -ne 0 ]
     [[ "$output" == *"is not an absolute path of letters, digits"* ]]
-    run env MEDIAMTX_LOG_FILE='/var/log/it"s.log' bash -c 'source "$ISCRIPT" >/dev/null 2>&1; render_systemd_unit' _
+    run env MEDIAMTX_LOG_FILE='/var/log/it"s.log' STREAM_MANAGER_LOG_FILE='/var/log/it"s.log' bash -c 'source "$ISCRIPT" >/dev/null 2>&1; render_systemd_unit' _
     [ "$status" -ne 0 ]
     # the script installed under a path with a space
     mkdir -p "$UN/with space/config"
@@ -361,39 +361,39 @@ PY
 
 @test "TimeoutStartSec and TimeoutStopSec: the template's numbers are the manager's worst case for 8 streams, and follow the configured timeouts [LB-11]" {
     make_install
-    # 30 lock + 9*5 cleanup + 15 restart wait + 10 USB + 60 API + 8*(13 + 3*(5+2)) = 432; +10 % rounded up to 10 s
+    # 30 lock + 9*5 cleanup + 15 restart wait + 10 USB + 60 API + 8*(13 + 3*(5+2+3)) = 504; +10 % rounded up to 10 s
     inst unit_start_timeout_seconds
-    [ "$output" = "480" ]
-    [ "$(unit_value "$TEMPLATE" Service TimeoutStartSec)" = "480" ]
+    [ "$output" = "560" ]
+    [ "$(unit_value "$TEMPLATE" Service TimeoutStartSec)" = "560" ]
     # 5 lock + 8*10 wrappers + 30 MediaMTX = 115; +10 % rounded up to 10 s
     inst unit_stop_timeout_seconds
     [ "$output" = "130" ]
     [ "$(unit_value "$TEMPLATE" Service TimeoutStopSec)" = "130" ]
     # the rendered unit carries them
     inst render_systemd_unit
-    [[ "$output" == *$'\nTimeoutStartSec=480\n'* && "$output" == *$'\nTimeoutStopSec=130\n'* ]]
+    [[ "$output" == *$'\nTimeoutStartSec=560\n'* && "$output" == *$'\nTimeoutStopSec=130\n'* ]]
 
-    # 30 + 15 + 15 + 10 + 60 + 2*34 = 198 -> 218 -> 220
+    # 30 + 15 + 15 + 10 + 60 + 2*43 = 216 -> 238 -> 240
     inst unit_start_timeout_seconds 2 10
-    [ "$output" = "220" ]
+    [ "$output" = "240" ]
     inst unit_start_timeout_seconds 16 10
-    [ "$output" -gt 480 ]
+    [ "$output" -gt 560 ]
     run env STREAM_VALIDATION_DELAY=15 bash -c 'source "$ISCRIPT" >/dev/null 2>&1; unit_start_timeout_seconds' _
-    [ "$output" -gt 480 ]
-    # +60 s of API wait: 432 + 60 = 492 -> 542 -> 550
+    [ "$output" -gt 560 ]
+    # +60 s of API wait: 504 + 60 = 564 -> 621 -> 630
     run env MEDIAMTX_API_TIMEOUT=120 bash -c 'source "$ISCRIPT" >/dev/null 2>&1; unit_start_timeout_seconds' _
-    [ "$output" -eq 550 ]
+    [ "$output" -eq 630 ]
     # 60 + 80 + 30 = 170 -> 187 -> 190
     run env STOP_LOCK_TIMEOUT=60 bash -c 'source "$ISCRIPT" >/dev/null 2>&1; unit_stop_timeout_seconds' _
     [ "$output" -eq 190 ]
     # LYREBIRD_UNIT_MAX_STREAMS sizes the unit for more (or fewer) streams
     run env LYREBIRD_UNIT_MAX_STREAMS=16 bash -c 'source "$ISCRIPT" >/dev/null 2>&1; render_systemd_unit' _
-    [[ "$output" == *$'\nTimeoutStartSec=820\n'* && "$output" == *$'\nTimeoutStopSec=220\n'* ]]
+    [[ "$output" == *$'\nTimeoutStartSec=980\n'* && "$output" == *$'\nTimeoutStopSec=220\n'* ]]
 }
 
 @test "the constants of the timeout derivation are the ones the code uses: 5 s per cleaned process, 10 s per wrapper stop, 30 s for MediaMTX, the settle sleep and the validation attempts [LB-11]" {
     local src="$PROJECT_ROOT/lyrebird-stream-manager.sh"
-    run bash -c 'source "$1" >/dev/null 2>&1; declare -f cleanup_stale_processes stop_ffmpeg_stream stop_mediamtx start_ffmpeg_stream validate_stream' _ "$src"
+    run bash -c 'source "$1" >/dev/null 2>&1; declare -f cleanup_stale_processes stop_ffmpeg_stream stop_mediamtx start_ffmpeg_stream validate_stream probe_stream_ready mediamtx_api_probe' _ "$src"
     [ "$status" -eq 0 ]
     [[ "$output" == *'local timeout="${1:-5}"'* ]]
     [[ "$output" == *'stop_recorded_process "$pid_file" wrapper 10 "$stream_path"'* ]]
@@ -401,7 +401,9 @@ PY
     [[ "$output" == *'sleep $((STREAM_STARTUP_DELAY + 3))'* ]]
     [[ "$output" == *'local max_attempts="${2:-${STREAM_VALIDATION_ATTEMPTS}}"'* ]]
     [[ "$output" == *'sleep "${STREAM_VALIDATION_DELAY}"'* ]]
-    [[ "$output" == *'curl -s --max-time 2'* ]]
+    # the per-attempt API cost: the path query (3 s) and one version-detection request (2 s)
+    [[ "$output" == *'/paths/get/${stream_path}" 3'* ]]
+    [[ "$output" == *'local max_time="${1:-2}"'* ]]
 }
 
 @test "ReadWritePaths: the defaults, the directories of configured paths, and a recording path off tmpfs that may be absent [LB-11]" {
@@ -412,7 +414,7 @@ PY
     [ "$(unit_value "$TEMPLATE" Service ReadWritePaths)" = "/etc/mediamtx /var/log /run" ]
 
     run env MEDIAMTX_CONFIG_DIR=/srv/mtx/etc MEDIAMTX_FFMPEG_DIR=/srv/mtx/ff MEDIAMTX_PID_FILE=/run/lb/x.pid \
-        MEDIAMTX_LOG_FILE=/srv/log/sm.log MEDIAMTX_LOCK_FILE=/run/lb/x.lock bash -c 'source "$ISCRIPT" >/dev/null 2>&1; unit_read_write_paths "$1"' _ "$TEMPLATE"
+        MEDIAMTX_LOG_FILE=/srv/log/sm.log STREAM_MANAGER_LOG_FILE=/srv/log/sm.log MEDIAMTX_LOCK_FILE=/run/lb/x.lock bash -c 'source "$ISCRIPT" >/dev/null 2>&1; unit_read_write_paths "$1"' _ "$TEMPLATE"
     [ "$status" -eq 0 ]
     [ "$output" = "/srv/mtx/etc /srv/log /run /srv/mtx/ff" ]
 
@@ -561,7 +563,7 @@ cron_monitor_calls() { # cron_monitor_calls CRONFILE: prints "individual:<name>"
     rm -rf "$UN/ff" "$UN/cronstate"
     mkdir -p "$UN/ff"
     env -i "${assigns[@]}" HOME=/root ISCRIPT="$ISCRIPT" UN="$UN" MEDIAMTX_PID_FILE="$UN/mtx.pid" MEDIAMTX_FFMPEG_DIR="$UN/ff" \
-        MEDIAMTX_CONFIG_DIR="$UN/cfg" MEDIAMTX_LOG_FILE="$UN/sm.log" MEDIAMTX_LOCK_FILE="$UN/run.lock" \
+        MEDIAMTX_CONFIG_DIR="$UN/cfg" MEDIAMTX_LOG_FILE="$UN/sm.log" STREAM_MANAGER_LOG_FILE="$UN/sm.log" MEDIAMTX_LOCK_FILE="$UN/run.lock" \
         CRON_RESTART_STATE_DIR="$UN/cronstate" DEEP_HEALTH_STATE_DIR="$UN/deep" MEDIAMTX_HOST=cron.invalid \
         bash -c '
         source "$ISCRIPT" >/dev/null 2>&1

@@ -56,7 +56,7 @@ ExecReload=/usr/local/bin/lyrebird-stream-manager.sh reload
 # Worst case of the manager's own start / stop for 8 streams (derivation:
 # unit_start_timeout_seconds, unit_stop_timeout_seconds in the script). A
 # `reload` is bounded by TimeoutStartSec= too, and is shorter than a start.
-TimeoutStartSec=480
+TimeoutStartSec=560
 TimeoutStopSec=130
 
 # 24/7 operation: a MediaMTX that exits for any reason (a configuration it

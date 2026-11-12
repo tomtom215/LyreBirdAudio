@@ -192,31 +192,6 @@ teardown() {
     [ "${lines[2]}" = "no card: 1" ]
 }
 
-@test "check_audio_level records from the capture PCM, not from device 0 [LB-24]" {
-    sd_fake_card 3 0p 1c
-    sd_fake_card 4 0c 1c
-    # Stood in for: ffmpeg, which records its arguments and reports a normal level
-    printf '%s\n' '#!/bin/bash' \
-        'printf "%s\n" "$*" >>"'"$SD"'/ffmpeg.calls"' \
-        'echo "[Parsed_volumedetect_0 @ 0x1] max_volume: -20.0 dB"' >"$SD/bin/ffmpeg"
-    chmod +x "$SD/bin/ffmpeg"
-    : >"$SD/ffmpeg.calls"
-    run smq '
-        check_audio_level 3 pcmtest_a; echo "default for card 3: $?"
-        check_audio_level 4 pcmtest_b; echo "default for card 4: $?"
-        check_audio_level 4 pcmtest_c 1; echo "explicit 1 on card 4: $?"
-        check_audio_level 1 pcmtest_d; echo "no capture PCM listed: $?"'
-    [ "$status" -eq 0 ]
-    [ "$(sed -n 1p "$SD/ffmpeg.calls")" = "-f alsa -i plughw:3,1 -t 3 -af volumedetect -f null /dev/null" ]
-    [ "$(sed -n 2p "$SD/ffmpeg.calls")" = "-f alsa -i plughw:4,0 -t 3 -af volumedetect -f null /dev/null" ]
-    [ "$(sed -n 3p "$SD/ffmpeg.calls")" = "-f alsa -i plughw:4,1 -t 3 -af volumedetect -f null /dev/null" ]
-    # a card with no capture PCM in /proc/asound keeps the old assumption (device 0), and
-    # FFmpeg is left to say whether it can be opened (a host without /proc/asound is in this case)
-    [ "$(sed -n 4p "$SD/ffmpeg.calls")" = "-f alsa -i plughw:1,0 -t 3 -af volumedetect -f null /dev/null" ]
-    [ "$(wc -l <"$SD/ffmpeg.calls")" -eq 4 ]
-    [[ "$output" == *"no capture PCM listed: 0"* ]]
-}
-
 # ---------------------------------------------------------------------------
 # The streams
 # ---------------------------------------------------------------------------

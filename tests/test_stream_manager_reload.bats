@@ -22,7 +22,7 @@ setup() {
     mkdir -p "$RL"/{cfg,ff}
     export PROJECT_ROOT RL
     export MEDIAMTX_CONFIG_DIR="$RL/cfg" MEDIAMTX_FFMPEG_DIR="$RL/ff" MEDIAMTX_PID_FILE="$RL/mtx.pid"
-    export MEDIAMTX_LOCK_FILE="$RL/run.lock" MEDIAMTX_LOG_FILE="$RL/sm.log"
+    export MEDIAMTX_LOCK_FILE="$RL/run.lock" MEDIAMTX_LOG_FILE="$RL/sm.log" STREAM_MANAGER_LOG_FILE="$RL/sm.log"
     export MEDIAMTX_RESTART_MARKER="$RL/restart.marker" MEDIAMTX_CLEANUP_MARKER="$RL/cleanup.marker"
     export MEDIAMTX_HOST=reload.invalid MEDIAMTX_BINARY="$RL/no-mediamtx"
     SCRIPT="$PROJECT_ROOT/lyrebird-stream-manager.sh"

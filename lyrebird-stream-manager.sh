@@ -7357,12 +7357,14 @@ systemd_escape_env_value() {
 # waits (RESTART_STABILIZATION_DELAY and USB_DELAY, the delay the unit sets),
 # the MediaMTX API wait, and for every stream the settle sleep of
 # start_ffmpeg_stream (STREAM_STARTUP_DELAY + 3) plus validate_stream's attempts
-# (STREAM_VALIDATION_DELAY plus up to 2 s of curl each). 10 % are added and the
+# (STREAM_VALIDATION_DELAY plus, for a healthy but slow API, up to 2 s to detect
+# the API version and 3 s for the path query, both curl --max-time values of
+# detect_mediamtx_api_version and probe_stream_ready). 10 % are added and the
 # result is rounded up to 10 s.
 #   unit_start_timeout_seconds [STREAMS=8] [USB_DELAY=10]
 unit_start_timeout_seconds() {
     local streams="${1:-8}" usb="${2:-10}"
-    local per_stream=$(((STREAM_STARTUP_DELAY + 3) + STREAM_VALIDATION_ATTEMPTS * (STREAM_VALIDATION_DELAY + 2)))
+    local per_stream=$(((STREAM_STARTUP_DELAY + 3) + STREAM_VALIDATION_ATTEMPTS * (STREAM_VALIDATION_DELAY + 2 + 3)))
     local sum=$((LOCK_ACQUISITION_TIMEOUT + (streams + 1) * 5 + RESTART_STABILIZATION_DELAY + usb + MEDIAMTX_API_TIMEOUT + streams * per_stream))
     local scaled=$(((sum * 110 + 99) / 100))
     printf '%s' "$(((scaled + 9) / 10 * 10))"

@@ -24,7 +24,7 @@ setup() {
     BG_PIDS=()
     export PROJECT_ROOT SG
     export MEDIAMTX_CONFIG_DIR="$SG/cfg" MEDIAMTX_FFMPEG_DIR="$SG/ff" MEDIAMTX_PID_FILE="$SG/mtx.pid"
-    export MEDIAMTX_LOCK_FILE="$SG/run.lock" MEDIAMTX_LOG_FILE="$SG/sm.log"
+    export MEDIAMTX_LOCK_FILE="$SG/run.lock" MEDIAMTX_LOG_FILE="$SG/sm.log" STREAM_MANAGER_LOG_FILE="$SG/sm.log"
     export MEDIAMTX_RESTART_MARKER="$SG/restart.marker" MEDIAMTX_CLEANUP_MARKER="$SG/cleanup.marker"
     export SILENCE_STATE_DIR="$SG/state" CRON_RESTART_STATE_DIR="$SG/cron" DEEP_HEALTH_STATE_DIR="$SG/deep"
     export HEARTBEAT_FILE="$SG/heartbeat" MEDIAMTX_HOST=signals.invalid
@@ -276,10 +276,12 @@ probe_calls() {
     call="$(cat "$SG/ffmpeg.calls")"
     [[ "$call" == *"-i rtsp://127.0.0.1:37123/mic2"* ]]
     [[ "$call" == *"-t 2 "* ]]
-    # a value that is not a port falls back to the default
+    # a value that is not a port is refused when the manager is loaded (D15: no silent
+    # fallback), so no probe is made at all
     : >"$SG/ffmpeg.calls"
     run env MEDIAMTX_RTSP_PORT=abc bash -c 'source "$PROJECT_ROOT/lyrebird-stream-manager.sh" >/dev/null 2>&1; probe_stream_level mic2'
-    [[ "$(cat "$SG/ffmpeg.calls")" == *"-i rtsp://127.0.0.1:8554/mic2"* ]]
+    [ "$status" -eq 4 ]
+    [ ! -s "$SG/ffmpeg.calls" ]
 }
 
 @test "the level-signal functions never refer to an ALSA device, and the old ALSA-opening probe is gone [LB-14, D6]" {
