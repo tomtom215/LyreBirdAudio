@@ -1,15 +1,13 @@
 # LyreBirdAudio
 
-Production-hardened RTSP audio streaming suite for USB microphones with 24/7 reliability.
-
-Turn USB microphones into reliable RTSP streams for continuous monitoring and recording. Built on MediaMTX with automatic recovery, device persistence, and comprehensive diagnostics for unattended operation.
+RTSP audio streaming for USB microphones, built on MediaMTX and FFmpeg. A set of Bash scripts installs MediaMTX, gives every USB sound card a name that follows its USB port, publishes each microphone as an RTSP stream, and checks the streams from cron and systemd. It is meant for unattended use, for example monitoring bird activity with spare mini PCs. What has and has not been tested is listed under [System Requirements](#system-requirements) and [Testing](#testing).
 
 **If you like or use this project, please "star" this repository!**
 
 If you are using it in a cool or interesting way or at a large scale, please tell me about it in our GitHub Discussions for this repository!
 
 **License:** Apache 2.0  
-**Platform:** Linux (Ubuntu/Debian/Raspberry Pi OS)  
+**Platform:** Linux with systemd (see [System Requirements](#system-requirements))  
 **Author:** Tom F - https://github.com/tomtom215  
 **GitHub:** https://github.com/tomtom215/LyreBirdAudio
 
@@ -28,6 +26,7 @@ If you are using it in a cool or interesting way or at a large scale, please tel
 - [Troubleshooting](#troubleshooting)
 - [Diagnostics & Monitoring](#diagnostics--monitoring)
 - [Version Management](#version-management)
+- [Upgrading an Existing Node](#upgrading-an-existing-node)
 - [Performance & Optimization](#performance--optimization)
 - [Architecture & Design](#architecture--design)
 - [Component Reference](#component-reference)
@@ -42,16 +41,13 @@ If you are using it in a cool or interesting way or at a large scale, please tel
 
 ## Quick Start
 
-Get streaming in 5 minutes:
+**Which version this README describes.** It describes the `main` branch. The newest release tag, `v1.3.0`, was cut before the 2026-11 audit fixes and does not contain them: it has no `lyrebird-updater.sh --rollback`, no stream manager exit codes 8 and 9, no `/run/lyrebird/status.json`, and the MediaMTX configuration it writes puts the API and the metrics endpoint on every network interface (each of these can be checked with `git show v1.3.0:<file>`). Until a release that contains the fixes is tagged, install from `main` as shown below. `git describe --tags --abbrev=0` and the updater's "Switch to Latest Stable Release" both select `v1.3.0`, so do not use them to get what this README describes. [Version Management](#version-management) says how to pin a release later.
 
 ```bash
-# 1. Clone and setup, this will clone the Main branch which has the most up to date features
+# 1. Clone and use the main branch
 git clone https://github.com/tomtom215/LyreBirdAudio.git
 cd LyreBirdAudio
-
-# If you want to use a tagged release instead of the Main branch: Checkout latest stable release
-git checkout $(git describe --tags --abbrev=0)
-
+git checkout main
 chmod +x *.sh
 
 # 2. Run guided setup (installs MediaMTX, maps devices, starts streams)
@@ -62,9 +58,12 @@ sudo ./lyrebird-orchestrator.sh
 # rtsp://your-ip:8554/device-name
 ```
 
-That's it! The Orchestrator will act as a wizard that guides you through installation, device mapping, configuration, and stream startup.
+The wizard has four steps: install MediaMTX, map the USB audio devices, start the streams, run quick diagnostics. At the end it reports, stream by stream, whether the stream is publishing and, if it is not, why.
 
-**For Production Deployments:** Use tagged releases (shown above) for maximum stability. The main branch contains the latest features but may be work-in-progress. Tagged releases are normally tested for at least 72 hours before releasing. Tests are performed on an Intel N100 mini-PC with 5 USB microphones running Ubuntu.
+Two things the wizard does not do:
+
+- It does not install the systemd unit or the monitor cron job. Streams it starts run until the next reboot. For unattended use run `sudo ./lyrebird-stream-manager.sh install` afterwards ([Installation](#manual-installation)).
+- It does not protect the streams. By default anyone who can reach port 8554 can publish to and read from them ([Security Hardening](#security-hardening)).
 
 For manual installation, see [Installation](#installation).
 
@@ -74,48 +73,53 @@ For manual installation, see [Installation](#installation).
 
 ### What This Project Does
 
-**Core Functionality:**
-- Transforms USB microphones into reliable RTSP streams
-- Provides persistent device naming across reboots
-- Automatically detects hardware capabilities and generates optimal configurations
-- Monitors stream health and restarts failed streams automatically
-- Offers unified management through interactive orchestrator or individual scripts
+- Publishes each USB microphone as its own RTSP stream through MediaMTX, or mixes several into one (multiplex mode).
+- Keeps device names stable across reboots with udev rules tied to the USB port the card is plugged into.
+- Reads what each card supports from `/proc/asound` and can write a matching audio configuration.
+- Says, per stream, whether MediaMTX sees it publishing and whether bytes are flowing: `lyrebird-stream-manager.sh status`, or the document `/run/lyrebird/status.json`.
+- Checks the streams every 5 minutes from cron and restarts the ones that stopped, within a per-hour budget.
+- Updates from git, with history and rollback.
 
-**Key Advantages:**
-- **No Configuration Guesswork**: Automatically detects what your hardware supports
-- **Survives Reboots**: USB devices maintain consistent names via udev rules
-- **Self-Healing**: Automatic recovery from crashes and failures
-- **Easy Updates**: Git-based version management with rollback capability
-- **Production-Ready**: Designed for unattended 24/7 operation
+### Reliability: what recovers and what does not
+
+| What goes wrong | What the suite does about it | Limit |
+|-----------------|-------------------------------|-------|
+| One stream's FFmpeg exits | Its wrapper restarts it after 10 s, doubling the wait up to 300 s; a run longer than 300 s resets the wait | After 5 failures in a row (`MAX_CONSECUTIVE_FAILURES`) or 50 restarts without a 300 s run (`MAX_WRAPPER_RESTARTS`) the wrapper stops. The monitor starts it again, at most `CRON_RESTART_MAX_PER_HOUR` (6) times per hour per stream |
+| A wrapper died, or a microphone appeared or came back | The monitor starts the stream on its next run | The monitor is the cron job `install` writes (every 5 minutes). Without it, nothing does |
+| A wrapper is alive but its MediaMTX path is not ready | After `DEEP_HEALTH_MAX_STRIKES` (3) monitor runs in a row, the monitor restarts the stream | Needs an API that answers. A refused connection, a 401/403 or a 5xx never counts against a stream |
+| MediaMTX exits | Under systemd, `Restart=always` starts the unit again after 30 s (at most 10 starts in 20 minutes). The monitor also starts MediaMTX when it is gone and `start` was run and `stop` was not | The monitor's restarts share the 6-per-hour budget; when it is used up the monitor exits 7 and logs that it did not start MediaMTX |
+| The file descriptors or CPU of MediaMTX or FFmpeg pass the critical level, or there are more wrapper processes than streams | The monitor exits 2 and the cron job restarts `mediamtx-audio` | Thresholds are settings (`MAX_FD_CRITICAL`, `MAX_CPU_CRITICAL`). A full disk, low memory or a lost network are logged and make the monitor exit 1, but restarting would not help, so nothing is restarted |
+| A microphone delivers silence | The monitor reads the published stream for 3 seconds on each run and logs a `DEAD MIC` error once per silence episode (60 seconds of silence by default) | Log line only: no restart, no metric, no alert. The -60 dB threshold was checked against digital silence and a test tone, not against a real dead microphone |
+| The machine hangs | Nothing in this project | There is **no watchdog**: no software watchdog, no hardware watchdog code and no `WatchdogSec=` in the unit. A hardware watchdog is systemd's `RuntimeWatchdogSec=` in `/etc/systemd/system.conf` or a watchdog daemon; this project neither configures nor tests either |
+| Power is cut | The unit starts at boot if it was enabled | Recording kept in RAM (the default) is gone; nothing in the suite tests power-cut durability |
+
+The "heartbeat" is the Unix time of the last monitor run, written to `/run/mediamtx-audio.heartbeat` on every run (also while MediaMTX is down). It shows that the monitor ran; it does not show that any stream is up (`lyrebird_stream_up` and `lyrebird_api_up` do). No heartbeat service exists. A node whose cron job is missing or whose monitor never runs gets none of the recoveries above that depend on it.
 
 ### Project Origin
 
-This project was inspired by monitoring bird activity using USB microphones and spare Mini PCs. After discovering cberge908's original MediaMTX launcher script, it became clear that 24/7 reliable operation required handling numerous edge cases. LyreBirdAudio is the result -- a production-hardened solution for long-term unattended operation.
+This project was inspired by monitoring bird activity using USB microphones and spare Mini PCs. After discovering cberge908's original MediaMTX launcher script, it became clear that unattended operation needed many edge cases handled. LyreBirdAudio is the result of that work.
 
 ### Technical Approach
 
 **USB Device Persistence:**
 - Maps devices to physical USB ports using udev rules
-- Eliminates naming conflicts from USB enumeration order
+- Removes naming conflicts caused by USB enumeration order
 - Supports multiple identical devices on different ports
 
 **Stream Management:**
-- Wrapper-based process supervision with exponential backoff (10s to 300s)
-- Health monitoring via MediaMTX API
-- Graceful shutdown with process tree termination
-- Cron-based monitoring for production deployments
+- A generated wrapper script per stream runs FFmpeg and restarts it with exponential backoff (10 s to 300 s)
+- MediaMTX health is read from its API; stream state is written to the status document
+- Processes are identified by PID and start time, never by name; shutdown is SIGTERM, then SIGKILL after a timeout, for the whole process tree
+- A cron job runs the monitor every 5 minutes
 
 **Hardware Detection:**
-- Non-invasive capability detection via `/proc/asound`
-- Avoids opening devices (won't interrupt active streams)
-- Detects sample rates, channels, formats automatically
-- Warns about USB audio adapter chip limitations
+- `lyrebird-mic-check.sh` reads `/proc/asound` and does not open the devices, so it does not interrupt a running stream
+- Detects sample rates, channels and formats
+- Warns about USB audio adapter chips whose capabilities are not the microphone's
 
 **Resource Monitoring:**
-- Tracks CPU, memory, file descriptors
-- Configurable warning/critical thresholds
-- Detects audio subsystem conflicts
-- Provides actionable remediation steps
+- The monitor checks CPU and file descriptors of its own processes, system memory, disk space and network reachability against configurable thresholds, and logs what it finds
+- `lyrebird-diagnostics.sh` reports audio subsystem conflicts and suggests remediation steps
 
 ---
 
@@ -248,64 +252,61 @@ These diagrams show how LyreBirdAudio components work together to transform USB 
 
 ## System Requirements
 
-### Minimum Requirements
+This section keeps three things apart: what the scripts check when they start, what the test suite ran on, and what nobody has tested.
 
-- **Operating System**: Linux kernel 4.0+ (Ubuntu 20.04+, Debian 11+, Raspberry Pi OS)
-- **Architecture**: x86_64, ARM64, ARMv7, ARMv6
-- **Processor**: 1 CPU core (2+ recommended for multiple streams)
-- **Memory**: 512MB RAM (1GB+ recommended for multiple streams)
-- **Storage**: 100MB for MediaMTX and scripts
-- **Bash**: Version 4.0+ (for associative array support)
+### What the test suite ran on
 
-### Hardware Recommendations
+- **Linux, x86_64, Bash 5.2, FFmpeg 6.1.1, systemd-analyze 255.** The suite also runs in CI on the `ubuntu-latest` runner.
+- **MediaMTX 1.15.0, 1.18.0, 1.19.0, 1.21.1, 1.21.2 and 1.21.3**: the live tests start each of these real binaries (checksum-pinned by `tests/fetch_mediamtx.sh`). Other versions are not part of the suite.
+- **No real systemd manager.** Unit files are checked with `systemd-analyze verify`; nothing starts a unit, so boot ordering, `Conflicts=`, the start limit and the sandbox directives have not been exercised on a running system.
+- **No real USB hardware.** The stream manager is tested against fake `/proc/asound` and `/dev/snd` trees. Only `usb-audio-mapper.sh` was tested end to end on real Linux kernels with a real `systemd-udevd` (in QEMU: [docs/ENGINEERING-REVIEW-2026-07.md](docs/ENGINEERING-REVIEW-2026-07.md), section 9).
+- **No ARM, no Bash 4.x, no macOS or BSD.** Nothing in this README about those is a test result.
 
-**Raspberry Pi Limitations:**
-- Maximum 2 USB microphones due to USB bandwidth/power constraints
-- Pi Zero and 3B+ should use 1 microphone maximum for stability
-- Not recommended for multi-microphone production deployments
+### Operating system and architecture
 
-**Recommended: Intel N100/N150 Mini PCs**
-- More reliable USB architecture without shared bandwidth issues
-- Support for 4+ simultaneous USB audio devices
-- Better performance and stability under load
-- Cost-effective ($100-150 range)
+- **Linux with systemd.** `usb-audio-mapper.sh` refuses to run on anything else (exit 4); the stream manager reads `/proc/asound` and manages a systemd unit.
+- **Distributions.** The suite ran on Ubuntu (24.04). Debian and Raspberry Pi OS are the intended targets but nothing in the suite runs on them.
+- **Architecture.** `install_mediamtx.sh` maps `uname -m` (`x86_64`, `i386`/`i686`, `aarch64`/`arm64`, `armv7*`/`armhf`, `armv6*`) to the name of a MediaMTX release asset (`amd64`, `386`, `arm64`, `armv7`, `armv6`) and downloads that asset. The suite ran on x86_64 only. That the installer picks the right name on an ARM board, that MediaMTX publishes an asset for every one of those names, and that FFmpeg and the scripts perform acceptably on a Pi Zero or other ARMv6 hardware were not checked. The installer also recognises macOS and FreeBSD, but the rest of the suite does not run there.
 
-### Software Dependencies
+### Bash
 
-**Required:**
-- bash 4.0+ (check: `bash --version`)
-- ffmpeg with ALSA support
-- curl or wget
-- tar, gzip
-- systemd (for service management)
-- udev
-- git 2.0+ (for version management)
-- lsusb (usbutils package)
-- arecord, alsamixer (alsa-utils package)
+Every script that checks its Bash version checks for 4.0 or newer (the diagnostics for 4.4), but several use features that appeared later. This table comes from searching the scripts for the features by version; the suite ran on Bash 5.2 only, so every figure below is read from the code and none was run.
 
-**Optional but Recommended:**
-- jq (JSON parsing for MediaMTX API)
-- lsof or ss (port monitoring)
-- shellcheck (development/validation)
-- logrotate (log management)
+| Script | Version it checks for | Newest Bash feature found in its code |
+|--------|-----------------------|---------------------------------------|
+| `usb-audio-mapper.sh` | 4.0 | 4.0 (`${var^^}`) |
+| `lyrebird-updater.sh` | 4.0 | 4.1 (`exec {fd}>` redirections) |
+| `lyrebird-metrics.sh` | none | 4.1 (`{fd}` redirections) |
+| `install_mediamtx.sh` | 4.0 | 4.0 by itself; 4.2 once it loads `lyrebird-common.sh` (`install` does) |
+| `lyrebird-common.sh` | 4.0 | 4.2 (`declare -gA`) |
+| `lyrebird-alerts.sh`, `lyrebird-storage.sh` | none | 4.2 (`declare -gA`) |
+| `lyrebird-stream-manager.sh` | none | 4.2 (`declare -g`, `[[ -v`), 4.1 (`{fd}`) |
+| `lyrebird-orchestrator.sh` | 4.0 | 4.2 (`[[ -v`) |
+| `lyrebird-mic-check.sh` | none | 4.3 (`${array[-1]}`) |
+| `lyrebird-diagnostics.sh` | 4.4 | 4.2 (`declare -g`) |
 
-**Verification:**
-```bash
-# Check Bash version (must be 4.0+)
-bash --version
+Treat 4.4 as the lowest version for the whole suite and 5.2 as the only one that has been run. Check yours with `bash --version`.
 
-# Check root access
-sudo -v
+### Software
 
-# Verify required commands
-command -v lsusb udevadm git ffmpeg arecord
-```
+Required by the stream manager (`start` stops with exit 3 and names what is missing): `ffmpeg` (with ALSA input), `jq`, `arecord` (`alsa-utils`), `curl`, and the MediaMTX binary. Also needed:
 
-### Audio Requirements
+| Needed by | Tool |
+|-----------|------|
+| stream manager | `flock` (`util-linux`), systemd (for the unit), cron (for the monitor job); `setsid`, `lsof` or `ss` are optional (without `lsof` and `ss`, `start` warns and does not check that the ports are free) |
+| `usb-audio-mapper.sh` | `udevadm`, root; `awk grep sed sort tr mktemp readlink dirname basename head` |
+| `lyrebird-updater.sh` | `git` 2.0 or newer, `awk`, `sed`, `grep`, `tput`, `flock`; the working copy must be a git clone of this repository with a remote named `origin` |
+| `install_mediamtx.sh` | `curl`, `tar`, `mktemp`, `flock`, root; `sha256sum` or `shasum` (without one, the checksum cannot be verified and `install` needs `--force`); `jq` is optional (a fallback parser is used); systemd for the unit |
+| `lyrebird-metrics.sh serve` | a netcat (OpenBSD `nc`, `ncat`, traditional/GNU `nc` or BusyBox `nc`) |
+| `lyrebird-alerts.sh` | `curl`; `flock` for duplicate protection (without it alerts are still sent) |
+| troubleshooting | `lsusb` (`usbutils`), `alsamixer` (`alsa-utils`) |
+| optional | `logrotate` (the stream manager writes `/etc/logrotate.d/mediamtx` when it is present); `shellcheck`, `shfmt`, `bashate`, `bats` for development |
 
-- USB audio device with ALSA driver support
-- Sufficient USB bandwidth for desired sample rates
-- ALSA utilities installed (arecord, alsamixer)
+FFmpeg: the amix `normalize` option exists from FFmpeg 4.4; the manager asks FFmpeg whether it has it, and leaves it out for older versions. That path was tested with a stand-in `ffmpeg`, not with a real 4.2 or 4.3. No minimum FFmpeg version is claimed.
+
+Hardware: a USB audio device with an ALSA driver and enough USB bandwidth for the sample rates you choose. No minimum CPU, memory or disk size was measured; see [Performance & Optimization](#performance--optimization) for what is and is not known. The stream manager's disk, memory and CPU thresholds are settings ([Environment Variables](#environment-variables)).
+
+**Raspberry Pi and other small boards.** No limit on the number of microphones per board is claimed, because none was measured. Shared USB bandwidth and power are the usual limits; find yours by soak-testing the board with `tools/soak/` (see [Testing](#testing)) before relying on it.
 
 ---
 
@@ -314,65 +315,70 @@ command -v lsusb udevadm git ffmpeg arecord
 ### Prerequisites
 
 ```bash
-# Verify Bash version (must be 4.0+)
+# Verify Bash version (see System Requirements; 4.4 or newer, 5.2 is the one that was tested)
 bash --version
 
 # Check root access
 sudo -v
 
 # Verify required commands
-command -v lsusb udevadm git
+command -v lsusb udevadm git ffmpeg arecord jq curl flock
 ```
 
 ### Using the Orchestrator (Recommended)
 
-The orchestrator provides a guided wizard that handles everything:
+The orchestrator is a menu that runs the other scripts. Its Quick Setup Wizard has four steps:
+
+1. Install MediaMTX (`install_mediamtx.sh install`). An installer exit status of 7 ("already installed") does not stop the wizard.
+2. Map the USB audio devices (`usb-audio-mapper.sh`, interactive).
+3. Start the streams (`lyrebird-stream-manager.sh start`) and report the outcome per stream.
+4. Run quick diagnostics.
 
 ```bash
-# 1. Clone repository
+# 1. Clone the repository (use main: see Quick Start for why not the newest tag)
 git clone https://github.com/tomtom215/LyreBirdAudio.git
 cd LyreBirdAudio
-
-# RECOMMENDED FOR PRODUCTION: Use latest stable release
-git checkout $(git describe --tags --abbrev=0)
-
+git checkout main
 chmod +x *.sh
 
-# 2. Launch orchestrator
+# 2. Launch the orchestrator
 sudo ./lyrebird-orchestrator.sh
 
-# 3. Select "Quick Setup Wizard" from menu
-# The wizard will:
-#   - Install MediaMTX
-#   - Map your USB audio devices
-#   - Generate optimal configuration
-#   - Start streams
-#   - Run diagnostics
+# 3. Select "Quick Setup Wizard" from the menu
 ```
 
-**Production Note:** Using tagged releases ensures maximum stability. Skip the `git checkout` command to use the main branch with latest features (may be less stable).
+The wizard does not generate an audio device configuration, does not detect hardware capabilities (both are in the menu under USB Device Management, options 4 to 6), and does not install the systemd unit or the monitor cron job. Streams it starts stop at the next reboot unless you run the `install` step below.
+
+The scripts need to be executable after a clone (`chmod +x *.sh`): the repository does not store the executable bit for all of them.
 
 ### Manual Installation
 
 For automation or when you prefer manual control:
 
 ```bash
-# 1. Install MediaMTX
+# 1. Install MediaMTX (writes /etc/mediamtx/mediamtx.yml and mediamtx.service)
 sudo ./install_mediamtx.sh install
 
 # 2. Map USB devices (interactive)
 sudo ./usb-audio-mapper.sh
 
-# 3. Generate configuration
+# 3. Generate the audio device configuration (optional: without it every
+#    stream uses the defaults)
 sudo ./lyrebird-mic-check.sh -g
 
-# 4. Start streams
-sudo ./lyrebird-stream-manager.sh start
-
-# Optional: Install as systemd service
+# 4. Run the streams under systemd, with the monitor cron job
 sudo ./lyrebird-stream-manager.sh install
-sudo systemctl enable mediamtx-audio
+sudo systemctl enable --now mediamtx-audio
 ```
+
+Instead of step 4 you can start the streams by hand with `sudo ./lyrebird-stream-manager.sh start`; they then run until the next reboot and nothing monitors them.
+
+Notes on `install`:
+
+- It writes `/etc/systemd/system/mediamtx-audio.service` and `/etc/cron.d/mediamtx-monitor`, both rendered from `config/` next to the script, and `/etc/logrotate.d/mediamtx` when `logrotate` is installed. It stops with exit 4 if `config/mediamtx-audio.service` is missing, so run it from the checkout.
+- The unit and the cron job name the script by its absolute path at the time of `install`. If you move the checkout, run `install` again.
+- It carries `-m`, `-f` and `-n` (stream mode, multiplex filter, multiplex name) into both files. Other settings (the ports, `RTSP_AUTH_MODE`, `LYREBIRD_START_POLICY` and so on) are not written into either file; [Environment Variables](#environment-variables) says how to give them to the service and to the cron job.
+- `install` does not enable or start anything. The standalone `mediamtx.service` that step 1 wrote and `mediamtx-audio.service` cannot run together ([MediaMTX Integration](#which-unit-runs-mediamtx)).
 
 ### Verification
 
@@ -380,12 +386,14 @@ sudo systemctl enable mediamtx-audio
 # Check system health
 sudo ./lyrebird-diagnostics.sh quick
 
-# View stream status
-./lyrebird-stream-manager.sh status
+# View stream status (works without root, but then cannot identify the stream processes)
+sudo ./lyrebird-stream-manager.sh status
 
 # Access your streams
 # rtsp://your-ip:8554/device-name
 ```
+
+`device-name` is the name the card has in `/proc/asound/cards` when it is a lower-case name such as one given by `usb-audio-mapper.sh` (`mic-left` gives `rtsp://your-ip:8554/mic-left`); otherwise it is the device name made lower-case with every other character turned into `_`. `lyrebird-stream-manager.sh status` prints the real URLs.
 
 **No reboot needed for USB mapping:** `usb-audio-mapper.sh` (4.0.0+) applies each name immediately and confirms it with the kernel. Check the result with `./usb-audio-mapper.sh --list`.
 
@@ -393,14 +401,14 @@ sudo ./lyrebird-diagnostics.sh quick
 
 Access your streams at:
 ```
-rtsp://hostname:8554/Device_1
-rtsp://hostname:8554/Device_2
+rtsp://hostname:8554/mic-left
+rtsp://hostname:8554/mic-right
 ```
 
 Test with VLC or ffplay:
 ```bash
-ffplay rtsp://localhost:8554/Device_1
-vlc rtsp://localhost:8554/Device_1
+ffplay rtsp://localhost:8554/mic-left
+vlc rtsp://localhost:8554/mic-left
 ```
 
 ---
@@ -1166,120 +1174,127 @@ The orchestrator integrates diagnostics into multiple workflows:
 
 ## Version Management
 
-### Update Process
+### Choosing a version
 
-LyreBirdAudio uses git-based version management via `lyrebird-updater.sh`:
+| Source | What it is | Use it for |
+|--------|------------|------------|
+| `main` | the development line; contains every fix this README describes | installing now |
+| a release tag (`v1.3.0`, ...) | one fixed commit | pinning, once a release that has the fixes exists |
+| any other branch | whatever its author pushed | testing only |
 
-1. **Check for Updates**
-   ```bash
-   ./lyrebird-updater.sh --status
-   ```
+The newest tag, `v1.3.0`, does not contain the 2026-11 fixes ([Quick Start](#quick-start)). Whether a tag has them can be checked before you switch to it: `git ls-tree -r --name-only <tag> docs | grep REMEDIATION-2026-11` prints a file name for a tag that has them and nothing for `v1.3.0`. Pin a tag in production only after that check, then try newer versions on a spare node before upgrading the real one.
 
-2. **List Available Versions**
-   ```bash
-   ./lyrebird-updater.sh --list
-   ```
+A release built by the current release workflow carries a source tarball (`LyreBirdAudio-<version>.tar.gz`, made with `git archive` of the tagged commit) and `SHA256SUMS`. Download both into one directory and run `sha256sum -c SHA256SUMS`. That proves the tarball is the published file; it is not a signature and says nothing about who published it, because releases are not signed. The updater needs a git clone, so a tarball install cannot be updated with it.
 
-3. **Upgrade to Latest**
-   ```bash
-   ./lyrebird-updater.sh
-   # Select option 2: Upgrade to Latest Version
-   ```
+### The updater
 
-4. **Switch to Specific Version**
-   ```bash
-   ./lyrebird-updater.sh
-   # Select option 3: Switch to Specific Version
-   ```
+`lyrebird-updater.sh` switches a git clone between versions and undoes an update that went wrong.
 
-### Branch Structure
+```bash
+./lyrebird-updater.sh --status        # current version, branch and sync state
+./lyrebird-updater.sh --list          # fetch and list available versions (needs the network)
+./lyrebird-updater.sh --history       # past updates, rollbacks and failed updates (local, no network)
+./lyrebird-updater.sh --rollback      # back to the version before the last update
+./lyrebird-updater.sh --rollback v1.3.0   # to a release tag or a commit already in the clone
+./lyrebird-updater.sh --migrate       # run the post-update migrations by hand
+./lyrebird-updater.sh                 # the interactive menu
+```
 
-**Recommended for Production:**
-- **Tags** (v1.0.0, v1.1.0, etc.): Stable releases - **Use these for production deployments**
-  - Thoroughly tested and validated
-  - Production-ready with known behavior
-  - Recommended for 24/7 operations
+Run it as the user who owns the clone, not with `sudo`: started as root it asks for confirmation (declining exits with 9), and a clone owned by root is refused (exit 5). The menu:
 
-**For Latest Features:**
-- **main**: Latest features and fixes - Use with caution
-  - Contains newest functionality
-  - Generally stable but may be work-in-progress
-  - Suitable for testing new features
-  - May have minor issues being resolved
+| Key | Action |
+|-----|--------|
+| 1 | Switch to Latest Stable Release: the newest tag (today `v1.3.0`, which lacks the fixes) |
+| 2 | Switch to Development Version: the repository's default branch (`main`; if both `main` and `develop` exist, `develop`) |
+| 3 | Switch to Specific Version or Branch |
+| 4 | Check for New Updates |
+| 5 | Show Detailed Status |
+| 6 | Discard All Changes & Reset |
+| H, Q | Help, quit |
 
-**Unstable/Testing Only:**
-- **development** and other branches: Nightly builds - Not recommended for production
-  - Active development code
-  - May contain breaking changes
-  - For testing and development only
-  - Stability not guaranteed
+To follow `main`, use 2.
 
-**Best Practice:** Pin to a specific tagged release for production systems, then test newer versions in a staging environment before upgrading.
+**What an update does**
 
-### Update Behavior
+- Asks to save your local changes in a git stash (`lyrebird-tx-...`), switches, and puts them back. If they conflict with the new version they stay in the stash and the exit status is 10; declining the question changes nothing and exits 9.
+- Stops `mediamtx-audio` first when it is running, and starts it afterwards. When `lyrebird-stream-manager.sh` changed between the two versions, it runs that script's `install` again (keeping `Environment=` lines you added to the unit). That `install` is run without `-m`, `-f` and `-n`, so on a multiplex node run it again by hand with them afterwards, or the cron file is left in individual mode.
+- Makes every tracked `*.sh` executable, and runs the migrations for renamed files (below).
+- Keeps a journal in `<git-dir>/lyrebird-updater/` while it works. If it is killed or the power fails, the next run undoes the unfinished update (or, for a self-update, completes it). Your uncommitted changes are never discarded.
+- Checks that the files it wrote match the target version, and syntax-checks its own new version before it re-runs itself.
 
-- Automatically stashes local changes before switching versions
-- Restores stashed changes after version switch (with conflict detection)
-- Preserves executable permissions on all scripts
-- Self-update capability when updater script changes
-- Transaction-based operations with automatic rollback on failure
-- Lock file prevents concurrent executions
-- Systemd service coordination (stops before update, reinstalls after)
-- Cron job update handling
-- **Automatic migrations** for breaking changes (script renames, path changes)
+The service handling was tested against a stand-in `systemctl`; it has not run against a real systemd manager.
+
+**Rollback and history.** `--history` reads `<git-dir>/lyrebird-updater/history.log` (UTC time, kind, result, from, to). `--rollback` with no argument goes back to the version the last completed update came from; with an argument it goes to that release tag or commit, which must already be in the clone (a branch name is refused: exit 1; not in the clone: exit 6; no network is used). It is the update's own transaction, so it stops and restarts the service the same way. Rolling back to a release whose updater is older than 1.7.0 (`v1.3.0` ships 1.6.0) puts that updater in place, and that one has neither `--history` nor `--rollback`.
+
+**Lock.** Every command except `--history` takes a kernel `flock` on `<git-dir>/lyrebird-updater/updater.lock` (never removed: there is no stale lock to clean up). "Lock held by process ..." means another updater is running; wait or stop that process. After `LYREBIRD_UPDATER_LOCK_WAIT` seconds (30) the run exits 7. `flock` must be installed (exit 2 if not).
+
+**Network.** `--list` and the menu's checks fetch from `origin` (30 s per attempt, three attempts; `LYREBIRD_FETCH_TIMEOUT`, `LYREBIRD_FETCH_RETRIES`, `LYREBIRD_FETCH_RETRY_DELAY`). Offline, `--list` shows what the last fetch found and exits 4. `--version`, `--help`, `--status`, `--migrate`, `--history` and `--rollback` do not use the network.
+
+**Exit codes**
+
+| Code | Meaning |
+|------|---------|
+| 0 | success |
+| 1 | general error (a failed switch, an invalid version, an unknown option) |
+| 2 | prerequisites not met (git, awk, sed, grep, tput or flock missing; git or Bash too old) |
+| 3 | not a git repository |
+| 4 | could not reach the remote (fetch failed) or no remote; `--list` then shows cached data |
+| 5 | permission (repository not writable or owned by root; state directory or lock file cannot be written) |
+| 6 | the requested or previous version is not available in this clone |
+| 7 | locked by another updater |
+| 8 | bad git state (merge or rebase in progress, unreadable journal) |
+| 9 | user aborted (declined a prompt, input ended at a confirmation, SIGINT, SIGTERM) |
+| 10 | switch done, but your saved changes conflict with the new version and were not re-applied; they are in the stash |
+| 11 | the automatic rollback could not restore everything; the message names the `git checkout --force <sha>` to run |
+| 12 | standard input ended at a menu prompt (Ctrl-D, closed pipe) |
+
+In the menu a failed switch is reported and the menu stays open; `Q` leaves with the status of the last switch or reset.
 
 ### Migration Notes
 
-**Script Rename (v1.4.3+):** The stream manager was renamed for branding consistency:
-- `mediamtx-stream-manager.sh` → `lyrebird-stream-manager.sh`
-- Log file: `/var/log/mediamtx-stream-manager.log` → `/var/log/lyrebird-stream-manager.log`
-
-**Automatic Migration:** When you update using `lyrebird-updater.sh`, migrations run automatically:
-- Updates systemd service file references
-- Updates cron job references
-- Migrates `/usr/local/bin` installation
-- Creates backward-compatible log symlinks
-
-**Manual Migration:** If needed, you can run migrations manually:
-```bash
-sudo ./lyrebird-updater.sh --migrate
-```
-
-**Detection:** The orchestrator will warn you at startup if old script names are detected in your system.
-
-### Version Requirements
-
-- Requires git clone of repository (not compatible with standalone tarball installations)
-- Git 2.0+ must be installed
-- Repository must have remote origin configured
-- Recommended to run as normal user (not root)
-
-### Rollback
-
-If an update causes issues:
-```bash
-./lyrebird-updater.sh
-# Select option 3: Switch to Specific Version
-# Choose previous stable version
-```
-
-The updater maintains transaction logs for debugging:
-```bash
-git reflog  # View recent operations
-git stash list  # View stashed changes
-```
+Releases before the rename called the stream manager `mediamtx-stream-manager.sh` (log `/var/log/mediamtx-stream-manager.log`). The updater's migration, run after an update or with `--migrate`, rewrites the unit and cron references to `lyrebird-stream-manager.sh`, removes the old script from `/usr/local/bin`, installs the new one there, links the old log name to the new log, and records completion in `/var/lib/lyrebird/migrations/`. A switch to a release whose updater predates the hand-over (before 1.5) is finished by the current updater and does not run that release's migrations; run `--migrate` after it.
 
 ### Manual Version Management
 
 ```bash
-# Use the version manager (handles complexity)
-sudo ./lyrebird-updater.sh
-
-# Or manually (not recommended)
+# The updater handles the stash, the service and the checks above; by hand:
 git fetch origin
-git checkout <tag-name>  # e.g., v1.2.0
+git checkout main && git pull --ff-only     # or: git checkout <tag>
 chmod +x *.sh
 ```
+
+A manual checkout does not stop or restart the service and does not run the migrations. After it, follow [Upgrading an Existing Node](#upgrading-an-existing-node).
+
+---
+
+## Upgrading an Existing Node
+
+Read this before moving a node that already streams to the code on `main`. Do the steps in order; each one says what it refreshes, because several files are not refreshed by an update.
+
+1. **Find out who runs MediaMTX now.** `systemctl is-active mediamtx mediamtx-audio` and, as root, `./install_mediamtx.sh status` (`Running (systemd)` is the standalone `mediamtx.service`, `Running (stream manager service)` is `mediamtx-audio.service`). Only one of them should be active ([Which unit runs MediaMTX](#which-unit-runs-mediamtx)).
+2. **Keep a copy of what you have**: `sudo cp -a /etc/mediamtx /root/mediamtx.before-upgrade`, and a copy of `/etc/systemd/system/mediamtx-audio.service` (or `mediamtx.service`) and `/etc/cron.d/mediamtx-monitor`.
+3. **Get the code**, as the clone's owner: `./lyrebird-updater.sh` and key `2`, or `git fetch origin && git checkout main && git pull --ff-only` followed by `chmod +x *.sh`. The newest tag does not have these changes.
+4. **Refresh the unit and the cron job** (nodes run by the stream manager). Neither is rewritten by anything but `install`:
+   `sudo ./lyrebird-stream-manager.sh install` (add `-m multiplex -f amix -n NAME` on a multiplex node), then `sudo systemctl restart mediamtx-audio`. The restart interrupts the streams for the length of a start. The new unit has `Conflicts=mediamtx.service`, `Restart=always` and a real `ExecReload` (`systemctl reload mediamtx-audio` applies a changed MediaMTX configuration without a restart).
+5. **Refresh the standalone `mediamtx.service`** (nodes without the stream manager). `install_mediamtx.sh update` replaces the binary only. To get the new unit and configuration run `sudo ./install_mediamtx.sh --force install` (add `-V vX.Y.Z` to keep your MediaMTX version, otherwise it installs the latest), then `sudo systemctl restart mediamtx`. The old configuration and unit are saved as `mediamtx.yml.backup.<time>` and `mediamtx.service.backup.<time>`.
+6. **Know what happens to `/etc/mediamtx/mediamtx.yml`** ([Configuration ownership](#configuration-ownership)):
+   - Written by an earlier stream manager (first line `# MediaMTX Configuration - Audio Streams`): the first `start` or `reload` replaces it with the current rendering after a timestamped backup (`mediamtx.yml.<UTC time>.<nn>.bak`). Edits you made to it by hand are in the backup, not in the new file.
+   - Written by the earlier installer, or edited by you so that its first line differs: it is yours, so it is never rewritten, and each start warns. Its API and metrics keep listening on every interface and SRT and MoQ stay on. To move it to the new defaults run `sudo ./lyrebird-stream-manager.sh --regenerate-config restart` (stream manager nodes) or step 5 (standalone nodes); both save a backup first.
+7. **Check the result.** `sudo ./lyrebird-stream-manager.sh status` (or `status --json | jq .overall`), `ss -ltn | grep -E ':(9997|9998) '` (both on `127.0.0.1`), and `systemctl cat mediamtx-audio | grep Conflicts`.
+
+**What can break after an upgrade**
+
+- Anything that used MediaMTX's API (port 9997) or metrics (9998) from another host. They listen on `127.0.0.1` now. `lyrebird-metrics.sh serve` also listens on `127.0.0.1` by default; a Prometheus on another host needs `--bind` ([Prometheus Metrics](#prometheus-metrics-lyrebird-metricssh)).
+- Scripts that read the exit status of `start`. `0` now means the start policy is met; `9` is new and means no stream is publishing (before, `start` printed `[FAIL]` and still exited `0`). With no microphone plugged in, `start` used to exit `6` and not start MediaMTX; it now exits `0`, starts MediaMTX and reports `waiting_for_devices` (set `LYREBIRD_ALLOW_EMPTY_START=false` for the old behaviour). `monitor` with no microphone likewise exits `0`, not `6`. See [Stream Manager exit codes](#stream-manager-lyrebird-stream-managersh).
+- `/etc/lyrebird/storage.conf`. Earlier releases documented it but never read it; `lyrebird-storage.sh` reads it now, so retention and directory settings in an old file start to apply. Run `lyrebird-storage.sh --dry-run cleanup` before the next cron run.
+- `AUDIO_DISK_PERSIST`, `AUDIO_DISK_PATH`, `HEARTBEAT_INTERVAL`, `HARDWARE_WATCHDOG_*` and `ENABLE_HARDWARE_WATCHDOG` no longer exist. If one is set, every run logs one warning and ignores it.
+- `MEDIAMTX_LOG_FILE` no longer moves the stream manager's own log (it names MediaMTX's output file only). Set `STREAM_MANAGER_LOG_FILE` if you relied on the old behaviour.
+- The device configuration is read as data. Mixed-case keys written by an old `lyrebird-mic-check.sh` start to apply; `DEFAULT_*=` lines in the file, a `CODEC` other than `opus`, `aac` or `mp3`, and values outside the documented ranges are reported as errors and skipped (`lyrebird-stream-manager.sh validate` lists them). Per-device settings are no longer taken from the environment.
+- A multiplex stream name is made lower-case with every character outside `a-z 0-9 _ -` replaced by `_` (`Studio Mix` becomes `studio_mix`), so its URL can change.
+- A USB card that cannot capture (a speaker or DAC) is skipped; it no longer counts as a failed stream.
+- `curl` is now required by the stream manager (exit 3 if it is missing) and `flock` by the updater (exit 2) and the installer (exit 4).
+- `systemctl reload mediamtx` on a standalone install never reloaded anything; MediaMTX picks up a changed configuration file by itself, and the new unit has no `ExecReload=`.
+- The first `stop` or `force-stop` after an in-place upgrade can refuse with exit 5 when the node was started by an older release, because the old processes held the manager's lock file open. `sudo systemctl restart mediamtx-audio` still works; by hand, stop the processes the message lists.
 
 ---
 
@@ -1460,26 +1475,29 @@ This modular design prevents duplicate business logic and ensures maintainabilit
 
 ### Quick Reference Table
 
+Versions are the values in the scripts (`grep -m1 VERSION= <script>`).
+
 | Script | Version | Purpose |
 |--------|---------|---------|
-| lyrebird-orchestrator.sh | 2.1.3 | Unified management interface |
-| lyrebird-updater.sh | 1.6.1 | Version management with rollback |
-| lyrebird-stream-manager.sh | 1.5.1 | Stream lifecycle management |
-| usb-audio-mapper.sh | 4.0.0 | USB device persistence via udev |
-| lyrebird-mic-check.sh | 1.0.1 | Hardware capability detection |
+| lyrebird-orchestrator.sh | 2.2.0 | Unified management interface |
+| lyrebird-updater.sh | 1.8.0 | Version management with rollback |
+| lyrebird-stream-manager.sh | 2.0.0 | Stream lifecycle management |
+| usb-audio-mapper.sh | 4.0.1 | USB device persistence via udev |
+| lyrebird-mic-check.sh | 1.0.2 | Hardware capability detection |
 | lyrebird-diagnostics.sh | 1.0.2 | System diagnostics |
-| install_mediamtx.sh | 2.0.1 | MediaMTX installation/upgrade |
-| lyrebird-metrics.sh | 1.2.0 | Prometheus metrics export |
-| lyrebird-storage.sh | 1.1.0 | Storage management & cleanup |
-| lyrebird-alerts.sh | 1.0.1 | Webhook alerting system |
+| install_mediamtx.sh | 2.1.0 | MediaMTX installation/upgrade |
+| lyrebird-metrics.sh | 1.4.0 | Prometheus metrics export |
+| lyrebird-storage.sh | 1.3.0 | Storage management & cleanup |
+| lyrebird-alerts.sh | 1.1.0 | Webhook alerting (called by you; nothing else in the suite sends alerts) |
+| lyrebird-common.sh | 1.1.0 | Shared library (logging, atomic writes, the MediaMTX configuration renderer) |
 
 ### Configuration Files
 
 | File | Purpose |
 |------|---------|
-| `config/mediamtx.service` | systemd service for MediaMTX |
-| `config/mediamtx-audio.service` | systemd service for stream manager (with watchdog) |
-| `config/lyrebird-logrotate.conf` | Log rotation configuration |
+| `config/mediamtx.service` | Template of the standalone MediaMTX unit (`mediamtx.service`); `install_mediamtx.sh` renders it |
+| `config/mediamtx-audio.service` | Template of the stream manager unit (`mediamtx-audio.service`); `lyrebird-stream-manager.sh install` renders it. No watchdog (see [Reliability](#reliability-what-recovers-and-what-does-not)) |
+| `config/lyrebird-logrotate.conf` | Log rotation example for `/etc/logrotate.d/`. Its FFmpeg stanza names `/var/log/lyrebird/*.log`, but the stream manager keeps FFmpeg logs in `/var/lib/mediamtx-ffmpeg/`; the file `install` writes (`/etc/logrotate.d/mediamtx`) names the right directory |
 | `docs/SECURITY-GUIDE.md` | Security configuration guide (optional features) |
 
 ### Orchestrator (lyrebird-orchestrator.sh)
