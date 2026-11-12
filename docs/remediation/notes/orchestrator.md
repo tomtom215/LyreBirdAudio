@@ -209,7 +209,7 @@ keep their numbers; new:
 - Wherever the stream manager's exit codes are documented (README "Exit Codes", about
   L1583; `docs/components.html`): the orchestrator is a consumer of 5, 8, 9 and 6.
 - `tests/README.md` (not edited here): rows for `test_orchestrator_delegation.bats`
-  (9 tests), `test_orchestrator_outcome.bats` (26), `test_orchestrator_wizard.bats` (9),
+  (9 tests), `test_orchestrator_outcome.bats` (27), `test_orchestrator_wizard.bats` (9),
   `test_orchestrator_updater_menu.bats` (19), `test_orchestrator_manager_contract.bats`
   (6, uses the manager stage, about 50 s on a loaded machine);
   `test_lyrebird_orchestrator.bats` 48 -> 49 tests; the helper files

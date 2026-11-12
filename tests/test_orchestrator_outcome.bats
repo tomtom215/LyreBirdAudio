@@ -332,6 +332,18 @@ print_outcome_streams | grep mic1 | sed "s/^.*not publishing/LINE: not publishin
     [[ "$output" == *'LINE: not publishing - bad [31mred and \033[32m green \n newline'* ]]
 }
 
+@test "the field separator inside a reason can neither shift the fields nor reach the terminal [LB-21]" {
+    jq -n '{schema_version: 1, overall: "failed", policy: "degraded", command: "start",
+            mediamtx: {running: true},
+            streams: [{path: "mic\u001f1", path_ready: false, bytes_flowing: false, last_error: "a\u001fb\u001fc"}]}' >"$ORCH_DIR/us.json"
+    orch_run '
+parse_status_document "$(cat "$ORCH_DIR/us.json")"
+printf "PATH=[%s] ERROR=[%s] READY=[%s]\n" "${OUTCOME_S_PATH[0]}" "${OUTCOME_S_ERROR[0]}" "${OUTCOME_S_READY[0]}" | cat -v'
+    echo "$output"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"PATH=[mic1] ERROR=[abc] READY=[false]"* ]]
+}
+
 @test "a status document with more than 100 streams lists 100 and counts the rest [LB-21]" {
     local specs=() i
     for ((i = 0; i < 130; i++)); do specs+=("mic$i|true|true|"); done

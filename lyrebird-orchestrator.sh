@@ -931,9 +931,9 @@ readonly OUTCOME_MAX_STREAMS=100
 # jq program: one "H" line (overall, policy, command, MediaMTX running) and one
 # "S" line per stream (path, path_ready, bytes_flowing, last_error), fields
 # separated by the unit separator (not whitespace, so empty fields survive
-# `read`); null becomes an empty field. Prints nothing for anything that is not
-# a schema_version 1 document.
-readonly STATUS_JQ_FILTER='def s: if . == null then "" else tostring end;
+# `read`; the separator is removed from the values); null becomes an empty field.
+# Prints nothing for anything that is not a schema_version 1 document.
+readonly STATUS_JQ_FILTER='def s: if . == null then "" else tostring | gsub("\u001f"; "") end;
 def hline: ["H", .overall, (.policy | s), (.command | s), (.mediamtx.running | s)] | join("\u001f");
 def sline: ["S", (.path | s), (.path_ready | s), (.bytes_flowing | s), (.last_error | s)] | join("\u001f");
 select(type == "object" and .schema_version == 1 and (.overall | type) == "string" and (.streams | type) == "array")
