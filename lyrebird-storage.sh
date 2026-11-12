@@ -14,23 +14,32 @@
 #   ./lyrebird-storage.sh cleanup       # Run cleanup based on retention policy
 #   ./lyrebird-storage.sh emergency     # Emergency cleanup (critical disk usage)
 #   ./lyrebird-storage.sh monitor       # Monitor and cleanup if needed
+#   (--quiet for cleanup and monitor: warnings, errors and one summary line;
+#   --once for monitor: one check, which is all monitor ever does)
+#
+# Configuration: environment variables, or /etc/lyrebird/storage.conf (see
+# --help and the "Configuration" section below).
 #
 # Cron Integration:
 #   # Daily cleanup at 3 AM
-#   0 3 * * * /usr/local/bin/lyrebird-storage.sh cleanup
+#   0 3 * * * /usr/local/bin/lyrebird-storage.sh cleanup --quiet
 #
-#   # Hourly monitoring
-#   0 * * * * /usr/local/bin/lyrebird-storage.sh monitor
+#   # Every 15 minutes: silent while the disk is fine
+#   */15 * * * * /usr/local/bin/lyrebird-storage.sh monitor --once
 #
-# Exit status: 0 success, 1 usage error, 3 finished but at least one deletion
-# failed (permission, immutable file, read-only filesystem; see the ERROR lines).
+# Exit status: 0 success, 1 usage error, 3 finished but something could not be
+# done: a deletion failed (permission, immutable file, read-only filesystem) or a
+# directory could not be listed (see the ERROR lines), 4 finished but lines of the
+# configuration file were not accepted.
 #
-# Version: 1.2.0 - Every recording codec covered, empty/active segment handling,
-#                  failed deletions surfaced, deterministic emergency eviction
+# Version: 1.3.0 - Symlinked and relative directories, listing failures counted,
+#                  --quiet/--once, /etc/lyrebird/storage.conf (read as data);
+#                  1.2.0: every recording codec covered, empty/active segment
+#                  handling, failed deletions surfaced, deterministic eviction
 
 set -euo pipefail
 
-readonly VERSION="1.2.0"
+readonly VERSION="1.3.0"
 SCRIPT_NAME="$(basename "${BASH_SOURCE[0]}")"
 readonly SCRIPT_NAME
 
