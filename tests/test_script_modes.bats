@@ -10,6 +10,12 @@
 
 setup() {
     ROOT="$(cd "$BATS_TEST_DIRNAME/.." && pwd)"
+}
+
+# The index is only there in a git work tree (not in a tarball, and not in the copy of the
+# project the suite's own can-fail check makes). The skip is inside the tests, not in
+# setup(): a setup that skips would let that check's appended test be skipped, too.
+require_git() {
     git -C "$ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1 || skip "not a git work tree"
 }
 
@@ -19,6 +25,7 @@ tracked_modes() {
 }
 
 @test "every script that is run directly is 100755 in the index [X-56]" {
+    require_git
     local mode path bad=""
     # what they run directly: the scripts of the suite and its tools
     for path in install_mediamtx.sh lyrebird-alerts.sh lyrebird-diagnostics.sh lyrebird-metrics.sh lyrebird-mic-check.sh \
@@ -34,6 +41,7 @@ tracked_modes() {
 }
 
 @test "no tracked file that starts with a shebang is left at 100644, except the test files bats runs and the sourced-only library [X-56]" {
+    require_git
     local mode path first bad=""
     while read -r mode path; do
         case "$path" in
@@ -51,6 +59,7 @@ tracked_modes() {
 }
 
 @test "the files that are sourced, not run, are not required to be executable: the helpers under tests/ are 100644 and the library is either [X-56]" {
+    require_git
     local mode path bad=""
     while read -r mode path; do
         case "$path" in
