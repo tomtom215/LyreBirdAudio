@@ -724,7 +724,10 @@ collect_api_metrics() {
     if api_get "${api_url}/v3/info"; then
         info_json="$API_BODY"
     fi
-    if [[ -n "$info_json" ]] && echo "$info_json" | grep -q '"version"'; then
+    # A pattern match, not `echo | grep -q`: grep -q leaves at the first match, and
+    # under pipefail the echo that is still writing a large body then dies of
+    # SIGPIPE, the pipeline's status is 141 and a live API read as down.
+    if [[ "$info_json" == *'"version"'* ]]; then
         api_up=1
     fi
 

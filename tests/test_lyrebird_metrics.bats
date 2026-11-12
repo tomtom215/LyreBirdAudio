@@ -294,6 +294,37 @@ CURLEOF
     [[ "$output" =~ lyrebird_api_up[[:space:]]+1 ]]
 }
 
+# --- X-30 (d): a large /v3/info body must not read as "API down" ---------------
+
+@test "a large /v3/info body that names the version early still reads as an API that is up: no SIGPIPE of echo into grep -q under pipefail [X-30]" {
+    local bin="$TEST_SCRATCH/bigapi"
+    mkdir -p "$bin"
+    # about 2.6 MB over 40000 lines, "version" on the first
+    cat >"$bin/curl" <<'CURLEOF'
+#!/bin/bash
+for a in "$@"; do
+    case "$a" in
+        *"/v3/info")
+            printf '{"version":"1.19.2","upTime":100000000000,\n'
+            yes '"pad": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",' | head -n 40000
+            printf '"end":1}\n'
+            exit 0
+            ;;
+    esac
+done
+echo '{"itemCount":0,"items":[]}'
+CURLEOF
+    chmod +x "$bin/curl"
+    local i
+    for i in 1 2 3; do
+        run env PROJECT_ROOT="$PROJECT_ROOT" PATH="$bin:$PATH" \
+            bash -c 'source "$PROJECT_ROOT/lyrebird-metrics.sh"; collect_api_metrics'
+        [ "$status" -eq 0 ]
+        [[ "$output" == *$'\nlyrebird_api_up 1\n'* ]] || { echo "run $i: $(printf '%s\n' "$output" | grep api_up)"; return 1; }
+        [[ "$output" == *'lyrebird_api_info{version="1.19.2"} 1'* ]]
+    done
+}
+
 # --- MET-2: grep -c must not emit "0\n0" and break the scrape ------------------
 
 @test "configured_devices emits a single valid 0, never '0\\n0' [MET-2 regression]" {
