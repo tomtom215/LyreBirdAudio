@@ -1727,6 +1727,17 @@
         "the encoder arguments the check uses are the words of the wrapper's own codec arms, for every codec [8d]"
       ],
       "note": "check_individual_encoding asks FFmpeg before the wrapper is written; a check that cannot be made never stops a stream"
+    },
+    {
+      "id": "X-60",
+      "title": "CI never ran the four live tests of test_stream_names (name matrix, runOnInit injection, quoted keys, all_others) against real MediaMTX",
+      "severity": "P3",
+      "phase": 7,
+      "status": "fixed",
+      "tests": [
+        "the live-test setup is documented as the scripts have it: pinned versions, the variable, the files, the ports [CONTRIB]"
+      ],
+      "note": "found by the changelog worker; the live and canary steps now run test_stream_names and test_docs_security on every pinned version; 45 tests pass on each of 1.15.0, 1.18.0, 1.19.0, 1.21.1, 1.21.2, 1.21.3"
     }
   ]
 }

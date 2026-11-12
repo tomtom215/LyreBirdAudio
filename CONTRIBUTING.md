@@ -494,11 +494,10 @@ LYREBIRD_TEST_MEDIAMTX_BINS="$(tests/fetch_mediamtx.sh)" \
 
 The files with live tests are `test_mediamtx_live`, `test_mediamtx_config_live`,
 `test_mediamtx_api_live`, `test_mediamtx_e2e_ports`, `test_install_mediamtx_live`,
-`test_soak_live` and `test_soak_observer`, which CI runs once per pinned version,
-`test_stream_names`, four of whose tests are live and which no CI job runs
-with the variable set, and `test_docs_security`, whose live test loads every YAML
-block of the security guide into each binary that has `--validate-conf` (also not
-run by a CI job with the variable set).
+`test_soak_live`, `test_soak_observer`, `test_stream_names` (four of its tests are
+live) and `test_docs_security` (its live test loads every YAML block of the security
+guide into each binary that has `--validate-conf`), which CI runs once per pinned
+version.
 
 The private-port rule: a new test must not bind a default port of MediaMTX or of
 the metrics server (8554, 8000, 8001, 9997, 9998, 9100, 8890 to 8893) on the

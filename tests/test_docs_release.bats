@@ -692,11 +692,11 @@ EOF
         [ "$f" = test_ci_config ] && continue
         grep -qF -- "$f" <<<"$flat" || { echo "CONTRIBUTING does not name $f, which has live tests"; missing=1; }
     done
-    for f in test_mediamtx_live test_mediamtx_config_live test_mediamtx_api_live test_mediamtx_e2e_ports test_install_mediamtx_live test_soak_live test_soak_observer; do
+    for f in test_mediamtx_live test_mediamtx_config_live test_mediamtx_api_live test_mediamtx_e2e_ports test_install_mediamtx_live test_soak_live test_soak_observer test_stream_names test_docs_security; do
         grep -qF "tests/$f.bats" "$ROOT/.github/workflows/bash-ci.yml" || { echo "$f is not run by the live job any more"; missing=1; }
     done
-    # test_stream_names has live tests that no CI job runs, as CONTRIBUTING says
-    ! grep -qF 'test_stream_names' "$ROOT/.github/workflows/bash-ci.yml" || { echo "CI runs test_stream_names now: update CONTRIBUTING"; missing=1; }
+    # (the live step is where the four live tests of test_stream_names and the YAML blocks of the
+    # security guide meet every pinned binary; the Bats job, without the variable, skips them)
     # the private-port rule: the two files that still bind default ports
     grep -q '8554' "$ROOT/tests/test_soak_live.bats"
     grep -q '8554' "$ROOT/tests/test_soak_observer.bats"

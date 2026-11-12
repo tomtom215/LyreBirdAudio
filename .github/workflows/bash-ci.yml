@@ -642,7 +642,7 @@ jobs:
           tests/check_tmp_leaks.sh --print-output-on-failure --timing \
             tests/test_mediamtx_live.bats tests/test_soak_live.bats tests/test_soak_observer.bats \
             tests/test_mediamtx_config_live.bats tests/test_mediamtx_api_live.bats tests/test_mediamtx_e2e_ports.bats \
-            tests/test_install_mediamtx_live.bats
+            tests/test_install_mediamtx_live.bats tests/test_stream_names.bats tests/test_docs_security.bats
 
   # ===========================================================================
   # Job 7c: Canary against the newest upstream MediaMTX release
@@ -679,7 +679,7 @@ jobs:
           tests/check_tmp_leaks.sh --print-output-on-failure --timing \
             tests/test_mediamtx_live.bats tests/test_soak_live.bats tests/test_soak_observer.bats \
             tests/test_mediamtx_config_live.bats tests/test_mediamtx_api_live.bats tests/test_mediamtx_e2e_ports.bats \
-            tests/test_install_mediamtx_live.bats
+            tests/test_install_mediamtx_live.bats tests/test_stream_names.bats tests/test_docs_security.bats
 
   # ===========================================================================
   # Job 8: Final Summary
