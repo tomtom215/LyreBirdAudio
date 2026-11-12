@@ -423,15 +423,12 @@ DEEP_HEALTH_MAX_STRIKES=$(_uint_or "${DEEP_HEALTH_MAX_STRIKES:-}" 3)
 readonly DEEP_HEALTH_MAX_STRIKES
 readonly DEEP_HEALTH_STATE_DIR="${DEEP_HEALTH_STATE_DIR:-/run/lyrebird/deep-health}"
 
-# Watchdog/Heartbeat settings
-# Heartbeat runs more frequently than cron for faster failure detection
-HEARTBEAT_INTERVAL=$(_uint_or "${HEARTBEAT_INTERVAL:-}" 30) # Seconds between heartbeats
-readonly HEARTBEAT_INTERVAL
+# Heartbeat: the Unix time of the last monitor run (update_heartbeat, written
+# once per run of the cron `monitor`). It proves that the monitor ran, nothing
+# else: it is written while MediaMTX is down too. There is no software watchdog in
+# this script; a hardware watchdog is systemd's RuntimeWatchdogSec= or a watchdog
+# daemon (the settings of the removed implementation: warn_removed_settings).
 readonly HEARTBEAT_FILE="${HEARTBEAT_FILE:-/run/mediamtx-audio.heartbeat}"
-readonly ENABLE_HARDWARE_WATCHDOG="${ENABLE_HARDWARE_WATCHDOG:-auto}" # auto, yes, no
-readonly HARDWARE_WATCHDOG_DEVICE="${HARDWARE_WATCHDOG_DEVICE:-/dev/watchdog}"
-HARDWARE_WATCHDOG_TIMEOUT=$(_uint_or "${HARDWARE_WATCHDOG_TIMEOUT:-}" 60) # Seconds
-readonly HARDWARE_WATCHDOG_TIMEOUT
 
 # Disk space monitoring thresholds
 DISK_SPACE_WARNING_PERCENT=$(_uint_or "${DISK_SPACE_WARNING_PERCENT:-}" 80)
@@ -458,31 +455,46 @@ readonly NETWORK_CHECK_TIMEOUT
 NETWORK_FAIL_THRESHOLD=$(_uint_or "${NETWORK_FAIL_THRESHOLD:-}" 3) # Consecutive failures before alert
 readonly NETWORK_FAIL_THRESHOLD
 
-# Audio buffering (memory-based with optional disk persistence)
+# Audio buffering (memory only)
 # Memory buffering is done via FFmpeg's rtbufsize option (no SD card wear)
 readonly AUDIO_BUFFER_ENABLED="${AUDIO_BUFFER_ENABLED:-true}"   # Enable enhanced memory buffering
 AUDIO_BUFFER_SIZE_MB=$(_uint_or "${AUDIO_BUFFER_SIZE_MB:-}" 64) # Memory buffer size per stream (MB)
 readonly AUDIO_BUFFER_SIZE_MB
 AUDIO_RTBUFSIZE=$(_uint_or "${AUDIO_RTBUFSIZE:-}" 33554432) # Real-time buffer size in bytes (32MB default)
 readonly AUDIO_RTBUFSIZE
-# Local recording (ring buffer) - writes audio to tmpfs or disk alongside streaming
+# Local recording (ring buffer): FFmpeg writes the last AUDIO_RECORDING_SEGMENTS
+# segments of each stream to AUDIO_RECORDING_PATH alongside streaming. The default
+# is tmpfs (RAM): it does not survive a reboot or power loss. Recording that must
+# survive means pointing AUDIO_RECORDING_PATH at persistent storage; there is no
+# separate disk-persistence switch (AUDIO_DISK_PERSIST / AUDIO_DISK_PATH were
+# removed: they only created a directory nothing wrote to).
 readonly AUDIO_LOCAL_RECORDING="${AUDIO_LOCAL_RECORDING:-false}"                  # Enable local recording backup
 readonly AUDIO_RECORDING_PATH="${AUDIO_RECORDING_PATH:-/dev/shm/lyrebird-buffer}" # Default to tmpfs (RAM)
 AUDIO_RECORDING_SEGMENT_TIME=$(_uint_or "${AUDIO_RECORDING_SEGMENT_TIME:-}" 300)  # 5 min segments
 readonly AUDIO_RECORDING_SEGMENT_TIME
 AUDIO_RECORDING_SEGMENTS=$(_uint_or "${AUDIO_RECORDING_SEGMENTS:-}" 12) # Keep last 12 segments (1 hour)
 readonly AUDIO_RECORDING_SEGMENTS
-readonly AUDIO_DISK_PERSIST="${AUDIO_DISK_PERSIST:-false}" # Move segments to disk (SD card wear!)
-readonly AUDIO_DISK_PATH="${AUDIO_DISK_PATH:-/var/lib/mediamtx-ffmpeg/recordings}"
 
-# Audio level monitoring (detect dead/silent microphones)
+# Audio level monitoring (detect dead/silent microphones). The monitor reads a
+# few seconds of each published stream back from MediaMTX over RTSP and measures
+# its level (probe_stream_level, monitor_signals); it never opens an ALSA device.
 readonly AUDIO_LEVEL_CHECK_ENABLED="${AUDIO_LEVEL_CHECK_ENABLED:-true}"      # Enable silence detection
-AUDIO_LEVEL_SAMPLE_DURATION=$(_uint_or "${AUDIO_LEVEL_SAMPLE_DURATION:-}" 3) # Seconds to sample for level check
+AUDIO_LEVEL_SAMPLE_DURATION=$(_uint_or "${AUDIO_LEVEL_SAMPLE_DURATION:-}" 3) # Seconds of the stream to measure
 readonly AUDIO_LEVEL_SAMPLE_DURATION
-AUDIO_SILENCE_THRESHOLD_DB=$(_int_or "${AUDIO_SILENCE_THRESHOLD_DB:-}" -60) # dB below which is "silence"
+# Seconds the probe may spend connecting and finishing beyond the sample itself
+# before it is killed (the whole probe is bounded by sample + this)
+AUDIO_LEVEL_PROBE_GRACE=$(_uint_or "${AUDIO_LEVEL_PROBE_GRACE:-}" 10)
+readonly AUDIO_LEVEL_PROBE_GRACE
+# Least seconds between two probes of one stream: a monitor run that comes
+# sooner (a manual run, cron every minute) leaves the stream alone
+AUDIO_LEVEL_CHECK_INTERVAL=$(_uint_or "${AUDIO_LEVEL_CHECK_INTERVAL:-}" 240)
+readonly AUDIO_LEVEL_CHECK_INTERVAL
+AUDIO_SILENCE_THRESHOLD_DB=$(_int_or "${AUDIO_SILENCE_THRESHOLD_DB:-}" -60) # dB (max_volume) at or below which is "silence"
 readonly AUDIO_SILENCE_THRESHOLD_DB
-AUDIO_SILENCE_WARN_DURATION=$(_uint_or "${AUDIO_SILENCE_WARN_DURATION:-}" 60) # Seconds of silence before warning
+AUDIO_SILENCE_WARN_DURATION=$(_uint_or "${AUDIO_SILENCE_WARN_DURATION:-}" 60) # Seconds of silence before the DEAD MIC error
 readonly AUDIO_SILENCE_WARN_DURATION
+# Silence episodes and probe times per stream (under /run: cleared at boot)
+readonly SILENCE_STATE_DIR="${SILENCE_STATE_DIR:-/run/lyrebird/silence}"
 
 # MediaMTX API version compatibility
 readonly MEDIAMTX_API_VERSION="${MEDIAMTX_API_VERSION:-auto}"   # auto, v3, v2, v1
@@ -607,6 +619,19 @@ cleanup() {
     exit "${exit_code}"
 }
 
+# Is this process run by systemd (the mediamtx-audio unit)? The unit says so
+# with LYREBIRD_UNDER_SYSTEMD=1. systemd (232 and later) also sets INVOCATION_ID
+# for every service process, which is honoured too so that a unit written by an
+# older version of this script (it set INVOCATION_ID=systemd by hand) keeps
+# working. Defined before its first use, at load time, below.
+lyrebird_under_systemd() {
+    case "${LYREBIRD_UNDER_SYSTEMD:-}" in
+        1 | true | yes) return 0 ;;
+        *) ;;
+    esac
+    [[ -n "${INVOCATION_ID:-}" ]]
+}
+
 # Set trap for cleanup only in main script
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]] && [[ $$ -eq $BASHPID ]]; then
     # Comprehensive signal handling for production reliability
@@ -617,16 +642,14 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]] && [[ $$ -eq $BASHPID ]]; then
 
     # Enhanced signal handlers
     # Only set custom handlers when NOT running under systemd
-    if [[ -z "${INVOCATION_ID:-}" ]]; then
+    if ! lyrebird_under_systemd; then
         # Not running under systemd - safe to use custom handlers
         # SIGHUP: Reload configuration without full restart
         trap 'log INFO "Received SIGHUP, reloading configuration"; restart_mediamtx' HUP
         # SIGUSR1: Dump status for debugging
         trap 'log INFO "Received SIGUSR1, dumping status"; show_status >/dev/null 2>&1 || log INFO "Status dump completed"' USR1
-        # SIGUSR2: Force heartbeat update
-        trap 'log DEBUG "Received SIGUSR2, updating heartbeat"; update_heartbeat' USR2
     fi
-    # Note: When running under systemd (INVOCATION_ID is set), default signal handlers are used
+    # Note: When running under systemd (lyrebird_under_systemd), default signal handlers are used
 fi
 
 # Critical section protection - prevents signal handlers from interrupting
@@ -652,7 +675,7 @@ exit_critical_section() {
     fi
     CRITICAL_SECTION_ACTIVE=false
     # Restore signal handlers (only when not running under systemd)
-    if [[ -z "${INVOCATION_ID:-}" ]]; then
+    if ! lyrebird_under_systemd; then
         trap 'log INFO "Received SIGHUP, reloading configuration"; restart_mediamtx' HUP
         trap 'log INFO "Received SIGUSR1, dumping status"; show_status >/dev/null 2>&1 || log INFO "Status dump completed"' USR1
     fi
@@ -1846,16 +1869,6 @@ setup_directories() {
                 log WARN "Could not create audio buffer directory: ${AUDIO_RECORDING_PATH}"
             fi
         fi
-
-        # If disk persistence is enabled, create disk path
-        if [[ "${AUDIO_DISK_PERSIST}" == "true" ]] && [[ ! -d "${AUDIO_DISK_PATH}" ]]; then
-            if mkdir -p "${AUDIO_DISK_PATH}" 2>/dev/null; then
-                chmod 755 "${AUDIO_DISK_PATH}"
-                log INFO "Created disk recording directory: ${AUDIO_DISK_PATH}"
-            else
-                log WARN "Could not create disk recording directory: ${AUDIO_DISK_PATH}"
-            fi
-        fi
     fi
 
     # Setup MediaMTX log rotation if logrotate is available
@@ -1867,7 +1880,7 @@ setup_directories() {
 # Setup MediaMTX log rotation
 setup_mediamtx_logrotate() {
     # Skip if running under systemd with protected filesystem
-    if [[ -n "${INVOCATION_ID:-}" ]] || [[ ! -w /etc/logrotate.d ]]; then
+    if lyrebird_under_systemd || [[ ! -w /etc/logrotate.d ]]; then
         log DEBUG "Skipping logrotate setup (read-only filesystem or systemd environment)"
         return 0
     fi
@@ -2984,125 +2997,282 @@ check_alsa_device_available() {
     return 0
 }
 
-# Check audio level for a device to detect dead/silent microphones
-# Uses FFmpeg's volumedetect filter to sample audio levels
-# Returns: 0 = audio detected, 1 = silence/dead mic, 2 = check failed
-check_audio_level() {
-    local card_num="$1"
-    local stream_name="${2:-unknown}"
-    local pcm="${3:-}"
+# ============================================================================
+# Audio level signals (LB-14, X-05; decision D6)
+# ============================================================================
+# A dead microphone is a stream that is published and silent. The PID file and
+# the API's ready flag cannot show it, and it must not be looked for by opening
+# the ALSA device a second time: that contends with the capture FFmpeg. The
+# level is measured where every listener gets it, from the stream MediaMTX
+# publishes, with a short RTSP read. Four signals stay apart: the path is ready
+# (probe_stream_ready), bytes move (the deep health probe), the level
+# (probe_stream_level) and prolonged silence (track_silence).
 
-    if [[ "${AUDIO_LEVEL_CHECK_ENABLED}" != "true" ]]; then
-        return 0
+# dB with at most one decimal as tenths of a dB, so the threshold comparison
+# needs no floating point: "-12.5" -> -125, "-inf" -> -99999. Fails (printing
+# nothing) for a value that is not a number. A decimal comma is accepted.
+_db_to_tenths() {
+    local v="${1//,/.}"
+    case "$v" in
+        -inf | -Inf | -INF)
+            printf '%s' -99999
+            return 0
+            ;;
+        inf | +inf | Inf | INF)
+            printf '%s' 99999
+            return 0
+            ;;
+    esac
+    local re='^(-?)([0-9]+)(\.([0-9]))?[0-9]*$'
+    [[ "$v" =~ $re ]] || return 1
+    local tenths=$((10#${BASH_REMATCH[2]} * 10 + 10#${BASH_REMATCH[4]:-0}))
+    if [[ -n "${BASH_REMATCH[1]}" ]]; then
+        tenths=$((-tenths))
     fi
-
-    # Verify FFmpeg is available
-    if ! command_exists ffmpeg; then
-        log DEBUG "FFmpeg not available for audio level check"
-        return 0
-    fi
-
-    if [[ -z "$pcm" ]]; then
-        pcm="$(first_capture_pcm "$card_num")"
-    fi
-    if [[ -z "$pcm" ]]; then
-        # ALSA lists no capture PCM for the card (no /proc/asound here, say): keep the
-        # old assumption, device 0, and let FFmpeg say whether it can be opened
-        pcm=0
-    fi
-    local audio_device="plughw:${card_num},${pcm}"
-    local sample_duration="${AUDIO_LEVEL_SAMPLE_DURATION}"
-    local silence_threshold="${AUDIO_SILENCE_THRESHOLD_DB}"
-
-    log DEBUG "Checking audio level for $stream_name (device: $audio_device)"
-
-    # Use FFmpeg to sample audio and detect volume
-    # -t limits duration, volumedetect filter outputs max/mean volume
-    local ffmpeg_output
-    ffmpeg_output=$(ffmpeg -f alsa -i "$audio_device" -t "$sample_duration" \
-        -af volumedetect -f null /dev/null 2>&1) || {
-        log DEBUG "FFmpeg audio level check failed for $stream_name"
-        return 2
-    }
-
-    # Parse max volume from output (format: "max_volume: -XX.X dB")
-    local max_volume
-    max_volume=$(echo "$ffmpeg_output" | grep -o "max_volume: [0-9.-]*" | grep -o "[0-9.-]*" | head -1) || true
-
-    if [[ -z "$max_volume" ]]; then
-        log DEBUG "Could not parse audio level for $stream_name"
-        return 2
-    fi
-
-    # Compare with threshold (both are negative dB values)
-    # Note: -30 dB is louder than -60 dB, so we check if max > threshold
-    local max_int="${max_volume%.*}" # Remove decimal for integer comparison
-    local threshold_int="${silence_threshold%.*}"
-
-    if [[ $max_int -lt $threshold_int ]]; then
-        log WARN "Silence detected on $stream_name: max volume ${max_volume} dB (threshold: ${silence_threshold} dB)"
-
-        # Track silence duration
-        local silence_file="/run/mediamtx-silence-${stream_name}"
-        local silence_start
-        if [[ -f "$silence_file" ]]; then
-            silence_start=$(cat "$silence_file" 2>/dev/null || echo "0")
-        else
-            silence_start=$(_now_monotonic)
-            echo "$silence_start" >"$silence_file" 2>/dev/null || true
-        fi
-
-        local now
-        now=$(_now_monotonic)
-        # A start value in the future means a stale wall-clock timestamp from a
-        # pre-monotonic run (or clock scale mismatch): restart tracking from now
-        # rather than silently never reaching the DEAD MIC threshold again.
-        if [[ ! "$silence_start" =~ ^[0-9]+$ ]] || ((silence_start > now)); then
-            silence_start=$now
-            echo "$silence_start" >"$silence_file" 2>/dev/null || true
-        fi
-        local silence_duration=$((now - silence_start))
-
-        if [[ $silence_duration -ge ${AUDIO_SILENCE_WARN_DURATION} ]]; then
-            log ERROR "DEAD MIC: $stream_name has been silent for ${silence_duration}s (>${AUDIO_SILENCE_WARN_DURATION}s)"
-        fi
-
-        return 1
-    else
-        # Audio detected - clear silence tracking
-        rm -f "/run/mediamtx-silence-${stream_name}" 2>/dev/null || true
-        log DEBUG "Audio level OK for $stream_name: max volume ${max_volume} dB"
-        return 0
-    fi
+    printf '%s' "$tenths"
 }
 
-# Check all streams for audio levels
-check_all_audio_levels() {
+# Measure the level of one published stream by reading AUDIO_LEVEL_SAMPLE_DURATION
+# seconds of it over RTSP (never an ALSA device).
+#
+#   probe_stream_level PATH [SECONDS]
+#
+# Prints one line, "<state> <max dB> <mean dB> <detail>", with "-" where a value
+# is unknown, and returns 0. state is
+#   ok             samples were read and the loudest one is above
+#                  AUDIO_SILENCE_THRESHOLD_DB
+#   silent         samples were read and max_volume is at or below the threshold
+#                  (digital silence measures -91.0)
+#   no_audio_data  the stream opened but delivered no samples
+#   unreachable    the stream could not be opened: not published, nothing
+#                  listening, timed out (the deep health probe's business)
+#   probe_error    the measurement failed: no ffmpeg or timeout, ffmpeg crashed
+#                  or printed nothing usable, or the server wants credentials
+# Only "silent" says anything about the microphone. The probe is bounded by
+# timeout(1): sample seconds + AUDIO_LEVEL_PROBE_GRACE. The RTSP port is
+# MEDIAMTX_RTSP_PORT (default 8554).
+probe_stream_level() {
+    local stream="${1:-}" seconds="${2:-${AUDIO_LEVEL_SAMPLE_DURATION}}"
+    local state="probe_error" max="-" mean="-" detail=""
+
+    if [[ ! "$stream" =~ ^[A-Za-z0-9_-]+$ ]]; then
+        detail="not a usable stream path: '${stream}'"
+    elif ! command_exists ffmpeg || ! command_exists timeout; then
+        detail="ffmpeg and timeout are both required"
+    else
+        if [[ ! "$seconds" =~ ^[0-9]+$ ]] || ((10#$seconds < 1)); then
+            seconds=1
+        fi
+        seconds=$((10#$seconds))
+        local port="${MEDIAMTX_RTSP_PORT:-8554}"
+        if [[ ! "$port" =~ ^[0-9]+$ ]] || ((10#$port < 1 || 10#$port > 65535)); then
+            port=8554
+        fi
+        port=$((10#$port))
+
+        # volumedetect reports on stderr at INFO level; LC_ALL=C pins the
+        # number format. "-f null -" discards the decoded audio.
+        local out="" rc=0
+        out="$(LC_ALL=C timeout -k 2 "$((seconds + AUDIO_LEVEL_PROBE_GRACE))" \
+            ffmpeg -nostdin -hide_banner -nostats -loglevel info -rtsp_transport tcp \
+            -i "rtsp://127.0.0.1:${port}/${stream}" -t "$seconds" -vn \
+            -af volumedetect -f null - 2>&1)" || rc=$?
+
+        # A filter graph that ffmpeg rebuilt prints one block of its own: the
+        # last block is the measurement ("n_samples: 0" blocks carry no volume)
+        local re_samples='n_samples: *([0-9]+)'
+        local re_mean='mean_volume: *(-?[A-Za-z0-9.,]+) dB'
+        local re_max='max_volume: *(-?[A-Za-z0-9.,]+) dB'
+        local marker='Input #0' # ffmpeg's first line once the input is open
+        local line last_line="" samples=0 connected=false
+        while IFS= read -r line; do
+            if [[ -n "$line" ]]; then
+                last_line="$line"
+            fi
+            if [[ "$line" == "$marker"* ]]; then
+                connected=true
+            elif [[ "$line" =~ $re_samples ]]; then
+                samples=$((10#${BASH_REMATCH[1]}))
+                max="-"
+                mean="-"
+            elif [[ "$line" =~ $re_mean ]]; then
+                mean="${BASH_REMATCH[1]}"
+            elif [[ "$line" =~ $re_max ]]; then
+                max="${BASH_REMATCH[1]}"
+            fi
+        done <<<"$out"
+
+        local max_tenths=""
+        if ((rc == 0 && samples > 0)) && max_tenths="$(_db_to_tenths "$max")"; then
+            if ((max_tenths <= AUDIO_SILENCE_THRESHOLD_DB * 10)); then
+                state="silent"
+            else
+                state="ok"
+            fi
+            _db_to_tenths "$mean" >/dev/null || mean="-"
+        else
+            max="-"
+            mean="-"
+            local re_auth='(401 Unauthorized|403 Forbidden|Server returned 40[13])'
+            local re_down='(Connection refused|Connection timed out|Connection reset|Operation timed out|No route to host|Network is unreachable|Name or service not known|404 Not Found|Server returned 4[0-9][0-9]|Server returned 5[0-9][0-9]|method DESCRIBE failed)'
+            if [[ "$connected" == "false" && "$out" =~ $re_auth ]]; then
+                detail="the server wants credentials, the probe reads anonymously"
+            elif [[ "$connected" == "true" ]] && ((rc == 0 || rc == 124)); then
+                state="no_audio_data"
+                detail="the stream opened but delivered no samples (ffmpeg exit ${rc})"
+            elif ((rc == 124)) || [[ "$out" =~ $re_down ]]; then
+                state="unreachable"
+                detail="could not open rtsp port ${port} path ${stream} (ffmpeg exit ${rc})"
+            else
+                detail="ffmpeg exit ${rc}, last line: ${last_line:0:120}"
+            fi
+        fi
+    fi
+
+    log DEBUG "Level probe ${stream}: ${state} ${max} ${mean}${detail:+ ${detail}}"
+    printf '%s %s %s%s\n' "$state" "$max" "$mean" "${detail:+ ${detail}}"
+    return 0
+}
+
+# Per-stream signal state, one file per stream under SILENCE_STATE_DIR:
+# "<silence start> <alerted 0|1> <last probe>". The times are monotonic seconds
+# (_now_monotonic): wall-clock steps cannot turn minutes into a DEAD MIC. "-"
+# means "no silence episode" / "never probed". Read into SIGNAL_START,
+# SIGNAL_ALERTED and SIGNAL_LAST.
+declare -g SIGNAL_START="-" SIGNAL_ALERTED=0 SIGNAL_LAST="-"
+
+_signal_state_read() {
+    local file="${SILENCE_STATE_DIR}/${1}.state" start="" alerted="" last=""
+    SIGNAL_START="-"
+    SIGNAL_ALERTED=0
+    SIGNAL_LAST="-"
+    [[ -r "$file" ]] || return 0
+    { IFS=' ' read -r start alerted last <"$file"; } 2>/dev/null || true
+    if [[ "$start" =~ ^[0-9]+$ ]]; then
+        SIGNAL_START="$((10#$start))"
+    fi
+    if [[ "$alerted" == "1" ]]; then
+        SIGNAL_ALERTED=1
+    fi
+    if [[ "$last" =~ ^[0-9]+$ ]]; then
+        SIGNAL_LAST="$((10#$last))"
+    fi
+    return 0
+}
+
+_signal_state_write() {
+    local stream="$1" file tmp
+    file="${SILENCE_STATE_DIR}/${stream}.state"
+    tmp="${file}.tmp.$$"
+    if mkdir -p "${SILENCE_STATE_DIR}" 2>/dev/null \
+        && printf '%s %s %s\n' "$2" "$3" "$4" >"$tmp" 2>/dev/null \
+        && mv -f "$tmp" "$file" 2>/dev/null; then
+        return 0
+    fi
+    rm -f "$tmp" 2>/dev/null || true
+    log WARN "Cannot record the audio level state of ${stream} in ${SILENCE_STATE_DIR}: silence tracking cannot persist between monitor runs"
+    return 0
+}
+
+# Feed one verdict of probe_stream_level into the stream's silence episode.
+#
+#   track_silence STREAM STATE MAX_DB NOW
+#
+# An episode starts with the first "silent" probe, raises the DEAD MIC error
+# once when it has lasted AUDIO_SILENCE_WARN_DURATION seconds, and ends with the
+# first "ok" probe (logged as recovery). unreachable, no_audio_data and
+# probe_error say nothing about the microphone: they neither start, extend, end
+# nor alert an episode. NOW is the monotonic time of the probe; it is also kept
+# as the stream's last probe time.
+track_silence() {
+    local stream="$1" state="$2" max="$3" now="$4"
+    _signal_state_read "$stream"
+    local start="$SIGNAL_START" alerted="$SIGNAL_ALERTED"
+    case "$state" in
+        ok)
+            if [[ "$start" != "-" ]]; then
+                local was=$((now - start))
+                if ((was < 0)); then
+                    was=0
+                fi
+                log INFO "Audio recovered on ${stream} after ${was}s of silence (max volume ${max} dB)"
+            fi
+            start="-"
+            alerted=0
+            ;;
+        silent)
+            # A start in the future is a value from another clock scale: begin again
+            if [[ "$start" == "-" ]] || ((start > now)); then
+                start="$now"
+                alerted=0
+                log WARN "Silence detected on ${stream}: max volume ${max} dB (threshold: ${AUDIO_SILENCE_THRESHOLD_DB} dB)"
+            fi
+            local silent_for=$((now - start))
+            if ((silent_for >= AUDIO_SILENCE_WARN_DURATION)) && [[ "$alerted" != "1" ]]; then
+                alerted=1
+                log ERROR "DEAD MIC: ${stream} has been silent for ${silent_for}s (>${AUDIO_SILENCE_WARN_DURATION}s)"
+            fi
+            ;;
+        *) ;;
+    esac
+    _signal_state_write "$stream" "$start" "$alerted" "$now"
+}
+
+# The signals step of one monitor run: for every stream this manager runs (a
+# PID file in FFMPEG_PID_DIR names a live process) that MediaMTX reports ready,
+# measure the level once and feed the verdict to the silence episode. A stream
+# probed less than AUDIO_LEVEL_CHECK_INTERVAL seconds ago is skipped, so one
+# monitor run opens at most one short reader per stream. Purely informational:
+# it changes nothing and always returns 0. AUDIO_LEVEL_CHECK_ENABLED=false turns
+# it off.
+monitor_signals() {
     if [[ "${AUDIO_LEVEL_CHECK_ENABLED}" != "true" ]]; then
         return 0
     fi
 
-    local devices=()
-    readarray -t devices < <(detect_audio_devices 2>/dev/null) || return 0
+    local nullglob_state
+    shopt -q nullglob && nullglob_state=on || nullglob_state=off
+    shopt -s nullglob
 
-    local silent_count=0
-    for device_info in "${devices[@]}"; do
-        IFS=':' read -r device_name card_num <<<"$device_info"
-        [[ -z "$device_name" ]] || [[ -z "$card_num" ]] && continue
-
-        local stream_path
-        stream_path="$(generate_stream_path "$device_name" "$card_num" 2>/dev/null)" || continue
-
-        if ! check_audio_level "$card_num" "$stream_path"; then
-            ((silent_count++)) || true
+    local pid_file stream pid now rc verdict state max mean detail
+    for pid_file in "${FFMPEG_PID_DIR}"/*.pid; do
+        stream="${pid_file##*/}"
+        stream="${stream%.pid}"
+        if [[ ! "$stream" =~ ^[A-Za-z0-9_-]+$ ]]; then
+            continue
         fi
+        pid="$(read_pid_safe "$pid_file")"
+        if [[ -z "$pid" ]]; then
+            continue
+        fi
+        rc=0
+        probe_stream_ready "$stream" || rc=$?
+        if ((rc != 0)); then
+            log DEBUG "Level probe skipped for ${stream}: path not ready or API unknown (probe_stream_ready=${rc})"
+            continue
+        fi
+        now="$(_now_monotonic)"
+        _signal_state_read "$stream"
+        if [[ "$SIGNAL_LAST" != "-" ]] && ((SIGNAL_LAST <= now && now - SIGNAL_LAST < AUDIO_LEVEL_CHECK_INTERVAL)); then
+            log DEBUG "Level probe skipped for ${stream}: probed $((now - SIGNAL_LAST))s ago (interval ${AUDIO_LEVEL_CHECK_INTERVAL}s)"
+            continue
+        fi
+
+        verdict="$(probe_stream_level "$stream")"
+        read -r state max mean detail <<<"$verdict"
+        case "$state" in
+            ok) log DEBUG "Audio level OK for ${stream}: max volume ${max} dB, mean ${mean} dB" ;;
+            silent) ;;
+            no_audio_data) log WARN "Stream ${stream} is published but delivered no audio samples during the level probe" ;;
+            unreachable) log DEBUG "Level probe: ${stream} could not be opened (${detail})" ;;
+            *) log WARN "Level probe of ${stream} failed, not counted as silence: ${detail}" ;;
+        esac
+        track_silence "$stream" "$state" "$max" "$(_now_monotonic)"
     done
 
-    if [[ $silent_count -gt 0 ]]; then
-        log WARN "Audio level check: $silent_count device(s) with silence detected"
-        return 1
+    if [[ "$nullglob_state" == "off" ]]; then
+        shopt -u nullglob
     fi
-
     return 0
 }
 
@@ -3135,8 +3305,10 @@ validate_config() {
     return 0
 }
 
-# Watchdog heartbeat - writes timestamp to heartbeat file
-# Can be used by external watchdog or systemd WatchdogSec
+# Heartbeat: write the Unix time of this monitor run to HEARTBEAT_FILE
+# (lyrebird-metrics.sh reads it as lyrebird_heartbeat_*). Called once per monitor
+# run, by check_all_resources, whatever the state of MediaMTX or the streams: the
+# file says "the monitor ran at this time" and nothing more.
 update_heartbeat() {
     local timestamp
     timestamp=$(date +%s)
@@ -3147,67 +3319,40 @@ update_heartbeat() {
     [[ -d "$heartbeat_dir" ]] || mkdir -p "$heartbeat_dir" 2>/dev/null || true
 
     # Write timestamp atomically
-    echo "$timestamp" >"${HEARTBEAT_FILE}.tmp" 2>/dev/null \
-        && mv "${HEARTBEAT_FILE}.tmp" "${HEARTBEAT_FILE}" 2>/dev/null \
-        || true
-
-    # Notify systemd watchdog if running under systemd
-    if [[ -n "${NOTIFY_SOCKET:-}" ]] && command_exists systemd-notify; then
-        systemd-notify WATCHDOG=1 2>/dev/null || true
+    if ! { echo "$timestamp" >"${HEARTBEAT_FILE}.tmp" && mv "${HEARTBEAT_FILE}.tmp" "${HEARTBEAT_FILE}"; } 2>/dev/null; then
+        log WARN "Cannot write the monitor heartbeat ${HEARTBEAT_FILE}"
     fi
-
-    # Kick hardware watchdog if enabled
-    kick_hardware_watchdog
-}
-
-# Initialize hardware watchdog (graceful - never blocks if unavailable)
-init_hardware_watchdog() {
-    # Check if hardware watchdog should be enabled
-    case "${ENABLE_HARDWARE_WATCHDOG}" in
-        no | false | 0)
-            log DEBUG "Hardware watchdog disabled by configuration"
-            return 0
-            ;;
-        yes | true | 1)
-            # Explicitly enabled - warn if not available
-            if [[ ! -c "${HARDWARE_WATCHDOG_DEVICE}" ]]; then
-                log WARN "Hardware watchdog enabled but device ${HARDWARE_WATCHDOG_DEVICE} not found"
-                return 0
-            fi
-            ;;
-        auto | *)
-            # Auto-detect - silently skip if not available
-            if [[ ! -c "${HARDWARE_WATCHDOG_DEVICE}" ]]; then
-                log DEBUG "Hardware watchdog not available (auto-detect)"
-                return 0
-            fi
-            ;;
-    esac
-
-    # Try to set watchdog timeout (requires root)
-    if [[ -w "${HARDWARE_WATCHDOG_DEVICE}" ]]; then
-        # Note: This uses the magic close feature - we just write to keep it alive
-        # The timeout is typically set in kernel/firmware
-        log INFO "Hardware watchdog initialized at ${HARDWARE_WATCHDOG_DEVICE}"
-        export HARDWARE_WATCHDOG_ACTIVE=true
-    else
-        log DEBUG "Hardware watchdog device not writable (may require root)"
-        export HARDWARE_WATCHDOG_ACTIVE=false
-    fi
-
     return 0
 }
 
-# Kick hardware watchdog to prevent system reset
-kick_hardware_watchdog() {
-    if [[ "${HARDWARE_WATCHDOG_ACTIVE:-false}" != "true" ]]; then
+# Settings of features that were removed because they did nothing (LB-15, LB-16;
+# decisions D7, D8). They are still read from the environment only to say, once
+# per run, that they are ignored and what replaces them.
+REMOVED_SETTINGS_WARNED=false
+warn_removed_settings() {
+    if [[ "${REMOVED_SETTINGS_WARNED}" == "true" ]]; then
         return 0
     fi
-
-    # Write any character to the watchdog device to kick it
-    if [[ -w "${HARDWARE_WATCHDOG_DEVICE}" ]]; then
-        echo "1" >"${HARDWARE_WATCHDOG_DEVICE}" 2>/dev/null || true
+    REMOVED_SETTINGS_WARNED=true
+    local name found=""
+    for name in HEARTBEAT_INTERVAL HARDWARE_WATCHDOG_TIMEOUT ENABLE_HARDWARE_WATCHDOG HARDWARE_WATCHDOG_DEVICE LYREBIRD_WATCHDOG_ENABLED LYREBIRD_WATCHDOG_INTERVAL; do
+        if [[ -v "$name" ]]; then
+            found+="${found:+, }${name}"
+        fi
+    done
+    if [[ -n "$found" ]]; then
+        log WARN "Ignoring removed setting(s): ${found}. The manager has no watchdog: it never opened a watchdog device. For a hardware watchdog use systemd's RuntimeWatchdogSec= (system.conf) or a watchdog daemon; the monitor only records the time of its last run in ${HEARTBEAT_FILE}"
     fi
+    found=""
+    for name in AUDIO_DISK_PERSIST AUDIO_DISK_PATH; do
+        if [[ -v "$name" ]]; then
+            found+="${found:+, }${name}"
+        fi
+    done
+    if [[ -n "$found" ]]; then
+        log WARN "Ignoring removed setting(s): ${found}. Nothing is moved to disk: recording is RAM-only by default (AUDIO_RECORDING_PATH=/dev/shm/lyrebird-buffer, lost at reboot or power loss). For recording that survives, point AUDIO_RECORDING_PATH at persistent storage"
+    fi
+    return 0
 }
 
 # Version compatibility check
@@ -3275,7 +3420,8 @@ check_all_resources() {
         ((issues++)) || true
     fi
 
-    # Update heartbeat to show we're alive
+    # Record the time of this monitor run (it says the monitor ran, not that
+    # anything is healthy)
     update_heartbeat
 
     if [[ "$critical" == "true" ]]; then
@@ -6910,6 +7056,149 @@ restart_mediamtx() {
     start_mediamtx
 }
 
+# What MediaMTX does when it re-reads its configuration file and one top-level
+# key has changed. MediaMTX watches the file itself and applies a change without
+# restarting; no key this script writes needs a restart of the process. What a
+# change does to the publishers that are connected was measured on a real
+# MediaMTX 1.15.0 and 1.21.1 (tests/test_mediamtx_live.bats, "reload"):
+#   publishers stay      api, apiAddress, rtmp, hls, webrtc, srt, a path entry
+#                        that is added
+#   every publisher is   logLevel, readTimeout, writeTimeout, metrics,
+#   disconnected         metricsAddress, rtsp, rtspAddress, rtspTransports
+#   the publishers of    a path entry whose settings change (sourceProtocol)
+#   that path are
+#   disconnected
+# A disconnected publisher's FFmpeg exits; its wrapper restarts it, or the
+# reconcile step of `reload` starts the wrapper again when it is gone.
+# A configuration file that does not load (a syntax error, a key combination
+# MediaMTX refuses) makes the running MediaMTX log the error and exit: that is
+# why `reload` only ever installs what this script generated.
+# Prints one phrase for the key given as $1.
+mediamtx_reload_effect() {
+    case "$1" in
+        api | apiAddress | rtmp | hls | webrtc | srt)
+            printf '%s' "applied live by MediaMTX; connected publishers stay connected"
+            ;;
+        logLevel | readTimeout | writeTimeout | metrics | metricsAddress | rtsp | rtspAddress | rtspTransports)
+            printf '%s' "applied live by MediaMTX, which disconnects every publisher; each stream's FFmpeg has to reconnect (its wrapper restarts it; a wrapper that is gone is started again by this reload)"
+            ;;
+        paths)
+            printf '%s' "applied live by MediaMTX; the publishers of a path entry that changed are disconnected and have to reconnect, other paths are untouched"
+            ;;
+        *)
+            printf '%s' "applied live by MediaMTX; whether connected publishers stay was not verified for this key"
+            ;;
+    esac
+}
+
+# Print the names of the top-level keys whose text differs between two
+# configuration texts ($1 old, $2 new), one per line. A key's text is its line
+# and the indented lines under it ("paths:" is one key); comments and blank
+# lines do not count.
+mediamtx_changed_keys() {
+    local -A old_blocks=() new_blocks=()
+    local line key
+    local -a order=()
+    while IFS=$'\t' read -r key line; do
+        [[ -n "$key" ]] || continue
+        old_blocks["$key"]="$line"
+        order+=("$key")
+    done < <(_mediamtx_config_blocks "$1")
+    while IFS=$'\t' read -r key line; do
+        [[ -n "$key" ]] || continue
+        new_blocks["$key"]="$line"
+        if [[ -z "${old_blocks[$key]+set}" ]]; then
+            order+=("$key")
+        fi
+    done < <(_mediamtx_config_blocks "$2")
+    for key in "${order[@]}"; do
+        if [[ "${old_blocks[$key]-}" != "${new_blocks[$key]-}" ]]; then
+            printf '%s\n' "$key"
+        fi
+    done
+}
+
+# One line per top-level key of the configuration text $1: "<key><TAB><block>",
+# the block being the key's lines joined with a literal \n
+_mediamtx_config_blocks() {
+    printf '%s\n' "$1" | awk '
+        /^[A-Za-z][A-Za-z0-9]*:/ {
+            if (key != "") print key "\t" block
+            key = $0
+            sub(/:.*/, "", key)
+            block = $0
+            next
+        }
+        /^[[:space:]]*(#.*)?$/ { next }
+        key != "" { block = block "\\n" $0 }
+        END { if (key != "") print key "\t" block }
+    '
+}
+
+# Reload (the `reload` command, ExecReload= of the unit): re-render the MediaMTX
+# configuration and let the running MediaMTX apply it, then reconcile the
+# streams, without an outage this script causes.
+#
+# - Nothing is stopped or restarted. MediaMTX applies a changed file by itself
+#   (mediamtx_reload_effect says per key what that does to the publishers); an
+#   unchanged configuration leaves everything alone.
+# - The streams are reconciled by the idempotent start path: a stream whose
+#   wrapper is running is not touched, a missing one is started.
+# - It acts only on the MediaMTX this manager started: another owner is refused
+#   (E_OWNERSHIP), a MediaMTX that is not running is reported (E_MEDIAMTX_DOWN;
+#   use start). It never leaves the cleanup marker, which would stop the
+#   wrappers.
+reload_mediamtx() {
+    SKIP_CLEANUP=true
+    if ! acquire_lock; then
+        log ERROR "Refusing to reload: another lifecycle command holds the lock (${LOCK_FILE})"
+        return "${E_LOCK_FAILED}"
+    fi
+
+    local foreign_owner=""
+    if foreign_owner="$(foreign_mediamtx_owner)"; then
+        log ERROR "Refusing to reload: ${foreign_owner}"
+        return "${E_OWNERSHIP}"
+    fi
+
+    local mtx_pid=""
+    if ! mtx_pid="$(owned_mediamtx_pid)"; then
+        log ERROR "Cannot reload: the MediaMTX of this manager is not running (use start)"
+        return "${E_MEDIAMTX_DOWN}"
+    fi
+
+    local old_text="" new_text=""
+    if [[ -f "${CONFIG_FILE}" ]]; then
+        old_text="$(cat "${CONFIG_FILE}")"
+    fi
+    if ! generate_mediamtx_config; then
+        log ERROR "Reload failed: the MediaMTX configuration could not be generated; MediaMTX (PID ${mtx_pid}) was left alone"
+        return "${E_CONFIG_ERROR}"
+    fi
+    new_text="$(cat "${CONFIG_FILE}")"
+
+    if [[ "$old_text" == "$new_text" ]]; then
+        log INFO "MediaMTX configuration is unchanged; nothing for MediaMTX (PID ${mtx_pid}) to reload"
+    else
+        local key
+        while IFS= read -r key; do
+            log INFO "MediaMTX configuration key '${key}' changed: $(mediamtx_reload_effect "$key")"
+        done < <(mediamtx_changed_keys "$old_text" "$new_text")
+        # MediaMTX notices the file by itself; give it a moment, then make sure
+        # it survived the change and answers again
+        sleep 1
+        if ! wait_for_mediamtx_ready "$mtx_pid"; then
+            log ERROR "MediaMTX (PID ${mtx_pid}) did not come back after the new configuration was written to ${CONFIG_FILE}; run restart"
+            return "${E_GENERAL}"
+        fi
+        log INFO "MediaMTX (PID ${mtx_pid}) is running with the new configuration; it was not restarted"
+    fi
+
+    local rc=0
+    start_mediamtx || rc=$?
+    return "$rc"
+}
+
 # Show status
 show_status() {
     SKIP_CLEANUP=true
@@ -7027,67 +7316,333 @@ show_config() {
     cat "${DEVICE_CONFIG_FILE}"
 }
 
+# ============================================================================
+# systemd unit and monitor cron job (`install`)
+# ============================================================================
+# One template, config/mediamtx-audio.service (LB-11, LB-12, X-12; decision
+# D12). It is a complete unit with the manager's defaults; render_systemd_unit
+# replaces the few values that depend on the installation (the directive lines
+# the template header lists) and copies everything else as it is.
+
+# Where the unit's template is: LYREBIRD_UNIT_TEMPLATE, else config/ next to the script
+unit_template_path() {
+    printf '%s' "${LYREBIRD_UNIT_TEMPLATE:-${SCRIPT_DIR}/config/mediamtx-audio.service}"
+}
+
+# Is $1 an absolute path made only of characters a unit file and a cron line carry
+# without any quoting or escaping?
+_unit_safe_path() {
+    [[ "$1" =~ ^/[A-Za-z0-9_./+-]*$ ]]
+}
+
+# Escape $1 for inside the double quotes of an Environment="NAME=VALUE" line:
+# backslash, double quote and (systemd specifier) percent are escaped. A value
+# with a control character (a newline would start a new directive) cannot be
+# carried at all: fails, printing nothing.
+systemd_escape_env_value() {
+    local v="$1"
+    if [[ "$v" =~ [[:cntrl:]] ]]; then
+        return 1
+    fi
+    v="${v//\\/\\\\}"
+    v="${v//\"/\\\"}"
+    v="${v//"%"/"%%"}"
+    printf '%s' "$v"
+}
+
+# Worst case, in seconds, of this manager's own `start` for STREAMS streams (the
+# unit's TimeoutStartSec=; a `reload` is bounded by it too and is shorter). The
+# longest path is a restart: waiting for the lifecycle lock, cleaning up (5 s
+# per recorded process: the streams and MediaMTX), the two USB stabilization
+# waits (RESTART_STABILIZATION_DELAY and USB_DELAY, the delay the unit sets),
+# the MediaMTX API wait, and for every stream the settle sleep of
+# start_ffmpeg_stream (STREAM_STARTUP_DELAY + 3) plus validate_stream's attempts
+# (STREAM_VALIDATION_DELAY plus up to 2 s of curl each). 10 % are added and the
+# result is rounded up to 10 s.
+#   unit_start_timeout_seconds [STREAMS=8] [USB_DELAY=10]
+unit_start_timeout_seconds() {
+    local streams="${1:-8}" usb="${2:-10}"
+    local per_stream=$(((STREAM_STARTUP_DELAY + 3) + STREAM_VALIDATION_ATTEMPTS * (STREAM_VALIDATION_DELAY + 2)))
+    local sum=$((LOCK_ACQUISITION_TIMEOUT + (streams + 1) * 5 + RESTART_STABILIZATION_DELAY + usb + MEDIAMTX_API_TIMEOUT + streams * per_stream))
+    local scaled=$(((sum * 110 + 99) / 100))
+    printf '%s' "$(((scaled + 9) / 10 * 10))"
+}
+
+# Worst case, in seconds, of `stop` for STREAMS streams (TimeoutStopSec=): the
+# lifecycle lock wait, up to 10 s for each wrapper (stop_ffmpeg_stream) one
+# after the other and up to 30 s for MediaMTX (stop_mediamtx); +10 %, rounded
+# up to 10 s.
+#   unit_stop_timeout_seconds [STREAMS=8]
+unit_stop_timeout_seconds() {
+    local streams="${1:-8}"
+    local sum=$((STOP_LOCK_TIMEOUT + streams * 10 + 30))
+    local scaled=$(((sum * 110 + 99) / 100))
+    printf '%s' "$(((scaled + 9) / 10 * 10))"
+}
+
+# The directories the unit must make writable besides the ones it creates
+# itself (StateDirectory=, RuntimeDirectory= of the template): the directory of
+# every file and the directory the manager writes, as this process has them
+# configured, without the ones below another listed directory or below /dev
+# (not read-only under ProtectSystem=strict). The recording directory is
+# prefixed with "-" (ignored when it does not exist, for example a USB disk that
+# is not mounted yet: recording fails, the streams do not).
+#   unit_read_write_paths TEMPLATE
+# Prints them space-separated; fails for a path a unit file cannot carry.
+unit_read_write_paths() {
+    local template="$1" line name
+    local -a covered=() candidates=() kept=()
+    while IFS= read -r line; do
+        case "$line" in
+            StateDirectory=*) for name in ${line#StateDirectory=}; do covered+=("/var/lib/${name}"); done ;;
+            RuntimeDirectory=*) for name in ${line#RuntimeDirectory=}; do covered+=("/run/${name}"); done ;;
+            LogsDirectory=*) for name in ${line#LogsDirectory=}; do covered+=("/var/log/${name}"); done ;;
+            *) ;;
+        esac
+    done <"$template"
+
+    candidates=("${CONFIG_DIR}" "$(dirname "${LOG_FILE}")" "$(dirname "${MEDIAMTX_LOG_FILE}")" "$(dirname "${PID_FILE}")"
+    "$(dirname "${LOCK_FILE}")" "$(dirname "${RESTART_MARKER}")" "$(dirname "${CLEANUP_MARKER}")"
+    "$(dirname "${HEARTBEAT_FILE}")" "${FFMPEG_PID_DIR}" "$(dirname "${MEM_SAMPLE_FILE}")"
+    "${CRON_RESTART_STATE_DIR}" "${DEEP_HEALTH_STATE_DIR}" "${SILENCE_STATE_DIR}")
+    local path other skip
+    for path in "${candidates[@]}"; do
+        if ! _unit_safe_path "$path"; then
+            log ERROR "Cannot write the unit: '${path}' is not an absolute path of letters, digits and _ . / + - only"
+            return 1
+        fi
+        skip=false
+        for other in ${covered[@]+"${covered[@]}"}; do
+            if [[ "$path" == "$other" || "$path" == "$other"/* ]]; then
+                skip=true
+            fi
+        done
+        if [[ "$path" == /dev || "$path" == /dev/* ]]; then
+            skip=true
+        fi
+        if [[ "$skip" == "false" ]]; then
+            kept+=("$path")
+        fi
+    done
+    local -a result=()
+    local keep
+    for path in ${kept[@]+"${kept[@]}"}; do
+        keep=true
+        for other in ${kept[@]+"${kept[@]}"}; do
+            if [[ "$path" != "$other" && "$path" == "${other%/}"/* ]]; then
+                keep=false
+            fi
+        done
+        for other in ${result[@]+"${result[@]}"}; do
+            if [[ "$path" == "$other" ]]; then
+                keep=false
+            fi
+        done
+        if [[ "$keep" == "true" ]]; then
+            result+=("$path")
+        fi
+    done
+    if [[ "${AUDIO_LOCAL_RECORDING}" == "true" && "${AUDIO_RECORDING_PATH}" != /dev/* ]]; then
+        if ! _unit_safe_path "${AUDIO_RECORDING_PATH}"; then
+            log ERROR "Cannot write the unit: AUDIO_RECORDING_PATH '${AUDIO_RECORDING_PATH}' is not an absolute path of letters, digits and _ . / + - only"
+            return 1
+        fi
+        result+=("-${AUDIO_RECORDING_PATH}")
+    fi
+    printf '%s' "${result[*]}"
+}
+
+# Render the unit to stdout: the template with the lines the header of the
+# template lists replaced by this installation's values. Everything else, the
+# comments included, is copied unchanged, so with the default settings the
+# output is the template byte for byte.
+render_systemd_unit() {
+    local template stream_mode="${STREAM_MODE:-individual}"
+    local multiplex_filter="${MULTIPLEX_FILTER_TYPE:-amix}" multiplex_name="${MULTIPLEX_STREAM_NAME:-all_mics}"
+    local script="${SCRIPT_DIR}/${SCRIPT_NAME}"
+    template="$(unit_template_path)"
+    if [[ ! -r "$template" ]]; then
+        log ERROR "The unit template ${template} is missing: run install from a complete checkout of LyreBirdAudio (config/mediamtx-audio.service), or set LYREBIRD_UNIT_TEMPLATE"
+        return 1
+    fi
+    case "$stream_mode" in
+        individual | multiplex) ;;
+        *)
+            log ERROR "Cannot write the unit: STREAM_MODE '${stream_mode}' is neither individual nor multiplex"
+            return 1
+            ;;
+    esac
+    case "$multiplex_filter" in
+        amix | amerge) ;;
+        *)
+            log ERROR "Cannot write the unit: MULTIPLEX_FILTER_TYPE '${multiplex_filter}' is neither amix nor amerge"
+            return 1
+            ;;
+    esac
+    local path
+    for path in "$script" "${PID_FILE}" "${LOG_FILE}"; do
+        if ! _unit_safe_path "$path"; then
+            log ERROR "Cannot write the unit: '${path}' is not an absolute path of letters, digits and _ . / + - only (move the script or the file to such a path)"
+            return 1
+        fi
+    done
+    local escaped_name
+    if ! escaped_name="$(systemd_escape_env_value "$multiplex_name")" || [[ -z "$multiplex_name" ]]; then
+        log ERROR "Cannot write the unit: MULTIPLEX_STREAM_NAME is empty or contains a control character"
+        return 1
+    fi
+
+    local -a lines=()
+    mapfile -t lines <"$template"
+    # the template's own values: the script path and the USB delay the unit sets
+    local line template_script="" usb_delay=10
+    for line in ${lines[@]+"${lines[@]}"}; do
+        case "$line" in
+            ExecStart=*)
+                template_script="${line#ExecStart=}"
+                template_script="${template_script%% *}"
+                ;;
+            'Environment="USB_STABILIZATION_DELAY='*)
+                usb_delay="${line#*=}"
+                usb_delay="${usb_delay#*=}"
+                usb_delay="${usb_delay%\"}"
+                ;;
+            *) ;;
+        esac
+    done
+    if [[ -z "$template_script" ]]; then
+        log ERROR "The unit template ${template} has no ExecStart= line"
+        return 1
+    fi
+    if [[ ! "$usb_delay" =~ ^[0-9]+$ ]]; then
+        usb_delay=10
+    fi
+    local streams
+    streams="$(_uint_or "${LYREBIRD_UNIT_MAX_STREAMS:-}" 8)"
+    ((streams >= 1)) || streams=8
+    local rw_paths=""
+    rw_paths="$(unit_read_write_paths "$template")" || return 1
+
+    for line in ${lines[@]+"${lines[@]}"}; do
+        case "$line" in
+            ExecStart=* | ExecStop=* | ExecReload=*)
+                line="${line/"$template_script"/"$script"}"
+                ;;
+            PIDFile=*) line="PIDFile=${PID_FILE}" ;;
+            StandardOutput=append:*) line="StandardOutput=append:${LOG_FILE}" ;;
+            StandardError=append:*) line="StandardError=append:${LOG_FILE}" ;;
+            TimeoutStartSec=*) line="TimeoutStartSec=$(unit_start_timeout_seconds "$streams" "$usb_delay")" ;;
+            TimeoutStopSec=*) line="TimeoutStopSec=$(unit_stop_timeout_seconds "$streams")" ;;
+            ReadWritePaths=*) line="ReadWritePaths=${rw_paths}" ;;
+            'Environment="STREAM_MODE='*) line="Environment=\"STREAM_MODE=${stream_mode}\"" ;;
+            'Environment="MULTIPLEX_FILTER_TYPE='*) line="Environment=\"MULTIPLEX_FILTER_TYPE=${multiplex_filter}\"" ;;
+            'Environment="MULTIPLEX_STREAM_NAME='*) line="Environment=\"MULTIPLEX_STREAM_NAME=${escaped_name}\"" ;;
+            *) ;;
+        esac
+        printf '%s\n' "$line"
+    done
+}
+
+# Render the monitor's cron file to stdout. The monitor runs in a process of its
+# own (cron's), so it is given the stream mode, the filter and the multiplex
+# stream name here: without them a cron `monitor` always runs in individual
+# mode and, on a multiplex node, starts per-device streams next to the
+# multiplexed one. cron files take NAME=value lines without quoting, so the
+# values are limited to what needs none. The restart policy is unchanged: only
+# exit status 2 restarts the service.
+render_monitor_cron() {
+    local stream_mode="${STREAM_MODE:-individual}"
+    local multiplex_filter="${MULTIPLEX_FILTER_TYPE:-amix}" multiplex_name="${MULTIPLEX_STREAM_NAME:-all_mics}"
+    local script="${SCRIPT_DIR}/${SCRIPT_NAME}"
+    case "$stream_mode" in
+        individual | multiplex) ;;
+        *)
+            log ERROR "Cannot write the cron file: STREAM_MODE '${stream_mode}' is neither individual nor multiplex"
+            return 1
+            ;;
+    esac
+    case "$multiplex_filter" in
+        amix | amerge) ;;
+        *)
+            log ERROR "Cannot write the cron file: MULTIPLEX_FILTER_TYPE '${multiplex_filter}' is neither amix nor amerge"
+            return 1
+            ;;
+    esac
+    if [[ ! "$multiplex_name" =~ ^[A-Za-z0-9_-]+$ ]]; then
+        log ERROR "Cannot write the cron file: MULTIPLEX_STREAM_NAME '${multiplex_name}' has characters outside A-Z a-z 0-9 _ - that a cron environment line cannot carry"
+        return 1
+    fi
+    if ! _unit_safe_path "$script"; then
+        log ERROR "Cannot write the cron file: '${script}' is not an absolute path of letters, digits and _ . / + - only"
+        return 1
+    fi
+    cat <<EOF
+# Monitor MediaMTX resource usage and stream health every 5 minutes
+# Conservative restart policy (only on critical resource failure):
+#   Exit 0: All healthy - no action
+#   Exit 2: Critical resource state - RESTART SERVICE
+#   Exit 6: No USB devices - LOG ONLY (transient, will recover)
+#   Exit 7: MediaMTX not running - LOG ONLY (may recover)
+#   Exit 10: Stream degradation - LOG ONLY (monitor will fix on next cycle)
+#
+# CRON=1 enables explicit cron context detection
+# STREAM_MODE, MULTIPLEX_FILTER_TYPE and MULTIPLEX_STREAM_NAME give the monitor
+# the stream mode of the unit (change them by running install again)
+# flock prevents overlapping runs when monitor exceeds 5-minute interval
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+CRON=1
+STREAM_MODE=${stream_mode}
+MULTIPLEX_FILTER_TYPE=${multiplex_filter}
+MULTIPLEX_STREAM_NAME=${multiplex_name}
+
+*/5 * * * * root flock -n /run/mediamtx-monitor.lock -c '${script} monitor; EXIT=\$?; if [ \$EXIT -eq 2 ]; then systemctl restart mediamtx-audio; elif [ \$EXIT -ne 0 ]; then logger -t mediamtx-monitor "Non-critical exit code \$EXIT (no restart)"; fi' || logger -t mediamtx-monitor "Monitor already running or locked"
+EOF
+}
+
+# Write TEXT ($2) to FILE ($1) atomically (a temporary file next to it, then rename)
+_unit_install_file() {
+    local file="$1" text="$2" tmp
+    mkdir -p "$(dirname "$file")" || return 1
+    tmp="$(mktemp "${file}.XXXXXX")" || return 1
+    if printf '%s\n' "$text" >"$tmp" && chmod 644 "$tmp" && mv -f "$tmp" "$file"; then
+        return 0
+    fi
+    rm -f "$tmp"
+    return 1
+}
+
 # Create systemd service
+#
+# LYREBIRD_SYSROOT (default empty) is a prefix for /etc/systemd/system,
+# /etc/logrotate.d and /etc/cron.d, for packaging and tests; with it set, systemd
+# is not asked to reload.
 create_systemd_service() {
-    local service_file="/etc/systemd/system/mediamtx-audio.service"
+    SKIP_CLEANUP=true
+    local root="${LYREBIRD_SYSROOT:-}"
+    local service_file="${root}/etc/systemd/system/mediamtx-audio.service"
+    local cron_file="${root}/etc/cron.d/mediamtx-monitor"
 
     # Capture current configuration for systemd service
     local stream_mode="${STREAM_MODE:-individual}"
     local multiplex_filter="${MULTIPLEX_FILTER_TYPE:-amix}"
     local multiplex_name="${MULTIPLEX_STREAM_NAME:-all_mics}"
 
-    cat >"$service_file" <<EOF
-[Unit]
-Description=MediaMTX Audio Stream Manager v${VERSION}
-After=network.target sound.target
-Wants=sound.target
+    # Render everything before anything is written: a value that cannot be
+    # carried safely stops the install with nothing changed
+    local unit_text cron_text
+    unit_text="$(render_systemd_unit)" || return "${E_CONFIG_ERROR}"
+    cron_text="$(render_monitor_cron)" || return "${E_CONFIG_ERROR}"
 
-[Service]
-Type=forking
-ExecStart=${SCRIPT_DIR}/${SCRIPT_NAME} start
-ExecStop=${SCRIPT_DIR}/${SCRIPT_NAME} stop
-ExecReload=${SCRIPT_DIR}/${SCRIPT_NAME} restart
-PIDFile=${PID_FILE}
-Restart=on-failure
-RestartSec=30
-StartLimitInterval=1200
-StartLimitBurst=10
-User=root
-Group=audio
-
-StandardOutput=append:${LOG_FILE}
-StandardError=append:${LOG_FILE}
-
-TimeoutStartSec=300
-TimeoutStopSec=120
-
-LimitNOFILE=65536
-LimitNPROC=4096
-
-PrivateTmp=yes
-ProtectSystem=full
-NoNewPrivileges=yes
-ReadWritePaths=/etc/mediamtx /var/lib/mediamtx-ffmpeg /var/log /var/run
-
-Environment="HOME=/root"
-Environment="PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-Environment="USB_STABILIZATION_DELAY=10"
-Environment="STREAM_MODE=${stream_mode}"
-Environment="MULTIPLEX_FILTER_TYPE=${multiplex_filter}"
-Environment="MULTIPLEX_STREAM_NAME=${multiplex_name}"
-Environment="INVOCATION_ID=systemd"
-WorkingDirectory=${SCRIPT_DIR}
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-    chmod 644 "$service_file"
+    if ! _unit_install_file "$service_file" "$unit_text"; then
+        log ERROR "Could not write ${service_file}"
+        return "${E_GENERAL}"
+    fi
 
     # Setup logrotate configuration during install
-    if command_exists logrotate && [[ -d /etc/logrotate.d ]]; then
+    if command_exists logrotate && [[ -d "${root}/etc/logrotate.d" ]]; then
         log INFO "Setting up log rotation configuration"
-        cat >/etc/logrotate.d/mediamtx <<EOF
+        cat >"${root}/etc/logrotate.d/mediamtx" <<EOF
 ${MEDIAMTX_LOG_FILE} {
     daily
     rotate 7
@@ -7131,35 +7686,23 @@ ${FFMPEG_PID_DIR}/*.log {
     size ${FFMPEG_LOG_MAX_SIZE}
 }
 EOF
-        chmod 644 /etc/logrotate.d/mediamtx
+        chmod 644 "${root}/etc/logrotate.d/mediamtx"
         log INFO "Log rotation configured successfully"
     fi
 
-    # Create monitoring cron job with conservative restart policy and overlap protection
-    # Conservative restart policy: only restart on critical resource failure
-    # Using flock to prevent overlapping monitor instances when checks exceed 5 minutes
-    cat >/etc/cron.d/mediamtx-monitor <<EOF
-# Monitor MediaMTX resource usage and stream health every 5 minutes
-# Conservative restart policy (only on critical resource failure):
-#   Exit 0: All healthy - no action
-#   Exit 2: Critical resource state - RESTART SERVICE
-#   Exit 6: No USB devices - LOG ONLY (transient, will recover)
-#   Exit 7: MediaMTX not running - LOG ONLY (may recover)
-#   Exit 10: Stream degradation - LOG ONLY (monitor will fix on next cycle)
-#
-# CRON=1 enables explicit cron context detection
-# flock prevents overlapping runs when monitor exceeds 5-minute interval
-SHELL=/bin/bash
-PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-CRON=1
+    # Monitoring cron job: conservative restart policy (exit 2 only) and flock
+    # against overlapping runs
+    if ! _unit_install_file "$cron_file" "$cron_text"; then
+        log ERROR "Could not write ${cron_file}"
+        return "${E_GENERAL}"
+    fi
 
-*/5 * * * * root flock -n /run/mediamtx-monitor.lock -c '${SCRIPT_DIR}/${SCRIPT_NAME} monitor; EXIT=\$?; if [ \$EXIT -eq 2 ]; then systemctl restart mediamtx-audio; elif [ \$EXIT -ne 0 ]; then logger -t mediamtx-monitor "Non-critical exit code \$EXIT (no restart)"; fi' || logger -t mediamtx-monitor "Monitor already running or locked"
-EOF
-
-    systemctl daemon-reload
+    if [[ -z "$root" ]]; then
+        systemctl daemon-reload
+    fi
 
     echo "Systemd service created: $service_file"
-    echo "Monitoring cron job created: /etc/cron.d/mediamtx-monitor"
+    echo "Monitoring cron job created: $cron_file"
     echo ""
     echo "=== v1.4.1 Configuration Enhancements ==="
     echo "  * Friendly name support for audio device configuration"
@@ -7180,15 +7723,14 @@ EOF
         echo "  Stream name: ${multiplex_name}"
     fi
     echo ""
-    echo "To change mode after installation:"
-    echo "  sudo systemctl edit mediamtx-audio"
-    echo "  Add/modify: Environment=\"STREAM_MODE=multiplex\""
-    echo "  Add/modify: Environment=\"MULTIPLEX_FILTER_TYPE=amix\""
-    echo "  Add/modify: Environment=\"MULTIPLEX_STREAM_NAME=studio\""
-    echo "  Then: sudo systemctl daemon-reload && sudo systemctl restart mediamtx-audio"
+    echo "To change mode after installation run install again, with the options, so the"
+    echo "unit and the monitor cron job get the same mode:"
+    echo "  sudo ./${SCRIPT_NAME} -m multiplex -f amix -n studio install"
+    echo "  Then: sudo systemctl restart mediamtx-audio"
     echo ""
     echo "Enable: sudo systemctl enable mediamtx-audio"
     echo "Start: sudo systemctl start mediamtx-audio"
+    echo "Apply a changed MediaMTX configuration without an outage: sudo systemctl reload mediamtx-audio"
 }
 
 # Show help
@@ -7246,6 +7788,13 @@ Commands:
                 --yes it only prints those processes and why, signals nothing
                 and exits 1.
     restart     Restart everything
+    reload      Re-render the MediaMTX configuration and let the running MediaMTX
+                apply it, then start any stream that is missing. Nothing is
+                stopped or restarted by the manager: a stream that is running is
+                left alone. Says which changed keys make MediaMTX disconnect
+                its publishers (their wrappers reconnect them). Exit 7 when
+                MediaMTX is not running (use start), 8 when another MediaMTX
+                owns the node. This is what systemd's ExecReload= runs.
     status      Show current status
     config      Show device configuration
     validate    Check the device configuration file (exit 4 if a line cannot
@@ -7253,7 +7802,9 @@ Commands:
     monitor     Check resource usage and stream health
                 Exit codes: 0=healthy, 2=critical resources, 3=MediaMTX down,
                             7=no devices, 10=streams degraded
-    install     Create systemd service
+    install     Create the systemd unit (rendered from config/mediamtx-audio.service,
+                next to this script) and the monitor cron job, both with the stream
+                mode given by -m/-f/-n. Run it again to change the mode.
     help        Show this help
 
 Configuration files:
@@ -7391,6 +7942,8 @@ parse_arguments() {
 #   stop        - Checks root, dependencies, directories, then stops service
 #   force-stop  - Checks root, directories, then force-stops service
 #   restart     - Checks root, dependencies, directories, then restarts service
+#   reload      - Checks root, dependencies, directories, then re-renders the
+#                 MediaMTX config and reconciles streams without restarting
 #   status      - Shows current status (no root check)
 #   config      - Shows configuration (no root check)
 #   monitor     - Checks root, directories, resources, then monitors streams
@@ -7423,6 +7976,7 @@ main() {
     # Note: COMMAND is global so cleanup() can check it
     COMMAND=""
     parse_arguments "$@"
+    warn_removed_settings
 
     # One canonical stream name for everything that follows (D13)
     case "${COMMAND}" in
@@ -7443,7 +7997,6 @@ main() {
             # v1.4.2: Pre-start validation and initialization
             check_version_compatibility || log WARN "Version compatibility check failed (continuing anyway)"
             validate_config || log WARN "Device configuration has problems (listed above); the settings concerned use their defaults and the streams start"
-            init_hardware_watchdog
             start_mediamtx
             exit_code=$?
             ;;
@@ -7465,6 +8018,14 @@ main() {
             check_dependencies
             setup_directories
             restart_mediamtx
+            exit_code=$?
+            ;;
+        reload)
+            check_root
+            check_dependencies
+            setup_directories
+            validate_config || error_exit "Configuration validation failed" ${E_CONFIG_ERROR}
+            reload_mediamtx
             exit_code=$?
             ;;
         status)
@@ -7497,6 +8058,8 @@ main() {
                 exit ${E_CRITICAL_RESOURCE}
             fi
             # Non-critical resource issues are logged but we continue
+            # Audio level / dead-mic signals (informational, never fails the run)
+            monitor_signals || true
             # Then check and restart streams (returns error codes for failures)
             monitor_streams
             exit_code=$?

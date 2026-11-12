@@ -136,3 +136,99 @@ require_netns() {
         rm -rf "$TEST_SCRATCH/e2e"
     done
 }
+
+@test "audio level signals against a real MediaMTX and real publishers: a tone is ok, silence is silent, one DEAD MIC per episode that ends with the tone, an unpublished stream is unreachable and a failing probe tool is never silence [LB-14, X-05, D6]" {
+    require_live
+    require_netns
+    local bin out rc
+    for bin in $LYREBIRD_TEST_MEDIAMTX_BINS; do
+        echo "# $("$bin" --version 2>/dev/null | head -n 1)" >&3
+        mkdir -p "$TEST_SCRATCH/sig"
+        rc=0
+        out="$("${NETNS_CMD[@]}" env PATH="$PATH" PROJECT_ROOT="$PROJECT_ROOT" BIN="$bin" \
+            WORK="$TEST_SCRATCH/sig" OWNER="$(id -u):$(id -g)" \
+            bash "$PROJECT_ROOT/tests/signals_e2e.bash" 2>&1 3>&-)" || rc=$?
+        if [[ $rc -ne 0 ]]; then
+            echo "$out"
+            false
+        fi
+        sed 's/^/# /' <<<"$out" >&3
+        [[ "$out" == *"E2E: DONE"* ]]
+        chmod -R u+rwx "$TEST_SCRATCH/sig"
+        rm -rf "$TEST_SCRATCH/sig"
+    done
+}
+
+@test "reload against a real MediaMTX and real FFmpeg: nothing is restarted, a changed key is reported with its measured effect, a dead wrapper is started, a stopped or foreign MediaMTX is refused [LB-11, X-12]" {
+    require_live
+    require_netns
+    local bin out rc
+    for bin in $LYREBIRD_TEST_MEDIAMTX_BINS; do
+        echo "# $("$bin" --version 2>/dev/null | head -n 1)" >&3
+        mkdir -p "$TEST_SCRATCH/rel"
+        rc=0
+        out="$("${NETNS_CMD[@]}" env PATH="$PATH" PROJECT_ROOT="$PROJECT_ROOT" BIN="$bin" \
+            WORK="$TEST_SCRATCH/rel" OWNER="$(id -u):$(id -g)" \
+            bash "$PROJECT_ROOT/tests/reload_e2e.bash" 2>&1 3>&-)" || rc=$?
+        if [[ $rc -eq 77 ]]; then
+            skip "$(grep E2E-SKIP <<<"$out")"
+        fi
+        if [[ $rc -ne 0 ]]; then
+            echo "$out"
+            false
+        fi
+        sed 's/^/# /' <<<"$out" >&3
+        [[ "$out" == *"E2E: DONE"* ]]
+        chmod -R u+rwx "$TEST_SCRATCH/rel"
+        rm -rf "$TEST_SCRATCH/rel"
+    done
+}
+
+# One run of tests/unit_sandbox_e2e.bash: sandbox_run MODE UNIT_FILE WORKNAME
+sandbox_run() {
+    local mode="$1" unit="$2" work="$TEST_SCRATCH/$3" bin
+    bin="${LYREBIRD_TEST_MEDIAMTX_BINS%% *}"
+    mkdir -p "$work"
+    rc=0
+    out="$("${NETNS_CMD[@]}" env PATH="$PATH" PROJECT_ROOT="$PROJECT_ROOT" BIN="$bin" WORK="$work" \
+        UNIT_FILE="$unit" MODE="$mode" OWNER="$(id -u):$(id -g)" \
+        bash "$PROJECT_ROOT/tests/unit_sandbox_e2e.bash" 2>&1 3>&-)" || rc=$?
+    if [[ $rc -eq 77 ]]; then
+        skip "$(grep E2E-SKIP <<<"$out")"
+    fi
+}
+
+@test "every path the manager writes by default is writable under the unit: audited on a real run, then run under an emulation of ProtectSystem=strict that opens only the unit's paths; the sample unit this replaces fails the same run [LB-11, D12]" {
+    require_live
+    require_netns
+    local out rc
+    # (one MediaMTX binary: what the manager writes does not depend on the MediaMTX version)
+    echo "# $("${LYREBIRD_TEST_MEDIAMTX_BINS%% *}" --version 2>/dev/null | head -n 1)" >&3
+    bash -c 'source "$1" >/dev/null 2>&1; render_systemd_unit' _ "$PROJECT_ROOT/lyrebird-stream-manager.sh" >"$TEST_SCRATCH/unit.service"
+    [ -s "$TEST_SCRATCH/unit.service" ]
+
+    sandbox_run audit "$TEST_SCRATCH/unit.service" audit
+    if [[ $rc -ne 0 ]]; then
+        echo "$out"
+        false
+    fi
+    sed 's/^/# /' <<<"$out" >&3
+    [[ "$out" == *"all inside the unit's writable paths"* ]]
+
+    sandbox_run strict "$TEST_SCRATCH/unit.service" strict
+    if [[ $rc -ne 0 ]]; then
+        echo "$out"
+        false
+    fi
+    sed 's/^/# /' <<<"$out" >&3
+    [[ "$out" == *"worked with only the declared paths writable"* ]]
+
+    # the negative control: the writable paths of the sample unit this change replaces
+    # (ReadWritePaths=/var/log /var/lib/lyrebird /etc/mediamtx /run, nothing created for
+    # /var/lib/mediamtx-ffmpeg): setup_directories hits EROFS, as reproduced for LB-11
+    printf '[Service]\nProtectSystem=strict\nReadWritePaths=/var/log /var/lib/lyrebird /etc/mediamtx /run\nEnvironment="PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"\n' >"$TEST_SCRATCH/old.service"
+    sandbox_run strict "$TEST_SCRATCH/old.service" control
+    [ "$rc" -ne 0 ]
+    [[ "$out" == *"mkdir: cannot create directory '/var/lib/mediamtx-ffmpeg': Read-only file system"* ]]
+    chmod -R u+rwx "$TEST_SCRATCH"/audit "$TEST_SCRATCH"/strict "$TEST_SCRATCH"/control 2>/dev/null || true
+}

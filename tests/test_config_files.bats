@@ -21,6 +21,12 @@ setup() {
     [ "$status" -ne 0 ]
 }
 
+@test "no shipped unit sets or mentions the LYREBIRD_WATCHDOG_* variables no code reads [LB-15]" {
+    # They claimed to drive a heartbeat / hardware watchdog; nothing ever read them.
+    run grep -n 'LYREBIRD_WATCHDOG' "$CFG/mediamtx.service" "$CFG/mediamtx-audio.service"
+    [ "$status" -ne 0 ]
+}
+
 # --- the audio unit must be Type=forking with a PIDFile (CFG-2) --------------
 
 @test "mediamtx-audio.service is Type=forking with a PIDFile (start daemonizes) [CFG-2]" {

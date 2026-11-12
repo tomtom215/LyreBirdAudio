@@ -223,10 +223,8 @@ teardown() {
 @test "default values are set for timeouts" {
     # These should be set with defaults
     MEDIAMTX_API_TIMEOUT="${MEDIAMTX_API_TIMEOUT:-60}"
-    HEARTBEAT_INTERVAL="${HEARTBEAT_INTERVAL:-30}"
 
     [ "$MEDIAMTX_API_TIMEOUT" -eq 60 ]
-    [ "$HEARTBEAT_INTERVAL" -eq 30 ]
 }
 
 @test "environment variables override defaults" {
@@ -370,27 +368,8 @@ teardown() {
 }
 
 # ============================================================================
-# Heartbeat/Watchdog Tests
+# Heartbeat Tests
 # ============================================================================
-
-@test "heartbeat file update writes timestamp" {
-    HEARTBEAT_FILE=$(mktemp)
-    rm "$HEARTBEAT_FILE"
-
-    update_heartbeat() {
-        local file="$1"
-        date +%s > "$file"
-    }
-
-    run update_heartbeat "$HEARTBEAT_FILE"
-    [ "$status" -eq 0 ]
-    [ -f "$HEARTBEAT_FILE" ]
-
-    content=$(cat "$HEARTBEAT_FILE")
-    [[ "$content" =~ ^[0-9]+$ ]]
-
-    rm -f "$HEARTBEAT_FILE"
-}
 
 @test "heartbeat staleness detection" {
     is_heartbeat_stale() {
