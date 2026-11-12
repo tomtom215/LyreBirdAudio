@@ -15,9 +15,12 @@ setup() {
     scratch_setup
     updater_node_setup
     HISTORY="$REPO/.git/lyrebird-updater/history.log"
+    HOLDER_PIDS=()
+    ORPHAN_PIDS=()
 }
 
 teardown() {
+    updater_holders_stop
     scratch_teardown
 }
 
@@ -62,7 +65,7 @@ teardown() {
 @test "an update that failed and was rolled back is recorded with the reason" {
     updater_checkout v1.1.0
     updater_inject checkout after FAIL
-    updater_stdin 3 v1.2.0
+    updater_stdin 3 v1.2.0 "" q
     updater_run
     [ "$status" -eq 1 ]
     [ "$(wc -l <"$HISTORY")" -eq 1 ]
@@ -74,12 +77,12 @@ teardown() {
 @test "a failure before anything changed is recorded as failed, a cancelled one is not recorded" {
     updater_checkout v1.1.0
     echo "edit" >>"$REPO/config.txt"
-    updater_stdin 3 v1.2.0 n
+    updater_stdin 3 v1.2.0 n "" q
     updater_run
     [ "$status" -eq 9 ]
     [ ! -e "$HISTORY" ]
     updater_inject stash-push before FAIL
-    updater_stdin 3 v1.2.0 y
+    updater_stdin 3 v1.2.0 y "" q
     updater_run
     [ "$status" -eq 1 ]
     [ "$(wc -l <"$HISTORY")" -eq 1 ]
@@ -99,7 +102,7 @@ teardown() {
 @test "an update whose saved changes conflict is recorded ok with the note" {
     updater_checkout v1.0.0
     echo "config LOCAL EDIT" >"$REPO/config.txt"
-    updater_stdin 3 v1.1.0 y
+    updater_stdin 3 v1.1.0 y "" q
     updater_run
     [ "$status" -eq 10 ]
     grep -q $'\tupdate\tok\t' "$HISTORY"
@@ -146,7 +149,7 @@ teardown() {
     updater_run
     [ "$status" -eq 0 ]
     updater_inject checkout after FAIL
-    updater_stdin 3 v1.0.0
+    updater_stdin 3 v1.0.0 "" q
     updater_run
     [ "$status" -eq 1 ]
     updater_inject_clear
@@ -171,13 +174,8 @@ teardown() {
     mkdir -p "$NODE/nogit"
     printf '#!/bin/bash\necho "git must not be called" >&2\nexit 99\n' >"$NODE/nogit/git"
     chmod +x "$NODE/nogit/git"
-    mkdir -p "$REPO/.git/lyrebird-updater/lock"
-    ( exec -a "lyrebird-updater.sh" sleep 30 ) &
-    local holder=$!
-    echo "$holder" >"$REPO/.git/lyrebird-updater/lock/pid"
+    updater_hold_lock 25 --status
     run env PATH="$NODE/nogit:$PATH" LYREBIRD_UPDATER_LOCK_WAIT=1 bash "$REPO/lyrebird-updater.sh" --history
-    kill "$holder" 2>/dev/null || true
-    wait "$holder" 2>/dev/null || true
     [ "$status" -eq 0 ]
     [[ "$output" == *"v1.2.0"* ]]
     [[ "$output" != *"git must not be called"* ]]
@@ -194,7 +192,7 @@ teardown() {
     [[ "$output" == *"1 unreadable line(s) skipped"* ]]
     [[ "$output" == *"v1.2.0"* ]]
     updater_inject checkout after FAIL
-    updater_stdin 3 v1.1.0
+    updater_stdin 3 v1.1.0 "" q
     updater_run
     [ "$status" -eq 1 ]
     updater_inject_clear

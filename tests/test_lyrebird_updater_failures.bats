@@ -16,10 +16,13 @@ setup_file() {
 setup() {
     scratch_setup
     updater_node_setup
+    HOLDER_PIDS=()
+    ORPHAN_PIDS=()
 }
 
 teardown() {
     updater_blackhole_stop
+    updater_holders_stop
     scratch_teardown
 }
 
@@ -91,15 +94,17 @@ _updater_vars() {
     updater_checkout v1.1.0
     echo "local edit" >>"$REPO/config.txt"
     echo "notes" >"$REPO/mynotes.txt"
-    export FAULT_PROBE_PATH="$REPO/.git/lyrebird-updater/lock"
-    updater_inject checkout before PROBE
+    export FAULT_PROBE_PATH="$REPO/.git/lyrebird-updater/updater.lock"
+    updater_inject checkout before PROBE_LOCK
     updater_stdin 3 v1.2.0 y "" q
     updater_run
     [ "$status" -eq 0 ]
     [ "$(updater_head)" = "v1.2.0" ]
-    grep -q "probe present $FAULT_PROBE_PATH" "$FAULT_LOG"
-    # and it is released again at exit
-    [ ! -e "$FAULT_PROBE_PATH" ]
+    # held (not merely present) at the moment git switches the tree
+    grep -q "probe lock held checkout $FAULT_PROBE_PATH" "$FAULT_LOG"
+    # and released again at exit; the file itself is never removed
+    [ -f "$FAULT_PROBE_PATH" ]
+    flock -n "$FAULT_PROBE_PATH" true
 }
 
 @test "a self-update restores local changes and leaves no stash entry behind" {
@@ -150,15 +155,10 @@ _updater_vars() {
 
 @test "a second updater is refused while the first holds the lock (exit 7)" {
     updater_checkout v1.1.0
-    mkdir -p "$REPO/.git/lyrebird-updater/lock"
-    ( exec -a "lyrebird-updater.sh" sleep 30 ) &
-    local holder=$!
-    echo "$holder" >"$REPO/.git/lyrebird-updater/lock/pid"
+    updater_hold_lock 25 --status
     LYREBIRD_UPDATER_LOCK_WAIT=1 updater_run --status
-    kill "$holder" 2>/dev/null || true
-    wait "$holder" 2>/dev/null || true
     [ "$status" -eq 7 ]
-    [[ "$output" == *"Lock held by process $holder"* ]]
+    [[ "$output" == *"Lock held by process $HOLDER_PID"* ]]
 }
 
 # ============================================================================
@@ -212,7 +212,7 @@ _updater_vars() {
     updater_checkout v1.1.0
     # git completes the checkout, then reports failure (what a write error half way through looks like)
     updater_inject checkout after FAIL
-    updater_stdin 3 v1.2.0
+    updater_stdin 3 v1.2.0 "" q
     updater_run
     [ "$status" -eq 1 ]
     [[ "$output" == *"Rollback complete"* ]]
@@ -225,7 +225,7 @@ _updater_vars() {
 @test "a rollback removes the files the failed switch had already added" {
     updater_checkout v1.1.0
     updater_inject checkout after FAIL
-    updater_stdin 3 v1.2.0
+    updater_stdin 3 v1.2.0 "" q
     updater_run
     [ "$status" -eq 1 ]
     [ "$(updater_head)" = "v1.1.0" ]
@@ -266,7 +266,7 @@ _updater_vars() {
     git -C "$REPO" fetch -q origin
     # the fast-forward happens, then git reports failure
     updater_inject merge after FAIL
-    updater_stdin 3 main
+    updater_stdin 3 main "" q
     updater_run
     [ "$status" -eq 1 ]
     [ "$(git -C "$REPO" symbolic-ref --short HEAD)" = "main" ]
@@ -277,7 +277,7 @@ _updater_vars() {
 @test "declining to save local changes keeps them" {
     updater_checkout v1.1.0
     echo "precious edit" >>"$REPO/config.txt"
-    updater_stdin 3 v1.2.0 n
+    updater_stdin 3 v1.2.0 n "" q
     updater_run
     [ "$status" -eq 9 ]
     [[ "$output" == *"Operation cancelled"* ]]
@@ -290,7 +290,7 @@ _updater_vars() {
     updater_checkout v1.1.0
     echo "precious edit" >>"$REPO/config.txt"
     updater_inject stash-push before FAIL
-    updater_stdin 3 v1.2.0 y
+    updater_stdin 3 v1.2.0 y "" q
     updater_run
     [ "$status" -eq 1 ]
     [[ "$output" == *"Failed to save your changes"* ]]
@@ -304,7 +304,7 @@ _updater_vars() {
     local local_tip
     local_tip="$(git -C "$REPO" rev-parse dev)"
     updater_checkout v1.1.0
-    updater_stdin 3 dev
+    updater_stdin 3 dev "" q
     updater_run
     [ "$status" -eq 1 ]
     [[ "$output" == *"local history has diverged"* ]]
@@ -318,7 +318,7 @@ _updater_vars() {
     updater_checkout v1.0.0
     echo "config LOCAL EDIT" >"$REPO/config.txt" # v1.1.0 changes the same line
     echo "mine" >"$REPO/mynotes.txt"
-    updater_stdin 3 v1.1.0 y
+    updater_stdin 3 v1.1.0 y "" q
     updater_run
     [ "$status" -eq 10 ]
     [[ "$output" == *"were NOT re-applied"* ]]
@@ -336,7 +336,7 @@ _updater_vars() {
 @test "a stash holding an untracked file the new version now tracks: the version's file stays, the operator's is kept" {
     updater_checkout v1.1.0
     echo "operator's own file" >"$REPO/added-in-1.2.0.txt" # untracked here, tracked from v1.2.0 on
-    updater_stdin 3 v1.2.0 y
+    updater_stdin 3 v1.2.0 y "" q
     updater_run
     [ "$status" -eq 10 ]
     [ "$(updater_head)" = "v1.2.0" ]
@@ -390,7 +390,7 @@ _updater_vars() {
     updater_make_big_tag
     echo "precious edit" >>"$REPO/config.txt"
     # RLIMIT_FSIZE: git prints "unable to write file big.bin", leaves it truncated and exits 0
-    updater_stdin 3 v1.4.0 y
+    updater_stdin 3 v1.4.0 y "" q
     run env PATH="$SHIMS:$PATH" bash -c 'trap "" XFSZ; ulimit -f 200; exec bash "$1"' _ \
         "$REPO/lyrebird-updater.sh" <<<"${UPDATER_INPUT%$'\n'}"
     unset UPDATER_INPUT
@@ -421,7 +421,7 @@ _updater_vars() {
         dd if=/dev/zero of="$SMALL/filler" bs=1k count=$((free_kb - 300)) 2>/dev/null
         # inside the namespace the user may be root (unshare -r): answer the root prompt and
         # let the repository pass the updater'"'"'s "owned by root" check
-        { [ "$EUID" -eq 0 ] && echo y; printf "3\nv1.4.0\ny\n"; } \
+        { [ "$EUID" -eq 0 ] && echo y; printf "3\nv1.4.0\ny\n\nq\n"; } \
             | env UPDATER_FAKE_OWNER=fixture PATH="$SHIMS:$PATH" bash ./lyrebird-updater.sh >"$SMALL/out.txt" 2>&1
         echo "RC=${PIPESTATUS[1]}"
         echo "HEAD=$(git describe --tags --exact-match 2>/dev/null)"
@@ -433,7 +433,8 @@ _updater_vars() {
         cat "$SMALL/out.txt"
     '
     [[ "$output" == *"unable to write file"* ]] || [[ "$output" == *"Failed to switch to version"* ]]
-    [[ "$output" == *"RC=1"* ]]
+    # exactly 1 (the substring "RC=1" also matches "RC=12", the status of a run whose input ended)
+    printf '%s\n' "$output" | grep -qx 'RC=1'
     [[ "$output" == *"HEAD=v1.1.0"* ]]
     [[ "$output" == *"DIRTY=1"* ]] # only the operator's config.txt edit
     [[ "$output" == *"EDIT=1"* ]]
@@ -450,7 +451,7 @@ _updater_vars() {
     original="$(git -C "$REPO" rev-parse HEAD)"
     echo "precious edit" >>"$REPO/config.txt"
     updater_inject checkout-force before FAIL
-    updater_stdin 3 dev y
+    updater_stdin 3 dev y "" q
     updater_run
     [ "$status" -eq 11 ]
     [[ "$output" == *"Could not restore the original version"* ]]
@@ -489,7 +490,7 @@ _scripts_executable() {
     updater_checkout v1.0.0
     chmod +x "$REPO"/*.sh
     updater_inject checkout after FAIL
-    updater_stdin 3 v1.2.0 # rewrites config.txt, the stream manager and the diagnostics script, then "fails"
+    updater_stdin 3 v1.2.0 "" q # rewrites config.txt, the stream manager and the diagnostics script, then "fails"
     updater_run
     [ "$status" -eq 1 ]
     [ "$(updater_head)" = "v1.0.0" ]

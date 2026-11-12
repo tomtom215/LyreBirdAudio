@@ -1,0 +1,24 @@
+#!/bin/bash
+# Test shim, put on the PATH under the name of a command (mkdir, cp, ...) by
+# updater_install_killat. When the command's arguments contain KILLAT_ARG it
+# SIGKILLs the updater (the outermost ancestor whose command line names
+# lyrebird-updater.sh) instead of running the command, which is how a test
+# stops the updater at one exact step of its own; any other call runs the real
+# command. UPDATER_REAL_PATH is the PATH without the shims.
+name="${0##*/}"
+real="$(PATH="${UPDATER_REAL_PATH:?UPDATER_REAL_PATH not set}" command -v "$name")"
+
+if [[ -n "${KILLAT_ARG:-}" && " $* " == *"$KILLAT_ARG"* ]]; then
+    p="$PPID"
+    top=""
+    while [[ -n "$p" && "$p" -gt 1 ]]; do
+        if tr '\0' ' ' <"/proc/$p/cmdline" 2>/dev/null | grep -q 'lyrebird-updater\.sh'; then
+            top="$p"
+        fi
+        p="$(awk '{print $4}' "/proc/$p/stat" 2>/dev/null)" || break
+    done
+    echo "killat $name $* updater=${top}" >>"${FAULT_LOG:-/dev/null}"
+    [[ -n "$top" ]] && kill -KILL "$top"
+    exit 137
+fi
+exec "$real" "$@"

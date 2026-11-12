@@ -14,6 +14,18 @@
 #               SKIP               exit 0 without running git (with FAULT_WHEN=before)
 #               DNS                print a curl-style DNS error and exit 128
 #               PROBE              log whether FAULT_PROBE_PATH exists, then carry on
+#               PROBE_FD           log whether THIS process has FAULT_PROBE_PATH open as a
+#                                  file descriptor (a lock descriptor inherited from the
+#                                  updater) and the GIT_HTTP_LOW_SPEED_TIME it was started
+#                                  with, then carry on
+#               PROBE_LOCK         log whether another process holds an flock on
+#                                  FAULT_PROBE_PATH ("lock held" / "lock free"), then carry on
+#               SLEEP              sleep FAULT_SLEEP seconds (default 5), then carry on:
+#                                  keeps the updater inside its critical section
+#               DETACH             start a child that outlives git and the updater (a
+#                                  sleep of FAULT_SLEEP seconds, default 20; its pid is
+#                                  logged as "detached <pid>"), then carry on: what the
+#                                  `git gc --auto` that a fetch can leave behind looks like
 #   FAULT_SKIP  matching calls to let through before injecting (default 0)
 #   FAULT_REPEAT  when set, inject on every matching call from then on, not just once
 #   FAULT_STATE file used to count matching calls (required with FAULT_ON)
@@ -72,6 +84,25 @@ inject() {
                 echo "probe MISSING $FAULT_PROBE_PATH" >>"${FAULT_LOG:-/dev/null}"
             fi
             ;;
+        PROBE_FD)
+            found=no
+            for fd in /proc/$$/fd/*; do
+                [[ "$fd" -ef "$FAULT_PROBE_PATH" ]] && found=yes
+            done
+            echo "probe fd-open=$found $key $FAULT_PROBE_PATH low-speed-time=${GIT_HTTP_LOW_SPEED_TIME:-unset}" >>"${FAULT_LOG:-/dev/null}"
+            ;;
+        PROBE_LOCK)
+            if flock -n "$FAULT_PROBE_PATH" true 2>/dev/null; then
+                echo "probe lock free $key $FAULT_PROBE_PATH" >>"${FAULT_LOG:-/dev/null}"
+            else
+                echo "probe lock held $key $FAULT_PROBE_PATH" >>"${FAULT_LOG:-/dev/null}"
+            fi
+            ;;
+        SLEEP) sleep "${FAULT_SLEEP:-5}" ;;
+        DETACH)
+            sleep "${FAULT_SLEEP:-20}" >/dev/null 2>&1 3>&- &
+            echo "detached $!" >>"${FAULT_LOG:-/dev/null}"
+            ;;
         DNS)
             echo "fatal: unable to access 'https://github.com/tomtom215/LyreBirdAudio.git/': Could not resolve host: github.com" >&2
             exit 128
@@ -81,8 +112,11 @@ inject() {
 
 if ((hit)) && [[ "${FAULT_WHEN:-after}" == before ]]; then
     inject
-    # a signal sent "before" means git never ran
-    [[ "$FAULT_ACT" == PROBE ]] || exit 128
+    # a signal sent "before" means git never ran; the probes and SLEEP only observe or delay
+    case "$FAULT_ACT" in
+        PROBE | PROBE_FD | PROBE_LOCK | SLEEP | DETACH) ;;
+        *) exit 128 ;;
+    esac
 fi
 "$real" "$@"
 rc=$?

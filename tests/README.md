@@ -14,8 +14,8 @@ Unit tests for LyreBirdAudio using the [Bats](https://github.com/bats-core/bats-
 | lyrebird-alerts.sh | test_lyrebird_alerts.bats | 54 | 60% |
 | lyrebird-metrics.sh | test_lyrebird_metrics.bats | 39 | 55% |
 | lyrebird-storage.sh | test_lyrebird_storage.bats | 59 | 65% |
-| lyrebird-updater.sh | test_lyrebird_updater.bats | 58 | 75% |
-| lyrebird-updater.sh, real git repositories with injected failures | test_lyrebird_updater_failures.bats, test_lyrebird_updater_history.bats, test_lyrebird_updater_rollback.bats | 55 + 12 + 19 | not estimated (real script vs. local bare origin; see `tests/updater_helper.bash`) |
+| lyrebird-updater.sh | test_lyrebird_updater.bats | 60 | 75% |
+| lyrebird-updater.sh, real git repositories with injected failures | test_lyrebird_updater_failures.bats, test_lyrebird_updater_history.bats, test_lyrebird_updater_rollback.bats, test_lyrebird_updater_lock.bats, test_lyrebird_updater_menu.bats, test_lyrebird_updater_migrations.bats | 55 + 12 + 19 + 22 + 11 + 8 | not estimated (real script vs. local bare origin; see `tests/updater_helper.bash`) |
 | install_mediamtx.sh | test_install_mediamtx.bats | 66 | 70% |
 | lyrebird-mic-check.sh | test_lyrebird_mic_check.bats | 45 | 70% |
 | lyrebird-stream-manager.sh vs. MediaMTX versions | test_mediamtx_config_versions.bats, test_mediamtx_live.bats | 4 + 1 live | not estimated |
@@ -126,6 +126,9 @@ bats tests/ --filter "validation"
 | `test_lyrebird_updater_failures.bats` | The updater against real git repositories (a local bare origin plus a clone) with injected failures: SIGKILL/SIGTERM/SIGINT at chosen points of an update, DNS failure, a black-holed origin, a full disk (real ENOSPC on a size-limited tmpfs in a private mount namespace, skipped where that is not permitted), stash conflicts, divergent branches, file modes |
 | `test_lyrebird_updater_history.bats` | The update history log and `--history` |
 | `test_lyrebird_updater_rollback.bats` | `--rollback [VERSION]`, including with the service installed (stateful systemctl stand-in) |
+| `test_lyrebird_updater_lock.bats` | The updater lock (a `flock` on a never-removed file): owner record, SIGKILL of the holder, N updaters started in the same instant (real processes, some executed directly), no name-based staleness, the lock descriptor not inherited by git, systemctl or the stream manager (nor by a child that outlives the updater), the self-update hand-over, locks of older updaters |
+| `test_lyrebird_updater_menu.bats` | The menu's exit-status contract driven through stdin: a failed switch or reset keeps the menu open, Q leaves with its status, end of input at a prompt leaves with 12 |
+| `test_lyrebird_updater_migrations.bats` | Post-update migrations after a self-update: run once by the new updater, recovered after kill -9 before or during them |
 | `test_install_mediamtx.bats` | Tests for MediaMTX installer (version comparison, platform detection, validation) |
 | `test_lyrebird_mic_check.bats` | Tests for mic check utility (device detection, capability testing, config generation) |
 | `test_storage_suite_safety.bats` | Guards `test_lyrebird_storage.bats` itself: its setup must point the storage script at private temp dirs, never at real recordings, logs or `/tmp` |
