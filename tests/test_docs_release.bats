@@ -764,3 +764,132 @@ EOF
     # the commands it shows for a clone are run with bash, not ./
     ! grep -qE '^[[:space:]]+\./lyrebird-[a-z-]+\.sh' "$contrib" || { echo "CONTRIBUTING runs a script as ./script.sh"; return 1; }
 }
+
+# ---------------------------------------------------------------------------
+# tools/soak/README.md [DOC-03]
+# ---------------------------------------------------------------------------
+
+# flat FILE: the text of a file on one line, runs of blanks squeezed
+flat() {
+    tr '\n' ' ' <"$1" | tr -s ' '
+}
+
+# manager_default NAME: the default the stream manager gives a numeric setting
+manager_default() {
+    sed -nE "s/^${1}=\\\$\\(_(u?int)_or \"\\\$\\{${1}:-\\}\" (-?[0-9]+)\\).*/\\2/p" "$ROOT/lyrebird-stream-manager.sh"
+}
+
+@test "the soak README says what the manager's silence check does and does not catch, with the defaults the manager has [DOC-03]" {
+    local readme="$DOCS/tools/soak/README.md" text name want script="$ROOT/lyrebird-stream-manager.sh"
+    text="$(flat "$readme")"
+    # the old claim is gone: nothing says the monitor "covers" a silent capsule without saying how
+    ! grep -qF "LyreBirdAudio's own silence detection covers that" "$readme" || { echo "the old claim is still there"; return 1; }
+    grep -qE '^## Silence$' "$readme"
+    # the settings and their defaults are the manager's own
+    for name in AUDIO_LEVEL_SAMPLE_DURATION AUDIO_LEVEL_CHECK_INTERVAL AUDIO_SILENCE_WARN_DURATION; do
+        want="$(manager_default "$name")"
+        [ -n "$want" ] || { echo "no default found for $name"; return 1; }
+        grep -qF "$want seconds (\`$name\`)" <<<"$text" || { echo "the README does not say '$want seconds (\`$name\`)'"; return 1; }
+    done
+    want="$(manager_default AUDIO_SILENCE_THRESHOLD_DB)"
+    [ "$want" = "-60" ]
+    grep -qF -- "$want dB (\`AUDIO_SILENCE_THRESHOLD_DB\`)" <<<"$text"
+    grep -qE '^readonly AUDIO_LEVEL_CHECK_ENABLED="\$\{AUDIO_LEVEL_CHECK_ENABLED:-true\}"' "$script"
+    grep -qF 'AUDIO_LEVEL_CHECK_ENABLED=false' "$readme"
+    # the log lines it names are the ones the manager writes
+    for name in 'DEAD MIC' 'Silence detected' 'Audio recovered'; do
+        grep -qF "$name" "$readme" || { echo "the README does not name the log line: $name"; return 1; }
+        grep -qF "$name" "$script" || { echo "the manager has no log line: $name"; return 1; }
+    done
+    # it reads the published stream from loopback, and opens no sound card
+    sed -n '/^probe_stream_level()/,/^}/p' "$script" | grep -qF 'rtsp://127.0.0.1:'
+    # every 5 minutes, from the cron job `install` writes, which runs the monitor
+    grep -qF '*/5 * * * * root flock -n /run/mediamtx-monitor.lock' "$script"
+    grep -qF 'every 5 minutes' "$readme"
+    grep -qF '/etc/cron.d/mediamtx-monitor' "$readme"
+    # the only record is the log: no metric and no alert type mention it
+    ! grep -qiE 'dead.?mic|silence' "$ROOT/lyrebird-metrics.sh" "$ROOT/lyrebird-alerts.sh" || { echo "metrics or alerts mention silence now: update the README"; return 1; }
+    grep -qF "There is no metric and no alert type for it" <<<"$text"
+    # what it does not catch
+    for name in 'idles louder than -60 dB' 'behind read authentication' 'without that cron job' 'Quick Setup Wizard'; do
+        grep -qF -- "$name" <<<"$text" || { echo "the README does not say: $name"; return 1; }
+    done
+}
+
+@test "the soak README says what was and was not run for the observer: Linux only, no macOS, bash 3.2 only if you provide it [DOC-03]" {
+    local readme="$DOCS/tools/soak/README.md" text
+    text="$(flat "$readme")"
+    ! grep -qF 'a second machine (Linux or macOS)' "$readme" || { echo "the table still lists macOS"; return 1; }
+    ! grep -qF 'tested with bash 3.2.57' "$readme" || { echo "the README still claims runs under bash 3.2.57"; return 1; }
+    grep -qF 'run only on Linux' "$readme"
+    grep -qF 'Not run: macOS and BSD' <<<"$text"
+    grep -qF 'no bash 3.2 was run in this check' <<<"$text"
+    # the test file supports another bash through LYREBIRD_TEST_BASH32, and nothing in CI sets it
+    grep -qF 'LYREBIRD_TEST_BASH32' "$readme"
+    grep -qF 'OBS_BASH="${LYREBIRD_TEST_BASH32:-bash}"' "$ROOT/tests/test_soak_observer.bats"
+    ! grep -rqF 'LYREBIRD_TEST_BASH32' "$ROOT/.github" || { echo "CI sets LYREBIRD_TEST_BASH32 now: update the README"; return 1; }
+    # no workflow runs on macOS or BSD, so nothing ran the observer there
+    ! grep -rhE 'runs-on:.*(macos|windows|freebsd)' "$ROOT/.github/workflows" || { echo "a workflow runs on another OS: update the README"; return 1; }
+    # the report really does try GNU date, then BSD date, as the README says
+    grep -qF 'date -u -d @' "$ROOT/tools/soak/observer-report.awk"
+    grep -qF 'date -u -r ' "$ROOT/tools/soak/observer-report.awk"
+    # the observer records URLs as given, credentials included
+    grep -qF 'log "$idx" connect "$url"' "$ROOT/tools/soak/lyrebird-soak-observer.sh"
+    grep -qF '"$i" "$url" >>"$DIR/streams"' "$ROOT/tools/soak/lyrebird-soak-observer.sh"
+    grep -qF 'credentials' <<<"$text"
+}
+
+@test "the tools, commands, faults and defaults the soak README names are the ones the harness and the observer have [DOC-03]" {
+    local readme="$DOCS/tools/soak/README.md" text soak="$ROOT/tools/soak/lyrebird-soak.sh" obs="$ROOT/tools/soak/lyrebird-soak-observer.sh" f key
+    text="$(flat "$readme")"
+    # the tools each command needs, as the harness checks them
+    sed -n '/^cmd_init()/,/^}/p' "$soak" | grep -qF 'need curl jq udevadm pgrep'
+    sed -n '/^cmd_run()/,/^}/p' "$soak" | grep -qF 'need curl jq udevadm pgrep flock'
+    grep -qF '`init` needs bash 4.2+, curl, jq, udevadm and pgrep; `run` also needs flock; every fault with a duration needs systemd-run' <<<"$text"
+    grep -qF 'systemd-run is required for fault' "$soak"
+    # every fault in the README's profile is a fault the harness has, and every setting it names is a config key
+    for f in $(sed -n 's/^   SOAK_FAULTS=\(.*\)$/\1/p' "$readme" | tr ',' ' '); do
+        grep -qE "^readonly ALL_FAULTS=.*\\b${f}\\b" "$soak" || { echo "the README profile names a fault the harness lacks: $f"; return 1; }
+    done
+    for key in $(grep -oE '`SOAK_[A-Z_]+`' "$readme" | tr -d '`' | sort -u) SOAK_FAULT_MIN_GAP SOAK_FAULT_MAX_GAP; do
+        grep -qF "[$key]=" "$soak" || { echo "the README names $key, which is not a harness setting"; return 1; }
+    done
+    # the defaults it states
+    for key in 'SOAK_RECOVERY_DEADLINE:=360' 'SOAK_REBOOT_DEADLINE:=300' 'SOAK_STALL_SAMPLES:=3' 'SOAK_INTERVAL:=10' 'SOAK_EXHAUSTION_DAYS:=30' 'SOAK_API_URL:=http://127.0.0.1:9997'; do
+        grep -qF "$key" "$soak" || { echo "the harness default is not $key"; return 1; }
+    done
+    grep -qF 'default `http://127.0.0.1:9997`' <<<"$text"
+    grep -qF 'gap=5 boot=300' "$obs"
+    grep -qF 'POWER_OFF_FOR=30' "$obs"
+    grep -qF 'TIMEOUT=5' "$obs"
+    # the commands the README gives for the harness exist
+    for key in init sample 'fault KIND' restore status 'report [DIR]'; do
+        grep -qF -- "$key" "$soak" || { echo "the harness has no command: $key"; return 1; }
+    done
+}
+
+@test "the observer commands in the soak README work as written: run until the stop file, then report, exit 1 for a stream that never delivered [DOC-03]" {
+    local readme="$DOCS/tools/soak/README.md" obs="$ROOT/tools/soak/lyrebird-soak-observer.sh" pid rc=0 i
+    command -v ffmpeg >/dev/null || skip "ffmpeg not installed"
+    grep -qF 'touch obs-run/stop' "$readme"
+    grep -qF '`report` exits 0 for PASS and 1 for FAIL, for example when a stream never delivered audio' <<<"$(tr '\n' ' ' <"$readme" | tr -s ' ')"
+    cd "$TEST_SCRATCH"
+    # a closed port: the reader fails at once and retries, which is all this needs
+    "$obs" run --dir obs-run rtsp://127.0.0.1:1/mic_a rtsp://127.0.0.1:1/mic_b >"$TEST_SCRATCH/run.out" 2>&1 3>&- &
+    pid=$!
+    for i in $(seq 1 100); do
+        [ -s obs-run/observer.tsv ] && grep -q connect obs-run/observer.tsv && break
+        sleep 0.1
+    done
+    touch obs-run/stop
+    wait "$pid" || rc=$?
+    [ "$rc" -eq 0 ] || { cat "$TEST_SCRATCH/run.out"; return 1; }
+    [ "$(wc -l <obs-run/streams)" -eq 2 ]
+    rc=0
+    run "$obs" report --dir obs-run
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"never received audio"* ]]
+    # a usage error is exit 2
+    run "$obs" run --dir obs-run
+    [ "$status" -eq 2 ]
+}

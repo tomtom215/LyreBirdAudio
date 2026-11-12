@@ -452,6 +452,11 @@ list; 8 and 9 are new, 5, 6 and 7 changed)
   left armed; seen in 6 of 480 shutdowns under load). [X-44]
 - **`usb-audio-mapper.sh` could read a directory above its sysfs root as a USB
   port.** Real sysfs was not affected; the mapper is 4.0.1. [X-45]
+- **`tools/soak/README.md` claimed more than had been checked.** It said that
+  LyreBirdAudio's own silence detection covered a muted microphone (nothing ran
+  it) and listed macOS for the observer (it has not been run there). It now
+  has a Silence section that says what the monitor's check reads and what it
+  cannot catch, and says what was and was not run for the observer. [DOC-03]
 - **The version table at the end of this file was out of date.** It listed
   versions the scripts no longer had and called them current. It now gives each
   script's version in v1.3.0 and in this tree. [DOC-04]

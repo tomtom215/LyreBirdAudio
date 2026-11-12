@@ -8,7 +8,7 @@ directory has two tools for that:
 | Tool | Runs on | Measures |
 |---|---|---|
 | `lyrebird-soak.sh` | the node (root, systemd) | device names, stream liveness, services, resources; injects faults and times recovery |
-| `lyrebird-soak-observer.sh` | a second machine (Linux or macOS) | audio actually arriving over RTSP, including through power cuts; can cut the node's power |
+| `lyrebird-soak-observer.sh` | a second machine with ffmpeg (written for bash 3.2; run only on Linux) | audio actually arriving over RTSP, including through power cuts; can cut the node's power |
 
 Use both. The node harness sees causes (which device, which process); the
 observer sees what a listener sees, including outages the node cannot record
@@ -28,7 +28,8 @@ and storage model as the field nodes.
    (default 360 s) after it ended, or `SOAK_REBOOT_DEADLINE` (300 s) after
    boot. Recovered means every check below is back to normal.
 2. **No reboot happened that the harness did not cause.** A new boot ID with no
-   reboot fault in progress means a crash, a watchdog reset or a power loss.
+   reboot fault in progress means a crash, a power loss or, if you configured
+   one, a hardware watchdog reset.
 3. **Device names held.** For each name in the usb-audio-mapper rules, the
    sound card at that USB path (`ID_PATH`, or the port, for older rules) has
    that name, no other card has it, and `/dev/sound/by-id/<name>` points at the
@@ -58,9 +59,52 @@ Limits worth knowing:
   `--node-events` to explain gaps; `clock-jump` faults upset that by design.
 - The harness reads `ID_PATH` from udev; names are checked against the mapper's
   rules, so a node mapped without usb-audio-mapper gets no name checks.
-- `stream-stalled` relies on MediaMTX's byte counters. Audio that arrives but
-  is silent (a muted or disconnected capsule) is not detected; LyreBirdAudio's
-  own silence detection covers that.
+- `stream-stalled` relies on MediaMTX's byte counters, and the observer on the
+  position of the stream. Audio that arrives but is silent (a muted or
+  disconnected capsule) keeps both moving, so neither tool reports it. The
+  stream manager's monitor looks for it, with limits of its own: see
+  [Silence](#silence). The soak report does not read what the monitor logs.
+- The harness reads MediaMTX's API at `SOAK_API_URL` (default
+  `http://127.0.0.1:9997`): set it if the node uses another
+  `MEDIAMTX_API_PORT`.
+
+## Silence
+
+The soak tools do not measure the level of the audio. The stream manager does,
+in its monitor, which is the cron job `lyrebird-stream-manager.sh install`
+writes (every 5 minutes):
+
+- Each monitor run reads every published stream over RTSP from `127.0.0.1` for 3
+  seconds (`AUDIO_LEVEL_SAMPLE_DURATION`) with FFmpeg's `volumedetect`, and no
+  stream more often than every 240 seconds (`AUDIO_LEVEL_CHECK_INTERVAL`). It
+  opens no sound card. `AUDIO_LEVEL_CHECK_ENABLED=false` turns it off.
+- A probe is silent when its loudest sample is at or below -60 dB
+  (`AUDIO_SILENCE_THRESHOLD_DB`). The first silent probe logs `Silence detected`;
+  a later silent probe, once the silence has lasted 60 seconds
+  (`AUDIO_SILENCE_WARN_DURATION`), logs `DEAD MIC` once for that episode. With
+  the 5-minute cron job that is the second silent probe. A probe that cannot
+  decide (the stream is not published, no samples arrived, the measurement
+  failed) neither starts nor ends an episode, and a probe that hears sound ends
+  it (`Audio recovered`).
+- The only record is the manager's log, `/var/log/lyrebird-stream-manager.log`
+  (`STREAM_MANAGER_LOG_FILE`). There is no metric and no alert type for it, and
+  the soak report does not count it: after a run, look with
+  `grep 'DEAD MIC' /var/log/lyrebird-stream-manager.log`.
+- The settings are environment variables of the monitor process. Cron does not
+  pass the unit's environment, so a non-default value must also be in
+  `/etc/cron.d/mediamtx-monitor`, which every `lyrebird-stream-manager.sh install`
+  rewrites.
+
+What it does not catch:
+
+- A capsule that idles louder than -60 dB. The threshold was checked against
+  digital silence and an FFmpeg test tone, not against real microphones.
+- Silence between two probes, or shorter than the time to the second probe.
+- Silence on a stream behind read authentication: the probe reads anonymously,
+  so MediaMTX refuses it, a failed probe is logged at every run, and it is never
+  counted as silence.
+- Anything on a node without that cron job, which includes a node set up only
+  by the Quick Setup Wizard (the wizard does not run `install`).
 
 ## Install on the node
 
@@ -74,9 +118,9 @@ sudo install -m 600 tools/soak/lyrebird-soak.conf.example /etc/lyrebird-soak.con
 sudo systemctl daemon-reload
 ```
 
-Needs bash 4.2+, curl, jq, udevadm, pgrep, flock and systemd-run (all present
-on a node with LyreBirdAudio installed); `ip`, `fallocate` and `uhubctl` only
-for the faults that use them.
+`init` needs bash 4.2+, curl, jq, udevadm and pgrep; `run` also needs flock;
+every fault with a duration needs systemd-run; `ip`, `fallocate` and `uhubctl`
+are needed only by the faults that use them.
 
 ## Run
 
@@ -133,9 +177,22 @@ undo itself when it starts again.
 
 ## Observer
 
-On a second machine with ffmpeg. The observer is written for bash 3.2 (as
-shipped with macOS) and tested with bash 3.2.57 and 5.2 on Linux; it has not
-been run on macOS itself.
+On a second machine with ffmpeg. The observer is written for bash 3.2 (the bash
+macOS ships) and for portable commands: its report formats times with GNU
+`date`, then with BSD `date`.
+
+What was run: `tests/test_soak_observer.bats` runs it on Linux under the `bash`
+on `PATH`. That is its report on synthetic logs always, and its reader against a
+real MediaMTX, including a simulated power cut, when `LYREBIRD_TEST_MEDIAMTX_BINS`
+is set. The test file can run the observer under a bash 3.2 binary you provide
+(`LYREBIRD_TEST_BASH32=/path/to/bash`); CI does not set that variable, and no
+bash 3.2 was run in this check. Not run: macOS and BSD, so neither the BSD `date`
+branch nor bash 3.2 on a Mac has been seen to work.
+
+The observer reads anonymously unless a URL carries credentials, and it records
+every URL as given in `obs-run/streams` and `obs-run/observer.tsv`. That matters
+when the node runs with `RTSP_AUTH_MODE=local-only-publish`, which refuses remote
+readers that are not listed.
 
 ```bash
 tools/soak/lyrebird-soak-observer.sh run --dir obs-run \
@@ -161,8 +218,9 @@ tools/soak/lyrebird-soak-observer.sh report --dir obs-run \
     --node-events node-run/events.tsv     # copied from the node's SOAK_DIR
 ```
 
-Each reader uses an RTSP socket timeout (`--timeout`, 5 s), so a connection
-that dies without a reset, as in a power cut, is noticed and retried.
+`report` exits 0 for PASS and 1 for FAIL, for example when a stream never
+delivered audio. Each reader uses an RTSP socket timeout (`--timeout`, 5 s), so a
+connection that dies without a reset, as in a power cut, is noticed and retried.
 
 ## Files
 
@@ -197,6 +255,10 @@ The live tests run when `LYREBIRD_TEST_MEDIAMTX_BINS` names MediaMTX binaries:
 LYREBIRD_TEST_MEDIAMTX_BINS="$(tests/fetch_mediamtx.sh)" \
     bats tests/test_soak_live.bats tests/test_soak_observer.bats
 ```
+
+They bind 8554 and 9997 on the machine they run on, and `test_soak_live.bats` kills
+the ffmpeg and MediaMTX processes it finds (it skips while one is running). Do not
+run them on a node.
 
 None of this replaces the soak run itself: the tests show the tools measure
 correctly; only the run on your hardware shows the node holds up.
