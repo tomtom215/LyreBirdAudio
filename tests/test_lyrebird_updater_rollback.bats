@@ -247,7 +247,7 @@ _update_to() {
     updater_checkout v1.1.0
     updater_install_fake_service running
     export FAKE_SVC_FAIL_START=1
-    updater_stdin 3 v1.2.0
+    updater_stdin 3 v1.2.0 "" q
     updater_run
     [ "$status" -eq 1 ]
     [[ "$output" == *"Service update failed after checkout"* ]]

@@ -14,6 +14,9 @@
 #     truncated (decision D2); a dead holder releases it by dying, so there is
 #     no stale-lock removal. The lock descriptor is closed in every git and
 #     systemctl the updater starts and before a self-update re-exec
+#   - A switch or reset that fails in the menu no longer ends the run: it is
+#     reported and the menu stays open (Q leaves with that status). End of input
+#     at a prompt leaves with exit status 12 and a message instead of a silent 1
 #
 # v1.7.0:
 #   - --rollback [VERSION]: back to the previous version (or a tag/commit already
@@ -168,6 +171,7 @@ readonly E_BAD_STATE=8
 readonly E_USER_ABORT=9
 readonly E_RESTORE_CONFLICT=10 # switch done, but your saved changes could not be re-applied (kept in the stash)
 readonly E_ROLLBACK_FAILED=11  # the automatic rollback could not restore everything; see the messages
+readonly E_INPUT_EOF=12        # standard input ended (Ctrl-D, closed pipe) while a menu waited for an answer
 
 # Version requirements
 readonly MIN_GIT_MAJOR=2
@@ -3522,7 +3526,8 @@ select_version_interactive() {
     echo "  - A commit hash (e.g., abc1234)"
     echo "  - Press Enter to cancel"
     echo
-    read -r -p "Your selection: " selection
+    local selection=""
+    menu_read selection "Your selection: "
 
     if [[ -z "$selection" ]]; then
         log_info "Selection cancelled"
@@ -3805,7 +3810,7 @@ show_startup_diagnostics() {
 
     # Only prompt if stdin is a terminal
     if [[ -t 0 ]]; then
-        read -r -p "Press Enter to continue..."
+        menu_pause
     fi
 }
 
@@ -3946,6 +3951,13 @@ A: No, custom environment variables are automatically preserved
 Q: What if the updater itself has errors?
 A: Syntax validation prevents deployment of broken scripts
 
+=== EXIT STATUS OF THE MENU ===
+
+A switch or reset that fails is reported and the menu stays open. Q leaves the
+menu with the status of the last switch or reset you ran (0 when it worked;
+the status table is in the documentation). End of input at a prompt (Ctrl-D, a
+closed pipe) leaves with status ${E_INPUT_EOF}, never with a silent 1.
+
 === MORE HELP ===
 
 Visit: https://github.com/tomtom215/LyreBirdAudio
@@ -3953,7 +3965,87 @@ Visit: https://github.com/tomtom215/LyreBirdAudio
 EOF
 }
 
+# Exit status of the last switch or reset run from the menu. Q ends the run
+# with it (see main), so a script that feeds the menu through stdin can read
+# whether what it asked for worked.
+MENU_LAST_STATUS=0
+
+# Standard input ended while a menu waited for an answer (Ctrl-D, a closed
+# pipe, /dev/null). Not an error of the operator's and not a silent failure
+# either: say what happened and leave with the status of its own.
+menu_input_ended() {
+    echo
+    log_warn "Input ended (end of file) at a prompt: leaving the version manager."
+    if [[ "$MENU_LAST_STATUS" -ne 0 ]]; then
+        log_warn "The last action ended with exit status ${MENU_LAST_STATUS}."
+    fi
+    log_info "Exit status ${E_INPUT_EOF} means the input ended; Q leaves the menu normally."
+    exit "$E_INPUT_EOF"
+}
+
+# Read one line of the menu's input into the variable named $1 (discarded when
+# $1 is empty). A last line without a newline still counts; end of input with
+# nothing read ends the run (menu_input_ended). (A plain `read` that fails under
+# errexit ended the run silently with status 1.)
+# Usage: menu_read VARIABLE PROMPT
+menu_read() {
+    local __menu_target="$1" __menu_prompt="$2" __menu_line=""
+    if ! read -r -p "$__menu_prompt" __menu_line && [[ -z "$__menu_line" ]]; then
+        menu_input_ended
+    fi
+    if [[ -n "$__menu_target" ]]; then
+        printf -v "$__menu_target" '%s' "$__menu_line"
+    fi
+}
+
+menu_pause() {
+    menu_read "" "Press Enter to continue..."
+}
+
+# Run one menu action. When it fails the menu does not end: the failure is
+# reported and the status is kept for Q (MENU_LAST_STATUS). The action runs in
+# a `||` context, where errexit is off: a statement that fails inside it no
+# longer ends the whole run, the action's own checks decide, and those already
+# roll the transaction back for every failure they know about
+# (transaction_abort); the check below is the net under that.
+# Usage: menu_run COMMAND [ARGS...]
+menu_run() {
+    local rc=0
+    "$@" || rc=$?
+    # An action never returns with a transaction open. If one ever did, every
+    # later action would refuse with "Transaction already active": roll it back.
+    if [[ "${TRANSACTION_STATE[active]}" == "true" ]]; then
+        log_error "The action ended with its transaction still open: rolling it back"
+        if ! transaction_rollback "the menu action ended with its transaction open"; then
+            rc="$E_ROLLBACK_FAILED"
+        elif [[ $rc -eq 0 ]]; then
+            rc="$E_GENERAL"
+        fi
+    fi
+    MENU_LAST_STATUS="$rc"
+    if [[ $rc -ne 0 ]]; then
+        echo
+        log_warn "That did not complete (exit status ${rc}). The menu is still open."
+    fi
+    return 0
+}
+
+# A read-only choice (check, status, help): reported when it fails, but it does
+# not replace the status of the last switch or reset
+menu_view() {
+    local previous="$MENU_LAST_STATUS"
+    menu_run "$@"
+    MENU_LAST_STATUS="$previous"
+}
+
+menu_check_for_updates() {
+    if fetch_updates_safe; then
+        list_available_releases
+    fi
+}
+
 main_menu() {
+    local choice=""
     while true; do
         get_current_version
         check_local_changes
@@ -4009,37 +4101,35 @@ main_menu() {
         echo
         echo "  ${BOLD}H${NC}) Help  |  ${BOLD}Q${NC}) Quit"
         echo
-        read -r -p "Select [1-6, H, Q]: " choice
+        menu_read choice "Select [1-6, H, Q]: "
 
         case "$choice" in
             1)
-                switch_to_latest_stable
-                read -r -p "Press Enter to continue..."
+                menu_run switch_to_latest_stable
+                menu_pause
                 ;;
             2)
-                switch_to_development
-                read -r -p "Press Enter to continue..."
+                menu_run switch_to_development
+                menu_pause
                 ;;
             3)
-                select_version_interactive
-                read -r -p "Press Enter to continue..."
+                menu_run select_version_interactive
+                menu_pause
                 ;;
             4)
-                if fetch_updates_safe; then
-                    list_available_releases
-                fi
-                read -r -p "Press Enter to continue..."
+                menu_view menu_check_for_updates
+                menu_pause
                 ;;
             5)
-                show_status
-                read -r -p "Press Enter to continue..."
+                menu_view show_status
+                menu_pause
                 ;;
             6)
-                reset_menu
+                menu_run reset_menu
                 ;;
             h | H)
-                show_help
-                read -r -p "Press Enter to continue..."
+                menu_view show_help
+                menu_pause
                 ;;
             q | Q)
                 echo
@@ -4054,7 +4144,9 @@ main_menu() {
     done
 }
 
+# Returns the status of the reset it ran (0 when the operator cancelled)
 reset_menu() {
+    local reset_status=0 choice="" version=""
     while true; do
         echo
         echo "${BOLD}=== DISCARD CHANGES & RESET ===${NC}"
@@ -4067,7 +4159,7 @@ reset_menu() {
         echo "  ${BOLD}3${NC}) Specific version (let me choose)"
         echo "  ${BOLD}C${NC}) Cancel"
         echo
-        read -r -p "Select [1-3, C]: " choice
+        menu_read choice "Select [1-3, C]: "
 
         case "$choice" in
             1)
@@ -4076,26 +4168,26 @@ reset_menu() {
                     log_warn "You're viewing a specific version (not tracking a branch)"
                     log_info "Resetting to HEAD won't change anything"
                     log_info "Choose option 2 or 3 instead"
-                    read -r -p "Press Enter to continue..."
+                    menu_pause
                 else
                     if git show-ref --verify --quiet "refs/remotes/origin/$CURRENT_BRANCH"; then
-                        reset_to_clean_state "origin/$CURRENT_BRANCH"
+                        reset_to_clean_state "origin/$CURRENT_BRANCH" || reset_status=$?
                     else
                         log_error "Remote branch not found: origin/$CURRENT_BRANCH"
                     fi
                 fi
-                read -r -p "Press Enter to continue..."
-                return 0
+                menu_pause
+                return "$reset_status"
                 ;;
             2)
                 if git show-ref --verify --quiet "refs/remotes/origin/${DEFAULT_BRANCH}"; then
-                    reset_to_clean_state "origin/${DEFAULT_BRANCH}"
+                    reset_to_clean_state "origin/${DEFAULT_BRANCH}" || reset_status=$?
                 else
                     log_error "Development branch not found: origin/${DEFAULT_BRANCH}"
                     log_info "Try option 4 from main menu to fetch updates"
                 fi
-                read -r -p "Press Enter to continue..."
-                return 0
+                menu_pause
+                return "$reset_status"
                 ;;
             3)
                 log_step "Fetching available versions..."
@@ -4105,21 +4197,21 @@ reset_menu() {
 
                 list_available_releases
                 echo
-                read -r -p "Enter version to reset to: " version
+                menu_read version "Enter version to reset to: "
 
                 if [[ -z "$version" ]]; then
                     log_info "Cancelled"
                 elif ! validate_version_exists "$version"; then
                     log_error "Version '$version' does not exist"
                 else
-                    reset_to_clean_state "$version"
+                    reset_to_clean_state "$version" || reset_status=$?
                 fi
-                read -r -p "Press Enter to continue..."
-                return 0
+                menu_pause
+                return "$reset_status"
                 ;;
             c | C)
                 log_info "Cancelled"
-                read -r -p "Press Enter to continue..."
+                menu_pause
                 return 0
                 ;;
             *)
@@ -4345,6 +4437,12 @@ main() {
     # Run interactive menu
     main_menu
 
+    # Left with Q: the status of the last switch or reset that was run from the
+    # menu if it failed, else the run's own (E_RESTORE_CONFLICT after a
+    # self-update that could not re-apply the saved changes, else 0)
+    if [[ "$MENU_LAST_STATUS" -ne 0 ]]; then
+        exit "$MENU_LAST_STATUS"
+    fi
     exit "$EXIT_STATUS"
 }
 
