@@ -15,9 +15,12 @@ setup() {
     scratch_setup
     updater_node_setup
     HISTORY="$REPO/.git/lyrebird-updater/history.log"
+    HOLDER_PIDS=()
+    ORPHAN_PIDS=()
 }
 
 teardown() {
+    updater_holders_stop
     scratch_teardown
 }
 
@@ -171,13 +174,8 @@ teardown() {
     mkdir -p "$NODE/nogit"
     printf '#!/bin/bash\necho "git must not be called" >&2\nexit 99\n' >"$NODE/nogit/git"
     chmod +x "$NODE/nogit/git"
-    mkdir -p "$REPO/.git/lyrebird-updater/lock"
-    ( exec -a "lyrebird-updater.sh" sleep 30 ) &
-    local holder=$!
-    echo "$holder" >"$REPO/.git/lyrebird-updater/lock/pid"
+    updater_hold_lock 25 --status
     run env PATH="$NODE/nogit:$PATH" LYREBIRD_UPDATER_LOCK_WAIT=1 bash "$REPO/lyrebird-updater.sh" --history
-    kill "$holder" 2>/dev/null || true
-    wait "$holder" 2>/dev/null || true
     [ "$status" -eq 0 ]
     [[ "$output" == *"v1.2.0"* ]]
     [[ "$output" != *"git must not be called"* ]]

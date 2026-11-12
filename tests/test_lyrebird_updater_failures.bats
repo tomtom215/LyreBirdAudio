@@ -16,10 +16,13 @@ setup_file() {
 setup() {
     scratch_setup
     updater_node_setup
+    HOLDER_PIDS=()
+    ORPHAN_PIDS=()
 }
 
 teardown() {
     updater_blackhole_stop
+    updater_holders_stop
     scratch_teardown
 }
 
@@ -91,15 +94,17 @@ _updater_vars() {
     updater_checkout v1.1.0
     echo "local edit" >>"$REPO/config.txt"
     echo "notes" >"$REPO/mynotes.txt"
-    export FAULT_PROBE_PATH="$REPO/.git/lyrebird-updater/lock"
-    updater_inject checkout before PROBE
+    export FAULT_PROBE_PATH="$REPO/.git/lyrebird-updater/updater.lock"
+    updater_inject checkout before PROBE_LOCK
     updater_stdin 3 v1.2.0 y "" q
     updater_run
     [ "$status" -eq 0 ]
     [ "$(updater_head)" = "v1.2.0" ]
-    grep -q "probe present $FAULT_PROBE_PATH" "$FAULT_LOG"
-    # and it is released again at exit
-    [ ! -e "$FAULT_PROBE_PATH" ]
+    # held (not merely present) at the moment git switches the tree
+    grep -q "probe lock held checkout $FAULT_PROBE_PATH" "$FAULT_LOG"
+    # and released again at exit; the file itself is never removed
+    [ -f "$FAULT_PROBE_PATH" ]
+    flock -n "$FAULT_PROBE_PATH" true
 }
 
 @test "a self-update restores local changes and leaves no stash entry behind" {
@@ -150,15 +155,10 @@ _updater_vars() {
 
 @test "a second updater is refused while the first holds the lock (exit 7)" {
     updater_checkout v1.1.0
-    mkdir -p "$REPO/.git/lyrebird-updater/lock"
-    ( exec -a "lyrebird-updater.sh" sleep 30 ) &
-    local holder=$!
-    echo "$holder" >"$REPO/.git/lyrebird-updater/lock/pid"
+    updater_hold_lock 25 --status
     LYREBIRD_UPDATER_LOCK_WAIT=1 updater_run --status
-    kill "$holder" 2>/dev/null || true
-    wait "$holder" 2>/dev/null || true
     [ "$status" -eq 7 ]
-    [[ "$output" == *"Lock held by process $holder"* ]]
+    [[ "$output" == *"Lock held by process $HOLDER_PID"* ]]
 }
 
 # ============================================================================

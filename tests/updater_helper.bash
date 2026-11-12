@@ -277,3 +277,81 @@ updater_unshare_cmd() {
 updater_git_clean() {
     [ -z "$(git -C "$REPO" -c core.fileMode=false status --porcelain)" ]
 }
+
+# ============================================================================
+# The updater lock (a flock on <git-dir>/lyrebird-updater/updater.lock)
+# ============================================================================
+
+updater_lock_path() {
+    printf '%s' "$REPO/.git/lyrebird-updater/updater.lock"
+}
+
+# updater_wait_for COMMAND...: poll (about 30 s at most) until the command succeeds
+updater_wait_for() {
+    local tries=0
+    while ! "$@" 2>/dev/null; do
+        tries=$((tries + 1))
+        [[ "$tries" -lt 600 ]] || return 1
+        sleep 0.05
+    done
+}
+
+# updater_starttime PID: field 22 of /proc/PID/stat
+updater_starttime() {
+    sed 's/^.*) //' "/proc/$1/stat" | awk '{print $20}'
+}
+
+# updater_descendants PID: every process below PID, one per line
+updater_descendants() {
+    local child
+    for child in $(pgrep -P "$1" 2>/dev/null); do
+        echo "$child"
+        updater_descendants "$child"
+    done
+}
+
+# updater_hold_lock SECONDS [ARGS...]: start an updater in the background that
+# stays inside its critical section for SECONDS (the git shim sleeps at the
+# first `git rev-parse`, which the updater only runs once it holds the lock)
+# and wait until it is there. Sets HOLDER_PID. With UPDATER_HOLD_DIRECT=yes the
+# script is executed as a program (it must be executable) instead of through
+# `bash script`; UPDATER_HOLD_SCRIPT names another path to the same script.
+updater_hold_lock() {
+    local seconds="$1"
+    shift
+    local -a cmd=(bash "${UPDATER_HOLD_SCRIPT:-$REPO/lyrebird-updater.sh}")
+    if [[ "${UPDATER_HOLD_DIRECT:-}" == yes ]]; then
+        cmd=("${UPDATER_HOLD_SCRIPT:-$REPO/lyrebird-updater.sh}")
+    fi
+    updater_inject rev-parse before SLEEP
+    export FAULT_SLEEP="$seconds"
+    [[ -n "${UPDATER_INPUT+set}" ]] || updater_stdin
+    env "${UPDATER_SIGNAL_ARGS[@]}" PATH="$SHIMS:$PATH" "${cmd[@]}" "$@" \
+        <<<"${UPDATER_INPUT%$'\n'}" >"$NODE/holder.out" 2>&1 3>&- &
+    HOLDER_PID=$!
+    HOLDER_PIDS+=("$HOLDER_PID")
+    unset UPDATER_INPUT
+    updater_wait_for grep -q 'fault SLEEP' "$FAULT_LOG" || {
+        echo "the holder never reached its critical section:"
+        cat "$NODE/holder.out"
+        return 1
+    }
+    updater_inject_clear
+    unset FAULT_SLEEP
+}
+
+# Kill what updater_hold_lock started (and what a killed holder left running);
+# call it from teardown
+updater_holders_stop() {
+    local pid kid
+    for pid in "${HOLDER_PIDS[@]:-}" "${ORPHAN_PIDS[@]:-}"; do
+        [[ -n "$pid" ]] || continue
+        for kid in $(updater_descendants "$pid"); do
+            kill -KILL "$kid" 2>/dev/null || true
+        done
+        kill -KILL "$pid" 2>/dev/null || true
+        wait "$pid" 2>/dev/null || true
+    done
+    HOLDER_PIDS=()
+    ORPHAN_PIDS=()
+}

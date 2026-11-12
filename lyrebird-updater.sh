@@ -7,9 +7,15 @@
 # Copyright: Tom F and LyreBirdAudio contributors
 # License: Apache 2.0
 #
-# Version: 1.7.0
+# Version: 1.8.0
 #
-# NEW in v1.7.0:
+# NEW in v1.8.0:
+#   - The updater lock is a flock(2) lock on a file that is never removed or
+#     truncated (decision D2); a dead holder releases it by dying, so there is
+#     no stale-lock removal. The lock descriptor is closed in every git and
+#     systemctl the updater starts and before a self-update re-exec
+#
+# v1.7.0:
 #   - --rollback [VERSION]: back to the previous version (or a tag/commit already
 #     in the clone) with the update's own transaction, no network needed
 #   - --history: past updates, failures and rollbacks (local append-only log)
@@ -99,7 +105,7 @@ SCRIPT_NAME="$(basename "${BASH_SOURCE[0]}")"
 readonly SCRIPT_NAME
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly SCRIPT_DIR
-readonly VERSION="1.7.0"
+readonly VERSION="1.8.0"
 
 # Updater state: the lock, the update history and the transaction journal live
 # in a directory INSIDE the git directory, never in the working tree. A lock in
@@ -132,7 +138,12 @@ else
 fi
 unset _updater_state_git_dir
 readonly UPDATER_STATE_DIR
-readonly LOCKFILE="${UPDATER_STATE_DIR}/lock"
+# The lock: a flock(2) lock on this file, which is never removed or truncated.
+# (Updaters up to 1.7.0 used a directory named "lock" next to it, see
+# OLD_STATE_LOCKDIR; the new file has another name so that a 1.7.0 updater,
+# e.g. after a rollback, can still create its own.)
+readonly LOCKFILE="${UPDATER_STATE_DIR}/updater.lock"
+readonly OLD_STATE_LOCKDIR="${UPDATER_STATE_DIR}/lock"
 readonly HISTORY_FILE="${UPDATER_STATE_DIR}/history.log"
 readonly JOURNAL_FILE="${UPDATER_STATE_DIR}/transaction"
 readonly GIT_CONFIG_SAVED_FILE="${UPDATER_STATE_DIR}/core.fileMode.saved"
@@ -495,27 +506,166 @@ journal_summary() {
 # Lock File Management
 ################################################################################
 
-# True (0) while an updater older than 1.7.0 still holds its in-tree lock. A
-# lock left by a dead one is removed: as an untracked directory it would
-# otherwise show up as a local modification of the repository forever.
+# The updater lock is a plain flock(2) lock on LOCKFILE (decision D2):
+#
+#   - The file is opened read-write WITHOUT truncation and is never removed. A
+#     removed-and-recreated path is a different lock, and two updaters could
+#     then both believe they hold "the" lock.
+#   - The kernel drops the flock when its holder dies, however it dies (exit,
+#     SIGKILL, OOM, power cut). A held lock is held and a released one is free:
+#     there is no stale lock, so there is no lock-age test, no process-name test
+#     and no removal step that two updaters started in the same instant could
+#     race on.
+#   - After winning the lock the owner overwrites the first line of the file in
+#     place with "<pid> <starttime>" (starttime = field 22 of /proc/<pid>/stat).
+#     The record is informational (it names the holder to an updater that has to
+#     give up); it is never used to decide whether the lock is held.
+#   - A flock belongs to an open file description, which every child inherits.
+#     A child that kept the descriptor would hold the lock after this updater
+#     exited (a detached `git gc --auto` does exactly that), so the descriptor is
+#     closed in every git and systemctl the updater starts (the git and systemctl
+#     functions below, run_unlocked) and before the self-update re-exec.
+
+# The descriptor holding the lock; -1 while it is not held
+UPDATER_LOCK_FD=-1
+
+# Run a command with the lock descriptor closed: "$@" is executed as given, so
+# a function or builtin runs in this shell with the descriptor closed only
+# around the call. The descriptor number is validated as an integer first (bash
+# 4.2 has no {var}>&- close form, hence the eval).
+# Usage: run_unlocked COMMAND [ARGS...]
+run_unlocked() {
+    local fd="$UPDATER_LOCK_FD"
+    if [[ "$fd" =~ ^[0-9]+$ ]] && ((fd > 2)); then
+        eval '"$@" '"${fd}"'>&-'
+    else
+        "$@"
+    fi
+}
+
+# Every git and systemctl the updater runs goes through these two functions, so
+# a call added later cannot forget to close the descriptor. (Anything that
+# looks for the programs themselves uses `type -P`: `command -v` also finds a
+# function.)
+git() {
+    run_unlocked command git "$@"
+}
+
+systemctl() {
+    run_unlocked command systemctl "$@"
+}
+
+# Print the start time (clock ticks since boot, field 22 of /proc/<pid>/stat)
+# of a process. PID plus start time identify one process for the life of the
+# machine; a recycled PID has a different start time.
+# Returns 1 when the process does not exist or the value cannot be read.
+updater_proc_starttime() {
+    local pid="$1" stat="" rest
+    local -a fields
+    [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+    # Read the whole file: the command name (field 2) may contain spaces,
+    # parentheses and even a newline, so the fields are counted from the last ")".
+    { IFS= read -r -d '' stat <"/proc/${pid}/stat"; } 2>/dev/null || [[ -n "$stat" ]] || return 1
+    [[ "$stat" == *") "* ]] || return 1
+    rest="${stat##*) }"
+    read -ra fields <<<"$rest"
+    [[ "${fields[19]:-}" =~ ^[0-9]+$ ]] || return 1
+    printf '%s\n' "${fields[19]}"
+}
+
+# Record this process as the owner of the lock held on descriptor $1: overwrite
+# the first line in place (the descriptor is at offset 0 and the line has a
+# fixed width, so the file never shrinks and is never empty while it is read).
+# Returns 1 when the record cannot be written (disk full, read-only).
+updater_lock_record_owner() {
+    local fd="$1" start
+    start="$(updater_proc_starttime "$$")" || start=0
+    { printf '%-64s\n' "$$ ${start}" >&"${fd}"; } 2>/dev/null
+}
+
+# Print a one-line description of the owner recorded in the lock file. The
+# recorded PID is only believed when its start time still matches, so a PID
+# that has been recycled by an unrelated process is never blamed.
+updater_lock_describe_holder() {
+    local rec_pid="" rec_start="" now_start="" cmdline=""
+    { IFS=' ' read -r rec_pid rec_start _ <"$LOCKFILE"; } 2>/dev/null || true
+    if ! [[ "$rec_pid" =~ ^[0-9]+$ ]] || ! [[ "$rec_start" =~ ^[0-9]+$ ]]; then
+        printf 'another process (no owner recorded)'
+        return 0
+    fi
+    now_start="$(updater_proc_starttime "$rec_pid")" || now_start=""
+    if [[ "$now_start" != "$rec_start" ]]; then
+        printf 'another process (the last recorded owner, process %s, start time %s, is not running)' "$rec_pid" "$rec_start"
+        return 0
+    fi
+    cmdline="$(tr '\0' ' ' 2>/dev/null <"/proc/${rec_pid}/cmdline")" || cmdline=""
+    printf 'process %s (start time %s): %s' "$rec_pid" "$rec_start" "${cmdline:0:200}"
+}
+
+# Print "PID(comm)" for every other process that has the lock file open: the
+# real holders, whatever the record says (a child that inherited the descriptor
+# from an updater of an earlier version shows up here).
+updater_lock_list_open_holders() {
+    local entry pid comm out=""
+    [[ -e "$LOCKFILE" ]] || return 0
+    for entry in /proc/[0-9]*/fd/*; do
+        [[ "$entry" -ef "$LOCKFILE" ]] || continue
+        pid="${entry#/proc/}"
+        pid="${pid%%/*}"
+        [[ "$pid" == "$$" || "$pid" == "${BASHPID}" ]] && continue
+        [[ " $out " == *" ${pid}("* ]] && continue
+        comm="$(tr -d '\n' 2>/dev/null <"/proc/${pid}/comm")" || comm="?"
+        out+="${out:+ }${pid}(${comm})"
+    done
+    printf '%s' "$out"
+}
+
+# True (0) while an updater older than 1.8.0 still holds its mkdir lock: the
+# directory kept in the working tree by updaters before 1.7.0 (LEGACY_LOCKFILE)
+# or the one in the state directory of 1.7.0 (OLD_STATE_LOCKDIR). Those updaters
+# know nothing of flock, so their own protocol is honoured here (a pid file and
+# a check that the process is an updater). A lock directory left by a dead one
+# is removed: it would otherwise block a 1.7.0 updater started later (after a
+# rollback) and, in the working tree, show up as a local modification for ever.
+# Sets LEGACY_LOCK_HELD_DIR to the directory that is held.
+LEGACY_LOCK_HELD_DIR=""
 legacy_lock_held() {
-    [[ -d "$LEGACY_LOCKFILE" ]] || return 1
-    local legacy_pid="" legacy_cmdline=""
-    if [[ -f "${LEGACY_LOCKFILE}/pid" ]]; then
-        legacy_pid="$(cat "${LEGACY_LOCKFILE}/pid" 2>/dev/null || true)"
-    fi
-    if [[ "$legacy_pid" =~ ^[0-9]+$ && "$legacy_pid" != "$$" ]] && kill -0 "$legacy_pid" 2>/dev/null; then
-        legacy_cmdline="$(tr '\0' ' ' <"/proc/${legacy_pid}/cmdline" 2>/dev/null || true)"
-        if [[ "$legacy_cmdline" == *"lyrebird-updater"* ]]; then
-            return 0
+    local dir legacy_pid legacy_cmdline
+    LEGACY_LOCK_HELD_DIR=""
+    for dir in "$LEGACY_LOCKFILE" "$OLD_STATE_LOCKDIR"; do
+        [[ -d "$dir" ]] || continue
+        legacy_pid="" legacy_cmdline=""
+        if [[ -f "${dir}/pid" ]]; then
+            legacy_pid="$(cat "${dir}/pid" 2>/dev/null || true)"
         fi
-    fi
-    rm -rf "$LEGACY_LOCKFILE" 2>/dev/null || true
+        if [[ "$legacy_pid" =~ ^[0-9]+$ && "$legacy_pid" != "$$" ]] && kill -0 "$legacy_pid" 2>/dev/null; then
+            legacy_cmdline="$(tr '\0' ' ' <"/proc/${legacy_pid}/cmdline" 2>/dev/null || true)"
+            if [[ "$legacy_cmdline" == *"lyrebird-updater"* ]]; then
+                LEGACY_LOCK_HELD_DIR="$dir"
+                return 0
+            fi
+        fi
+        rm -rf "$dir" 2>/dev/null || true
+    done
     return 1
 }
 
+# True (0) when this process already holds the lock
+updater_lock_held_by_us() {
+    [[ "$UPDATER_LOCK_FD" =~ ^[0-9]+$ ]] && ((UPDATER_LOCK_FD > 2)) \
+        && [[ "/proc/self/fd/${UPDATER_LOCK_FD}" -ef "$LOCKFILE" ]]
+}
+
+# Take the lock, waiting at most LOCK_MAX_WAIT seconds for another updater.
+# Returns 0 (held), E_LOCKED (another updater holds it) or E_PERMISSION (the
+# lock file cannot be opened or written).
 acquire_lock() {
-    local waited=0 pid_write_failures=0
+    local waited=0 fd=-1
+
+    # Already ours (a second call in the same process must not wait for itself)
+    if updater_lock_held_by_us; then
+        return 0
+    fi
 
     # The lock lives in the updater state directory (inside the git directory)
     if ! mkdir -p "$UPDATER_STATE_DIR" 2>/dev/null || [[ ! -w "$UPDATER_STATE_DIR" ]]; then
@@ -525,11 +675,19 @@ acquire_lock() {
         return "$E_PERMISSION"
     fi
 
+    # Created if absent; never truncated, never removed
+    if ! { exec {fd}<>"$LOCKFILE"; } 2>/dev/null; then
+        log_error "Cannot open the lock file: $LOCKFILE"
+        log_info "Permission denied or the file system is read-only"
+        return "$E_PERMISSION"
+    fi
+
     while true; do
-        # An old updater (< 1.7.0) running at the same time holds the old lock
+        # An old updater (< 1.8.0) running at the same time holds its own lock
         if legacy_lock_held; then
             if [[ $waited -ge $LOCK_MAX_WAIT ]]; then
-                log_error "Another (older) updater instance is running: $LEGACY_LOCKFILE"
+                log_error "Another (older) updater instance is running: $LEGACY_LOCK_HELD_DIR"
+                eval "exec ${fd}>&-"
                 return "$E_LOCKED"
             fi
             [[ $waited -eq 0 ]] && log_info "Waiting for other instance to finish..."
@@ -538,87 +696,54 @@ acquire_lock() {
             continue
         fi
 
-        # ATOMIC OPERATION: mkdir fails if directory exists
-        if mkdir "$LOCKFILE" 2>/dev/null; then
-            # Write PID atomically using temp file + rename
-            local pid_file="${LOCKFILE}/pid"
-            local pid_tmp="${LOCKFILE}/pid.$$"
-            if echo "$$" >"$pid_tmp" 2>/dev/null && mv "$pid_tmp" "$pid_file" 2>/dev/null; then
-                log_debug "Lock acquired (PID: $$)"
-                return 0
-            else
-                # Failed to write PID - clean up and retry a few times. On a full or
-                # read-only disk it fails every time: say so instead of spinning.
-                rm -rf "$LOCKFILE" 2>/dev/null
-                pid_write_failures=$((pid_write_failures + 1))
-                if [[ $pid_write_failures -ge 5 ]]; then
-                    log_error "Cannot write the lock file in $UPDATER_STATE_DIR (disk full or read-only?)"
-                    return "$E_PERMISSION"
-                fi
-                sleep 0.1
-                continue
-            fi
+        if flock -n "$fd" 2>/dev/null; then
+            break
         fi
 
-        # Check if lock is stale (process no longer exists)
-        if [[ -f "${LOCKFILE}/pid" ]]; then
-            local lock_pid
-            lock_pid=$(cat "${LOCKFILE}/pid" 2>/dev/null || echo "")
-
-            if [[ -n "$lock_pid" ]] && [[ "$lock_pid" =~ ^[0-9]+$ ]]; then
-                # Verify process is dead AND was actually our script (prevent PID recycling attack)
-                if ! kill -0 "$lock_pid" 2>/dev/null; then
-                    log_warn "Removing stale lock from dead process $lock_pid"
-                    # Atomically try to remove - if another process beats us, that's fine
-                    if rm -rf "$LOCKFILE" 2>/dev/null; then
-                        # Verify removal succeeded before retry
-                        if [[ ! -d "$LOCKFILE" ]]; then
-                            continue
-                        fi
-                    fi
-                    # Another process claimed lock between our check and removal - wait
-                    sleep 0.5
-                    continue
-                elif [[ -d "/proc/$lock_pid" ]]; then
-                    # Process exists - verify it's actually lyrebird-updater (not PID recycling)
-                    local proc_cmdline
-                    proc_cmdline=$(tr '\0' ' ' <"/proc/$lock_pid/cmdline" 2>/dev/null || echo "")
-                    if [[ -n "$proc_cmdline" ]] && [[ "$proc_cmdline" != *"lyrebird-updater"* ]]; then
-                        log_warn "Stale lock: PID $lock_pid is now a different process"
-                        rm -rf "$LOCKFILE" 2>/dev/null || true
-                        continue
-                    fi
-                fi
-            fi
-        fi
-
-        # Wait timeout
         if [[ $waited -ge $LOCK_MAX_WAIT ]]; then
-            local lock_owner
-            lock_owner=$(cat "${LOCKFILE}/pid" 2>/dev/null || echo "unknown")
-            log_error "Lock held by process $lock_owner"
-            log_error "If you're sure no other instance is running, remove: $LOCKFILE"
+            log_error "Lock held by $(updater_lock_describe_holder)"
+            local open_holders
+            open_holders="$(updater_lock_list_open_holders)"
+            if [[ -n "$open_holders" ]]; then
+                log_error "Processes with the lock file open: $open_holders"
+            fi
+            log_info "Wait for it to finish or stop that process: the lock is released when it exits."
+            log_info "Nothing needs to be deleted ($LOCKFILE is never removed)."
+            eval "exec ${fd}>&-"
             return "$E_LOCKED"
         fi
 
         [[ $waited -eq 0 ]] && log_info "Waiting for other instance to finish..."
-        sleep 1
+        # up to a second, and back the moment the holder is gone
+        if flock -w 1 "$fd" 2>/dev/null; then
+            break
+        fi
         ((waited++)) || true
     done
+
+    if ! updater_lock_record_owner "$fd"; then
+        # The record is only informational, but a disk that cannot take 64 bytes
+        # cannot take the journal or the history either: say so now instead of
+        # failing half way through an update.
+        log_error "Cannot write the lock file in $UPDATER_STATE_DIR (disk full or read-only?)"
+        eval "exec ${fd}>&-"
+        return "$E_PERMISSION"
+    fi
+    UPDATER_LOCK_FD="$fd"
+    log_debug "Lock acquired (PID: $$)"
+    return 0
 }
 
+# Give the lock up: close the descriptor. The file stays. Must run before the
+# self-update re-exec (the new image would inherit the descriptor and then wait
+# for a lock its own earlier open file description holds).
 # shellcheck disable=SC2317  # Function invoked indirectly via cleanup
 release_lock() {
-    if [[ -d "$LOCKFILE" ]]; then
-        local lock_pid
-        lock_pid=$(cat "${LOCKFILE}/pid" 2>/dev/null || echo "")
-
-        if [[ "$lock_pid" == "$$" ]]; then
-            rm -rf "$LOCKFILE"
-            log_debug "Lock released"
-        else
-            log_debug "Lock not owned by this process (PID: $$, lock: $lock_pid)"
-        fi
+    local fd="$UPDATER_LOCK_FD"
+    UPDATER_LOCK_FD=-1
+    if [[ "$fd" =~ ^[0-9]+$ ]] && ((fd > 2)); then
+        eval "exec ${fd}>&-" 2>/dev/null || true
+        log_debug "Lock released"
     fi
 }
 
@@ -834,7 +959,7 @@ reinstall_service_with_customizations() {
     # Call install command to regenerate service file
     # Capture output but suppress expected informational messages
     local install_output
-    if ! install_output=$("$script_path" install 2>&1); then
+    if ! install_output=$(run_unlocked "$script_path" install 2>&1); then
         log_error "Failed to reinstall service definition"
         if [[ -n "$install_output" ]]; then
             log_debug "Install output: $install_output"
@@ -1596,7 +1721,7 @@ check_prerequisites() {
     fi
 
     # Check for git
-    if ! command -v git >/dev/null 2>&1; then
+    if ! type -P git >/dev/null 2>&1; then
         log_error "Git is not installed or not in PATH"
         log_info "Installation instructions:"
         log_info "  Debian/Ubuntu: sudo apt-get install git"
@@ -1638,7 +1763,7 @@ check_prerequisites() {
     log_debug "Bash version: $bash_major.$bash_minor [OK]"
 
     # Check for required external utilities
-    local required_utils=("awk" "sed" "grep" "tput")
+    local required_utils=("awk" "sed" "grep" "tput" "flock")
     local missing_utils=()
 
     for util in "${required_utils[@]}"; do
@@ -1650,11 +1775,12 @@ check_prerequisites() {
     if [[ ${#missing_utils[@]} -gt 0 ]]; then
         log_error "Required utilities not found: ${missing_utils[*]}"
         log_info "Please install these utilities and try again"
+        log_info "(flock is part of util-linux)"
         return "$E_PREREQUISITES"
     fi
 
     # Check for systemctl (for service management)
-    if ! command -v systemctl >/dev/null 2>&1; then
+    if ! type -P systemctl >/dev/null 2>&1; then
         log_debug "systemctl not found - service update features will be limited"
     fi
 
@@ -1670,6 +1796,7 @@ check_prerequisites() {
         if [[ "$OSTYPE" == "darwin"* ]] && command -v gtimeout >/dev/null 2>&1; then
             log_debug "Using gtimeout (macOS coreutils)"
             # Create function alias for compatibility
+            # shellcheck disable=SC2329  # called through run_unlocked
             timeout() { gtimeout "$@"; }
             export -f timeout
         else
@@ -1866,7 +1993,7 @@ query_remote_default_branch() {
     local out
     if command -v timeout >/dev/null 2>&1; then
         out="$(GIT_HTTP_LOW_SPEED_LIMIT=1000 GIT_HTTP_LOW_SPEED_TIME="$REMOTE_PROBE_TIMEOUT" \
-            timeout "$REMOTE_PROBE_TIMEOUT" git ls-remote --symref origin HEAD 2>/dev/null)" || return 1
+            run_unlocked timeout "$REMOTE_PROBE_TIMEOUT" git ls-remote --symref origin HEAD 2>/dev/null)" || return 1
     else
         out="$(GIT_HTTP_LOW_SPEED_LIMIT=1000 GIT_HTTP_LOW_SPEED_TIME="$REMOTE_PROBE_TIMEOUT" \
             git ls-remote --symref origin HEAD 2>/dev/null)" || return 1
@@ -2489,7 +2616,7 @@ transaction_rollback() {
         rm -f "$SERVICE_UPDATE_MARKER"
     elif [[ "${TRANSACTION_STATE[service_was_running]}" == "true" ]] \
         && [[ "${TRANSACTION_STATE[recovering]}" == "true" ]] \
-        && command -v systemctl >/dev/null 2>&1 \
+        && type -P systemctl >/dev/null 2>&1 \
         && ! systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null; then
         # recovering after the marker is gone (reboot): the service was running
         # when the update began and is not now
@@ -2741,7 +2868,7 @@ fetch_updates_safe() {
         # stalled http transfer where there is no timeout command)
         if command -v timeout >/dev/null 2>&1; then
             if fetch_output=$(GIT_HTTP_LOW_SPEED_LIMIT=1000 GIT_HTTP_LOW_SPEED_TIME="$FETCH_TIMEOUT" \
-                timeout "$FETCH_TIMEOUT" git fetch --all --tags --prune 2>&1); then
+                run_unlocked timeout "$FETCH_TIMEOUT" git fetch --all --tags --prune 2>&1); then
                 fetch_succeeded=true
                 break
             fi
@@ -2768,7 +2895,7 @@ fetch_updates_safe() {
 
     # Update remote HEAD reference (this asks the remote again: bounded too)
     if command -v timeout >/dev/null 2>&1; then
-        timeout "$FETCH_TIMEOUT" git remote set-head origin --auto >/dev/null 2>&1 || true
+        run_unlocked timeout "$FETCH_TIMEOUT" git remote set-head origin --auto >/dev/null 2>&1 || true
     else
         git remote set-head origin --auto >/dev/null 2>&1 || true
     fi
@@ -3064,12 +3191,11 @@ switch_version_safe() {
         # temporary "false" as the operator's own value and kept it for good.)
         restore_git_config
 
-        # Release our lock BEFORE exec. exec replaces the process (same PID) and
-        # does NOT fire the EXIT trap, so the lock dir would survive. The re-exec'd
-        # process would then find a lock held by its own live PID -- the staleness
-        # check cannot fire (the PID is alive and is us) -- wait LOCK_MAX_WAIT, and
-        # abort with E_LOCKED. That made every self-update fail (and orphaned the
-        # stash and the service-update marker).
+        # Release our lock BEFORE exec. exec keeps the process, and with it the
+        # open lock descriptor, and does NOT fire the EXIT trap. The new image
+        # would then wait LOCK_MAX_WAIT for a lock that its own inherited
+        # descriptor holds and abort with E_LOCKED, which made every self-update
+        # fail (and orphaned the stash and the service-update marker).
         release_lock
 
         # Replace this process with the new script
@@ -3631,7 +3757,7 @@ show_startup_diagnostics() {
     # Quick fetch (with short timeout)
     local fetch_ok=false
     if command -v timeout >/dev/null 2>&1; then
-        if timeout 5 git fetch --all --tags --prune --quiet 2>/dev/null; then
+        if run_unlocked timeout 5 git fetch --all --tags --prune --quiet 2>/dev/null; then
             fetch_ok=true
         fi
     else

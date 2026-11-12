@@ -383,13 +383,39 @@ teardown() {
     [[ "$output" == *"release_lock"* ]]
 }
 
-@test "release_lock removes a lock owned by the current PID [C7 regression]" {
-    mkdir -p "$LOCKFILE"
-    echo "$$" > "$LOCKFILE/pid"
-    [ -d "$LOCKFILE" ]
+# acquire_lock, a competing flock, release_lock: held while we hold it, free
+# after release_lock, and the file is the same one throughout (never unlinked)
+_lock_cycle() {
+    local inode
+    acquire_lock || { echo "acquire_lock failed"; return 1; }
+    inode="$(stat -c %i "$LOCKFILE")"
+    if flock -n "$LOCKFILE" true; then echo "not held after acquire_lock"; return 1; fi
     release_lock
-    [ ! -d "$LOCKFILE" ]
-    rm -rf "$LOCKFILE" 2>/dev/null || true
+    flock -n "$LOCKFILE" true || { echo "still held after release_lock"; return 1; }
+    [ -f "$LOCKFILE" ] || { echo "release_lock removed the lock file"; return 1; }
+    [ "$(stat -c %i "$LOCKFILE")" = "$inode" ] || { echo "the lock file was replaced"; return 1; }
+}
+
+@test "release_lock frees the lock this process holds and leaves the lock file in place [C7 regression]" {
+    run _lock_cycle
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+}
+
+@test "release_lock without the lock is harmless" {
+    run release_lock
+    [ "$status" -eq 0 ]
+}
+
+@test "updater_proc_starttime is field 22 of /proc/PID/stat and fails for a process that does not exist" {
+    local expected
+    expected="$(sed 's/^.*) //' "/proc/$$/stat" | awk '{print $20}')"
+    run updater_proc_starttime "$$"
+    [ "$status" -eq 0 ]
+    [ "$output" = "$expected" ]
+    run updater_proc_starttime 2147483646
+    [ "$status" -ne 0 ]
+    run updater_proc_starttime "not-a-pid"
+    [ "$status" -ne 0 ]
 }
 
 # ============================================================================

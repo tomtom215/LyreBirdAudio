@@ -3,8 +3,15 @@
 # is "running" while the file named by FAKE_SVC_STATE holds "running".
 # Every call is appended to FAKE_SVC_LOG. FAKE_SVC_FAIL_START (any value) makes
 # `start` fail, as a service that crashes on its new version would.
+# FAKE_SVC_LOCK_PROBE names a file; a call that has it open as a descriptor is
+# logged as "lock-fd-open systemctl <args>".
 state="${FAKE_SVC_STATE:?FAKE_SVC_STATE not set}"
 echo "systemctl $*" >>"${FAKE_SVC_LOG:-/dev/null}"
+if [[ -n "${FAKE_SVC_LOCK_PROBE:-}" ]]; then
+    for fd in /proc/$$/fd/*; do
+        [[ "$fd" -ef "$FAKE_SVC_LOCK_PROBE" ]] && echo "lock-fd-open systemctl $*" >>"${FAKE_SVC_LOG:-/dev/null}"
+    done
+fi
 # options like --quiet are not interesting
 args=()
 for a in "$@"; do
