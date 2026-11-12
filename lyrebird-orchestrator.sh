@@ -425,7 +425,8 @@ check_terminal() {
 
 check_dependencies() {
     local missing=()
-    local deps=("pgrep" "grep" "awk" "sed")
+    # (pgrep is no longer needed: processes are found by identity, in /proc, X-54)
+    local deps=("grep" "awk" "sed")
 
     for cmd in "${deps[@]}"; do
         if ! command_exists "$cmd"; then
@@ -637,49 +638,37 @@ refresh_system_state() {
         MEDIAMTX_VERSION="not installed"
     fi
 
-    # Check if MediaMTX is running
-    if pgrep -x mediamtx >/dev/null 2>&1; then
+    # Is MediaMTX running? This installation's MediaMTX by identity: the program at
+    # MEDIAMTX_BINARY running the manager's configuration file. Never "a process called
+    # mediamtx": a decoy, an editor on the configuration and another installation's MediaMTX
+    # all carry that name (X-54, decision D11)
+    MEDIAMTX_RUNNING=false
+    if declare -F lyrebird_mediamtx_pids >/dev/null 2>&1 \
+        && lyrebird_mediamtx_pids "${MEDIAMTX_BINARY:-/usr/local/bin/mediamtx}" \
+            "${MEDIAMTX_CONFIG_FILE:-${MEDIAMTX_CONFIG_DIR:-/etc/mediamtx}/mediamtx.yml}" >/dev/null 2>&1; then
         MEDIAMTX_RUNNING=true
-    else
-        MEDIAMTX_RUNNING=false
     fi
 
-    # Count active streams with DoS prevention (limit to reasonable maximum)
+    # Count active streams: the stream manager's wrapper processes (one per stream, found
+    # by identity in the manager's FFmpeg directory), not every FFmpeg on the host
     ACTIVE_STREAMS=0
-
-    if pgrep -x ffmpeg >/dev/null 2>&1; then
-        local raw_count
-
-        # Use efficient pgrep -c if available, otherwise limit output before counting
-        if command_exists pgrep && pgrep --help 2>&1 | grep -q -- '-c'; then
-            # Modern pgrep supports -c for efficient counting. Use `|| true`, not
-            # `|| echo 0`: `pgrep -c` already prints "0" when there is no match
-            # (and exits 1), so `|| echo 0` would append a SECOND 0, yielding the
-            # two-line "0\n0" that fails the numeric guard below and logs a false
-            # "invalid stream count" warning.
-            raw_count=$(pgrep -c -x ffmpeg 2>/dev/null || true)
-            raw_count="${raw_count:-0}"
-        else
-            # Fallback: limit output before counting to prevent DoS
-            # head -n 1001 ensures we never process more than 1001 PIDs
-            raw_count=$(pgrep -x ffmpeg 2>/dev/null | head -n 1001 | wc -l) || true
-        fi
-
-        # Validate count with overflow protection
-        # First check string length to prevent overflow in arithmetic operations
-        if [[ ! "$raw_count" =~ ^[0-9]{1,7}$ ]]; then
-            # Not a valid number or too large (>9,999,999) - could cause overflow
-            log "WARN" "Invalid or oversized stream count: '${raw_count:0:20}'"
-            ACTIVE_STREAMS=0
-        elif ((raw_count > 0 && raw_count <= 1000)); then
-            ACTIVE_STREAMS=$raw_count
-        elif ((raw_count > 1000)); then
-            log "ERROR" "Excessive stream count detected: $raw_count (capping at 1000)"
-            log "ERROR" "System may be under attack or experiencing runaway processes"
-            ACTIVE_STREAMS=1000 # Cap at reasonable limit for display
-        else
-            ACTIVE_STREAMS=0
-        fi
+    local raw_count=""
+    if declare -F lyrebird_stream_wrapper_pids >/dev/null 2>&1; then
+        raw_count="$(lyrebird_stream_wrapper_pids "${MEDIAMTX_FFMPEG_DIR:-/var/lib/mediamtx-ffmpeg}" 2>/dev/null | head -n 1001 | wc -l)" || true
+    fi
+    raw_count="${raw_count//[[:space:]]/}"
+    raw_count="${raw_count:-0}"
+    # Validate the count with overflow protection: first the string length, so that
+    # arithmetic never sees a huge value
+    if [[ ! "$raw_count" =~ ^[0-9]{1,7}$ ]]; then
+        log "WARN" "Invalid or oversized stream count: '${raw_count:0:20}'"
+        ACTIVE_STREAMS=0
+    elif ((raw_count > 1000)); then
+        log "ERROR" "Excessive stream count detected: $raw_count (capping at 1000)"
+        log "ERROR" "System may be under attack or experiencing runaway processes"
+        ACTIVE_STREAMS=1000 # Cap at reasonable limit for display
+    else
+        ACTIVE_STREAMS=$((10#$raw_count))
     fi
 
     # Check if USB devices are mapped

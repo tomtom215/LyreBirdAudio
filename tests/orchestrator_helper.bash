@@ -31,10 +31,15 @@
 #   STUB_UPDATER_REWRITES=FILE       an updater `--rollback` appends a line to FILE (it rewrites
 #                                    the scripts on disk, as a real rollback does)
 #   STUB_PGREP_MEDIAMTX=1, STUB_PGREP_FFMPEG=N
-#                                    the pgrep stand-in sees MediaMTX / N FFmpeg processes;
+#                                    the process scans see MediaMTX / N stream wrappers
+#                                    (lyrebird_mediamtx_pids and lyrebird_stream_wrapper_pids
+#                                    of lyrebird-common.sh, which the orchestrator finds its
+#                                    processes with, by identity, X-54; the variable names are
+#                                    from the pgrep it used before);
 #                                    with STUB_PGREP_ONLY_AFTER_START=1 only once a stream
 #                                    manager `start` has been run (the state changes under
-#                                    the orchestrator, as it does on a real node)
+#                                    the orchestrator, as it does on a real node). The real
+#                                    scans are tested in tests/test_process_identity_display.bats
 
 ORCH_HELPER_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ORCH_ROOT="$(cd "$ORCH_HELPER_DIR/.." && pwd)"
@@ -97,37 +102,9 @@ ENGINE_EOF
         chmod +x "$ORCH_STUBS/$name"
     done
 
-    # The host's processes must not decide a test: pgrep sees what the test says
-    cat >"$ORCH_DIR/bin/pgrep" <<'PGREP_EOF'
-#!/bin/bash
-if [[ "$*" == *--help* ]]; then
-    echo "usage: pgrep [-c] [-x] PATTERN"
-    exit 0
-fi
-mtx="${STUB_PGREP_MEDIAMTX:-0}"
-ff="${STUB_PGREP_FFMPEG:-0}"
-if [[ -n "${STUB_PGREP_ONLY_AFTER_START:-}" && ! -e "$ORCH_DIR/started" ]]; then
-    mtx=0
-    ff=0
-fi
-case "$*" in
-    *mediamtx*)
-        [[ "$mtx" == 1 ]] && { echo 4242; exit 0; }
-        exit 1
-        ;;
-    *ffmpeg*)
-        n="$ff"
-        if [[ "$*" == *-c* ]]; then
-            echo "$n"
-            ((n > 0)) && exit 0
-            exit 1
-        fi
-        ((n > 0)) || exit 1
-        for ((i = 0; i < n; i++)); do echo $((5000 + i)); done
-        ;;
-esac
-PGREP_EOF
-    chmod +x "$ORCH_DIR/bin/pgrep"
+    # (the host's processes must not decide a test: orch_run replaces the two process scans,
+    # see STUB_PGREP_* above)
+    # a directory for the PATH stand-ins a test adds (sudo, ...)
     export PATH="$ORCH_DIR/bin:$PATH"
 }
 
@@ -168,6 +145,19 @@ orch_run() {
         printf 'source %q\n' "${ORCH_SOURCE:-$ORCH_ROOT/lyrebird-orchestrator.sh}"
         printf 'clear() { :; }\n'
         printf 'LOG_FILE=%q\n' "$ORCH_DIR/orchestrator.log"
+        # The host's processes must not decide a test: the process scans see what the test says
+        cat <<'SCAN_EOF'
+_stub_scan_active() { [[ -z "${STUB_PGREP_ONLY_AFTER_START:-}" || -e "$ORCH_DIR/started" ]]; }
+lyrebird_mediamtx_pids() {
+    [[ "${STUB_PGREP_MEDIAMTX:-0}" == 1 ]] && _stub_scan_active || return 1
+    echo 4242
+}
+lyrebird_stream_wrapper_pids() {
+    local n="${STUB_PGREP_FFMPEG:-0}" i
+    ((n > 0)) && _stub_scan_active || return 1
+    for ((i = 0; i < n; i++)); do echo $((5000 + i)); done
+}
+SCAN_EOF
         local key name
         for key in "${ORCH_KEYS[@]}"; do
             case "$key" in

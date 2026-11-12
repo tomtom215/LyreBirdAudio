@@ -7,7 +7,7 @@
 # Copyright: Tom F and LyreBirdAudio contributors
 # License: Apache 2.0
 #
-# Version: 1.1.0
+# Version: 1.2.0
 #
 # DESCRIPTION:
 #   This library provides shared utility functions used across all LyreBirdAudio
@@ -67,7 +67,7 @@ if [[ -n "${_LYREBIRD_COMMON_LOADED:-}" ]]; then
 fi
 
 # Version of the common library (declared after guard to avoid readonly error on re-source)
-readonly LYREBIRD_COMMON_VERSION="1.1.0"
+readonly LYREBIRD_COMMON_VERSION="1.2.0"
 readonly _LYREBIRD_COMMON_LOADED=true
 
 #=============================================================================
@@ -300,6 +300,81 @@ fi
 lyrebird_timestamp() {
     # Include timezone abbreviation for clarity in logs
     date '+%Y-%m-%d %H:%M:%S %Z' 2>/dev/null || echo "[UNKNOWN]"
+}
+
+#=============================================================================
+# Process Identity (decision D11, X-54)
+#=============================================================================
+# This installation's processes are told apart by what they are, never by what they
+# are called: a name or command-line pattern (`pgrep -x mediamtx`, `pgrep -f ...`)
+# also matches an editor on mediamtx.yml, a decoy, another installation's MediaMTX
+# and every other FFmpeg on the host. The display code (diagnostics, orchestrator)
+# uses these two scans; the stream manager and the metrics exporter keep their own
+# checks, which also use the start times they recorded.
+#
+# A process is identified by its executable (/proc/PID/exe, an upgrade's " (deleted)"
+# suffix ignored) and its first argument (argv[1]; /proc/PID/cmdline is readable by
+# every user). Where the executable of another user's process cannot be read (no
+# root), argv[1], which is this installation's own configuration file or wrapper
+# script, is the evidence.
+
+# Set _LYREBIRD_ARGV1 to the first argument of process $1. Fails when the process is
+# gone, a zombie or unreadable (nothing to read).
+_lyrebird_proc_argv1() {
+    _LYREBIRD_ARGV1=""
+    local argv0=""
+    {
+        IFS= read -r -d '' argv0 || true
+        IFS= read -r -d '' _LYREBIRD_ARGV1 || true
+    } 2>/dev/null <"/proc/$1/cmdline" || return 1
+    [[ -n "$argv0" ]]
+}
+
+# Print the PIDs of this installation's MediaMTX, one per line: the program at BIN
+# running the configuration file CONFIG (how the stream manager and mediamtx.service
+# both start it). Status 0 when there is one, 1 when there is none.
+# Usage: lyrebird_mediamtx_pids BIN CONFIG
+lyrebird_mediamtx_pids() {
+    local bin="${1:?lyrebird_mediamtx_pids: program required}" config="${2:?lyrebird_mediamtx_pids: configuration file required}"
+    local want dir pid exe found=1 deleted_suffix=" (deleted)"
+    want="$(readlink -f -- "$bin" 2>/dev/null)" || want=""
+    [[ -n "$want" ]] || want="$bin"
+    for dir in /proc/[0-9]*; do
+        pid="${dir#/proc/}"
+        _lyrebird_proc_argv1 "$pid" || continue
+        [[ "$_LYREBIRD_ARGV1" == "$config" ]] || continue
+        if exe="$(readlink "/proc/${pid}/exe" 2>/dev/null)" && [[ -n "$exe" ]]; then
+            [[ "${exe%"${deleted_suffix}"}" == "$want" ]] || continue
+        fi
+        printf '%s\n' "$pid"
+        found=0
+    done
+    return "$found"
+}
+
+# Print the PIDs of the stream manager's wrapper processes, one per line: a bash whose
+# first argument is a generated stream script, DIR/<stream>.sh (directly in DIR, the
+# manager's FFmpeg directory, MEDIAMTX_FFMPEG_DIR). One per stream: the FFmpeg it runs
+# is its child, and an FFmpeg that is not a child of one is none of ours. Status 0 when
+# there is one, 1 when there is none.
+# Usage: lyrebird_stream_wrapper_pids DIR
+lyrebird_stream_wrapper_pids() {
+    local dir="${1:?lyrebird_stream_wrapper_pids: wrapper directory required}"
+    local script pid exe found=1 dirpath
+    dir="${dir%/}"
+    for dirpath in /proc/[0-9]*; do
+        pid="${dirpath#/proc/}"
+        _lyrebird_proc_argv1 "$pid" || continue
+        script="$_LYREBIRD_ARGV1"
+        [[ "$script" == "${dir}/"*.sh ]] || continue
+        [[ "${script#"${dir}/"}" != */* ]] || continue
+        if exe="$(readlink "/proc/${pid}/exe" 2>/dev/null)" && [[ -n "$exe" ]]; then
+            [[ "${exe##*/}" == bash ]] || continue
+        fi
+        printf '%s\n' "$pid"
+        found=0
+    done
+    return "$found"
 }
 
 #=============================================================================

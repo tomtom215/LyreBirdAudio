@@ -635,18 +635,13 @@ get_script_version() {
     echo "${version:-unknown}"
 }
 
-# Get MediaMTX version from running process or binary
+# Get the MediaMTX version from the binary (the command line of a running MediaMTX
+# never carries one, so the process is not consulted)
 get_mediamtx_version() {
     local version=""
 
     if [[ -x "${MEDIAMTX_BINARY}" ]]; then
         version=$("${MEDIAMTX_BINARY}" --version 2>/dev/null | head -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' || echo "")
-    fi
-
-    if [[ -z "${version}" ]] && command -v pgrep >/dev/null 2>&1; then
-        if pgrep -f "${MEDIAMTX_BINARY}" >/dev/null 2>&1; then
-            version=$(pgrep -af "${MEDIAMTX_BINARY}" | head -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' || echo "")
-        fi
     fi
 
     echo "${version:-unknown}"
@@ -671,12 +666,14 @@ get_stream_manager_status() {
         fi
     fi
 
-    # Fallback: check if process is running (works for all init systems)
-    if command -v pgrep >/dev/null 2>&1; then
-        if pgrep -f "lyrebird-stream-manager.sh" >/dev/null 2>&1; then
-            echo "running"
-            return
-        fi
+    # Fallback (any init system): the manager's `start` returns once MediaMTX and the
+    # stream wrappers run in the background, so the node is running when this
+    # installation's MediaMTX is, found by identity and not by a name in a command line
+    # (X-54, D11)
+    if declare -F lyrebird_mediamtx_pids >/dev/null 2>&1 \
+        && lyrebird_mediamtx_pids "${MEDIAMTX_BINARY}" "${MEDIAMTX_CONFIG_FILE}" >/dev/null; then
+        echo "running"
+        return
     fi
 
     # Check for log file as indicator of previous installation
@@ -3167,6 +3164,17 @@ parse_arguments() {
     done
 }
 
+# Set MEDIAMTX_PID to this installation's MediaMTX by identity (the program at
+# MEDIAMTX_BINARY running MEDIAMTX_CONFIG_FILE), empty when there is none. Never a process
+# whose command line merely contains the binary's path: an editor on the configuration,
+# this script's own arguments, another installation's (X-54, decision D11)
+cache_mediamtx_pid() {
+    MEDIAMTX_PID=""
+    if declare -F lyrebird_mediamtx_pids >/dev/null 2>&1; then
+        MEDIAMTX_PID="$(lyrebird_mediamtx_pids "${MEDIAMTX_BINARY}" "${MEDIAMTX_CONFIG_FILE}" | head -n 1 || true)"
+    fi
+}
+
 # Main execution
 main() {
     detect_colors
@@ -3176,9 +3184,7 @@ main() {
     log INFO "Diagnostic started from ${SCRIPT_DIR} (version ${SCRIPT_VERSION}, mode: ${COMMAND}, init: ${INIT_SYSTEM})"
 
     # Cache MediaMTX PID once at startup
-    if command -v pgrep >/dev/null 2>&1; then
-        MEDIAMTX_PID="$(pgrep -f "${MEDIAMTX_BINARY}" | grep -v "^$$\$" | head -1 || echo "")"
-    fi
+    cache_mediamtx_pid
     log DEBUG "Cached MediaMTX PID: ${MEDIAMTX_PID}"
 
     if [[ "${QUIET}" != "true" ]]; then
