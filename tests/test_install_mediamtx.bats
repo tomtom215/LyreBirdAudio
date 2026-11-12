@@ -1040,10 +1040,12 @@ assert_decoys_alive() {
     export MEDIAMTX_RTSP_PORT=31021 MEDIAMTX_API_PORT=31022 MEDIAMTX_METRICS_PORT=31023
     run_strict create_config
     [ "$status" -eq 0 ]
+    # (the API and metrics bind the loopback address since installer pass 2 [LB-06 installer]; the
+    # port is what this test is about)
     grep -qxF 'rtspAddress: :31021' "$CONFIG_DIR/mediamtx.yml"
-    grep -qxF 'apiAddress: :31022' "$CONFIG_DIR/mediamtx.yml"
-    grep -qxF 'metricsAddress: :31023' "$CONFIG_DIR/mediamtx.yml"
-    run grep -E '^(rtsp|api|metrics)Address: :(8554|9997|9998)$' "$CONFIG_DIR/mediamtx.yml"
+    grep -qxF 'apiAddress: 127.0.0.1:31022' "$CONFIG_DIR/mediamtx.yml"
+    grep -qxF 'metricsAddress: 127.0.0.1:31023' "$CONFIG_DIR/mediamtx.yml"
+    run grep -E '^(rtsp|api|metrics)Address: .*:(8554|9997|9998)$' "$CONFIG_DIR/mediamtx.yml"
     [ "$status" -eq 1 ]
 }
 
@@ -1053,8 +1055,8 @@ assert_decoys_alive() {
     run_strict create_config
     [ "$status" -eq 0 ]
     grep -qxF 'rtspAddress: :8554' "$CONFIG_DIR/mediamtx.yml"
-    grep -qxF 'apiAddress: :9997' "$CONFIG_DIR/mediamtx.yml"
-    grep -qxF 'metricsAddress: :9998' "$CONFIG_DIR/mediamtx.yml"
+    grep -qxF 'apiAddress: 127.0.0.1:9997' "$CONFIG_DIR/mediamtx.yml"
+    grep -qxF 'metricsAddress: 127.0.0.1:9998' "$CONFIG_DIR/mediamtx.yml"
 }
 
 @test "show_status checks the ports named by MEDIAMTX_RTSP_PORT, MEDIAMTX_API_PORT and MEDIAMTX_METRICS_PORT [X-19 installer]" {
@@ -1102,4 +1104,344 @@ PY
             return 1
         }
     done
+}
+
+# ============================================================================
+# The configuration comes from the shared generator [LB-06 installer,
+# LB-22 installer, N-2]
+#
+# create_config used to write its own heredoc: API and metrics on every
+# interface, SRT and (MediaMTX 1.19+) MoQ left on, `paths: {}` (so MediaMTX
+# answers every publisher with "path is not configured"), no ownership marker,
+# the ports written as given. It now renders lyrebird_render_mediamtx_config,
+# the generator the stream manager uses, validates the ports and writes through
+# lyrebird_atomic_write. Real MediaMTX binaries: tests/test_install_mediamtx_live.bats.
+# ============================================================================
+
+# An executable that answers like MediaMTX where the installer asks: --version
+# prints VERSION. With "validate" its --help lists --validate-conf, and
+# --validate-conf=FILE logs FILE's path and first line to $FAKE_LOG and exits
+# 1 (printing "ERR: $FAKE_REJECT" on stderr) when FAKE_REJECT is set.
+#   fake_mediamtx PATH VERSION [validate]
+fake_mediamtx() {
+    local path="$1" version="$2" mode="${3:-}"
+    mkdir -p "$(dirname "$path")"
+    {
+        echo '#!/bin/bash'
+        echo 'case "${1:-}" in'
+        printf '    --version) echo %q; exit 0 ;;\n' "$version"
+        if [[ "$mode" == validate ]]; then
+            echo '    --help) echo "Flags:"; echo "  --validate-conf=path  check whether a configuration file is valid"; exit 0 ;;'
+            echo '    --validate-conf=*)'
+            echo '        f="${1#--validate-conf=}"'
+            echo '        { echo "validated $f"; head -n 1 "$f"; } >>"${FAKE_LOG:-/dev/null}"'
+            echo '        if [[ -n "${FAKE_REJECT:-}" ]]; then echo "ERR: $FAKE_REJECT" >&2; exit 1; fi'
+            echo '        exit 0 ;;'
+        fi
+        echo 'esac'
+        echo 'exit 0'
+    } >"$path"
+    chmod +x "$path"
+}
+
+# What the shared generator renders for the given options, on stdout
+render_expected() {
+    bash -c 'source "$1"; shift; lyrebird_render_mediamtx_config "$@"' _ "$PROJECT_ROOT/lyrebird-common.sh" "$@"
+}
+
+@test "create_config writes the shared generator's configuration for the installed binary, byte for byte, marker first [LB-22 installer, LB-06 installer]" {
+    installer_env
+    fake_mediamtx "$INSTALL_DIR/mediamtx" v1.21.1
+    export MEDIAMTX_RTSP_PORT=31021 MEDIAMTX_API_PORT=31022 MEDIAMTX_METRICS_PORT=31023
+    run_strict create_config
+    [ "$status" -eq 0 ]
+    render_expected --mediamtx-version v1.21.1 --rtsp-port 31021 --api-port 31022 --metrics-port 31023 >"$DECOY_DIR/expected.yml"
+    cmp "$DECOY_DIR/expected.yml" "$CONFIG_DIR/mediamtx.yml"
+    [ "$(head -n 1 "$CONFIG_DIR/mediamtx.yml")" = "# Managed by LyreBirdAudio" ]
+    # the loopback API and metrics, and every protocol the project does not use switched off
+    grep -qxF 'apiAddress: 127.0.0.1:31022' "$CONFIG_DIR/mediamtx.yml"
+    grep -qxF 'metricsAddress: 127.0.0.1:31023' "$CONFIG_DIR/mediamtx.yml"
+    local key
+    for key in rtmp hls webrtc srt moq; do
+        grep -qxF "$key: no" "$CONFIG_DIR/mediamtx.yml" || {
+            echo "$key is not switched off"
+            return 1
+        }
+    done
+    # a publisher can publish: one catch-all path, not `paths: {}`
+    grep -qF "'~^[a-zA-Z0-9_-]+\$':" "$CONFIG_DIR/mediamtx.yml"
+    ! grep -q 'paths: {}' "$CONFIG_DIR/mediamtx.yml" || false
+}
+
+@test "create_config leaves the moq key to the installed binary's version, and says so when it cannot tell [LB-06 installer]" {
+    installer_env
+    local version
+    for version in v1.15.0 v1.18.0; do
+        fake_mediamtx "$INSTALL_DIR/mediamtx" "$version"
+        rm -f "$CONFIG_DIR/mediamtx.yml"
+        run_strict create_config
+        [ "$status" -eq 0 ]
+        ! grep -q '^moq:' "$CONFIG_DIR/mediamtx.yml" || {
+            echo "moq written for $version, which rejects it"
+            return 1
+        }
+    done
+    for version in v1.19.0 v1.21.3 v2.0.0; do
+        fake_mediamtx "$INSTALL_DIR/mediamtx" "$version"
+        rm -f "$CONFIG_DIR/mediamtx.yml"
+        run_strict create_config
+        [ "$status" -eq 0 ]
+        grep -qxF 'moq: no' "$CONFIG_DIR/mediamtx.yml" || {
+            echo "moq not switched off for $version"
+            return 1
+        }
+    done
+    # a binary that does not run: the release being installed says which version it is
+    printf '#!/bin/bash\nexit 1\n' >"$INSTALL_DIR/mediamtx"
+    rm -f "$CONFIG_DIR/mediamtx.yml"
+    PREAMBLE='RELEASE_VERSION=v1.21.1' run_strict create_config
+    [ "$status" -eq 0 ]
+    grep -qxF 'moq: no' "$CONFIG_DIR/mediamtx.yml"
+    # no binary and no release: no key a version could reject, and a warning that says what that costs
+    rm -f "$INSTALL_DIR/mediamtx" "$CONFIG_DIR/mediamtx.yml"
+    PREAMBLE='' run_strict create_config
+    [ "$status" -eq 0 ]
+    ! grep -q '^moq:' "$CONFIG_DIR/mediamtx.yml" || false
+    [[ "$output" == *"version is unknown"* && "$output" == *"MoQ"* ]]
+}
+
+@test "a port that is not an integer from 1 to 65535 stops create_config with a message that names the variable, and nothing is written [N-2]" {
+    installer_env
+    local var value
+    for var in MEDIAMTX_RTSP_PORT MEDIAMTX_API_PORT MEDIAMTX_METRICS_PORT; do
+        for value in abc 0 65536 -1 1e3 ' 80' '80 81' $'80\n81' '8554;touch pwned' 99999999999; do
+            rm -f "$CONFIG_DIR/mediamtx.yml"
+            export "$var=$value"
+            run_strict create_config
+            unset "$var"
+            [ "$status" -eq 10 ] || {
+                echo "$var=$value: status $status"
+                echo "$output"
+                return 1
+            }
+            [[ "$output" == *"$var must be an integer from 1 to 65535"* ]] || {
+                echo "$var=$value: the message does not name the variable:"
+                echo "$output"
+                return 1
+            }
+            [ ! -e "$CONFIG_DIR/mediamtx.yml" ] || {
+                echo "$var=$value: a configuration was written"
+                return 1
+            }
+        done
+    done
+}
+
+@test "install checks the ports and the generator before it downloads or writes anything [N-2, LB-22 installer]" {
+    installer_env
+    local preamble='get_release_info() { : >"$DECOY_DIR/release.called"; RELEASE_VERSION=v9.9.9; }; download_mediamtx() { : >"$DECOY_DIR/download.called"; }'
+    # a bad port
+    MEDIAMTX_API_PORT=abc PREAMBLE="$preamble" run_strict install_mediamtx
+    [ "$status" -eq 10 ]
+    [[ "$output" == *"MEDIAMTX_API_PORT must be an integer from 1 to 65535 (got: abc)"* ]]
+    # two settings that name the same port: the generator refuses, and says which
+    MEDIAMTX_API_PORT=31022 MEDIAMTX_METRICS_PORT=31022 PREAMBLE="$preamble" run_strict install_mediamtx
+    [ "$status" -eq 10 ]
+    [[ "$output" == *"must differ"* ]]
+    # nothing was fetched, installed or written
+    [ ! -e "$DECOY_DIR/release.called" ]
+    [ ! -e "$DECOY_DIR/download.called" ]
+    [ ! -e "$INSTALL_DIR/mediamtx" ]
+    [ -z "$(ls -A "$CONFIG_DIR")" ]
+}
+
+@test "install without --no-config stops at once, exit 4, when lyrebird-common.sh is not beside the installer [LB-22 installer]" {
+    installer_env
+    # a copy of the installer in a directory that has no library
+    mkdir -p "$DECOY_DIR/standalone"
+    cp "$PROJECT_ROOT/install_mediamtx.sh" "$DECOY_DIR/standalone/"
+    export DECOY_DIR
+    run bash -c 'source "$DECOY_DIR/standalone/install_mediamtx.sh"
+        get_release_info() { : >"$DECOY_DIR/release.called"; }
+        install_mediamtx' _
+    [ "$status" -eq 4 ]
+    [[ "$output" == *"lyrebird-common.sh is required"* ]]
+    [ ! -e "$DECOY_DIR/release.called" ]
+    # create_config says the same; --no-config does not need the library
+    run bash -c 'source "$DECOY_DIR/standalone/install_mediamtx.sh"; create_config' _
+    [ "$status" -eq 4 ]
+    [[ "$output" == *"lyrebird-common.sh is required"* ]]
+    run bash -c 'source "$DECOY_DIR/standalone/install_mediamtx.sh"; SKIP_CONFIG=true; check_config_inputs; create_config' _
+    [ "$status" -eq 0 ]
+}
+
+@test "ports with leading zeros are read as decimal, and an empty variable means the default [N-2, X-19 installer]" {
+    installer_env
+    export MEDIAMTX_RTSP_PORT=08554 MEDIAMTX_API_PORT= MEDIAMTX_METRICS_PORT=09998
+    run_strict create_config
+    [ "$status" -eq 0 ]
+    grep -qxF 'rtspAddress: :8554' "$CONFIG_DIR/mediamtx.yml"
+    grep -qxF 'apiAddress: 127.0.0.1:9997' "$CONFIG_DIR/mediamtx.yml"
+    grep -qxF 'metricsAddress: 127.0.0.1:9998' "$CONFIG_DIR/mediamtx.yml"
+}
+
+@test "create_config on a new installation writes a 0644 file with no backup and no temporary file left [LB-22 installer]" {
+    installer_env
+    run_strict create_config
+    [ "$status" -eq 0 ]
+    [ "$(stat -c %a "$CONFIG_DIR/mediamtx.yml")" = 644 ]
+    [ "$(ls -A "$CONFIG_DIR")" = "mediamtx.yml" ]
+    [[ "$output" == *"delete its first line"* ]]
+}
+
+@test "create_config writes through lyrebird_atomic_write, and a write that fails leaves the old file as it was [LB-22 installer]" {
+    installer_env
+    run_strict create_config
+    [ "$status" -eq 0 ]
+    local before
+    before="$(sha256sum <"$CONFIG_DIR/mediamtx.yml")"
+    # the same helper the stream manager writes its configuration with: destination and mode
+    export MEDIAMTX_RTSP_PORT=31021
+    PREAMBLE='lyrebird_atomic_write() { printf "%s\n" "$*" >>"$DECOY_DIR/atomic.log"; return 1; }' \
+        run_strict create_config
+    [ "$status" -ne 0 ]
+    [ "$(cat "$DECOY_DIR/atomic.log")" = "$CONFIG_DIR/mediamtx.yml 0644" ]
+    [[ "$output" == *"Failed to write"* ]]
+    # (the failed write triggered the installer's rollback, which puts the backup it had made back)
+    [ "$(sha256sum <"$CONFIG_DIR/mediamtx.yml")" = "$before" ]
+    [ -z "$(compgen -G "$CONFIG_DIR/.mediamtx.yml.*" || true)" ]
+}
+
+@test "a managed file whose rendering is unchanged is left untouched: same inode, same mtime, no backup [LB-22 installer]" {
+    installer_env
+    run_strict create_config
+    [ "$status" -eq 0 ]
+    touch -d '2020-01-01 00:00:00' "$CONFIG_DIR/mediamtx.yml"
+    local inode mtime
+    inode="$(stat -c %i "$CONFIG_DIR/mediamtx.yml")"
+    mtime="$(stat -c %Y "$CONFIG_DIR/mediamtx.yml")"
+    run_strict create_config
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"left untouched"* ]]
+    [ "$(stat -c %i "$CONFIG_DIR/mediamtx.yml")" = "$inode" ]
+    [ "$(stat -c %Y "$CONFIG_DIR/mediamtx.yml")" = "$mtime" ]
+    [ "$(ls -A "$CONFIG_DIR")" = "mediamtx.yml" ]
+}
+
+@test "a managed file whose rendering changes is replaced after a timestamped backup of the old one [LB-22 installer]" {
+    installer_env
+    export MEDIAMTX_RTSP_PORT=31021
+    run_strict create_config
+    [ "$status" -eq 0 ]
+    cp "$CONFIG_DIR/mediamtx.yml" "$DECOY_DIR/first.yml"
+    export MEDIAMTX_RTSP_PORT=31031
+    run_strict create_config
+    [ "$status" -eq 0 ]
+    grep -qxF 'rtspAddress: :31031' "$CONFIG_DIR/mediamtx.yml"
+    local -a backups=()
+    mapfile -t backups < <(compgen -G "$CONFIG_DIR/mediamtx.yml.backup.*")
+    [ "${#backups[@]}" -eq 1 ]
+    [[ "${backups[0]}" =~ mediamtx\.yml\.backup\.[0-9]{8}-[0-9]{6}$ ]]
+    cmp "$DECOY_DIR/first.yml" "${backups[0]}"
+    [[ "$output" == *"backed up to: ${backups[0]}"* ]]
+}
+
+@test "an operator-owned file is not overwritten without --force: bytes, mode and inode survive, and the message says how to replace it [LB-22 installer]" {
+    installer_env
+    printf '# my own settings\nlogLevel: debug\nrtspAddress: :8554\n' >"$CONFIG_DIR/mediamtx.yml"
+    chmod 640 "$CONFIG_DIR/mediamtx.yml"
+    cp -p "$CONFIG_DIR/mediamtx.yml" "$DECOY_DIR/mine.yml"
+    local inode
+    inode="$(stat -c %i "$CONFIG_DIR/mediamtx.yml")"
+    run_strict create_config
+    [ "$status" -eq 0 ]
+    cmp "$DECOY_DIR/mine.yml" "$CONFIG_DIR/mediamtx.yml"
+    [ "$(stat -c %a "$CONFIG_DIR/mediamtx.yml")" = 640 ]
+    [ "$(stat -c %i "$CONFIG_DIR/mediamtx.yml")" = "$inode" ]
+    [ "$(ls -A "$CONFIG_DIR")" = "mediamtx.yml" ]
+    [[ "$output" == *"NOT overwritten"* && "$output" == *"--force"* && "$output" == *"# Managed by LyreBirdAudio"* ]]
+}
+
+@test "--force replaces an operator-owned file after saving a backup with its mode, and says it is doing so [LB-22 installer]" {
+    installer_env
+    printf '# my own settings\nlogLevel: debug\nauthMethod: internal\n' >"$CONFIG_DIR/mediamtx.yml"
+    chmod 640 "$CONFIG_DIR/mediamtx.yml"
+    cp -p "$CONFIG_DIR/mediamtx.yml" "$DECOY_DIR/mine.yml"
+    PREAMBLE='FORCE_MODE=true' run_strict create_config
+    [ "$status" -eq 0 ]
+    [ "$(head -n 1 "$CONFIG_DIR/mediamtx.yml")" = "# Managed by LyreBirdAudio" ]
+    local -a backups=()
+    mapfile -t backups < <(compgen -G "$CONFIG_DIR/mediamtx.yml.backup.*")
+    [ "${#backups[@]}" -eq 1 ]
+    cmp "$DECOY_DIR/mine.yml" "${backups[0]}"
+    # the copy keeps the mode: an operator's 0640 file does not become world-readable
+    [ "$(stat -c %a "${backups[0]}")" = 640 ]
+    [[ "$output" == *"was not generated by LyreBirdAudio: replacing it because --force was given"* ]]
+}
+
+@test "the file an earlier release of this installer wrote is recognised as such, kept without --force and replaced with it [LB-06 installer, LB-22 installer]" {
+    installer_env
+    {
+        echo '###############################################'
+        echo '# MediaMTX Configuration'
+        echo '# Generated by install_mediamtx.sh v2.0.1'
+        echo 'apiAddress: :9997'
+        echo 'paths: {}'
+    } >"$CONFIG_DIR/mediamtx.yml"
+    run_strict create_config
+    [ "$status" -eq 0 ]
+    grep -qxF 'apiAddress: :9997' "$CONFIG_DIR/mediamtx.yml"
+    [[ "$output" == *"earlier release of this installer"* && "$output" == *"every interface"* ]]
+    PREAMBLE='FORCE_MODE=true' run_strict create_config
+    [ "$status" -eq 0 ]
+    grep -qxF 'apiAddress: 127.0.0.1:9997' "$CONFIG_DIR/mediamtx.yml"
+    [[ "$output" == *"earlier release of this installer"* ]]
+}
+
+@test "an empty file, what a power cut during the old non-durable write leaves, is replaced and not treated as the operator's [LB-22 installer]" {
+    installer_env
+    : >"$CONFIG_DIR/mediamtx.yml"
+    run_strict create_config
+    [ "$status" -eq 0 ]
+    [ "$(head -n 1 "$CONFIG_DIR/mediamtx.yml")" = "# Managed by LyreBirdAudio" ]
+    [ "$(ls -A "$CONFIG_DIR")" = "mediamtx.yml" ]
+}
+
+@test "two replacements in the same second keep both backups [LB-22 installer]" {
+    installer_env
+    export MEDIAMTX_RTSP_PORT=31021
+    run_strict create_config
+    [ "$status" -eq 0 ]
+    local port
+    for port in 31031 31041; do
+        export MEDIAMTX_RTSP_PORT=$port
+        PREAMBLE='date() { echo 20260101-000000; }' run_strict create_config
+        [ "$status" -eq 0 ]
+    done
+    local -a backups=()
+    mapfile -t backups < <(compgen -G "$CONFIG_DIR/mediamtx.yml.backup.*" | sort)
+    [ "${#backups[@]}" -eq 2 ]
+    grep -qxF 'rtspAddress: :31021' "${backups[0]}" || grep -qxF 'rtspAddress: :31021' "${backups[1]}"
+    grep -qxF 'rtspAddress: :31031' "${backups[0]}" || grep -qxF 'rtspAddress: :31031' "${backups[1]}"
+}
+
+@test "the generated configuration is validated by the binary that will run it, before the file is replaced [LB-22 installer]" {
+    installer_env
+    fake_mediamtx "$INSTALL_DIR/mediamtx" v1.21.1 validate
+    export FAKE_LOG="$DECOY_DIR/fake.log"
+    run_strict create_config
+    [ "$status" -eq 0 ]
+    # MediaMTX was asked about a file other than the destination, and that file was the rendering
+    local asked
+    asked="$(sed -n 1p "$FAKE_LOG")"
+    [[ "$asked" == validated\ * && "$asked" != *"$CONFIG_DIR/mediamtx.yml" ]]
+    [ "$(sed -n 2p "$FAKE_LOG")" = "# Managed by LyreBirdAudio" ]
+    # a binary that rejects it: nothing is written and MediaMTX's own words are shown
+    cp "$CONFIG_DIR/mediamtx.yml" "$DECOY_DIR/before.yml"
+    export MEDIAMTX_RTSP_PORT=31031 FAKE_REJECT='json: unknown field "moq"'
+    run_strict create_config
+    [ "$status" -eq 7 ]
+    [[ "$output" == *'MediaMTX rejects the generated configuration'* && "$output" == *'unknown field "moq"'* ]]
+    cmp "$DECOY_DIR/before.yml" "$CONFIG_DIR/mediamtx.yml"
+    [ "$(ls -A "$CONFIG_DIR")" = "mediamtx.yml" ]
 }

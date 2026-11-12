@@ -1186,6 +1186,127 @@ download_mediamtx() {
     log_debug "Binary extracted and verified"
 }
 
+# The version a MediaMTX binary reports ("vX.Y.Z"), or nothing and status 1 when
+# it is not an executable, does not run, or prints no version.
+#   mediamtx_binary_version BINARY
+mediamtx_binary_version() {
+    local bin="$1" out="" ver=""
+    [[ -x "${bin}" ]] || return 1
+    if command -v timeout &>/dev/null; then
+        out=$(timeout 10 "${bin}" --version 2>/dev/null) || return 1
+    else
+        out=$("${bin}" --version 2>/dev/null) || return 1
+    fi
+    ver=$(grep -oE 'v?[0-9]+\.[0-9]+\.[0-9]+' <<<"${out}" | head -n 1) || true
+    [[ -n "${ver}" ]] || return 1
+    printf '%s\n' "${ver}"
+}
+
+# --- MediaMTX configuration --------------------------------------------------
+#
+# The configuration comes from lyrebird_render_mediamtx_config (lyrebird-common.sh),
+# the generator the stream manager uses too: API and metrics on the loopback
+# address, every protocol this project does not use switched off, MoQ switched
+# off only for MediaMTX versions that have it, the first line the marker that
+# says LyreBirdAudio generated the file. A file without that first line is the
+# operator's (decision D10): it is never overwritten unless --force says so.
+
+# Stop with a clear message unless the shared library, which holds the
+# generator, is beside this script.
+require_config_generator() {
+    if ! declare -F lyrebird_render_mediamtx_config >/dev/null 2>&1 \
+        || ! declare -F lyrebird_is_valid_port >/dev/null 2>&1 \
+        || ! declare -F lyrebird_atomic_write >/dev/null 2>&1; then
+        fatal "lyrebird-common.sh is required next to ${SCRIPT_NAME}: it holds the MediaMTX configuration generator (run the installer from a complete checkout of LyreBirdAudio, or use --no-config)" 4
+    fi
+}
+
+# The ports reach the configuration file, so each must be a decimal integer from
+# 1 to 65535 (leading zeros are fine and are not octal); an empty variable means
+# the default. A bad value stops the run before anything is written.
+validate_port_settings() {
+    local -a names=(MEDIAMTX_RTSP_PORT MEDIAMTX_API_PORT MEDIAMTX_METRICS_PORT)
+    local -a values=("${DEFAULT_RTSP_PORT}" "${DEFAULT_API_PORT}" "${DEFAULT_METRICS_PORT}")
+    local i
+    for i in "${!names[@]}"; do
+        if ! lyrebird_is_valid_port "${values[${i}]}"; then
+            fatal "${names[${i}]} must be an integer from 1 to 65535 (got: $(printf '%q' "${values[${i}]}"))" 10
+        fi
+    done
+}
+
+# Render the configuration for MediaMTX $2 (empty = unknown version: no key a
+# version could reject is written) into file $1. Prints nothing on stdout.
+render_mediamtx_config() {
+    local out_file="$1" version="${2:-}" err=""
+    local -a args=(--rtsp-port "${DEFAULT_RTSP_PORT}" --api-port "${DEFAULT_API_PORT}"
+        --metrics-port "${DEFAULT_METRICS_PORT}")
+    if [[ -n "${version}" ]]; then
+        args+=(--mediamtx-version "${version}")
+    fi
+    if ! err=$(lyrebird_render_mediamtx_config "${args[@]}" 2>&1 >"${out_file}"); then
+        log_error "Cannot render the MediaMTX configuration: ${err}"
+        return 1
+    fi
+}
+
+# Everything `install` needs to write the configuration is checked before it
+# changes anything: the generator is present, the ports are valid and differ.
+check_config_inputs() {
+    [[ "${SKIP_CONFIG}" != "true" ]] || return 0
+    require_config_generator
+    validate_port_settings
+    render_mediamtx_config /dev/null "" || fatal "Invalid MediaMTX port settings" 10
+}
+
+# Is the first line of file $1 the marker that says LyreBirdAudio generated it?
+# Trailing blanks and the CR of a CRLF line ending do not count.
+config_is_managed() {
+    local first=""
+    IFS= read -r first <"$1" || [[ -n "${first}" ]] || return 1
+    first="${first%"${first##*[![:space:]]}"}"
+    [[ "${first}" == "${LYREBIRD_MEDIAMTX_CONFIG_MARKER}" ]]
+}
+
+# Ask the MediaMTX binary $1 whether it accepts configuration file $2, where it
+# can (--validate-conf exists from 1.21; an older binary has no such check and
+# the answer is yes). Logs MediaMTX's own message when it does not.
+mediamtx_accepts_config() {
+    local bin="$1" file="$2" help="" out="" rc=0
+    [[ -x "${bin}" ]] || return 0
+    if command -v timeout &>/dev/null; then
+        help=$(timeout 10 "${bin}" --help 2>&1) || true
+    else
+        help=$("${bin}" --help 2>&1) || true
+    fi
+    [[ "${help}" == *--validate-conf* ]] || return 0
+    if command -v timeout &>/dev/null; then
+        out=$(timeout 20 "${bin}" "--validate-conf=${file}" 2>&1) || rc=$?
+    else
+        out=$("${bin}" "--validate-conf=${file}" 2>&1) || rc=$?
+    fi
+    if [[ ${rc} -ne 0 ]]; then
+        log_error "MediaMTX rejects the generated configuration: ${out}"
+        return 1
+    fi
+    return 0
+}
+
+# Keep a copy of the configuration file about to be replaced, next to it, with
+# its mode, owner and time. Sets CONFIG_BACKUP (execute_rollback puts it back).
+backup_config_file() {
+    local config_file="$1" stamp backup n=0
+    stamp="$(date +%Y%m%d-%H%M%S)"
+    backup="${config_file}.backup.${stamp}"
+    while [[ -e "${backup}" ]]; do
+        ((++n))
+        backup="${config_file}.backup.${stamp}.${n}"
+    done
+    cp -p -- "${config_file}" "${backup}" || return 1
+    CONFIG_BACKUP="${backup}"
+    log_info "Existing config backed up to: ${CONFIG_BACKUP}"
+}
+
 create_config() {
     local config_file="${CONFIG_DIR}/${CONFIG_NAME}"
 
@@ -1199,66 +1320,71 @@ create_config() {
         return 0
     fi
 
-    [[ -d "${CONFIG_DIR}" ]] || mkdir -p "${CONFIG_DIR}"
+    require_config_generator
+    validate_port_settings
 
-    # Backup existing config
-    if [[ -f "${config_file}" ]]; then
-        CONFIG_BACKUP="${config_file}.backup.$(date +%Y%m%d-%H%M%S)"
-        cp "${config_file}" "${CONFIG_BACKUP}"
-        log_info "Existing config backed up to: ${CONFIG_BACKUP}"
+    # The keys MediaMTX rejects depend on its version: render for the binary
+    # that was just installed
+    local version=""
+    version=$(mediamtx_binary_version "${INSTALL_DIR}/mediamtx") || version="${RELEASE_VERSION}"
+    if [[ -z "${version}" ]]; then
+        log_warn "The MediaMTX version is unknown: the generated configuration leaves out the keys only newer versions have (a MediaMTX 1.19 or later then starts a MoQ listener)"
     fi
 
-    cat >"${config_file}" <<EOF
-###############################################
-# MediaMTX Configuration
-# Generated by ${SCRIPT_NAME} v${SCRIPT_VERSION}
-# Date: $(date -Iseconds)
-###############################################
+    local rendered=""
+    rendered=$(mktemp) || fatal "Cannot create a temporary file for the configuration" 1
+    CLEANUP_FILES+=("${rendered}")
+    render_mediamtx_config "${rendered}" "${version}" || fatal "Not writing ${config_file}" 10
+    mediamtx_accepts_config "${INSTALL_DIR}/mediamtx" "${rendered}" || fatal "Not writing ${config_file}" 7
 
-# Global settings
-logLevel: info
-logDestinations: [stdout]
-logFile: ${STATE_DIR}/mediamtx.log
+    [[ -d "${CONFIG_DIR}" ]] || mkdir -p "${CONFIG_DIR}"
 
-# API Configuration
-api: yes
-apiAddress: :${DEFAULT_API_PORT}
+    # Who owns the file that is there? An empty one is what a power cut during a
+    # non-durable write leaves behind: nobody keeps an empty configuration.
+    local state=new
+    if [[ -s "${config_file}" ]]; then
+        if config_is_managed "${config_file}"; then
+            state=managed
+        else
+            state=operator
+        fi
+    elif [[ -e "${config_file}" ]]; then
+        state=managed
+    fi
 
-# Metrics
-metrics: yes
-metricsAddress: :${DEFAULT_METRICS_PORT}
+    case "${state}" in
+        managed)
+            if cmp -s "${rendered}" "${config_file}"; then
+                log_info "Configuration is up to date: ${config_file} left untouched"
+                return 0
+            fi
+            ;;
+        operator)
+            local origin=""
+            if [[ "$(sed -n 2p "${config_file}" 2>/dev/null)" == "# MediaMTX Configuration" ]]; then
+                origin=" It looks like the file an earlier release of this installer wrote: its API and metrics listen on every interface, it leaves SRT and MoQ on and it accepts no publisher."
+            fi
+            if [[ "${FORCE_MODE}" != "true" ]]; then
+                log_warn "${config_file} exists and does not start with the line '${LYREBIRD_MEDIAMTX_CONFIG_MARKER}': it is treated as yours, NOT overwritten, and used as it is.${origin} To replace it with the generated configuration, run the installer with --force (the previous file is saved first)."
+                return 0
+            fi
+            log_warn "${config_file} does not start with the line '${LYREBIRD_MEDIAMTX_CONFIG_MARKER}', so it was not generated by LyreBirdAudio: replacing it because --force was given.${origin}"
+            ;;
+        *) ;;
+    esac
 
-# RTSP Server Configuration
-rtsp: yes
-rtspAddress: :${DEFAULT_RTSP_PORT}
-rtspEncryption: "no"
-rtspTransports: [tcp, udp]
+    if [[ -s "${config_file}" ]]; then
+        backup_config_file "${config_file}" || fatal "Cannot save a backup of ${config_file}: leaving it as it is" 1
+    fi
 
-# RTMP Server (disabled by default)
-rtmp: no
-rtmpAddress: :1935
+    # Atomic and durable: a reader or a power cut sees the old file or the new one, never half
+    if ! lyrebird_atomic_write "${config_file}" 0644 <"${rendered}"; then
+        fatal "Failed to write ${config_file}" 1
+    fi
+    rm -f "${rendered}"
 
-# HLS Server (disabled by default)
-hls: no
-hlsAddress: :8888
-
-# WebRTC (disabled by default)
-webrtc: no
-webrtcAddress: :8889
-
-# Paths configuration
-pathDefaults:
-  source: publisher
-  sourceOnDemand: no
-
-paths: {}
-  # Define your paths here
-EOF
-
-    chmod 644 "${config_file}"
-    chown root:root "${config_file}" 2>/dev/null || true
-
-    log_info "Configuration created: ${config_file}"
+    log_info "Configuration created: ${config_file} (API and metrics listen on 127.0.0.1 only)"
+    log_info "To keep hand edits in it, delete its first line ('${LYREBIRD_MEDIAMTX_CONFIG_MARKER}'): a file without that line is yours and is never overwritten"
 }
 
 create_service() {
@@ -1389,6 +1515,10 @@ install_mediamtx() {
     if [[ -f "${INSTALL_DIR}/mediamtx" ]] && [[ "${FORCE_MODE}" != "true" ]]; then
         fatal "MediaMTX is already installed. Use --force to override or 'update' command" 7
     fi
+
+    # Settings that cannot be carried into the configuration stop the run before
+    # anything is downloaded or written
+    check_config_inputs
 
     # Early writability check
     if [[ "${DRY_RUN_MODE}" != "true" ]]; then
@@ -2107,7 +2237,9 @@ ${BOLD}OPTIONS:${NC}
     -v, --verbose              Enable verbose output
     -q, --quiet                Suppress non-error output
     -n, --dry-run              Show what would be done
-    -f, --force                Force operation (skip confirmations/checksums)
+    -f, --force                Force operation (skip confirmations; skip checksum verification
+                               only when no checksum is available; replace a configuration
+                               file that is not LyreBirdAudio's, saving a backup first)
     -V, --target-version VER   Install specific version
     -p, --prefix DIR           Installation prefix (default: ${DEFAULT_INSTALL_PREFIX})
     --version                  Show script version
