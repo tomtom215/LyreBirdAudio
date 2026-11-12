@@ -188,6 +188,11 @@ readonly EXIT_DELETE_FAILED=3
 # Deletions that failed in this run; every delete goes through safe_delete.
 DELETE_FAILURES=0
 
+# Files removed (or, in a dry run, that would be) in this run and their size in
+# bytes, for the summary line; safe_delete keeps them.
+RUN_FILES=0
+RUN_BYTES=0
+
 # Most files one emergency run evicts, so a single run stays short; the next
 # monitor run continues.
 readonly EMERGENCY_MAX_DELETE=100
@@ -227,9 +232,19 @@ fi
 # Helper Functions
 # ============================================================================
 
+# The log is stderr: this script writes nothing to stdout except `status`. With
+# --quiet (QUIET=true) the informational lines are dropped and warnings, errors
+# and the one summary line of the run (log_summary) remain; a cron job then
+# mails, or an `>> file 2>&1` redirection keeps, one line per run plus whatever
+# needs attention.
+QUIET=false
+
 log() {
     local level="${1:-INFO}"
     shift
+    if [[ "$QUIET" == "true" && "$level" == "INFO" ]]; then
+        return 0
+    fi
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] [${level}] $*" >&2
 }
 
@@ -237,6 +252,11 @@ log_info() { log INFO "$@"; }
 log_warn() { log WARN "$@"; }
 log_error() { log ERROR "$@"; }
 log_debug() { [[ "${DEBUG:-false}" == "true" ]] && log DEBUG "$@" || true; }
+# The one line --quiet still prints at INFO level
+log_summary() {
+    local QUIET=false
+    log INFO "$@"
+}
 
 # ============================================================================
 # Signal Handling
@@ -335,15 +355,22 @@ count_files() {
 safe_delete() {
     local path="$1"
     local desc="${2:-file}"
-    local err
+    local err size
+
+    # what the run's summary reports (stat does not follow a symlink)
+    size=$(stat -c%s -- "$path" 2>/dev/null || echo 0)
 
     if [[ "$DRY_RUN" == "true" ]]; then
         log_info "[DRY RUN] Would delete ${desc}: $path"
+        RUN_FILES=$((RUN_FILES + 1))
+        RUN_BYTES=$((RUN_BYTES + size))
         return 0
     fi
 
     log_debug "Deleting ${desc}: $path"
     if err=$(rm -f -- "$path" 2>&1); then
+        RUN_FILES=$((RUN_FILES + 1))
+        RUN_BYTES=$((RUN_BYTES + size))
         return 0
     fi
     # Already gone (another run, or the recorder reusing the slot): done.
@@ -867,22 +894,48 @@ cmd_status() {
     printf "  Emergency threshold: %d%%\n" "$DISK_EMERGENCY_PERCENT"
 }
 
-# Run standard cleanup
-cmd_cleanup() {
-    log_info "Starting storage cleanup"
+# What this run did, for the one summary line: "removed N file(s), X freed" (in a
+# dry run "would remove ..."), and what failed
+_run_totals() {
+    local verb="removed"
+    [[ "$DRY_RUN" != "true" ]] || verb="would remove"
+    printf '%s %d file(s), %s freed' "$verb" "$RUN_FILES" "$(format_bytes "$RUN_BYTES")"
+    if ((DELETE_FAILURES > 0)); then
+        printf '; %d deletion(s) FAILED' "$DELETE_FAILURES"
+    fi
+    if ((SCAN_FAILURES > 0)); then
+        printf '; %d listing(s) FAILED' "$SCAN_FAILURES"
+    fi
+}
 
+# The steps of a standard cleanup. The status is EXIT_DELETE_FAILED when a
+# deletion failed or a directory could not be listed.
+_cleanup_steps() {
+    log_info "Starting storage cleanup"
     cleanup_recordings
     cleanup_logs
     cleanup_temp
     truncate_large_logs
-
-    _report_delete_failures || return "$EXIT_DELETE_FAILED"
-    log_info "Cleanup completed"
+    _report_delete_failures
 }
 
-# Monitor and cleanup if needed
+# Run standard cleanup
+cmd_cleanup() {
+    local rc=0
+    _cleanup_steps || rc=$?
+    if ((rc != 0)); then
+        log_summary "Cleanup incomplete: $(_run_totals)"
+        return "$EXIT_DELETE_FAILED"
+    fi
+    log_summary "Cleanup completed: $(_run_totals)"
+}
+
+# Monitor and cleanup if needed. One check per invocation (run it from cron or a
+# timer); it prints nothing while the disk is fine. When it acts or finds the
+# disk above a threshold, the last line says what the disk looked like and what
+# was done (the one line --quiet keeps).
 cmd_monitor() {
-    local usage free_mb rc=0
+    local usage free_mb rc=0 level="ok" iusage=0
     usage=$(get_disk_usage "/")
     free_mb=$(get_free_space_mb "/")
 
@@ -892,7 +945,8 @@ cmd_monitor() {
     # the safe, retention-based cleanup (which deletes solely by age).
     if [[ ! "$usage" =~ ^[0-9]+$ ]] || [[ ! "$free_mb" =~ ^[0-9]+$ ]]; then
         log_error "Could not determine disk usage for / (df unparseable: usage='${usage}', free='${free_mb}'MB); running standard cleanup only"
-        cmd_cleanup || rc=$?
+        _cleanup_steps || rc=$?
+        log_summary "Monitor: disk usage of / unknown (df unparseable); standard cleanup only: $(_run_totals)"
         return "$rc"
     fi
 
@@ -900,7 +954,6 @@ cmd_monitor() {
     # inodes long before blocks, and every write then fails ENOSPC while the
     # block percentage still looks healthy. Unknown ("-", unsupported fs) is
     # treated as no pressure, never as an emergency.
-    local iusage
     iusage=$(get_inode_usage "/")
     [[ "$iusage" =~ ^[0-9]+$ ]] || iusage=0
 
@@ -908,19 +961,25 @@ cmd_monitor() {
 
     if [[ $usage -ge $DISK_EMERGENCY_PERCENT ]] || [[ $iusage -ge $DISK_EMERGENCY_PERCENT ]] \
         || [[ $free_mb -lt $MIN_FREE_SPACE_MB ]]; then
+        level="emergency"
         log_error "EMERGENCY: Disk ${usage}% full, inodes ${iusage}% used, ${free_mb}MB free"
         emergency_cleanup
-        cmd_cleanup || rc=$?
+        _cleanup_steps || rc=$?
     elif [[ $usage -ge $DISK_CRITICAL_PERCENT ]] || [[ $iusage -ge $DISK_CRITICAL_PERCENT ]]; then
+        level="critical"
         log_warn "CRITICAL: Disk ${usage}% full, inodes ${iusage}% used"
-        cmd_cleanup || rc=$?
+        _cleanup_steps || rc=$?
     elif [[ $usage -ge $DISK_WARNING_PERCENT ]] || [[ $iusage -ge $DISK_WARNING_PERCENT ]]; then
+        level="warning"
         log_warn "WARNING: Disk ${usage}% full, inodes ${iusage}% used"
         cleanup_temp
         truncate_large_logs
         _report_delete_failures || rc=$?
     else
         log_debug "Disk usage OK: ${usage}%"
+    fi
+    if [[ "$level" != "ok" ]]; then
+        log_summary "Monitor: disk ${usage}% used, inodes ${iusage}%, ${free_mb}MB free (${level}): $(_run_totals)"
     fi
     return "$rc"
 }
@@ -953,6 +1012,12 @@ Options:
   -v, --version  Show version
   -n, --dry-run  Show what would be deleted without deleting
   -d, --debug    Enable debug output
+  -q, --quiet    (cleanup, monitor) Print only warnings, errors and one summary
+                 line per run, to stderr like every other message; nothing to
+                 stdout
+  --once         (monitor) One check, then exit. This is what monitor always does:
+                 it never loops, run it from cron or a timer (there is no
+                 --interval)
 
 Environment Variables:
   RECORDING_RETENTION_DAYS   Days to keep recordings (default: 30)
@@ -974,7 +1039,8 @@ Recordings are files ending in: ${RECORDING_EXTENSIONS[*]}
 Exit status:
   0  success
   1  usage error
-  3  finished, but at least one deletion failed (see the ERROR lines)
+  3  finished, but at least one deletion failed (see the ERROR lines), or a
+     directory could not be listed (find's message and an ERROR line say which)
 
 Examples:
   ${SCRIPT_NAME} status
@@ -983,16 +1049,16 @@ Examples:
   ${SCRIPT_NAME} monitor
 
 Cron Integration:
-  # Daily cleanup at 3 AM
-  0 3 * * * ${SCRIPT_NAME} cleanup
+  # Daily cleanup at 3 AM, one summary line per run
+  0 3 * * * ${SCRIPT_NAME} cleanup --quiet
 
-  # Hourly monitoring
-  0 * * * * ${SCRIPT_NAME} monitor
+  # Every 15 minutes: silent while the disk is fine
+  */15 * * * * ${SCRIPT_NAME} monitor --once
 EOF
 }
 
 main() {
-    local command=""
+    local command="" quiet=false once=false
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -1012,6 +1078,14 @@ main() {
                 DEBUG="true"
                 shift
                 ;;
+            -q | --quiet)
+                quiet=true
+                shift
+                ;;
+            --once)
+                once=true
+                shift
+                ;;
             status | cleanup | monitor | emergency)
                 command="$1"
                 shift
@@ -1028,6 +1102,15 @@ main() {
         show_help
         exit 1
     fi
+    if [[ "$quiet" == "true" && "$command" != "cleanup" && "$command" != "monitor" ]]; then
+        log_error "--quiet applies to cleanup and monitor only (not ${command})"
+        exit 1
+    fi
+    if [[ "$once" == "true" && "$command" != "monitor" ]]; then
+        log_error "--once applies to monitor only (not ${command})"
+        exit 1
+    fi
+    QUIET="$quiet"
 
     case "$command" in
         status)
