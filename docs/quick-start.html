@@ -102,7 +102,7 @@ chmod +x *.sh</code></pre>
       <span class="callout-icon">⚠️</span>
       <div class="callout-body">
         <strong>Do not pin a node to a tag that predates the fixes</strong>
-        <p>The newest tag at the time of writing, <code>v1.3.0</code>, was made before the changes these pages describe (the status document, the start policy, the MediaMTX configuration ownership rules, the removal of the watchdog claims, and others). <code>git describe --tags --abbrev=0</code> returns that tag, and the version manager's "latest stable release" is the same tag, so neither gives you the current code until a newer tag exists. If <code>git tag --contains origin/main</code> prints nothing, no release contains the current code yet: use the main branch.</p>
+        <p>The newest tag at the time of writing, <code>v1.3.0</code>, was made before the changes these pages describe (the status document, the start policy, the MediaMTX configuration ownership rules, and others). <code>git describe --tags --abbrev=0</code> returns that tag, and the version manager's "latest stable release" is the same tag, so neither gives you the current code until a newer tag exists. If <code>git tag --contains origin/main</code> prints nothing, no release contains the current code yet: use the main branch.</p>
       </div>
     </div>
 
