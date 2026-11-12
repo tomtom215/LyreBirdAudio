@@ -2,8 +2,14 @@
 # Unit tests for lyrebird-diagnostics.sh
 # Run with: bats tests/test_lyrebird_diagnostics.bats
 
+# scratch_setup also points DIAGNOSTIC_LOG_FILE at the scratch directory: the
+# script logs as soon as it is sourced, and the tests below that source it
+# wrote the real /var/log/lyrebird-diagnostics.log (X-35)
+load scratch_tmpdir
+
 # Setup
 setup() {
+    scratch_setup
     TEST_DIR="$( cd "$( dirname "$BATS_TEST_FILENAME" )" && pwd )"
     PROJECT_ROOT="$( cd "$TEST_DIR/.." && pwd )"
 
@@ -16,6 +22,7 @@ setup() {
 
 teardown() {
     rm -rf "$TEST_TMP" 2>/dev/null || true
+    scratch_teardown
 }
 
 # ============================================================================
@@ -622,4 +629,18 @@ DFEOF
         printf '%s\n' "${mismatches[@]}"
         false
     fi
+}
+
+# X-35: the tests above that source the script ran it against the host's real
+# /var/log/lyrebird-diagnostics.log. The script logs as soon as it is sourced,
+# so the proof that the location is the scratch directory is that the log it
+# wrote is there.
+@test "sourcing the script logs to the scratch directory the suite set, never to /var/log [X-35]" {
+    run env PROJECT_ROOT="$PROJECT_ROOT" bash -c '
+        source "$PROJECT_ROOT/lyrebird-diagnostics.sh" >/dev/null 2>&1
+        printf "%s" "$DIAGNOSTIC_LOG_FILE"
+    '
+    [ "$status" -eq 0 ]
+    [ "$output" = "$TEST_SCRATCH/lyrebird-diagnostics.log" ]
+    [ -s "$TEST_SCRATCH/lyrebird-diagnostics.log" ]
 }

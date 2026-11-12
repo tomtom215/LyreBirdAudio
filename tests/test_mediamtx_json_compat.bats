@@ -142,6 +142,19 @@ _sm() {
     [[ "$output" == *"VALID"* ]]
 }
 
+# X-35: the test above logs through the real validate_stream, which used to
+# append to the host's /var/log/lyrebird-stream-manager.log. The suite now sets
+# STREAM_MANAGER_LOG_FILE; the proof is that the manager's log line is there.
+@test "validate_stream logs to the scratch directory the suite set, never to /var/log [X-35]" {
+    _write_stub_curl '{}' '{"name":"mic1","available":true}'
+    run env PROJECT_ROOT="$PROJECT_ROOT" PATH="$JC_TMP/bin:$PATH" \
+        MEDIAMTX_API_VERSION=v3 STREAM_VALIDATION_DELAY=0 STREAM_VALIDATION_ATTEMPTS=1 \
+        bash -c 'set -euo pipefail; source "$PROJECT_ROOT/lyrebird-stream-manager.sh" >/dev/null 2>&1; validate_stream mic1 >/dev/null 2>&1; printf "%s" "$LOG_FILE"'
+    [ "$status" -eq 0 ]
+    [ "$output" = "$TEST_SCRATCH/lyrebird-stream-manager.log" ]
+    [ -s "$TEST_SCRATCH/lyrebird-stream-manager.log" ]
+}
+
 @test "metrics api_paths_ready counts NEW-shape paths" {
     cat > "$JC_TMP/bin/curl" <<'CURLEOF'
 #!/bin/bash

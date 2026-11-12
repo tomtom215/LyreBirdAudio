@@ -32,6 +32,36 @@ teardown() {
 }
 
 # ---------------------------------------------------------------------------
+# scratch_setup (tests/scratch_tmpdir.bash) is what keeps the scripts' default
+# logs and state off the machine's /var/log and /var/lib in every test file that
+# loads it. The variable names it sets must be the ones the scripts read: each
+# script is sourced for real and asked where it will write.
+# ---------------------------------------------------------------------------
+
+@test "scratch_setup points the manager, diagnostics and alert logs and the alert state at the scratch directory [X-35]" {
+    run env ROOT="$ROOT" bash -c '
+        source "$ROOT/lyrebird-stream-manager.sh" >/dev/null 2>&1
+        printf "manager log: %s\n" "$LOG_FILE"
+    '
+    [ "$status" -eq 0 ]
+    [ "$output" = "manager log: $TEST_SCRATCH/lyrebird-stream-manager.log" ]
+
+    run env ROOT="$ROOT" bash -c '
+        source "$ROOT/lyrebird-diagnostics.sh" >/dev/null 2>&1
+        printf "diagnostics log: %s\n" "$DIAGNOSTIC_LOG_FILE"
+    '
+    [ "$status" -eq 0 ]
+    [ "$output" = "diagnostics log: $TEST_SCRATCH/lyrebird-diagnostics.log" ]
+
+    run env ROOT="$ROOT" bash -c '
+        source "$ROOT/lyrebird-alerts.sh" >/dev/null 2>&1
+        printf "alert log: %s\nalert state: %s\n" "$ALERT_LOG_FILE" "$ALERT_STATE_DIR"
+    '
+    [ "$status" -eq 0 ]
+    [ "$output" = "alert log: $TEST_SCRATCH/lyrebird-alerts.log"$'\n'"alert state: $TEST_SCRATCH/lyrebird-alert-state" ]
+}
+
+# ---------------------------------------------------------------------------
 # tests/check_tmp_leaks.sh with LYREBIRD_LEAK_CHECK_HOST=1 (X-35)
 #
 # The real script runs from a throwaway copy of the repository layout, with a
