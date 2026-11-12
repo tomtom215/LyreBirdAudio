@@ -152,6 +152,41 @@ SUDO_EOF
     [[ "$output" == *"lyrebird-updater.sh failed (exit code: 6 - that version is not available in this clone"* ]]
 }
 
+@test "no menu action that delegates swallows the failure of the script it ran (guard for the \`|| true\` that remain) [LB-21]" {
+    # The remaining `execute_script ... || true` are where a failure is not fatal
+    # for the menu; each must still have been reported, with its exit status
+    export STUB_RC_default=3
+    orch_run \
+        --step 'Select option: ' '2\n' --step 'Continue\? \(y/n\)' 'y' --step 'Press Enter to continue' '\n' \
+        --step 'Select option: ' '4\n' --step 'Press Enter to continue' '\n' \
+        --step 'Select option: ' '5\n' --step 'Press Enter to continue' '\n' \
+        --step 'Select option: ' '6\n' --step 'Press Enter to continue' '\n' \
+        --step 'Select option: ' '0\n' \
+        'menu_streaming'
+    echo "$output"
+    [ "$status" -eq 0 ]
+    # stop, status, stream URLs (status), monitor
+    [ "$(grep -c '\[ERROR\] lyrebird-stream-manager.sh failed (exit code: 3 - a required tool or the MediaMTX binary is missing)' <<<"$output")" -ge 4 ]
+
+    orch_run \
+        --step 'Select option: ' '1\n' --step 'Press Enter to continue' '\n' \
+        --step 'Select option: ' '2\n' --step 'Press Enter to continue' '\n' \
+        --step 'Select option: ' '4\n' --step 'Select operation: ' '1\n' --step 'Press Enter to continue' '\n' \
+        --step 'Select option: ' '4\n' --step 'Select operation: ' '2\n' --step 'Enter card number' '0\n' --step 'Press Enter to continue' '\n' \
+        --step 'Select option: ' '0\n' \
+        'menu_usb_devices'
+    echo "$output"
+    [ "$status" -eq 0 ]
+    # USB mapper (interactive, dry-run), mic check (list, one card)
+    [ "$(grep -c '\[ERROR\] usb-audio-mapper.sh failed (exit code: 3)' <<<"$output")" -eq 2 ]
+    [ "$(grep -c '\[ERROR\] lyrebird-mic-check.sh failed (exit code: 3)' <<<"$output")" -eq 2 ]
+
+    orch_run --step 'Select option: ' '1\n' --step 'Press Enter to continue' '\n' --step 'Select option: ' '0\n' 'menu_versions'
+    echo "$output"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"[ERROR] lyrebird-updater.sh failed (exit code: 3 - not a git repository)"* ]]
+}
+
 @test "MediaMTX menu: every installer action reports its failure with the exit status before the pause [LB-21]" {
     export STUB_RC_default=5
     orch_run \

@@ -114,7 +114,11 @@ def main():
             "pty_run: step %d never matched: %s\n" % (step + 1, steps[step][0].pattern)
         )
         return 125
-    return os.waitstatus_to_exitcode(status)
+    if os.WIFEXITED(status):
+        return os.WEXITSTATUS(status)
+    if os.WIFSIGNALED(status):
+        return 128 + os.WTERMSIG(status)
+    return 1
 
 
 if __name__ == "__main__":

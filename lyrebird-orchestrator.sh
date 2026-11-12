@@ -8,10 +8,31 @@
 # Copyright: Tom F and LyreBirdAudio contributors
 # License: Apache 2.0
 #
-# Version: 2.1.3
+# Version: 2.2.0
 # Description: Production-grade orchestrator providing unified access to all
 #              LyreBirdAudio components with comprehensive functionality,
 #              intuitive navigation, and robust error handling.
+#
+# v2.2.0 Truthful outcomes (register LB-21):
+#   - Changed: Start All Streams, Restart All Streams and the Quick Setup Wizard
+#              read what the stream manager recorded (its status document:
+#              status file, else `status --json`) and show every stream and the
+#              overall state with each failed stream's reason and the next step.
+#              A start that exits 9 is "no stream is publishing" (MediaMTX up, or
+#              stopped again, as the document says); a start that exits 0 with
+#              no microphone is "waiting for devices", with what to do.
+#   - Fixed: the wizard's summary used the state read BEFORE the start step: a
+#            good start on a fresh node ended in "completed with warnings", a
+#            failed start on a streaming node in "streams are now available".
+#   - Changed: execute_script keeps the delegated script's real exit status
+#              (LAST_EXIT_CODE) and the failure line carries its meaning for the
+#              stream manager's and the updater's exit codes; installer failures
+#              are shown right after the action.
+#   - Added: Version Management 3) Show Update History and 4) Roll Back to a
+#            Previous Version (lyrebird-updater.sh --history / --rollback, with
+#            the version it will go to and a confirmation). Menu numbers 1, 2, 0
+#            are unchanged.
+#   - Fixed: get_primary_ip aborted the orchestrator on a system without `ip`.
 #
 # v2.1.3 USB mapping:
 #   - Fixed: after mapping, no longer claims names live in /dev/snd/by-id/ or
@@ -91,7 +112,7 @@ unset _LYREBIRD_COMMON
 # Constants and Configuration
 # ============================================================================
 
-readonly SCRIPT_VERSION="2.1.3"
+readonly SCRIPT_VERSION="2.2.0"
 
 # Initialize constants safely (separate declaration from assignment to catch errors)
 SCRIPT_NAME=""
