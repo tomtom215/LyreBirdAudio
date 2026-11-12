@@ -148,16 +148,17 @@ _load_config_file() {
     fi
 
     CONFIG_FILE_USED="$file"
+    local label="$file" # what the messages in the loop name (the loop reads $file)
     while IFS= read -r line || [[ -n "$line" ]]; do
         lineno=$((lineno + 1))
         if ((CONFIG_PROBLEMS >= STORAGE_CONFIG_MAX_PROBLEMS)); then
-            _conf_log ERROR "${file}:${lineno}: stopped reading after ${STORAGE_CONFIG_MAX_PROBLEMS} problems; this line and the rest of the file were not read"
+            _conf_log ERROR "${label}:${lineno}: stopped reading after ${STORAGE_CONFIG_MAX_PROBLEMS} problems; this line and the rest of the file were not read"
             break
         fi
         # the length is checked before anything else touches the line
         if ((${#line} > STORAGE_CONFIG_MAX_LINE)); then
             if [[ "$line" != "#"* ]]; then
-                _conf_problem "$file" "$lineno" "" "line is ${#line} characters long, more than the ${STORAGE_CONFIG_MAX_LINE} character limit"
+                _conf_problem "$label" "$lineno" "" "line is ${#line} characters long, more than the ${STORAGE_CONFIG_MAX_LINE} character limit"
             fi
             continue
         fi
@@ -171,14 +172,14 @@ _load_config_file() {
             continue
         fi
         if [[ ! "$line" =~ ^([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]]; then
-            _conf_problem "$file" "$lineno" "" "not a KEY=value line (shell commands are not run): '${line:0:40}'" "KEY=value"
+            _conf_problem "$label" "$lineno" "" "not a KEY=value line (shell commands are not run): '${line:0:40}'" "KEY=value"
             continue
         fi
         key="${BASH_REMATCH[1]}"
         rest="${BASH_REMATCH[2]}"
         kind="${_CONF_KIND[$key]-}"
         if [[ -z "$kind" ]]; then
-            _conf_problem "$file" "$lineno" "$key" "unknown setting" "one of ${STORAGE_CONFIG_KEYS}"
+            _conf_problem "$label" "$lineno" "$key" "unknown setting" "one of ${STORAGE_CONFIG_KEYS}"
             continue
         fi
 
@@ -187,7 +188,7 @@ _load_config_file() {
             "'"*)
                 body="${rest:1}"
                 if [[ "$body" != *"'"* ]]; then
-                    _conf_problem "$file" "$lineno" "$key" "unterminated single quote" "a value in matching quotes"
+                    _conf_problem "$label" "$lineno" "$key" "unterminated single quote" "a value in matching quotes"
                     continue
                 fi
                 value="${body%%"'"*}"
@@ -196,13 +197,13 @@ _load_config_file() {
             '"'*)
                 body="${rest:1}"
                 if [[ "$body" != *'"'* ]]; then
-                    _conf_problem "$file" "$lineno" "$key" "unterminated double quote" "a value in matching quotes"
+                    _conf_problem "$label" "$lineno" "$key" "unterminated double quote" "a value in matching quotes"
                     continue
                 fi
                 value="${body%%'"'*}"
                 tail="${body#*'"'}"
                 if [[ "$value" =~ $re_expansion ]]; then
-                    _conf_problem "$file" "$lineno" "$key" "\$, backticks and backslashes are not interpreted in a value" "a plain value, or one in single quotes"
+                    _conf_problem "$label" "$lineno" "$key" "\$, backticks and backslashes are not interpreted in a value" "a plain value, or one in single quotes"
                     continue
                 fi
                 ;;
@@ -210,27 +211,27 @@ _load_config_file() {
                 value="${rest%%[[:space:]]*}"
                 tail="${rest#"$value"}"
                 if [[ ! "$value" =~ ^[A-Za-z0-9._+:/@%,=-]*$ ]]; then
-                    _conf_problem "$file" "$lineno" "$key" "shell syntax is not accepted in a value: '${value:0:40}'" "a plain value, or one in quotes"
+                    _conf_problem "$label" "$lineno" "$key" "shell syntax is not accepted in a value: '${value:0:40}'" "a plain value, or one in quotes"
                     continue
                 fi
                 ;;
         esac
         tail="${tail#"${tail%%[![:space:]]*}"}"
         if [[ -n "$tail" && "$tail" != "#"* ]]; then
-            _conf_problem "$file" "$lineno" "$key" "unexpected text after the value: '${tail:0:40}'" "one value, optionally followed by a # comment"
+            _conf_problem "$label" "$lineno" "$key" "unexpected text after the value: '${tail:0:40}'" "one value, optionally followed by a # comment"
             continue
         fi
 
         case "$kind" in
             uint)
                 if [[ ! "$value" =~ ^[0-9]{1,12}$ ]]; then
-                    _conf_problem "$file" "$lineno" "$key" "not a whole number: '${value:0:40}'" "digits only, for example 30"
+                    _conf_problem "$label" "$lineno" "$key" "not a whole number: '${value:0:40}'" "digits only, for example 30"
                     continue
                 fi
                 ;;
             path)
                 if [[ "$value" != /* ]]; then
-                    _conf_problem "$file" "$lineno" "$key" "not an absolute path: '${value:0:40}'" "a path that starts with /"
+                    _conf_problem "$label" "$lineno" "$key" "not an absolute path: '${value:0:40}'" "a path that starts with /"
                     continue
                 fi
                 ;;
@@ -242,7 +243,7 @@ _load_config_file() {
         else
             canon="$key"
             if [[ -n "${_CONF_VALUE[$canon]+x}" ]]; then
-                _conf_log WARN "${file}:${lineno}: ${key}: overrides the value on line ${_CONF_LINE[$canon]}"
+                _conf_log WARN "${label}:${lineno}: ${key}: overrides the value on line ${_CONF_LINE[$canon]}"
             fi
             _CONF_VALUE[$canon]="$value"
             _CONF_LINE[$canon]="$lineno"
