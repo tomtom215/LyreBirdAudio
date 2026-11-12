@@ -135,16 +135,10 @@ sm() {
 # after the stand-ins, to replace more of them for one test.
 _start_with_stub_mediamtx() {
     export EXTRA_SEAMS="${1:-}"
-    cat >"$D/bin/mediamtx" <<'STUB'
-#!/bin/bash
-[[ "${1:-}" == --version ]] && { echo v1.21.1; exit 0; }
-printf '%s\n' "$$" >>"$STUB_STARTED"
-exec sleep 300
-STUB
-    chmod +x "$D/bin/mediamtx"
+    make_launchable_mediamtx "$D/bin/mediamtx_proc" "$D"
     export STUB_STARTED="$D/mediamtx.started"
-    rm -f "$STUB_STARTED"
-    MEDIAMTX_BINARY="$D/bin/mediamtx" MEDIAMTX_API_TIMEOUT=2 run bash -c '
+    rm -f "$STUB_STARTED" "$STUB_STARTED.pid"
+    MEDIAMTX_BINARY="$STUB_MEDIAMTX_BINARY" BASH_ENV="$STUB_PRELUDE" MEDIAMTX_API_TIMEOUT=2 LYREBIRD_FLOW_SAMPLE_SECONDS=0 run bash -c '
         source "$1" >/dev/null 2>&1
         set +e
         detect_audio_devices() { echo "testmic:1"; }
@@ -152,9 +146,11 @@ STUB
         wait_for_mediamtx_ready() { return 0; }
         start_all_ffmpeg_streams() { :; }
         validate_stream() { return 0; }
+        device_node_exists() { return 0; }
+        mediamtx_path_info() { printf "{\"ready\":true,\"bytesReceived\":1}"; }
         eval "$EXTRA_SEAMS"
         start_mediamtx' _ "$SM"
-    [[ -f "$STUB_STARTED" ]] && HELD_PIDS+=("$(head -n 1 "$STUB_STARTED")")
+    [[ -f "$STUB_STARTED.pid" ]] && HELD_PIDS+=("$(head -n 1 "$STUB_STARTED.pid")")
     return 0
 }
 
@@ -190,7 +186,7 @@ time.sleep(120)' "$1" "$D/listening" 3>&- &
     [ "$status" -eq 0 ]
     [[ "$output" == *"[OK]"*"rtsp://localhost:${P_RTSP}/"* ]]
     [[ "$output" != *":8554/"* ]]
-    kill -9 "$(head -n 1 "$STUB_STARTED")" 2>/dev/null || true
+    kill -9 "$(head -n 1 "$STUB_STARTED.pid")" 2>/dev/null || true
     rm -f "$MEDIAMTX_PID_FILE"
     STREAM_MODE=multiplex MULTIPLEX_STREAM_NAME=studio _start_with_stub_mediamtx 'start_ffmpeg_multiplex_stream() { return 0; }'
     [ "$status" -eq 0 ]
@@ -199,12 +195,12 @@ time.sleep(120)' "$1" "$D/listening" 3>&- &
 
 @test "start_mediamtx prints the URL of a stream that failed validation with the configured RTSP port [X-19]" {
     command -v lsof >/dev/null || command -v ss >/dev/null || skip "neither lsof nor ss is installed"
-    _start_with_stub_mediamtx 'validate_stream() { return 1; }'
-    [[ "$output" == *"[FAIL]"*"rtsp://localhost:${P_RTSP}/"*"(failed)"* ]]
-    kill -9 "$(head -n 1 "$STUB_STARTED")" 2>/dev/null || true
+    _start_with_stub_mediamtx 'mediamtx_path_info() { return 1; }'
+    [[ "$output" == *"[FAIL]"*"rtsp://localhost:${P_RTSP}/"*"(failed"* ]]
+    kill -9 "$(head -n 1 "$STUB_STARTED.pid")" 2>/dev/null || true
     rm -f "$MEDIAMTX_PID_FILE"
-    STREAM_MODE=multiplex MULTIPLEX_STREAM_NAME=studio _start_with_stub_mediamtx 'validate_stream() { return 1; }; start_ffmpeg_multiplex_stream() { return 0; }'
-    [[ "$output" == *"[FAIL]"*"rtsp://localhost:${P_RTSP}/studio (failed)"* ]]
+    STREAM_MODE=multiplex MULTIPLEX_STREAM_NAME=studio _start_with_stub_mediamtx 'mediamtx_path_info() { return 1; }; start_ffmpeg_multiplex_stream() { return 0; }'
+    [[ "$output" == *"[FAIL]"*"rtsp://localhost:${P_RTSP}/studio (multiplexed from 1 devices) (failed"* ]]
 }
 
 @test "start_mediamtx refuses to start when any of the three configured ports is taken, checked with ss when lsof is absent [X-19]" {
@@ -241,7 +237,7 @@ SHIM
     local var port
     for var in P_RTSP P_API P_METRICS; do
         port="${!var}"
-        rm -f "$D/connected" "$D/sm.log" "$D/mediamtx.started"
+        rm -f "$D/connected" "$D/sm.log" "$D/mediamtx.started" "$D/mediamtx.started.pid"
         # a listener elsewhere, and a connected client whose local port is the configured one:
         # `lsof -i :PORT` lists it, nothing listens on PORT
         python3 -I -c '
@@ -268,7 +264,7 @@ time.sleep(120)' "$port" "$D/connected" 3>&- &
             false
         }
         [ -s "$D/mediamtx.started" ]
-        kill -9 "$(head -n 1 "$D/mediamtx.started")" 2>/dev/null || true
+        kill -9 "$(head -n 1 "$D/mediamtx.started.pid")" 2>/dev/null || true
         rm -f "$MEDIAMTX_PID_FILE"
         kill -9 "$LISTENER_PID" 2>/dev/null || true
         wait "$LISTENER_PID" 2>/dev/null || true

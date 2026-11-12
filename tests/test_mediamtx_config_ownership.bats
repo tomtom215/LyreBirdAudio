@@ -9,6 +9,7 @@
 # MediaMTX binaries. No port is bound: the numbers are only written into files.
 
 load scratch_tmpdir
+load mediamtx_live_helper
 
 setup() {
     scratch_setup
@@ -641,7 +642,15 @@ make_users_file() {
 start_with_stub() {
     export EXTRA_SEAMS="${1:-}" STUB_STARTED="$D/mediamtx.started"
     rm -f "$STUB_STARTED"
-    MEDIAMTX_API_TIMEOUT=2 run bash -c '
+    # A launch needs a process the manager recognises as its MediaMTX (a copy of bash
+    # at the binary path); the validation emulation (STUB_VALIDATE=1) is the script
+    # stub, whose tests expect the start to stop before launching anything
+    local binary="$D/bin/mediamtx" prelude=""
+    if [[ "${STUB_VALIDATE:-}" != 1 ]]; then
+        make_launchable_mediamtx "$D/bin/mediamtx_proc" "$D"
+        binary="$STUB_MEDIAMTX_BINARY" prelude="$STUB_PRELUDE"
+    fi
+    MEDIAMTX_BINARY="$binary" BASH_ENV="$prelude" MEDIAMTX_API_TIMEOUT=2 LYREBIRD_FLOW_SAMPLE_SECONDS=0 run bash -c '
         source "$1" >/dev/null 2>&1
         set +e
         detect_audio_devices() { echo "testmic:1"; }
@@ -649,6 +658,8 @@ start_with_stub() {
         wait_for_mediamtx_ready() { return 0; }
         start_all_ffmpeg_streams() { :; }
         validate_stream() { return 0; }
+        device_node_exists() { return 0; }
+        mediamtx_path_info() { printf "{\"ready\":true,\"bytesReceived\":1}"; }
         eval "$EXTRA_SEAMS"
         start_mediamtx' _ "$SM"
     local i

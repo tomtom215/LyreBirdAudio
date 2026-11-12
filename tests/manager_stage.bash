@@ -29,7 +29,11 @@ stage_setup() {
     ST="$TEST_SCRATCH/st"
     HW="$ST/hw"
     API="$ST/api"
-    mkdir -p "$ST/cfg" "$ST/ff" "$ST/bin" "$ST/shim" "$ST/state" "$ST/wrapbin" "$HW/dev-snd" "$API"
+    mkdir -p "$ST/cfg" "$ST/ff" "$ST/bin" "$ST/shim" "$ST/state" "$ST/wrapbin" "$HW/dev-snd" "$HW/asound" "$API"
+    # The manager reads a card's capture PCMs from ASOUND_PROC_ROOT and checks their
+    # device nodes under DEV_SND_ROOT; the wrapper carries both roots. A card without
+    # a capture PCM is skipped as playback-only, so device_add gives each one.
+    export ASOUND_PROC_ROOT="$HW/asound" DEV_SND_ROOT="$HW/dev-snd"
     mkfifo "$ST/hold"
     echo new >"$ST/api-shape"
     export ST HW API PROJECT_ROOT
@@ -38,7 +42,7 @@ stage_setup() {
     export MEDIAMTX_PID_FILE="$ST/mtx.pid"
     export MEDIAMTX_FFMPEG_DIR="$ST/ff"
     export MEDIAMTX_LOCK_FILE="$ST/run.lock"
-    export MEDIAMTX_LOG_FILE="$ST/sm.log"
+    export MEDIAMTX_LOG_FILE="$ST/sm.log" STREAM_MANAGER_LOG_FILE="$ST/sm.log"
     export MEDIAMTX_RESTART_MARKER="$ST/restart.marker"
     export MEDIAMTX_CLEANUP_MARKER="$ST/cleanup.marker"
     export MEDIAMTX_BINARY="$ST/bin/mediamtx"
@@ -196,9 +200,13 @@ stage_teardown() {
 device_add() {
     printf '%s\n' "$1" >"$HW/$2"
     : >"$HW/dev-snd/controlC$2"
+    mkdir -p "$HW/asound/card$2/pcm0c"
+    echo "0d8c:0014" >"$HW/asound/card$2/usbid"
+    : >"$HW/dev-snd/pcmC${2}D0c"
 }
 device_remove() {
-    rm -f "$HW/$1" "$HW/dev-snd/controlC$1"
+    rm -f "$HW/$1" "$HW/dev-snd/controlC$1" "$HW/dev-snd/pcmC${1}D0c"
+    rm -rf "$HW/asound/card$1"
 }
 
 # card_unavailable CARD / card_available CARD: the card stays detected but ALSA

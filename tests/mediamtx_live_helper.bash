@@ -257,3 +257,33 @@ mtx_cleanup() {
     mtx_stop
     stub_stop
 }
+
+# A MediaMTX the real start_mediamtx can launch and then recognise as its own.
+# The manager identifies its MediaMTX by executable and argv[1] (the binary path and
+# the configuration path), so a script that execs `sleep` would not be recognised.
+# The "binary" is therefore a copy of bash at $1; BASH_ENV (honoured only by that
+# copy) makes it record its arguments in $STUB_STARTED (one per line) and its PID
+# in $STUB_STARTED.pid, and wait on a FIFO instead of
+# running the configuration file as a script. Prints nothing; sets
+# STUB_MEDIAMTX_BINARY, STUB_STARTED and STUB_PRELUDE for the caller to pass on.
+#   make_launchable_mediamtx BINARY_PATH WORKDIR
+make_launchable_mediamtx() {
+    local bin="$1" work="$2"
+    mkdir -p "$(dirname "$bin")" "$work"
+    # (not over a copy a previous run still executes: that fails with "text file busy")
+    [[ -x "$bin" ]] || cp "$(command -v bash)" "$bin"
+    [[ -p "$work/mtx.hold" ]] || mkfifo "$work/mtx.hold"
+    cat >"$work/mtx.prelude.sh" <<PRELUDE
+if [[ "\$BASH" == "$bin" ]]; then
+    if [[ -n "\${STUB_STARTED:-}" ]]; then
+        tr '\\0' '\\n' </proc/\$\$/cmdline | sed 1d >"\$STUB_STARTED"
+        printf '%s\\n' "\$\$" >>"\$STUB_STARTED.pid"
+    fi
+    exec {stub_fd}<>"$work/mtx.hold"
+    read -r -t 300 -u "\$stub_fd" || true
+    exit 0
+fi
+PRELUDE
+    export STUB_MEDIAMTX_BINARY="$bin"
+    export STUB_PRELUDE="$work/mtx.prelude.sh"
+}
