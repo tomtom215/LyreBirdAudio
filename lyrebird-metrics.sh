@@ -96,6 +96,78 @@ HEARTBEAT_MAX_AGE="$(resolve_heartbeat_max_age)"
 readonly HEARTBEAT_MAX_AGE
 
 # ============================================================================
+# Process state
+# ============================================================================
+#
+# A process is looked at through /proc/<pid>/stat, which every user may read, and
+# never by sending it a signal: `kill -0` fails with EPERM for another user's
+# process, so a stream wrapper owned by root read as down whenever the exporter
+# ran as an unprivileged user (a cron job as node_exporter, a unit with User=).
+# A /proc entry that exists but cannot be read (/proc mounted with hidepid=1) is
+# "cannot tell", which is not "down": the caller leaves the metric out and fails
+# its collector rather than publish a made-up 0.
+
+_PS_STATE="" # set by read_proc_stat
+_PS_START=""
+_REC_START="" # set by pid_file_recorded_start
+
+# Set _PS_STATE and _PS_START from /proc/PID/stat. Returns 0 when read, 1 when
+# there is no such process, 2 when there is one whose stat cannot be read. The
+# command name is the only field that can contain spaces and is enclosed in
+# parentheses, so everything up to the last ") " is skipped.
+read_proc_stat() {
+    # the shutdown trap can interrupt `IFS= read` with that IFS still in effect
+    local IFS=$' \t\n'
+    local stat rest
+    local -a fields
+    _PS_STATE=""
+    _PS_START=""
+    if ! { read -r stat <"/proc/$1/stat"; } 2>/dev/null; then
+        [[ -d "/proc/$1" ]] && return 2
+        return 1
+    fi
+    rest="${stat##*) }"
+    read -r -a fields <<<"$rest"
+    _PS_STATE="${fields[0]:-}"
+    _PS_START="${fields[19]:-}"
+    return 0
+}
+
+# Is PID running, and (when START is given) the process that started at START
+# (field 22 of /proc/PID/stat)? A PID that has been reused has another start
+# time; a zombie has exited and counts as gone.
+#   0  running
+#   1  not running (no such process, a zombie, or another process under that PID)
+#   2  cannot tell: its /proc entry exists but cannot be read
+proc_check() {
+    local pid="$1" start="${2-}" rc=0
+    [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 1
+    read_proc_stat "$pid" || rc=$?
+    ((rc == 0)) || return "$rc"
+    [[ "$_PS_STATE" != "Z" && "$_PS_STATE" != "X" ]] || return 1
+    [[ -z "$start" || "$_PS_START" == "$start" ]]
+}
+
+# Set _REC_START to the start time the stream manager recorded next to PID file
+# $1 for process $2 ("<pid> <starttime>" in "<pid file>.id"); empty when there is
+# no record (older versions wrote none) or it is about another PID.
+pid_file_recorded_start() {
+    local rec_pid="" rec_start=""
+    _REC_START=""
+    { IFS=' ' read -r rec_pid rec_start _ <"${1}.id"; } 2>/dev/null || true
+    if [[ "$rec_pid" == "$2" && "$rec_start" =~ ^[0-9]+$ ]]; then
+        _REC_START="$rec_start"
+    fi
+}
+
+# Is PID $2 of PID file $1 still the process the manager recorded? proc_check's
+# statuses, with the recorded start time telling a reused PID from the original.
+pid_file_process_state() {
+    pid_file_recorded_start "$1" "$2"
+    proc_check "$2" "$_REC_START"
+}
+
+# ============================================================================
 # Metric Collection Functions
 # ============================================================================
 
@@ -242,10 +314,15 @@ collect_stream_manager_metrics() {
 
     # Check if stream manager is running
     if [[ -f "$PID_FILE" ]]; then
-        local pid
+        local pid state=0
         if pid=$(cat "$PID_FILE" 2>/dev/null); then
-            if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+            pid_file_process_state "$PID_FILE" "$pid" || state=$?
+            if ((state == 0)); then
                 stream_mgr_running=1
+            elif ((state == 2)); then
+                log "ERROR: cannot tell whether PID ${pid} of ${PID_FILE} is running: /proc/${pid} cannot be read (run as root)"
+                failed=1
+                stream_mgr_running=""
             fi
         elif [[ -e "$PID_FILE" ]]; then
             log "ERROR: cannot read ${PID_FILE}"
@@ -269,7 +346,14 @@ collect_stream_manager_metrics() {
                 active_streams=""
                 break
             fi
-            if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+            local state=0
+            pid_file_process_state "$pid_file" "$pid" || state=$?
+            if ((state == 2)); then
+                log "ERROR: cannot tell whether PID ${pid} of ${pid_file} is running: /proc/${pid} cannot be read (run as root)"
+                failed=1
+                active_streams=""
+                break
+            elif ((state == 0)); then
                 ((++active_streams))
             fi
         done
@@ -605,7 +689,7 @@ collect_stream_metrics() {
     fi
 
     local -a stream_names=() stream_pids=() stream_alive=()
-    local pid_file stream_name pid i n labels
+    local pid_file stream_name pid i n labels state
     local failed=0
     for pid_file in "${FFMPEG_PID_DIR}"/*.pid; do
         [[ -f "$pid_file" ]] || continue
@@ -618,9 +702,18 @@ collect_stream_metrics() {
             failed=1
             continue
         fi
+        state=0
+        pid_file_process_state "$pid_file" "$pid" || state=$?
+        if ((state == 2)); then
+            # a stream whose process cannot be looked at is neither up nor down:
+            # its samples are left out
+            log "ERROR: cannot tell whether PID ${pid} of ${pid_file} is running: /proc/${pid} cannot be read (run as root)"
+            failed=1
+            continue
+        fi
         stream_names+=("$stream_name")
         stream_pids+=("$pid")
-        if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+        if ((state == 0)); then
             stream_alive+=(1)
         else
             stream_alive+=(0)
@@ -886,8 +979,6 @@ _SRV_NC_BIN=""
 _SRV_NC_VARIANT=""
 _SRV_NC_HELP=""
 _SRV_NC_CMD=()
-_PS_STATE="" # set by read_proc_stat
-_PS_START=""
 _BYTES=0 # set by byte_length
 
 # A TCP port number, 1-65535.
@@ -1005,24 +1096,6 @@ build_nc_command() {
 # never written to. Takes seconds, fractions allowed.
 srv_sleep() {
     read -r -t "$1" -u "$_SRV_SLEEP" _ || true
-}
-
-# Set _PS_STATE and _PS_START from /proc/PID/stat; returns 1 if there is no such
-# process. The command name is the only field that can contain spaces and is
-# enclosed in parentheses, so everything up to the last ") " is skipped.
-read_proc_stat() {
-    # the shutdown trap can interrupt `IFS= read` with that IFS still in effect
-    local IFS=$' \t\n'
-    local stat rest
-    local -a fields
-    _PS_STATE=""
-    _PS_START=""
-    { read -r stat <"/proc/$1/stat"; } 2>/dev/null || return 1
-    rest="${stat##*) }"
-    read -r -a fields <<<"$rest"
-    _PS_STATE="${fields[0]:-}"
-    _PS_START="${fields[19]:-}"
-    return 0
 }
 
 # Is the nc we started in slot $1 still running? A pid alone could have been
