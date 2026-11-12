@@ -205,8 +205,32 @@ reads).
    at a time, 4-CPU host, load average 7-10 from other workers' suites) and
    passed in every re-run alone (also under `nohup`). Not reproduced, cause not
    found.
+5. **`test_lyrebird_metrics.bats` `serve: GET / and GET /metrics are 200, other
+   paths 404, other methods 405, malformed requests 400 [LB-18]` is flaky.**
+   It failed in one of four full-suite runs and in one of 26 runs of the test
+   alone (1 of the first 6, then 0 of 20). The captured output of the failed
+   full-suite run: `_stop_server_term_ok` failed (test line 1154, called from
+   line 1250), `server exit status 134`, and the server printed
+   `*** longjmp causes uninitialized stack frame ***: terminated` (a glibc
+   fortify abort; netcat: openbsd) instead of exiting on SIGTERM. Cause not
+   investigated; file owned by another worker. A lead running the suite may see
+   it as a red test that passes on re-run.
 
-## Result
+## Result (after the change; commit 28070f8 for the full-suite runs)
 
-See the final report for the counts of the runs that were made after this change
-(per-file scan, full suite twice with `LYREBIRD_LEAK_CHECK_HOST=1`).
+- Per-file scan of all 66 files: before, writers in 8 files (table above); after,
+  3 files (the open and accepted rows). Per-test attribution used the same
+  sandbox.
+- Gate on the four fixed files (diagnostics, pipefail_aborts, json_compat,
+  e2e_integration) in a private namespace with private copies of the host paths:
+  base `6f10415` exit 1 with a 3-file diff (`lyrebird-diagnostics.log`
+  38368 -> 39688, `lyrebird-stream-manager.log` 221973 -> 222098,
+  `lyrebird/alerts.log` 2397 -> 2448), after the change exit 0.
+- Full suite (1481 tests, 37 skipped) with `LYREBIRD_LEAK_CHECK_HOST=1
+  tests/check_tmp_leaks.sh`, started in the same kind of namespace, four times:
+  runs 3 and 4 passed 1481/1481 and printed `No temp files left behind.` and
+  `No host-state changes.` (exit 0); run 2 passed 1480/1481 (the flaky test in
+  item 5 above) and reported no host or TMPDIR finding; run 1 was started with
+  `nohup` and failed 1 test (item 3 above) and its report listed only this notes
+  file, which was edited while the run was going (the gate working as intended).
+
