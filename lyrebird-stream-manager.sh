@@ -5592,9 +5592,9 @@ check_multiplex_encoding() {
 
 # Can this FFmpeg encode what an individual stream feeds its encoder: CHANNELS channels
 # as CODEC? Which channel counts an encoder takes is up to FFmpeg (with FFmpeg 6.1.1 libopus
-# refuses 4 channels and 9 or more, aac 9 or more), and a
-# wrapper whose FFmpeg cannot do it only fails, restarts and fails again with the reason
-# buried in its log. As check_multiplex_encoding does for the multiplex graph, the question
+# refuses 4 channels and 9 or more, aac 9 or more), and a wrapper whose FFmpeg cannot do it
+# only fails, restarts and fails again with the reason buried in its log. As
+# check_multiplex_encoding does for the multiplex graph, the question
 # is put to FFmpeg itself before the wrapper is written: the encoder arguments the wrapper
 # will use (multiplex_encoder_args gives the same words as the wrapper's codec arms) and its
 # `-af` filter, run for a tenth of a second over a silent lavfi source with CHANNELS channels
