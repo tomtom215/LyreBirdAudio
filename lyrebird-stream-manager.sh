@@ -5590,6 +5590,48 @@ check_multiplex_encoding() {
     return 1
 }
 
+# Can this FFmpeg encode what an individual stream feeds its encoder: CHANNELS channels
+# as CODEC? Which channel counts an encoder takes is up to FFmpeg (with FFmpeg 6.1.1 libopus
+# refuses 4 channels and 9 or more, aac 9 or more), and a
+# wrapper whose FFmpeg cannot do it only fails, restarts and fails again with the reason
+# buried in its log. As check_multiplex_encoding does for the multiplex graph, the question
+# is put to FFmpeg itself before the wrapper is written: the encoder arguments the wrapper
+# will use (multiplex_encoder_args gives the same words as the wrapper's codec arms) and its
+# `-af` filter, run for a tenth of a second over a silent lavfi source with CHANNELS channels
+# (the wrapper's input is an ALSA device with that layout), written to the null muxer.
+# Returns 0 when FFmpeg accepts it, and also when the check cannot be made (no ffmpeg or
+# timeout, no lavfi, a timeout of 20 s): the stream then starts as it did before. Returns 1,
+# with an error that names the channels and the codec, when FFmpeg refuses it.
+# Usage: check_individual_encoding STREAM_PATH CHANNELS SAMPLE_RATE CODEC BITRATE
+check_individual_encoding() {
+    local stream_path="$1" channels="$2" rate="$3" codec="$4" bitrate="$5" out rc=0 reason
+    # The settings were checked when they were resolved (resolve_stream_settings), so these
+    # cannot happen; a question that cannot even be put is a check that cannot be made, and the
+    # wrapper generator has its own defences for such values
+    if [[ ! "$channels" =~ ^[0-9]+$ ]] || [[ ! "$rate" =~ ^[0-9]+$ ]] || ! multiplex_encoder_args "$codec" "$bitrate"; then
+        log DEBUG "Cannot check the encoding of $stream_path: channels, sample rate or codec is not usable here"
+        return 0
+    fi
+    if ! command_exists ffmpeg || ! command_exists timeout; then
+        log DEBUG "Cannot check the encoding of $stream_path (ffmpeg or timeout missing)"
+        return 0
+    fi
+    out="$(timeout 20 ffmpeg -nostdin -hide_banner -loglevel error \
+        -f lavfi -t 0.1 -i "anullsrc=channel_layout=$(_default_channel_layout "$channels"):sample_rate=${rate}" \
+        -af "aresample=async=1:first_pts=0" "${MULTIPLEX_ENCODER_ARGS[@]}" -f null - 2>&1)" || rc=$?
+    if ((rc == 0)); then
+        return 0
+    fi
+    if ((rc == 124)) || [[ "$out" == *"Unknown input format"* ]] || [[ "$out" == *"No such filter"* ]] || [[ "$out" == *"Filter anullsrc not found"* ]]; then
+        log WARN "Could not check whether FFmpeg can encode ${channels} channels as ${codec} for ${stream_path} (rc=${rc}); starting it anyway"
+        return 0
+    fi
+    reason="$(printf '%s\n' "$out" | grep -v '^[[:space:]]*$' | head -n 1)"
+    log ERROR "Stream $stream_path not started: FFmpeg cannot encode ${channels} channels as ${codec} (${bitrate}): $(visible_text "$reason" 160)"
+    log ERROR "Set the channel count of this device (DEVICE_<NAME>_CHANNELS) to one that ${codec} can encode, or its codec (DEVICE_<NAME>_CODEC) to aac"
+    return 1
+}
+
 # Start FFmpeg multiplex stream (single stream from multiple devices)
 start_ffmpeg_multiplex_stream() {
     local -a devices=("$@")
@@ -6169,6 +6211,11 @@ start_ffmpeg_stream() {
     codec="$STREAM_CODEC"
     bitrate="$STREAM_BITRATE"
     thread_queue="$STREAM_THREAD_QUEUE"
+
+    # A channel count the codec cannot encode would only make the wrapper fail in a loop
+    if ! check_individual_encoding "$stream_path" "$channels" "$sample_rate" "$codec" "$bitrate"; then
+        return 1
+    fi
 
     log INFO "Starting FFmpeg for $stream_path (device: $device_name, card: $card_num)"
 

@@ -189,3 +189,129 @@ assert_multiplex_never_charged() {
     [ "$(wc -l <"$CRON_RESTART_STATE_DIR/mix.restarts")" -eq 1 ]
     [ "$(cat "$ST/ff/mix.devices")" = "mic1:31,mic2:33,mic3:35," ]
 }
+
+# ---------------------------------------------------------------------------
+# 8d: an individual stream's channel count is checked against its codec
+# ---------------------------------------------------------------------------
+
+# The real ffmpeg must refuse 4 channels as opus (it does, FFmpeg 6.1.1) and accept them as aac
+require_ffmpeg_that_refuses_4ch_opus() {
+    command -v ffmpeg >/dev/null || skip "ffmpeg not installed"
+    command -v timeout >/dev/null || skip "timeout not installed"
+    local base=(timeout 20 ffmpeg -nostdin -hide_banner -loglevel error -f lavfi -t 0.1 -i "anullsrc=channel_layout=4.0:sample_rate=48000" -af "aresample=async=1:first_pts=0")
+    "${base[@]}" -c:a aac -b:a 128k -f null - >/dev/null 2>&1 || skip "this ffmpeg has no aac encoder or no lavfi anullsrc"
+    if "${base[@]}" -c:a libopus -b:a 128k -application audio -f null - >/dev/null 2>&1; then
+        skip "this ffmpeg accepts 4 channels as opus: nothing for the check to refuse"
+    fi
+}
+
+@test "check_individual_encoding asks FFmpeg: 4 channels as opus is refused with an error naming channels and codec, the counts opus can encode and aac are not [8d]" {
+    require_ffmpeg_that_refuses_4ch_opus
+    stage '
+        for combo in "1 opus" "2 opus" "3 opus" "4 opus" "8 opus" "9 opus" "2 aac" "4 aac" "6 aac" "2 mp3"; do
+            read -r ch codec <<<"$combo"
+            rc=0; check_individual_encoding mic1 "$ch" 48000 "$codec" 128k || rc=$?
+            echo "$ch $codec rc=$rc"
+        done'
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"1 opus rc=0"* ]]
+    [[ "$output" == *"2 opus rc=0"* ]]
+    [[ "$output" == *"4 opus rc=1"* ]]
+    [[ "$output" == *"9 opus rc=1"* ]]
+    [[ "$output" == *"2 aac rc=0"* ]]
+    [[ "$output" == *"4 aac rc=0"* ]]
+    [[ "$output" == *"2 mp3 rc=0"* ]]
+    grep -qF 'Stream mic1 not started: FFmpeg cannot encode 4 channels as opus (128k): ' "$ST/sm.log"
+    grep -qF 'Set the channel count of this device (DEVICE_<NAME>_CHANNELS) to one that opus can encode, or its codec (DEVICE_<NAME>_CODEC) to aac' "$ST/sm.log"
+}
+
+@test "a stream with 4 channels and opus is not started: the error names the channels and the codec and nothing is written or launched [8d]" {
+    require_ffmpeg_that_refuses_4ch_opus
+    device_add mic1 31
+    printf '%s\n' 'DEVICE_MIC1_CHANNELS=4' >"$ST/cfg/audio-devices.conf"
+    stage 'rc=0; start_ffmpeg_stream mic1 31 mic1 || rc=$?; echo "rc=$rc"'
+    [[ "$output" == *"rc=1"* ]]
+    grep -qF 'Stream mic1 not started: FFmpeg cannot encode 4 channels as opus (128k): ' "$ST/sm.log"
+    # before the wrapper is written: no script, no PID file, no process, no log
+    [ ! -e "$ST/ff/mic1.sh" ]
+    [ ! -e "$ST/ff/mic1.pid" ]
+    [ -z "$(stage_processes)" ]
+    [ ! -e "$ST/ff/mic1.log" ]
+}
+
+@test "the same device with 4 channels as aac starts, and so does 2 channels as opus [8d]" {
+    require_ffmpeg_that_refuses_4ch_opus
+    device_add mic1 31
+    printf '%s\n' 'DEVICE_MIC1_CHANNELS=4' 'DEVICE_MIC1_CODEC=aac' >"$ST/cfg/audio-devices.conf"
+    stage 'rc=0; start_ffmpeg_stream mic1 31 mic1 || rc=$?; echo "rc=$rc"'
+    [[ "$output" == *"rc=0"* ]]
+    pid_running "$(stream_pid mic1)"
+    ! grep -q 'cannot encode' "$ST/sm.log"
+    stage 'COMMAND=stop; stop_mediamtx'
+    printf '%s\n' 'DEVICE_MIC1_CHANNELS=2' >"$ST/cfg/audio-devices.conf"
+    stage 'rc=0; start_ffmpeg_stream mic1 31 mic1 || rc=$?; echo "rc=$rc"'
+    [[ "$output" == *"rc=0"* ]]
+    pid_running "$(stream_pid mic1)"
+}
+
+@test "a check that cannot be made does not stop the stream: no lavfi, a timeout, no ffmpeg [8d]" {
+    # Stood in for: ffmpeg, which says it has no lavfi (then `timeout` reports 124; then neither exists)
+    printf '%s\n' '#!/bin/bash' 'echo "Unknown input format: lavfi" >&2' 'exit 1' >"$ST/shim/ffmpeg"
+    chmod +x "$ST/shim/ffmpeg"
+    stage 'rc=0; check_individual_encoding mic1 4 48000 opus 128k || rc=$?; echo "no lavfi rc=$rc"'
+    [[ "$output" == *"no lavfi rc=0"* ]]
+    grep -qF 'Could not check whether FFmpeg can encode 4 channels as opus for mic1' "$ST/sm.log"
+
+    printf '%s\n' '#!/bin/bash' 'exit 124' >"$ST/shim/timeout"
+    chmod +x "$ST/shim/timeout"
+    : >"$ST/sm.log"
+    stage 'rc=0; check_individual_encoding mic1 4 48000 opus 128k || rc=$?; echo "timeout rc=$rc"'
+    [[ "$output" == *"timeout rc=0"* ]]
+    grep -qF 'for mic1 (rc=124); starting it anyway' "$ST/sm.log"
+
+    # no ffmpeg at all (command_exists says so): the check is skipped; the start fails on its own for
+    # a missing ffmpeg, and says so
+    stage 'COMMAND_CACHE[ffmpeg]=0; rc=0; check_individual_encoding mic1 4 48000 opus 128k || rc=$?; echo "no ffmpeg rc=$rc"'
+    [[ "$output" == *"no ffmpeg rc=0"* ]]
+}
+
+@test "a question that cannot be put to FFmpeg (a channel count or rate that is not a number, a codec with no encoder arguments) is a check that cannot be made, not a refusal [8d]" {
+    # The settings are checked when they are resolved, so this does not happen; the wrapper
+    # generator has its own defences for such values (tests/test_stream_wrappers.bats feeds it
+    # hostile ones with the validation layer stood in for)
+    stage 'rc=0; check_individual_encoding mic1 four 48000 opus 128k || rc=$?; echo "channels rc=$rc"
+        rc=0; check_individual_encoding mic1 2 loud opus 128k || rc=$?; echo "rate rc=$rc"
+        rc=0; check_individual_encoding mic1 2 48000 flac 128k || rc=$?; echo "codec rc=$rc"'
+    [[ "$output" == *"channels rc=0"* ]]
+    [[ "$output" == *"rate rc=0"* ]]
+    [[ "$output" == *"codec rc=0"* ]]
+    ! grep -q 'cannot encode' "$ST/sm.log"
+}
+
+@test "the encoder arguments the check uses are the words of the wrapper's own codec arms, for every codec [8d]" {
+    # The individual wrapper keeps its own `case "${CODEC}"`; the check runs multiplex_encoder_args.
+    # Read the wrapper's arms from the script and compare, so that the two cannot drift apart.
+    local codec opts_line expected actual
+    for codec in opus aac mp3; do
+        opts_line="$(awk -v c="$codec" '
+            /case "\$\{CODEC\}" in/ { incase = 1; next }
+            incase && /^[[:space:]]*esac/ { incase = 0 }
+            incase && $0 ~ "^[[:space:]]*" c "\\)" { arm = 1; next }
+            incase && /^[[:space:]]*;;/ { arm = 0 }
+            arm && /codec_opts=\(/ { print; exit }
+        ' "$MANAGER")"
+        [ -n "$opts_line" ] || {
+            echo "no codec_opts arm for $codec"
+            false
+        }
+        local codec_opts=() BITRATE=96k
+        eval "$opts_line"
+        expected="${codec_opts[*]}"
+        run bash -c 'source "$1" >/dev/null 2>&1; multiplex_encoder_args "$2" 96k; echo "${MULTIPLEX_ENCODER_ARGS[*]}"' _ "$MANAGER" "$codec"
+        actual="$output"
+        [ "$actual" = "$expected" ] || {
+            echo "$codec: wrapper '$expected', check '$actual'"
+            false
+        }
+    done
+}
