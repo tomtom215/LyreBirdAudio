@@ -643,6 +643,25 @@ SH
     [ "$status" -ne 0 ]
 }
 
+@test "bash-ci bats job runs the suite through check_tmp_leaks.sh with the host-state check on (X-35)" {
+    load_wf bash-ci
+    mkdir -p "$TEST_SCRATCH/repo/tests" "$TEST_SCRATCH/runner"
+    cat >"$TEST_SCRATCH/repo/tests/check_tmp_leaks.sh" <<'SH'
+#!/bin/bash
+echo "check_tmp_leaks host_check=${LYREBIRD_LEAK_CHECK_HOST-unset} args=[$*]" >>"$FAKE_LOG"
+exit "${FAKE_TEST_STATUS:-0}"
+SH
+    chmod +x "$TEST_SCRATCH"/repo/tests/*.sh
+    cd "$TEST_SCRATCH/repo"
+    run_step bats-tests "Run bats test suite" RUNNER_TEMP="$TEST_SCRATCH/runner" FAKE_LOG="$TEST_SCRATCH/log"
+    [ "$status" -eq 0 ]
+    grep -qxF 'check_tmp_leaks host_check=1 args=[]' "$TEST_SCRATCH/log"
+
+    # and a suite that fails or leaks fails the step
+    run_step bats-tests "Run bats test suite" RUNNER_TEMP="$TEST_SCRATCH/runner" FAKE_LOG="$TEST_SCRATCH/log" FAKE_TEST_STATUS=1
+    [ "$status" -ne 0 ]
+}
+
 @test "the canary is advisory: continue-on-error, labelled non-blocking, outside the summary, skipped for tags" {
     load_wf bash-ci
     run jq -e '
