@@ -103,8 +103,6 @@ head, _, tail = section.partition("#### Known limits")
 limits_only = ids_in(tail) - ids_in(head)
 
 problems = []
-# items whose remaining work is the documentation pass this section belongs to
-docs_pass = {"X-21", "DOC-02", "DOC-03", "DOC-04"}
 for i in sorted(cited):
     item = register.get(i)
     if item is None:
@@ -112,7 +110,7 @@ for i in sorted(cited):
     elif item["status"] == "wontfix":
         if i not in limits_only:
             problems.append("%s is wontfix and is cited outside the Known limits group" % i)
-    elif item["status"] not in ("fixed", "documented-hw") and not (item["status"] == "open" and i in docs_pass):
+    elif item["status"] not in ("fixed", "documented-hw"):
         problems.append("%s has status %s" % (i, item["status"]))
 if not cited:
     problems.append("the Unreleased section cites no register ID")

@@ -1,7 +1,6 @@
 #!/usr/bin/env bats
 # Version Management of lyrebird-orchestrator.sh: the updater's --history and
-# --rollback (register: LB-21; the updater side is X-21, see
-# docs/remediation/notes/updater.md). Real orchestrator in a copy of a checkout
+# --rollback (register: LB-21; the updater side is X-21). Real orchestrator in a copy of a checkout
 # (a .git directory, so the updater's state directory can be derived as it is on a
 # node), stand-ins for the delegated scripts, on a pseudo-terminal (see
 # tests/orchestrator_helper.bash). The history log is read with the REAL updater's

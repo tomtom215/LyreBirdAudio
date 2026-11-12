@@ -11,6 +11,9 @@
 #     stop for LYREBIRD_UNIT_MAX_STREAMS streams, see unit_start_timeout_seconds)
 #   - ReadWritePaths= (every directory the manager writes outside the state directories)
 #   - the STREAM_MODE, MULTIPLEX_FILTER_TYPE and MULTIPLEX_STREAM_NAME Environment= lines
+#   - further Environment= lines, added after the last one, for the port, listen-address,
+#     authentication and endpoint settings `install` was given that differ from their
+#     defaults (`lyrebird-stream-manager.sh help` lists them; none when all are defaults)
 # Nothing else is rewritten. Edit the unit with `systemctl edit mediamtx-audio`
 # (a drop-in), not here, to change anything else.
 #

@@ -714,8 +714,8 @@ recompute_script_checksums() {
 
 # One-line meaning of exit status CODE of delegated script KEY, for the messages
 # that report a failure. The stream manager's table is the one in
-# `lyrebird-stream-manager.sh --help` (docs/remediation/notes/stream-outcome.md),
-# the updater's the one in docs/remediation/notes/updater.md. Prints nothing and
+# `lyrebird-stream-manager.sh --help`, the updater's the one in
+# `lyrebird-updater.sh --help` (exit status list). Prints nothing and
 # returns 1 for a status without a documented meaning.
 describe_exit_code() {
     local key="$1" code="$2" signal_name=""
@@ -941,8 +941,8 @@ report_installer_result() {
 # Stream Outcome
 # What the stream manager says about the node after a start or restart, read
 # from its status document (`status --json`, or the file every start, restart,
-# stop and monitor run writes; schema_version 1, see
-# docs/remediation/notes/stream-outcome.md) instead of inferred from a process
+# stop and monitor run writes; schema_version 1, see `lyrebird-stream-manager.sh
+# help`) instead of inferred from a process
 # list taken before the command ran. Everything here degrades: without jq, a
 # readable document or an answer from the manager the callers still have the
 # exit status, and nothing in this section can fail the orchestrator.
