@@ -309,7 +309,10 @@ get_free_space_mb() {
 get_dir_size() {
     local path="$1"
     if [[ -d "$path" ]]; then
-        du -sbD "$path" 2>/dev/null | cut -f1
+        # du exits 1 for a subdirectory it cannot read but still prints the total
+        # of the rest; under pipefail and errexit that status used to end `status`
+        # right after its "Recordings:" heading, printing nothing more.
+        { du -sbD "$path" 2>/dev/null || true; } | cut -f1
     else
         echo "0"
     fi
@@ -363,11 +366,66 @@ _sweep_reset() {
     SWEEP_FREED=0
 }
 
+# Directory listings that failed in this run. A listing that could not be made
+# is not "nothing to clean": `find ... 2>/dev/null` used to turn an unreadable
+# directory (or any other find failure) into an empty result and a clean run.
+SCAN_FAILURES=0
+
+# A listing is NUL-separated records. When find fails, _find0 ends its listing
+# with one record that starts with this tag (real records are absolute paths, or
+# "<mtime> <path>" from _list_oldest_first, so none can look like it) and carries
+# find's exit status and the directory; _next_record reads it as the end of the
+# listing and counts it. find's own message ("find: '/x': Permission denied") is
+# left on stderr.
+readonly FIND_FAILED_TAG='!find-failed:'
+
+# find -H DIR [ARGS...], with the listing protocol above. -ignore_readdir_race:
+# a file that goes away between find reading its directory entry and looking at
+# it (the recorder rotating a segment) is not an error; it would only make a run
+# of a live system fail now and then.
+_find0() {
+    local dir="$1" rc=0
+    shift
+    find -H "$dir" -ignore_readdir_race "$@" || rc=$?
+    if ((rc != 0)); then
+        printf '%s%d:%s\0' "$FIND_FAILED_TAG" "$rc" "$dir"
+    fi
+    return 0
+}
+
+# Read the next record of a listing from stdin into the variable named $1.
+# Returns 1 at the end of the listing; a failure record ends it too, after it has
+# been counted in SCAN_FAILURES and logged.
+_next_record() {
+    local failure rc dir
+    IFS= read -r -d '' "$1" || return 1
+    if [[ "${!1}" == "$FIND_FAILED_TAG"* ]]; then
+        failure="${!1#"$FIND_FAILED_TAG"}"
+        rc="${failure%%:*}"
+        dir="${failure#*:}"
+        ((++SCAN_FAILURES))
+        log_error "Cannot list ${dir} completely: find exited with status ${rc} (its message is above); the files it could not reach were not examined"
+        return 1
+    fi
+    return 0
+}
+
+# Count the records of a listing read from stdin into COUNT_RECORDS.
+COUNT_RECORDS=0
+_count_records() {
+    # shellcheck disable=SC2034  # _next_record fills `record`; only the count matters
+    local record
+    COUNT_RECORDS=0
+    while _next_record record; do
+        ((++COUNT_RECORDS))
+    done
+}
+
 # Delete every NUL-separated path read from stdin through safe_delete, adding to
 # the SWEEP_* totals. A failure is counted and the sweep carries on.
 _sweep() {
     local desc="$1" file size
-    while IFS= read -r -d '' file; do
+    while _next_record file; do
         size=$(stat -c%s -- "$file" 2>/dev/null || echo 0)
         if safe_delete "$file" "$desc"; then
             ((++SWEEP_DELETED))
@@ -387,13 +445,18 @@ _failed_suffix() {
 }
 
 # End-of-command verdict: the run's exit status is EXIT_DELETE_FAILED when any
-# deletion failed, 0 otherwise.
+# deletion failed or any directory could not be listed, 0 otherwise.
 _report_delete_failures() {
+    local rc=0
     if ((DELETE_FAILURES > 0)); then
         log_error "Run finished with ${DELETE_FAILURES} failed deletion(s); the files named in the errors above are still on disk"
-        return "$EXIT_DELETE_FAILED"
+        rc="$EXIT_DELETE_FAILED"
     fi
-    return 0
+    if ((SCAN_FAILURES > 0)); then
+        log_error "Run finished with ${SCAN_FAILURES} directory listing(s) that failed; what could not be listed was not cleaned (see the errors above)"
+        rc="$EXIT_DELETE_FAILED"
+    fi
+    return "$rc"
 }
 
 # True when mtime $1 (epoch seconds) lies within ACTIVE_SEGMENT_SECONDS of now $2
@@ -420,9 +483,14 @@ _recently_modified() {
 # into a separate "path", which was then deleted relative to the current
 # directory.
 _list_oldest_first() {
-    local root="$1"
+    local root="$1" rc=0
     shift
-    find -H "$root" -type f "$@" -printf '%T@ %p\0' 2>/dev/null | LC_ALL=C sort -z -k1,1n -k2
+    find -H "$root" -ignore_readdir_race -type f "$@" -printf '%T@ %p\0' | LC_ALL=C sort -z -k1,1n -k2 || rc=$?
+    # the failure record comes after the sorted list (see _find0)
+    if ((rc != 0)); then
+        printf '%s%d:%s\0' "$FIND_FAILED_TAG" "$rc" "$root"
+    fi
+    return 0
 }
 
 # Delete the oldest files under $1, at most $2 attempts (0 = no limit), logging
@@ -439,7 +507,7 @@ _evict_oldest_first() {
     EVICT_FREED=0
     EVICT_PROTECTED=0
     now=$(date +%s)
-    while IFS= read -r -d '' rec; do
+    while _next_record rec; do
         mtime="${rec%% *}"
         file="${rec#* }"
         if _recently_modified "${mtime%%.*}" "$now"; then
@@ -495,7 +563,7 @@ cleanup_recordings() {
     # younger empty file is a segment being opened (FFmpeg keeps the segment in
     # progress at 0 bytes until its first flush). Same clock rule as below: a
     # pre-CLOCK_SANE_EPOCH mtime has no known age, so it is kept.
-    while IFS= read -r -d '' file; do
+    while _next_record file; do
         mtime=$(stat -c%Y -- "$file" 2>/dev/null || echo 0)
         if [[ "$mtime" -lt "$CLOCK_SANE_EPOCH" ]] || _recently_modified "$mtime" "$now_epoch"; then
             continue
@@ -505,10 +573,10 @@ cleanup_recordings() {
         else
             ((++failed))
         fi
-    done < <(find -H "$RECORDING_DIR" -type f "${RECORDING_NAME_TEST[@]}" -empty -print0 2>/dev/null)
+    done < <(_find0 "$RECORDING_DIR" -type f "${RECORDING_NAME_TEST[@]}" -empty -print0)
 
     # Find and delete old recording files
-    while IFS= read -r -d '' file; do
+    while _next_record file; do
         # A pre-CLOCK_SANE_EPOCH mtime means the file was written while the
         # clock was broken; its real age is unknown and it may be minutes old.
         mtime=$(stat -c%Y "$file" 2>/dev/null || echo 0)
@@ -523,7 +591,7 @@ cleanup_recordings() {
         else
             ((++failed))
         fi
-    done < <(find -H "$RECORDING_DIR" -type f "${RECORDING_NAME_TEST[@]}" -mtime "+${RECORDING_RETENTION_DAYS}" -print0 2>/dev/null)
+    done < <(_find0 "$RECORDING_DIR" -type f "${RECORDING_NAME_TEST[@]}" -mtime "+${RECORDING_RETENTION_DAYS}" -print0)
 
     if [[ $kept_broken_clock -gt 0 ]]; then
         log_warn "Kept $kept_broken_clock recording(s) with pre-${CLOCK_SANE_EPOCH} mtimes (written before NTP sync; real age unknown)"
@@ -534,7 +602,12 @@ cleanup_recordings() {
     # itself, and if the recorder does not recreate it on the next write, every
     # subsequent recording silently fails — permanent data loss on an
     # unattended box.
-    find -H "$RECORDING_DIR" -mindepth 1 -type d -empty -delete 2>/dev/null || true
+    local sweep_rc=0
+    find -H "$RECORDING_DIR" -ignore_readdir_race -mindepth 1 -type d -empty -delete || sweep_rc=$?
+    if ((sweep_rc != 0)); then
+        ((++SCAN_FAILURES))
+        log_error "Cannot sweep the empty directories of ${RECORDING_DIR} completely: find exited with status ${sweep_rc} (its message is above)"
+    fi
 
     if [[ $empty_removed -gt 0 ]]; then
         log_info "Removed $empty_removed empty recording segment(s) idle for over ${ACTIVE_SEGMENT_SECONDS}s"
@@ -550,12 +623,12 @@ cleanup_logs() {
 
     # Clean LyreBird logs
     if [[ -d "$LOG_DIR" ]]; then
-        _sweep "log" < <(find -H "$LOG_DIR" -type f -name "*.log*" -mtime "+${LOG_RETENTION_DAYS}" -print0 2>/dev/null)
+        _sweep "log" < <(_find0 "$LOG_DIR" -type f -name "*.log*" -mtime "+${LOG_RETENTION_DAYS}" -print0)
     fi
 
     # Clean rotated MediaMTX logs
     if [[ -d "$MEDIAMTX_LOG_DIR" ]]; then
-        _sweep "mediamtx log" < <(find -H "$MEDIAMTX_LOG_DIR" -type f -name "mediamtx*.out.*" -mtime "+${LOG_RETENTION_DAYS}" -print0 2>/dev/null)
+        _sweep "mediamtx log" < <(_find0 "$MEDIAMTX_LOG_DIR" -type f -name "mediamtx*.out.*" -mtime "+${LOG_RETENTION_DAYS}" -print0)
     fi
 
     log_info "Cleaned $SWEEP_DELETED log file(s), freed $(format_bytes "$SWEEP_FREED")$(_failed_suffix "$SWEEP_FAILED")"
@@ -568,11 +641,13 @@ cleanup_temp() {
     _sweep_reset
 
     # Clean LyreBird temp files in /tmp
-    _sweep "temp" < <(find -H "$TEMP_DIR" -maxdepth 1 -type f -name "lyrebird-*" -mmin "+$((TEMP_RETENTION_HOURS * 60))" -print0 2>/dev/null)
+    if [[ -d "$TEMP_DIR" ]]; then
+        _sweep "temp" < <(_find0 "$TEMP_DIR" -maxdepth 1 -type f -name "lyrebird-*" -mmin "+$((TEMP_RETENTION_HOURS * 60))" -print0)
+    fi
 
     # Clean memory buffer directory if present
     if [[ -d "$BUFFER_DIR" ]]; then
-        _sweep "buffer" < <(find -H "$BUFFER_DIR" -type f -mmin "+$((TEMP_RETENTION_HOURS * 60))" -print0 2>/dev/null)
+        _sweep "buffer" < <(_find0 "$BUFFER_DIR" -type f -mmin "+$((TEMP_RETENTION_HOURS * 60))" -print0)
     fi
 
     log_info "Cleaned $SWEEP_DELETED temp file(s), freed $(format_bytes "$SWEEP_FREED")$(_failed_suffix "$SWEEP_FAILED")"
@@ -585,8 +660,18 @@ truncate_large_logs() {
     # Clean up any stale .tmp files from interrupted previous runs.
     # MEDIAMTX_LOG_DIR is typically /var/log, so scope tightly to our own files
     # (maxdepth 1 + mediamtx-prefixed) rather than every *.tmp on the system.
-    find -H "$MEDIAMTX_LOG_DIR" -maxdepth 1 -name "mediamtx*.tmp" -mmin +5 -delete 2>/dev/null || true
-    [[ -d "$LOG_DIR" ]] && find -H "$LOG_DIR" -maxdepth 1 -name "*.tmp" -mmin +5 -delete 2>/dev/null || true
+    # They go through safe_delete like every other deletion: a dry run leaves them,
+    # a refusal is logged and counted (it used to be `-delete 2>/dev/null || true`).
+    _sweep_reset
+    if [[ -d "$MEDIAMTX_LOG_DIR" ]]; then
+        _sweep "stale temp" < <(_find0 "$MEDIAMTX_LOG_DIR" -maxdepth 1 \( -type f -o -type l \) -name "mediamtx*.tmp" -mmin +5 -print0)
+    fi
+    if [[ -d "$LOG_DIR" ]]; then
+        _sweep "stale temp" < <(_find0 "$LOG_DIR" -maxdepth 1 \( -type f -o -type l \) -name "*.tmp" -mmin +5 -print0)
+    fi
+    if ((SWEEP_DELETED + SWEEP_FAILED > 0)); then
+        log_info "Removed $SWEEP_DELETED stale temp file(s)$(_failed_suffix "$SWEEP_FAILED")"
+    fi
 
     # Check MediaMTX log
     if [[ -f "$MEDIAMTX_LOG" ]]; then
@@ -665,12 +750,16 @@ emergency_cleanup() {
     else
         _sweep_reset
         if [[ -d "$LOG_DIR" ]]; then
-            _sweep "rotated log" < <(find -H "$LOG_DIR" -maxdepth 1 -type f -name "*.gz" -print0 2>/dev/null)
+            _sweep "rotated log" < <(_find0 "$LOG_DIR" -maxdepth 1 -type f -name "*.gz" -print0)
         fi
-        _sweep "rotated mediamtx log" < <(find -H "$MEDIAMTX_LOG_DIR" -maxdepth 1 -type f -name "mediamtx*.out*.gz" -print0 2>/dev/null)
+        if [[ -d "$MEDIAMTX_LOG_DIR" ]]; then
+            _sweep "rotated mediamtx log" < <(_find0 "$MEDIAMTX_LOG_DIR" -maxdepth 1 -type f -name "mediamtx*.out*.gz" -print0)
+        fi
 
         # Clear LyreBird temp files
-        _sweep "temp" < <(find -H "$TEMP_DIR" -maxdepth 1 -name "lyrebird-*" -type f -print0 2>/dev/null)
+        if [[ -d "$TEMP_DIR" ]]; then
+            _sweep "temp" < <(_find0 "$TEMP_DIR" -maxdepth 1 -name "lyrebird-*" -type f -print0)
+        fi
         log_info "Emergency: Deleted $SWEEP_DELETED rotated log/temp file(s)$(_failed_suffix "$SWEEP_FAILED")"
     fi
 
@@ -728,15 +817,20 @@ cmd_status() {
     if [[ -d "$RECORDING_DIR" ]]; then
         local rec_size
         rec_size=$(get_dir_size "$RECORDING_DIR")
-        local rec_count empty_count
-        # `|| true`: find exits 1 on an unreadable subdirectory, which under
-        # pipefail would abort `status` before it printed anything.
-        rec_count=$({ find -H "$RECORDING_DIR" -type f "${RECORDING_NAME_TEST[@]}" ! -empty 2>/dev/null || true; } | wc -l)
-        empty_count=$({ find -H "$RECORDING_DIR" -type f "${RECORDING_NAME_TEST[@]}" -empty 2>/dev/null || true; } | wc -l)
+        local rec_count empty_count scan_failures_before="$SCAN_FAILURES"
+        # An unreadable subdirectory is reported (find's message and a failure
+        # record), not left out of the count unseen, and does not stop `status`.
+        _count_records < <(_find0 "$RECORDING_DIR" -type f "${RECORDING_NAME_TEST[@]}" ! -empty -print0)
+        rec_count="$COUNT_RECORDS"
+        _count_records < <(_find0 "$RECORDING_DIR" -type f "${RECORDING_NAME_TEST[@]}" -empty -print0)
+        empty_count="$COUNT_RECORDS"
         printf "  Path: %s\n" "$RECORDING_DIR"
         printf "  Size: %s\n" "$(format_bytes "$rec_size")"
         printf "  Files: %d\n" "$rec_count"
         printf "  Empty segments: %d\n" "$empty_count"
+        if ((SCAN_FAILURES > scan_failures_before)); then
+            printf "  (incomplete: part of %s could not be read, see the errors above)\n" "$RECORDING_DIR"
+        fi
         printf "  Retention: %d days\n" "$RECORDING_RETENTION_DAYS"
     else
         echo "  No recording directory"
