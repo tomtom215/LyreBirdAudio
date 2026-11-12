@@ -81,7 +81,7 @@ COMMAND=""
 
 # Derived paths
 INSTALL_DIR="${INSTALL_PREFIX}/bin"
-readonly SERVICE_DIR="/etc/systemd/system"
+readonly SERVICE_DIR="${MEDIAMTX_SERVICE_DIR:-/etc/systemd/system}"
 readonly SERVICE_NAME="mediamtx.service"
 readonly CONFIG_NAME="mediamtx.yml"
 # Unit that runs the stream manager (and through it MediaMTX plus its FFmpeg
@@ -1211,13 +1211,13 @@ mediamtx_binary_version() {
 # says LyreBirdAudio generated the file. A file without that first line is the
 # operator's (decision D10): it is never overwritten unless --force says so.
 
-# Stop with a clear message unless the shared library, which holds the
-# generator, is beside this script.
-require_config_generator() {
+# Stop with a clear message unless the shared library is beside this script: it
+# holds the configuration generator, the port check and the atomic file writer.
+require_common_library() {
     if ! declare -F lyrebird_render_mediamtx_config >/dev/null 2>&1 \
         || ! declare -F lyrebird_is_valid_port >/dev/null 2>&1 \
         || ! declare -F lyrebird_atomic_write >/dev/null 2>&1; then
-        fatal "lyrebird-common.sh is required next to ${SCRIPT_NAME}: it holds the MediaMTX configuration generator (run the installer from a complete checkout of LyreBirdAudio, or use --no-config)" 4
+        fatal "lyrebird-common.sh is required next to ${SCRIPT_NAME}: it holds the MediaMTX configuration generator and the atomic file writer (run the installer from a complete checkout of LyreBirdAudio; --no-config --no-service needs no library)" 4
     fi
 }
 
@@ -1254,7 +1254,7 @@ render_mediamtx_config() {
 # changes anything: the generator is present, the ports are valid and differ.
 check_config_inputs() {
     [[ "${SKIP_CONFIG}" != "true" ]] || return 0
-    require_config_generator
+    require_common_library
     validate_port_settings
     render_mediamtx_config /dev/null "" || fatal "Invalid MediaMTX port settings" 10
 }
@@ -1320,7 +1320,7 @@ create_config() {
         return 0
     fi
 
-    require_config_generator
+    require_common_library
     validate_port_settings
 
     # The keys MediaMTX rejects depend on its version: render for the binary
@@ -1387,6 +1387,111 @@ create_config() {
     log_info "To keep hand edits in it, delete its first line ('${LYREBIRD_MEDIAMTX_CONFIG_MARKER}'): a file without that line is yours and is never overwritten"
 }
 
+# --- systemd unit --------------------------------------------------------------
+#
+# One template, config/mediamtx.service (decision D12). It is a complete unit
+# with the default paths; render_service_unit replaces the few values that
+# depend on this installation (the lines the template's header lists) and
+# copies everything else, comments included, unchanged.
+
+# Where the unit's template is: MEDIAMTX_UNIT_TEMPLATE, else config/ next to this script
+service_template_path() {
+    printf '%s' "${MEDIAMTX_UNIT_TEMPLATE:-${SCRIPT_DIR}/config/mediamtx.service}"
+}
+
+# Will install write a systemd unit? Not with --no-service, and not without systemd.
+service_creation_enabled() {
+    [[ "${SKIP_SERVICE}" != "true" ]] && command -v systemctl &>/dev/null
+}
+
+# Render the unit to stdout: the template with ExecStart, User, Group,
+# WorkingDirectory, ReadWritePaths, StandardOutput and StandardError replaced
+# by this installation's values. Fails, printing no complete unit, for a value a
+# unit file cannot carry without quoting (a path with a space or another
+# character outside A-Z a-z 0-9 _ . / + -, an account name with a space or a
+# newline) and for a template that lacks a line to replace.
+render_service_unit() {
+    local template
+    template="$(service_template_path)"
+    if [[ ! -r "${template}" ]]; then
+        log_error "The unit template ${template} is missing: run the installer from a complete checkout of LyreBirdAudio (config/mediamtx.service), or set MEDIAMTX_UNIT_TEMPLATE"
+        return 1
+    fi
+
+    local path
+    for path in "${INSTALL_DIR}" "${CONFIG_DIR}" "${STATE_DIR}"; do
+        if [[ ! "${path}" =~ ^/[A-Za-z0-9_./+-]*$ ]]; then
+            log_error "Cannot write the unit: '${path}' is not an absolute path of letters, digits and _ . / + - only"
+            return 1
+        fi
+    done
+    local account
+    for account in "${SERVICE_USER}" "${SERVICE_GROUP}"; do
+        if [[ ! "${account}" =~ ^[A-Za-z_][A-Za-z0-9_.-]*$ ]]; then
+            log_error "Cannot write the unit: the account name '${account}' is not made of letters, digits and _ . - only"
+            return 1
+        fi
+    done
+
+    local -a lines=()
+    mapfile -t lines <"${template}"
+    local -A seen=()
+    local line out key
+    for line in ${lines[@]+"${lines[@]}"}; do
+        out="${line}"
+        key=""
+        case "${line}" in
+            ExecStart=*)
+                key=ExecStart
+                out="ExecStart=${INSTALL_DIR}/mediamtx ${CONFIG_DIR}/${CONFIG_NAME}"
+                ;;
+            '# User=mediamtx')
+                key=User
+                out="User=${SERVICE_USER}"
+                ;;
+            '# Group=mediamtx')
+                key=Group
+                out="Group=${SERVICE_GROUP}"
+                ;;
+            WorkingDirectory=*)
+                key=WorkingDirectory
+                out="WorkingDirectory=${STATE_DIR}"
+                ;;
+            ReadWritePaths=*)
+                key=ReadWritePaths
+                out="ReadWritePaths=/var/log ${STATE_DIR} ${CONFIG_DIR}"
+                ;;
+            StandardOutput=*)
+                key=StandardOutput
+                out="StandardOutput=journal"
+                ;;
+            StandardError=*)
+                key=StandardError
+                out="StandardError=journal"
+                ;;
+            *) ;;
+        esac
+        if [[ -n "${key}" ]]; then
+            seen["${key}"]=1
+        fi
+        printf '%s\n' "${out}"
+    done
+    for key in ExecStart User Group WorkingDirectory ReadWritePaths StandardOutput StandardError; do
+        if [[ -z "${seen[${key}]:-}" ]]; then
+            log_error "The unit template ${template} has no ${key} line to replace: the template and install_mediamtx.sh have drifted apart"
+            return 1
+        fi
+    done
+}
+
+# What `install` needs to write the unit is checked before it changes anything:
+# the library with the atomic writer, the template, and values the unit can carry.
+check_service_inputs() {
+    service_creation_enabled || return 0
+    require_common_library
+    render_service_unit >/dev/null || fatal "Cannot write the systemd unit" 10
+}
+
 create_service() {
     if [[ "${SKIP_SERVICE}" == "true" ]]; then
         log_debug "Skipping service creation"
@@ -1411,60 +1516,25 @@ create_service() {
         return 0
     fi
 
+    require_common_library
+
     local service_file="${SERVICE_DIR}/${SERVICE_NAME}"
+
+    # Render before anything is touched: a unit that cannot be written changes nothing
+    local unit=""
+    unit="$(render_service_unit && printf x)" || fatal "Cannot write the systemd unit" 10
+    unit="${unit%x}"
 
     # Backup existing service
     if [[ -f "${service_file}" ]]; then
         SERVICE_BACKUP="${service_file}.backup.$(date +%Y%m%d-%H%M%S)"
-        cp "${service_file}" "${SERVICE_BACKUP}"
+        cp -p -- "${service_file}" "${SERVICE_BACKUP}"
     fi
 
-    cat >"${service_file}" <<EOF
-[Unit]
-Description=MediaMTX Media Server
-Documentation=https://github.com/${DEFAULT_GITHUB_REPO}
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-User=${SERVICE_USER}
-Group=${SERVICE_GROUP}
-ExecStart=${INSTALL_DIR}/mediamtx ${CONFIG_DIR}/${CONFIG_NAME}
-ExecReload=/bin/kill -USR1 \$MAINPID
-
-# Restart configuration
-Restart=always
-RestartSec=10
-StartLimitInterval=60
-StartLimitBurst=3
-
-# Environment
-Environment="HOME=${STATE_DIR}"
-WorkingDirectory=${STATE_DIR}
-
-# Logging
-StandardOutput=journal
-StandardError=journal
-SyslogIdentifier=mediamtx
-
-# Security hardening
-NoNewPrivileges=true
-PrivateTmp=true
-ProtectSystem=strict
-ProtectHome=true
-ReadWritePaths=/var/log ${STATE_DIR}
-StateDirectory=mediamtx
-RuntimeDirectory=mediamtx
-
-# Resource limits
-LimitNOFILE=65536
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-    chmod 644 "${service_file}"
+    # Atomic and durable, like the configuration
+    if ! printf '%s' "${unit}" | lyrebird_atomic_write "${service_file}" 0644; then
+        fatal "Failed to write ${service_file}" 1
+    fi
     systemctl daemon-reload
 
     log_info "Service created: ${SERVICE_NAME}"
@@ -1519,6 +1589,7 @@ install_mediamtx() {
     # Settings that cannot be carried into the configuration stop the run before
     # anything is downloaded or written
     check_config_inputs
+    check_service_inputs
 
     # Early writability check
     if [[ "${DRY_RUN_MODE}" != "true" ]]; then
@@ -2272,6 +2343,8 @@ ${BOLD}ENVIRONMENT VARIABLES:${NC}
     MEDIAMTX_PREFIX       Installation prefix
     MEDIAMTX_CONFIG_DIR   Configuration directory
     MEDIAMTX_STATE_DIR    State directory
+    MEDIAMTX_SERVICE_DIR  Directory the systemd unit is written to (default /etc/systemd/system)
+    MEDIAMTX_UNIT_TEMPLATE  Unit template (default: config/mediamtx.service next to this script)
     MEDIAMTX_USER         Service user name
     MEDIAMTX_GROUP        Service group name
     MEDIAMTX_RTSP_PORT    RTSP port written to the config and checked by status (default 8554)

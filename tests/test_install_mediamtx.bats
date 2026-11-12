@@ -1144,6 +1144,18 @@ fake_mediamtx() {
     chmod +x "$path"
 }
 
+# Shell code that stands in, in the installer's process, for every step of install
+# that would reach outside this test's private directories (the release download,
+# the service user, the unit directory); each leaves a marker in $DECOY_DIR, so a
+# test can check that none of them ran
+install_stubs() {
+    printf '%s\n' \
+        'get_release_info() { : >"$DECOY_DIR/release.called"; RELEASE_VERSION=v9.9.9; }' \
+        'download_mediamtx() { : >"$DECOY_DIR/download.called"; }' \
+        'create_user() { : >"$DECOY_DIR/user.called"; }' \
+        'create_service() { : >"$DECOY_DIR/service.called"; }'
+}
+
 # What the shared generator renders for the given options, on stdout
 render_expected() {
     bash -c 'source "$1"; shift; lyrebird_render_mediamtx_config "$@"' _ "$PROJECT_ROOT/lyrebird-common.sh" "$@"
@@ -1239,7 +1251,8 @@ render_expected() {
 
 @test "install checks the ports and the generator before it downloads or writes anything [N-2, LB-22 installer]" {
     installer_env
-    local preamble='get_release_info() { : >"$DECOY_DIR/release.called"; RELEASE_VERSION=v9.9.9; }; download_mediamtx() { : >"$DECOY_DIR/download.called"; }'
+    local preamble
+    preamble="$(install_stubs)"
     # a bad port
     MEDIAMTX_API_PORT=abc PREAMBLE="$preamble" run_strict install_mediamtx
     [ "$status" -eq 10 ]
@@ -1251,6 +1264,8 @@ render_expected() {
     # nothing was fetched, installed or written
     [ ! -e "$DECOY_DIR/release.called" ]
     [ ! -e "$DECOY_DIR/download.called" ]
+    [ ! -e "$DECOY_DIR/user.called" ]
+    [ ! -e "$DECOY_DIR/service.called" ]
     [ ! -e "$INSTALL_DIR/mediamtx" ]
     [ -z "$(ls -A "$CONFIG_DIR")" ]
 }
@@ -1444,4 +1459,226 @@ render_expected() {
     [[ "$output" == *'MediaMTX rejects the generated configuration'* && "$output" == *'unknown field "moq"'* ]]
     cmp "$DECOY_DIR/before.yml" "$CONFIG_DIR/mediamtx.yml"
     [ "$(ls -A "$CONFIG_DIR")" = "mediamtx.yml" ]
+}
+
+# ============================================================================
+# The systemd unit is rendered from config/mediamtx.service [LB-02 installer,
+# X-12, LB-12, D12]
+#
+# create_service used to write its own heredoc: ExecReload=/bin/kill -USR1
+# (MediaMTX 1.21.1 ignores SIGUSR1; it re-reads its file by itself),
+# StartLimitInterval=/StartLimitBurst= under [Service] (accepted by systemd, but
+# not the canonical placement), no Conflicts= with the stream manager's unit.
+# It now renders the one template. systemd's own parser checks the result.
+# ============================================================================
+
+# The installer's unit-related environment, on top of installer_env: units go to
+# $DECOY_DIR/units (the systemctl shim logs daemon-reload), the service account is
+# "svcuser:svcgroup", the paths are private
+unit_env() {
+    installer_env
+    export MEDIAMTX_SERVICE_DIR="$DECOY_DIR/units" MEDIAMTX_USER=svcuser MEDIAMTX_GROUP=svcgroup
+    mkdir -p "$MEDIAMTX_SERVICE_DIR"
+}
+
+# The default settings: no override of a path or account
+render_default_unit() {
+    env -u MEDIAMTX_PREFIX -u MEDIAMTX_CONFIG_DIR -u MEDIAMTX_STATE_DIR -u MEDIAMTX_USER -u MEDIAMTX_GROUP \
+        -u MEDIAMTX_UNIT_TEMPLATE -u MEDIAMTX_SERVICE_DIR \
+        bash -c 'source "$1"; render_service_unit' _ "$PROJECT_ROOT/install_mediamtx.sh"
+}
+
+# The first KEY= line of SECTION in FILE (a unit file)
+unit_value() {
+    awk -v sec="[$2]" -v key="$3=" '
+        /^\[/ { cur = $0 }
+        cur == sec && index($0, key) == 1 { print substr($0, length(key) + 1); exit }' "$1"
+}
+
+@test "the unit with the default settings is the template, with only the lines its header lists replaced [LB-02 installer, D12: no drift]" {
+    local template="$PROJECT_ROOT/config/mediamtx.service" unit="$BATS_TEST_TMPDIR/unit.service"
+    render_default_unit >"$unit"
+    # with default paths and the default account the output is the template except the
+    # two account lines (the template has them commented out) and the log destination
+    run diff "$template" "$unit"
+    [ "$status" -eq 1 ]
+    [ "$(grep -c '^[<>]' <<<"$output")" -eq 8 ]
+    [ "$(grep '^[<>]' <<<"$output" | grep -vcE '^[<>] (# )?(User=mediamtx|Group=mediamtx|StandardOutput=|StandardError=)')" -eq 0 ]
+    grep -qxF 'User=mediamtx' "$unit"
+    grep -qxF 'Group=mediamtx' "$unit"
+    grep -qxF 'StandardOutput=journal' "$unit"
+    grep -qxF 'StandardError=journal' "$unit"
+    # with every setting changed, exactly the keys the header lists differ, line for line
+    unit_env
+    PREAMBLE='' run_strict render_service_unit
+    [ "$status" -eq 0 ]
+    printf '%s\n' "$output" >"$unit"
+    [ "$(wc -l <"$template")" -eq "$(wc -l <"$unit")" ]
+    local n=0 a b bad=""
+    while IFS= read -r a && IFS= read -r b <&3; do
+        n=$((n + 1))
+        if [ "$a" != "$b" ]; then
+            case "$a" in
+                ExecStart=* | WorkingDirectory=* | ReadWritePaths=* | StandardOutput=* | StandardError=* | '# User=mediamtx' | '# Group=mediamtx') ;;
+                *) bad+="line $n: '$a' became '$b'"$'\n' ;;
+            esac
+        fi
+    done <"$template" 3<"$unit"
+    [ -z "$bad" ] || {
+        echo "$bad"
+        false
+    }
+    grep -qxF "ExecStart=$INSTALL_DIR/mediamtx $CONFIG_DIR/mediamtx.yml" "$unit"
+    grep -qxF "WorkingDirectory=$MEDIAMTX_STATE_DIR" "$unit"
+    grep -qxF "ReadWritePaths=/var/log $MEDIAMTX_STATE_DIR $CONFIG_DIR" "$unit"
+    grep -qxF 'User=svcuser' "$unit"
+    grep -qxF 'Group=svcgroup' "$unit"
+}
+
+@test "the rendered unit conflicts with the stream manager's unit, has the start limit in [Unit] and no ExecReload or signal, and the script writes no unit text of its own [LB-02 installer, X-12, LB-12]" {
+    unit_env
+    local unit="$BATS_TEST_TMPDIR/unit.service"
+    PREAMBLE='' run_strict render_service_unit
+    [ "$status" -eq 0 ]
+    printf '%s\n' "$output" >"$unit"
+    [ "$(unit_value "$unit" Unit Conflicts)" = "mediamtx-audio.service" ]
+    # the two halves of the exclusion: no Wants=/Requires=/BindsTo=/PartOf= of the manager's unit
+    ! grep -qE '^(Wants|Requires|Requisite|BindsTo|PartOf|Upholds)=.*mediamtx-audio' "$unit" || false
+    # canonical placement, nothing in [Service]
+    [ -n "$(unit_value "$unit" Unit StartLimitIntervalSec)" ]
+    [ -n "$(unit_value "$unit" Unit StartLimitBurst)" ]
+    run awk '/^\[/ { cur = $0 } /^StartLimit/ { print cur }' "$unit"
+    [ -z "$(grep -v '^\[Unit\]$' <<<"$output")" ]
+    ! grep -q '^StartLimitInterval=' "$unit" || false
+    # MediaMTX re-reads its file by itself and ends on SIGHUP: nothing reloads by signal
+    [ -z "$(unit_value "$unit" Service ExecReload)" ]
+    # (active lines only: the template's comments explain why there is no reload)
+    ! grep -vE '^[[:space:]]*#' "$unit" | grep -qE 'USR1|USR2|-HUP|SIGHUP|/bin/kill' || false
+    # the account and the command
+    [ "$(unit_value "$unit" Service User)" = "svcuser" ]
+    [ "$(unit_value "$unit" Service Group)" = "svcgroup" ]
+    [ "$(unit_value "$unit" Service ExecStart)" = "$INSTALL_DIR/mediamtx $CONFIG_DIR/mediamtx.yml" ]
+    # no unit text left in the installer: no section header, no ExecReload, no inline directive
+    run grep -nE '^\[(Unit|Service|Install)\]|ExecReload|StartLimitInterval|kill -USR1' "$PROJECT_ROOT/install_mediamtx.sh"
+    [ "$status" -eq 1 ] || {
+        echo "$output"
+        false
+    }
+}
+
+@test "systemd accepts the rendered unit with no finding, alone and together with the stream manager's unit [LB-02 installer, LB-12, D12]" {
+    command -v systemd-analyze >/dev/null 2>&1 || skip "systemd-analyze not available"
+    unit_env
+    # ExecStart must name an existing executable for verify to say nothing at all
+    fake_mediamtx "$INSTALL_DIR/mediamtx" v1.21.3
+    PREAMBLE='' run_strict render_service_unit
+    [ "$status" -eq 0 ]
+    printf '%s\n' "$output" >"$DECOY_DIR/mediamtx.service"
+    run systemd-analyze verify "$DECOY_DIR/mediamtx.service"
+    [ -z "$output" ]
+    run systemd-analyze verify "$DECOY_DIR/mediamtx.service" "$PROJECT_ROOT/config/mediamtx-audio.service"
+    [ -z "$(grep -v 'is not executable: No such file or directory' <<<"$output")" ]
+    # the unit as installed on a node with no overrides (its ExecStart names /usr/local/bin/mediamtx,
+    # which this machine does not have: the one finding that is allowed)
+    render_default_unit >"$DECOY_DIR/default.service"
+    run systemd-analyze verify "$DECOY_DIR/default.service"
+    [ -z "$(grep -v 'is not executable: No such file or directory' <<<"$output")" ]
+}
+
+@test "a value the unit file cannot carry stops create_service before anything is written: a path with a space, an account name with a newline [LB-02 installer, D12]" {
+    unit_env
+    local value
+    for value in '/opt/my mediamtx' '/opt/x;y' '/opt/x%h' $'/opt/x\nExecStartPre=/bin/touch pwned'; do
+        MEDIAMTX_PREFIX="$value" PREAMBLE='' run_strict create_service
+        [ "$status" -eq 10 ] || {
+            echo "prefix '$value': status $status"
+            return 1
+        }
+        [[ "$output" == *"Cannot write the unit"* ]]
+    done
+    for value in 'svc user' $'svcuser\nExecStartPre=/bin/touch pwned' '-svcuser' 'svc%user'; do
+        MEDIAMTX_USER="$value" PREAMBLE='' run_strict create_service
+        [ "$status" -eq 10 ] || {
+            echo "user '$value': status $status"
+            return 1
+        }
+        [[ "$output" == *"account name"* ]]
+    done
+    [ -z "$(ls -A "$MEDIAMTX_SERVICE_DIR")" ]
+}
+
+@test "a missing template, and a template that lacks a line the renderer replaces, are refused with a message that says what to do [D12]" {
+    unit_env
+    MEDIAMTX_UNIT_TEMPLATE="$DECOY_DIR/nonexistent.service" PREAMBLE='' run_strict create_service
+    [ "$status" -eq 10 ]
+    [[ "$output" == *"unit template"*"is missing"* && "$output" == *"MEDIAMTX_UNIT_TEMPLATE"* ]]
+    local key
+    for key in ExecStart WorkingDirectory ReadWritePaths StandardOutput StandardError; do
+        grep -v "^${key}=" "$PROJECT_ROOT/config/mediamtx.service" >"$DECOY_DIR/drifted.service"
+        MEDIAMTX_UNIT_TEMPLATE="$DECOY_DIR/drifted.service" PREAMBLE='' run_strict create_service
+        [ "$status" -eq 10 ]
+        [[ "$output" == *"has no ${key} line"* ]] || {
+            echo "$key: $output"
+            return 1
+        }
+    done
+    # the commented account lines are replaced, so they must be there
+    for key in User Group; do
+        grep -v "^# ${key}=" "$PROJECT_ROOT/config/mediamtx.service" >"$DECOY_DIR/drifted.service"
+        MEDIAMTX_UNIT_TEMPLATE="$DECOY_DIR/drifted.service" PREAMBLE='' run_strict create_service
+        [ "$status" -eq 10 ]
+        [[ "$output" == *"has no ${key} line"* ]]
+    done
+    [ -z "$(ls -A "$MEDIAMTX_SERVICE_DIR")" ]
+}
+
+@test "create_service writes the rendered unit atomically with mode 0644, reloads systemd, and keeps a copy of the unit it replaces [LB-02 installer, D14]" {
+    unit_env
+    PREAMBLE='' run_strict render_service_unit
+    [ "$status" -eq 0 ]
+    printf '%s\n' "$output" >"$DECOY_DIR/expected.service"
+    # (run captures $output without the final newline: compare the content)
+    PREAMBLE='' run_strict create_service
+    [ "$status" -eq 0 ]
+    cmp "$DECOY_DIR/expected.service" "$MEDIAMTX_SERVICE_DIR/mediamtx.service"
+    [ "$(stat -c %a "$MEDIAMTX_SERVICE_DIR/mediamtx.service")" = 644 ]
+    grep -qx 'systemctl daemon-reload' "$SYSTEMCTL_LOG"
+    [ "$(ls -A "$MEDIAMTX_SERVICE_DIR")" = "mediamtx.service" ]
+    # a second install with another account replaces it, keeping the first as a backup with its mode
+    chmod 640 "$MEDIAMTX_SERVICE_DIR/mediamtx.service"
+    MEDIAMTX_USER=otheruser PREAMBLE='' run_strict create_service
+    [ "$status" -eq 0 ]
+    grep -qxF 'User=otheruser' "$MEDIAMTX_SERVICE_DIR/mediamtx.service"
+    local -a backups=()
+    mapfile -t backups < <(compgen -G "$MEDIAMTX_SERVICE_DIR/mediamtx.service.backup.*")
+    [ "${#backups[@]}" -eq 1 ]
+    cmp "$DECOY_DIR/expected.service" "${backups[0]}"
+    [ "$(stat -c %a "${backups[0]}")" = 640 ]
+    # the shared durable writer did the writing
+    MEDIAMTX_USER=thirduser PREAMBLE='lyrebird_atomic_write() { printf "%s\n" "$*" >>"$DECOY_DIR/atomic.log"; cat >/dev/null; return 1; }' \
+        run_strict create_service
+    [ "$status" -ne 0 ]
+    [ "$(cat "$DECOY_DIR/atomic.log")" = "$MEDIAMTX_SERVICE_DIR/mediamtx.service 0644" ]
+    [[ "$output" == *"Failed to write"* ]]
+}
+
+@test "install checks the unit template and the values it carries before it downloads or writes anything; --no-service skips the check [LB-02 installer, D12]" {
+    unit_env
+    local preamble
+    preamble="$(install_stubs)"
+    MEDIAMTX_UNIT_TEMPLATE="$DECOY_DIR/nonexistent.service" PREAMBLE="$preamble" run_strict install_mediamtx
+    [ "$status" -eq 10 ]
+    [[ "$output" == *"is missing"* ]]
+    MEDIAMTX_USER='svc user' PREAMBLE="$preamble" run_strict install_mediamtx
+    [ "$status" -eq 10 ]
+    [ ! -e "$DECOY_DIR/release.called" ]
+    [ ! -e "$DECOY_DIR/download.called" ]
+    [ ! -e "$DECOY_DIR/user.called" ]
+    [ ! -e "$DECOY_DIR/service.called" ]
+    [ -z "$(ls -A "$MEDIAMTX_SERVICE_DIR")" ]
+    # --no-service: no unit is written, so none is checked
+    MEDIAMTX_UNIT_TEMPLATE="$DECOY_DIR/nonexistent.service" PREAMBLE='check_service_inputs' run_strict true
+    [ "$status" -eq 10 ]
+    MEDIAMTX_UNIT_TEMPLATE="$DECOY_DIR/nonexistent.service" PREAMBLE='SKIP_SERVICE=true; check_service_inputs' run_strict true
+    [ "$status" -eq 0 ]
 }
