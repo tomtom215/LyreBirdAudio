@@ -2187,13 +2187,11 @@ parse_arguments() {
                 ;;
             --restore)
                 MODE_RESTORE=true
-                # Optional argument for timestamp
-                if [[ -n "$2" ]] && [[ "$2" != "--" ]]; then
-                    RESTORE_TIMESTAMP="$2"
-                    shift 2
-                else
-                    shift
-                fi
+                # getopt always puts one word after an option whose argument is optional:
+                # the value of --restore=VALUE, or an empty word. Taking only the option
+                # (and leaving the empty word) made the bare --restore an "internal error"
+                RESTORE_TIMESTAMP="$2"
+                shift 2
                 ;;
             --quality)
                 QUALITY_TIER="$2"
@@ -2209,6 +2207,15 @@ parse_arguments() {
                 ;;
         esac
     done
+
+    # `--restore VALUE`, the form the help shows: the option's argument is optional, which for
+    # getopt means it is taken only as --restore=VALUE, so a separate VALUE arrives here as the
+    # one operand. With --restore an operand cannot be a card number (that combination is an
+    # error below), so it is the timestamp.
+    if [[ "$MODE_RESTORE" = true ]] && [[ -z "$RESTORE_TIMESTAMP" ]] && [[ $# -eq 1 ]]; then
+        RESTORE_TIMESTAMP="$1"
+        shift
+    fi
 
     # Remaining argument is card number (optional)
     if [[ $# -gt 0 ]]; then
@@ -2373,17 +2380,23 @@ output_json() {
 # MAIN EXECUTION
 # ============================================================================
 
+# Is the ALSA proc filesystem there? (A container, or a kernel without ALSA, has none.)
+alsa_proc_available() {
+    [[ -d "/proc/asound" ]]
+}
+
 main() {
-    # Check if ALSA proc filesystem is available
-    if [[ ! -d "/proc/asound" ]]; then
-        log_error "ALSA proc filesystem not found at /proc/asound"
-        log_error "Is ALSA support enabled in your kernel?"
-        log_info "Check: lsmod | grep snd"
+    # Parse arguments first: --help and --version answer without touching the hardware
+    # (they used to exit 1 on a machine without /proc/asound, where help is just as useful)
+    if ! parse_arguments "$@"; then
         exit 1
     fi
 
-    # Parse arguments
-    if ! parse_arguments "$@"; then
+    # Everything below reads the hardware, or the directory it is listed in
+    if ! alsa_proc_available; then
+        log_error "ALSA proc filesystem not found at /proc/asound"
+        log_error "Is ALSA support enabled in your kernel?"
+        log_info "Check: lsmod | grep snd"
         exit 1
     fi
 
