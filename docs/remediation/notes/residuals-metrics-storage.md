@@ -37,7 +37,12 @@ the identity the stream manager uses (`is_managed_mediamtx_pid`). The exporter l
    what finds a stand-alone MediaMTX under `mediamtx.service`.
 
 The scan costs about 15 ms per scrape with 167 processes (measured, while the test suite
-was running).
+was running). The tests use decoys (copies of bash at the configured paths); the identity
+was also checked once by hand against a **real MediaMTX v1.21.3** on private ports (as root
+without a PID file: `mediamtx_up 1`, 15 descriptors, `api_info{version="v1.21.3"}`; with the
+PID file and `.id` record; as uid 65534 with the record: `mediamtx_up 1`, descriptor count
+omitted, mediamtx collector 0; as uid 65534 without it: `mediamtx_up` omitted, "cannot
+tell"; after the stop: `mediamtx_up 0`, `api_up 0`). That check is not part of the suite.
 No name or command-line pattern is used any more and `pgrep` is no longer a dependency
 (a decoy such as an editor on `mediamtx.yml`, `mediamtx-exporter`, `tail -f
 /var/log/mediamtx.log` or another installation's MediaMTX used to give
