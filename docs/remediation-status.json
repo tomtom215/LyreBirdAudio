@@ -1738,6 +1738,156 @@
         "the live-test setup is documented as the scripts have it: pinned versions, the variable, the files, the ports [CONTRIB]"
       ],
       "note": "found by the changelog worker; the live and canary steps now run test_stream_names and test_docs_security on every pinned version; 45 tests pass on each of 1.15.0, 1.18.0, 1.19.0, 1.21.1, 1.21.2, 1.21.3"
+    },
+    {
+      "id": "X-50",
+      "title": "a script run by bare name (bash lyrebird-stream-manager.sh ...) could not find lyrebird-common.sh, which became mandatory in this remediation",
+      "severity": "P2",
+      "phase": 7,
+      "status": "fixed",
+      "tests": [
+        "every script that needs the library finds it when started by its bare name from its own directory [X-50]",
+        "the stream manager started by its bare name in the repository writes the default device configuration [X-50]",
+        "started by its bare name the stream manager still verifies the library hash [X-50]",
+        "a script started through a symlink finds the library beside the file the link points at, and one beside the link first [X-50]",
+        "a script sourced by its bare name loads the library [X-50]",
+        "no script builds the library path with a slash-stripping expansion of BASH_SOURCE [X-50]"
+      ],
+      "note": "the library is looked up beside the script (or beside a symlink's target); all six scripts that load it"
+    },
+    {
+      "id": "X-51",
+      "title": "FFmpeg log directory wrong in diagnostics and the orchestrator; the shipped logrotate file and the one install writes listed the same logs (logrotate: duplicate log entry, nothing rotated)",
+      "severity": "P3",
+      "phase": 7,
+      "status": "fixed",
+      "tests": [
+        "the manager, the diagnostics and the orchestrator name one FFmpeg log directory by default [X-51]",
+        "MEDIAMTX_FFMPEG_DIR moves the FFmpeg log directory in all three; FFMPEG_LOG_DIR still overrides the two display scripts [X-51]",
+        "the orchestrator takes only a safe absolute path as the FFmpeg log directory [X-51]",
+        "the diagnostics log check finds the directory the manager writes its FFmpeg logs to [X-51]",
+        "a manager log that exists tells the diagnostics the manager was installed; the FFmpeg directory holds no such file [X-51]",
+        "Logs & Status item 4 lists the FFmpeg logs the manager wrote, in MEDIAMTX_FFMPEG_DIR [X-51]",
+        "the shipped logrotate file rotates the directory the alert log is written to and does not call it the FFmpeg log directory [X-51]",
+        "install's logrotate file rotates the FFmpeg logs where the manager writes them [X-51]",
+        "every log file is rotated by exactly one logrotate file: the shipped one and the one install writes list no log in common [X-51]"
+      ],
+      "note": "one owner per log; the display scripts follow MEDIAMTX_FFMPEG_DIR"
+    },
+    {
+      "id": "X-52",
+      "title": "the updater's service reinstall reset the cron file's stream mode to individual",
+      "severity": "P2",
+      "phase": 7,
+      "status": "fixed",
+      "tests": [
+        "install writes what it is given: a plain install after a multiplex one is the individual mode again [X-52]",
+        "the updater's service reinstall keeps the stream mode, the filter and the name in the cron file as well as in the unit [X-52]",
+        "the reinstall still restores an operator's own variable once, and takes the settings from the cron file for what the unit does not set [X-52]",
+        "a node that sets none of the settings is reinstalled with none: its unit and cron file are what a plain install writes [X-52]"
+      ],
+      "note": "the reinstall reads the node's settings from the installed unit or cron file and passes them to install"
+    },
+    {
+      "id": "X-53",
+      "title": "mic-check --restore VALUE and a bare --restore failed to parse, and --help needed /proc/asound",
+      "severity": "P3",
+      "phase": 7,
+      "status": "fixed",
+      "tests": [
+        "--restore VALUE, the form the help shows, and --restore=VALUE both give the timestamp; a bare --restore asks for none [X-53]",
+        "--restore still refuses what makes no sense: a second operand, another mode, a card number [X-53]",
+        "--help and --version exit 0 on a machine without /proc/asound and never look at the hardware [X-53]",
+        "everything that reads the hardware still stops with exit 1 and says why when /proc/asound is missing [X-53]",
+        "--restore VALUE restores that backup; a bare --restore offers the list [X-53]"
+      ],
+      "note": "the restore operand is read; the ALSA check runs after argument parsing"
+    },
+    {
+      "id": "X-54",
+      "title": "the orchestrator and diagnostics found MediaMTX and the stream wrappers by process name, and counted every FFmpeg on the host as a stream",
+      "severity": "P3",
+      "phase": 7,
+      "status": "fixed",
+      "tests": [
+        "lyrebird_mediamtx_pids names only the program at the binary's path running this configuration, among look-alikes [X-54]",
+        "lyrebird_stream_wrapper_pids names the manager's wrapper scripts directly in its directory, run by a bash, and no FFmpeg [X-54]",
+        "the orchestrator does not take a decoy called mediamtx or any FFmpeg of the host for MediaMTX and its streams [X-54]",
+        "the orchestrator counts this installation's MediaMTX and its wrappers, and only those [X-54]",
+        "the orchestrator needs no pgrep: the state is the same without it [X-54]",
+        "the diagnostics cache no PID and report no running manager for look-alikes: a decoy called mediamtx, an editor with the binary's path, a command line naming the manager [X-54]",
+        "the diagnostics cache the PID of this installation's MediaMTX and call the node running [X-54]"
+      ],
+      "note": "identity (executable and argument) through lyrebird_mediamtx_pids and lyrebird_stream_wrapper_pids in lyrebird-common.sh"
+    },
+    {
+      "id": "X-55",
+      "title": "diagnostics ignored MEDIAMTX_RTSP_PORT, the orchestrator printed port 8554 always, the exporter ignored MEDIAMTX_FFMPEG_DIR",
+      "severity": "P3",
+      "phase": 7,
+      "status": "fixed",
+      "tests": [
+        "the diagnostics read the RTSP port from MEDIAMTX_RTSP_PORT; MEDIAMTX_PORT is only the fallback; the default is 8554 [X-55]",
+        "the diagnostics' service check looks for MEDIAMTX_RTSP_PORT and says so [X-55]",
+        "the orchestrator's View Stream URLs prints the configured RTSP port, and 8554 only by default or for an invalid value [X-55]",
+        "the metrics exporter follows MEDIAMTX_FFMPEG_DIR, the manager's variable; FFMPEG_PID_DIR is the fallback; the default is the manager's [X-55]",
+        "a scrape of a node whose manager directory was moved with MEDIAMTX_FFMPEG_DIR sees its streams [X-55]"
+      ],
+      "note": "all three follow the manager's variables, the old names as fallback"
+    },
+    {
+      "id": "X-56",
+      "title": "six scripts were committed without the executable bit",
+      "severity": "P3",
+      "phase": 7,
+      "status": "fixed",
+      "tests": [
+        "every script that is run directly is 100755 in the index [X-56]",
+        "no tracked file that starts with a shebang is left at 100644, except the test files bats runs and the sourced-only library [X-56]",
+        "the files that are sourced, not run, are not required to be executable: the helpers under tests/ are 100644 and the library is either [X-56]"
+      ],
+      "note": "all scripts that are run directly are 100755"
+    },
+    {
+      "id": "X-57",
+      "title": "installer exit 7 meant already installed, not installed, could not stop and also failed extract/install steps; the wizard read any 7 as already installed",
+      "severity": "P3",
+      "phase": 7,
+      "status": "fixed",
+      "tests": [
+        "install: an archive that cannot be extracted exits 11, not the 7 of 'already installed' [X-57]",
+        "install: an archive without the binary exits 11 [X-57]",
+        "install: a binary that cannot be put in place exits 11, at the copy and at the move [X-57]",
+        "install: 7 still means 'already installed' and nothing else; update and uninstall of what is not installed keep 7 [X-57]",
+        "the installer's help lists its exit codes: 7 for already installed, not installed and could not be stopped, 11 for the binary steps [X-57]",
+        "wizard: a failed binary installation (the status the real installer gave for a corrupt archive) stops at step 1 instead of carrying on [X-57]",
+        "the orchestrator explains installer exit 7 without calling it a failed install step, and 11 as a failed binary installation [X-57]",
+        "MediaMTX menu: installer exit status 7 is explained as already installed or a failed step, 0 is silent [LB-21]"
+      ],
+      "note": "failed binary steps exit 11; the help has an exit-code table 0-11"
+    },
+    {
+      "id": "X-58",
+      "title": "install did not carry ports, binds, auth mode or endpoint settings into the unit and cron file: a cron restart of a crashed MediaMTX re-rendered the defaults and dropped the authentication (anonymous remote publishing returned)",
+      "severity": "P1",
+      "phase": 7,
+      "status": "fixed",
+      "tests": [
+        "install writes every listener, authentication and endpoint setting that differs from its default into the unit and the cron file [X-58]",
+        "with none of the settings given, or each given at its default, the unit and the cron file carry none of them [X-58]",
+        "a value the unit or the cron file cannot carry stops install with exit 4 and changes nothing [X-58]",
+        "a cron monitor that finds MediaMTX gone renders the configuration with the authentication and the ports the node was installed with [X-58]"
+      ],
+      "note": "install writes the nine settings it was given into both files; the monitor restart keeps authInternalUsers and the ports (real monitor code path); the updater reinstall keeps them"
+    },
+    {
+      "id": "X-59",
+      "title": "path variables (MEDIAMTX_CONFIG_DIR, PID, lock and log files, MEDIAMTX_FFMPEG_DIR) and the audio settings are not carried into the unit or cron file; a non-default MEDIAMTX_PID_FILE at install renders PIDFile= that the service never receives",
+      "severity": "P3",
+      "phase": 7,
+      "status": "wontfix",
+      "tests": [],
+      "note": "decision for the maintainer: carrying paths would change many tests that set them for hermetic renders; documented under known limits; set paths with a systemd drop-in and a cron environment line"
     }
   ]
 }
