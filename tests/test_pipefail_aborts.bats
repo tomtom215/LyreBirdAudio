@@ -176,6 +176,29 @@ EOF
     [[ "$output" == *"EMPTY-SEARCH-OK []"* ]]
 }
 
+@test "usb-mapper: card_usb_port reads a port only from the path below the sysfs root, never from a directory above it [X-45]" {
+    # a scratch or mount directory named like a USB port (<bus>-<port>) above the root
+    # was taken for the card's port; a real USB card below the root still is found
+    local sys="$PA_TMP/1794448449-17248/sys"
+    mkdir -p "$sys/devices/platform/soc/fe00b840.mailbox/sound/card0" "$sys/class/sound"
+    ln -s ../.. "$sys/devices/platform/soc/fe00b840.mailbox/sound/card0/device"
+    ln -s ../../devices/platform/soc/fe00b840.mailbox/sound/card0 "$sys/class/sound/card0"
+    mkdir -p "$sys/devices/pci0000:00/usb1/1-2/1-2:1.0/sound/card1"
+    ln -s ../.. "$sys/devices/pci0000:00/usb1/1-2/1-2:1.0/sound/card1/device"
+    ln -s ../../devices/pci0000:00/usb1/1-2/1-2:1.0/sound/card1 "$sys/class/sound/card1"
+
+    run env PROJECT_ROOT="$PROJECT_ROOT" USB_AUDIO_MAPPER_SYSFS="$sys" bash -c '
+        source "$PROJECT_ROOT/usb-audio-mapper.sh" >/dev/null 2>&1
+        rc=0
+        card_usb_port 0 >/dev/null || rc=$?
+        echo "PLATFORM rc=$rc"
+        echo "USB port=$(card_usb_port 1)"
+    '
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"PLATFORM rc=1"* ]]
+    [[ "$output" == *"USB port=1-2"* ]]
+}
+
 @test "installer: verify_checksum reports a MISSING checksum entry instead of aborting" {
     echo "binary-data" > "$PA_TMP/mediamtx.tar.gz"
     echo "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef  other_file.tar.gz" \

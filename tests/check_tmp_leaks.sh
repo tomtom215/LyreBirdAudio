@@ -18,6 +18,7 @@
 #   /var/log/lyrebird*  (this includes /var/log/lyrebird/)    /var/log/mediamtx*
 #   /var/lib/lyrebird   /var/lib/mediamtx-ffmpeg
 #   /run/lyrebird*      /run/mediamtx*      /dev/shm/lyrebird*
+#   /run/lock/mediamtx* (the installer's lock; moved by MEDIAMTX_INSTALLER_LOCK_FILE)
 #   /etc/lyrebird       /etc/mediamtx       /etc/cron.d/mediamtx*
 #   /etc/systemd/system/mediamtx*           /etc/logrotate.d/*
 # (the patterns are expanded again after the run, so a path that only exists
@@ -66,6 +67,7 @@ host_patterns() {
         "${host_root}/var/lib/mediamtx-ffmpeg" \
         "${host_root}/run/lyrebird*" \
         "${host_root}/run/mediamtx*" \
+        "${host_root}/run/lock/mediamtx*" \
         "${host_root}/etc/lyrebird" \
         "${host_root}/etc/mediamtx" \
         "${host_root}/etc/cron.d/mediamtx*" \

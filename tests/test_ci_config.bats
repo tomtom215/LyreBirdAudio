@@ -55,9 +55,9 @@ make_upstream() {
     local t
     UP="$TEST_SCRATCH/upstream"
     git init -q "$UP"
-    git -C "$UP" -c user.name=t -c user.email=t@example.invalid commit -q --allow-empty -m init
+    git -C "$UP" -c user.name=t -c user.email=t@example.invalid -c commit.gpgsign=false commit -q --allow-empty -m init
     for t in "$@"; do
-        git -C "$UP" tag "$t"
+        git -C "$UP" -c tag.gpgSign=false tag "$t"
     done
 }
 
@@ -845,7 +845,7 @@ make_tagged_repo() {
     echo nested >sub/b.txt
     git add a.sh sub/b.txt
     GIT_COMMITTER_DATE="2026-11-01T12:00:00Z" GIT_AUTHOR_DATE="2026-11-01T12:00:00Z" \
-        git -c user.name=t -c user.email=t@example.invalid commit -q -m "release content"
+        git -c user.name=t -c user.email=t@example.invalid -c commit.gpgsign=false commit -q -m "release content"
     echo untracked >untracked.txt
     GITHUB_SHA="$(git rev-parse HEAD)"
 }

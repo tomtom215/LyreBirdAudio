@@ -276,9 +276,12 @@ read_attr() {
 
 # Print the USB port (e.g. 1-3.1) of ALSA card N; fail if it is not a USB card.
 card_usb_port() {
-    local card="$1" dir base
+    local card="$1" dir base root
     dir=$(readlink -f "$SYSFS_ROOT/class/sound/card${card}/device" 2>/dev/null) || return 1
-    while [[ -n "$dir" && "$dir" != "/" && "$dir" != "." ]]; do
+    # Only the parts of the path below the sysfs root are looked at: a directory above
+    # it (a scratch directory named like 1794448449-17248, say) is not a USB port
+    root=$(readlink -f "$SYSFS_ROOT" 2>/dev/null) || return 1
+    while [[ -n "$dir" && "$dir" != "$root" && "$dir" == "${root%/}"/* ]]; do
         base=$(basename "$dir")
         if [[ "$base" =~ $USB_PORT_RE ]]; then
             printf '%s' "$base"

@@ -161,6 +161,7 @@ run_check() {
         var/lib/mediamtx-ffmpeg/segment.aac
         run/lyrebird/status.json
         run/mediamtx-audio.pid
+        run/lock/mediamtx-installer.lock
         etc/lyrebird/alerts.conf
         etc/mediamtx/audio-devices.conf
         etc/cron.d/mediamtx-monitor

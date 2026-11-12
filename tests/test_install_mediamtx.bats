@@ -14,14 +14,15 @@ setup() {
     PROJECT_ROOT="$( cd "$TEST_DIR/.." && pwd )"
 
     # Create temp directories for testing
-    # The installer resets TEMP_DIR/CONFIG_FILE to "" and makes LOCK_FILE a
-    # readonly system path when sourced, so keep this file's own paths in
-    # TEST_* variables and delete only those (deleting "$LOCK_FILE" removed
-    # the real /run/lock/mediamtx-installer.lock after every test).
+    # The installer resets TEMP_DIR/CONFIG_FILE to "" when sourced and makes
+    # LOCK_FILE readonly, so keep this file's own paths in TEST_* variables and
+    # delete only those (deleting "$LOCK_FILE" used to remove the real
+    # /run/lock/mediamtx-installer.lock after every test). The lock file is moved
+    # with MEDIAMTX_INSTALLER_LOCK_FILE, the only variable the installer reads for it.
     TEST_TEMP_DIR="$(mktemp -d)"
     TEST_LOCK_FILE="$(mktemp)"
     TEST_CONFIG_FILE="$(mktemp)"
-    export TEMP_DIR="$TEST_TEMP_DIR" LOCK_FILE="$TEST_LOCK_FILE" CONFIG_FILE="$TEST_CONFIG_FILE"
+    export TEMP_DIR="$TEST_TEMP_DIR" MEDIAMTX_INSTALLER_LOCK_FILE="$TEST_LOCK_FILE" CONFIG_FILE="$TEST_CONFIG_FILE"
 
     # Set dry-run mode to avoid actual system changes
     export DRY_RUN=true
@@ -505,6 +506,13 @@ teardown() {
     DRY_RUN_MODE=false PATH="$bin:$PATH" run verify_service_started systemd
     rm -rf "$bin"
     [ "$status" -eq 0 ]
+}
+
+@test "the installer's lock file is moved by MEDIAMTX_INSTALLER_LOCK_FILE only: an ambient LOCK_FILE does not choose where a root process creates a file [X-35]" {
+    run bash -c 'export LOCK_FILE=/nonexistent/ambient.lock MEDIAMTX_INSTALLER_LOCK_FILE="$1/mine.lock"; source "$2" >/dev/null 2>&1; printf "%s" "$LOCK_FILE"' _ "$TEST_TEMP_DIR" "$PROJECT_ROOT/install_mediamtx.sh"
+    [ "$output" = "$TEST_TEMP_DIR/mine.lock" ]
+    run bash -c 'unset MEDIAMTX_INSTALLER_LOCK_FILE; export LOCK_FILE=/nonexistent/ambient.lock; source "$1" >/dev/null 2>&1; printf "%s" "$LOCK_FILE"' _ "$PROJECT_ROOT/install_mediamtx.sh"
+    [ "$output" = "/run/lock/mediamtx-installer.lock" ] || [ "$output" = "/tmp/mediamtx-installer.lock" ]
 }
 
 @test "release_lock preserves the lock file, removes only the pid file [INST-8 regression]" {

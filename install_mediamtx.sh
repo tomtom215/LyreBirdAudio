@@ -95,13 +95,16 @@ TEMP_BASE="${TMPDIR:-/tmp}"
 TEMP_DIR=""
 LOG_FILE=""
 
-# FIX 1.1: Platform-specific lock file path
+# FIX 1.1: Platform-specific lock file path. MEDIAMTX_INSTALLER_LOCK_FILE moves it
+# (the tests use that, so that no test takes the lock of the machine it runs on);
+# the generic name LOCK_FILE is NOT read from the environment: the installer runs as
+# root and creates this file, so an ambient variable must not choose where.
 if [[ "$(uname)" == "Linux" ]]; then
     # Modern Linux uses /run/lock (tmpfs, auto-cleaned on boot)
-    readonly LOCK_FILE="/run/lock/mediamtx-installer.lock"
+    readonly LOCK_FILE="${MEDIAMTX_INSTALLER_LOCK_FILE:-/run/lock/mediamtx-installer.lock}"
 else
     # BSD/macOS fallback to /tmp
-    readonly LOCK_FILE="/tmp/mediamtx-installer.lock"
+    readonly LOCK_FILE="${MEDIAMTX_INSTALLER_LOCK_FILE:-/tmp/mediamtx-installer.lock}"
 fi
 
 LOCK_FD=""

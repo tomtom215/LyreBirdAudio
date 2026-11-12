@@ -329,7 +329,9 @@ PY
     run env MEDIAMTX_PID_FILE="/run/my pid.pid" bash -c 'source "$ISCRIPT" >/dev/null 2>&1; render_systemd_unit' _
     [ "$status" -ne 0 ]
     [[ "$output" == *"is not an absolute path of letters, digits"* ]]
-    run env MEDIAMTX_LOG_FILE='/var/log/it"s.log' STREAM_MANAGER_LOG_FILE='/var/log/it"s.log' bash -c 'source "$ISCRIPT" >/dev/null 2>&1; render_systemd_unit' _
+    # (under the scratch directory: a log path is opened when the script is sourced, and
+    # this one must not create /var/log/it"s.log on the machine the suite runs on [X-35])
+    run env MEDIAMTX_LOG_FILE="$UN"'/it"s.log' STREAM_MANAGER_LOG_FILE="$UN"'/it"s.log' bash -c 'source "$ISCRIPT" >/dev/null 2>&1; render_systemd_unit' _
     [ "$status" -ne 0 ]
     # the script installed under a path with a space
     mkdir -p "$UN/with space/config"

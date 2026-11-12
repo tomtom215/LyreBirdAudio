@@ -1444,8 +1444,32 @@
       "title": "test suite writes the host's real /var/log (lyrebird-diagnostics.log, lyrebird/alerts.log, residual stream-manager log) and relative alerts.log",
       "severity": "P3",
       "phase": 6,
-      "status": "open",
-      "tests": []
+      "status": "fixed",
+      "tests": [
+        "E2E: an alert's log line goes to the scratch directory the suite set, never to /var/log/lyrebird [X-35]",
+        "the installer's lock file is moved by MEDIAMTX_INSTALLER_LOCK_FILE only: an ambient LOCK_FILE does not choose where a root process creates a file [X-35]",
+        "sourcing the script logs to the scratch directory the suite set, never to /var/log [X-35]",
+        "validate_stream logs to the scratch directory the suite set, never to /var/log [X-35]",
+        "sourcing the diagnostics script logs to the scratch directory the suite set, never to /var/log [X-35]",
+        "scratch_setup points the manager, diagnostics and alert logs and the alert state at the scratch directory [X-35]",
+        "host check: a suite that leaves the host alone passes [X-35]",
+        "host check: appending to a watched log fails the run and shows the file with its before and after size [X-35]",
+        "host check: a file or directory created under every watched path is reported [X-35]",
+        "host check: a watched path that only exists after the run is reported as created [X-35]",
+        "host check: a watched file the suite removes is reported as removed [X-35]",
+        "host check: a file replaced by a rename with the same size and mtime is reported, by its inode [X-35]",
+        "host check: a rewrite in place with the same size and inode, and a plain touch, are reported by their mtime [X-35]",
+        "host check: a relative path written in the repository working tree is reported, changes under .git are not [X-35]",
+        "host check: a relative path written in the current directory outside the repository is reported [X-35]",
+        "host check: bats arguments are passed through and the check applies to the files they name [X-35]",
+        "host check: it is off unless LYREBIRD_LEAK_CHECK_HOST is 1, so a leaking suite passes by default and with 0 [X-35]",
+        "host check: any other value is refused with status 2 and runs nothing [X-35]",
+        "host check: it refuses to run, and runs nothing, while a LyreBird service unit is active [X-35]",
+        "host check: it refuses to run, and runs nothing, while a monitor cron job is installed [X-35]",
+        "host check: a failing suite keeps its failure status and the host changes are still shown [X-35]",
+        "host check: a TMPDIR leak and a host change are both reported [X-35]"
+      ],
+      "note": "the suite writes no LyreBird path of the host: scratch_setup moves the manager, diagnostics and alert logs and state; the installer's lock moves with MEDIAMTX_INSTALLER_LOCK_FILE; the one hostile-path unit test writes under its scratch directory; tests/check_tmp_leaks.sh with LYREBIRD_LEAK_CHECK_HOST=1 (on in CI) fails a run that changes the watched host paths, the repository tree or the current directory. Accepted: systemd-analyze touches /run/systemd/systemd-units-load; not watched: a hand-started manager, /tmp, HOME"
     },
     {
       "id": "X-36",
@@ -1542,6 +1566,17 @@
         "serve: a client that half-closes and one that sends a huge or endless request do not wedge the server [LB-18]"
       ],
       "note": "the tests now wait for the server to be idle (one listening socket, no live connection); the cause is netcat keeping its listening socket until it exits (SO_REUSEPORT), reproduced with two ncs, so a client that connects while another is served can be reset: documented in --help, wontfix without a different server (python3 or ncat), a maintainer decision"
+    },
+    {
+      "id": "X-45",
+      "title": "usb-audio-mapper card_usb_port took a directory above the sysfs root for the card's USB port",
+      "severity": "P4",
+      "phase": 6,
+      "status": "fixed",
+      "tests": [
+        "usb-mapper: card_usb_port reads a port only from the path below the sysfs root, never from a directory above it [X-45]"
+      ],
+      "note": "found by the hygiene worker: a scratch directory named like <bus>-<port> above the fake sysfs; real sysfs was not affected; the walk now stops at the root"
     }
   ]
 }
