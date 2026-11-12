@@ -530,14 +530,13 @@
         "check_alsa_device_available looks at the capture device node, not at device 0 [LB-24]",
         "check_audio_device accepts a card whose capture is on device 1 and refuses a playback-only card [LB-24]",
         "check_audio_device refuses a capture PCM whose device node has gone [LB-24]",
-        "check_audio_level records from the capture PCM, not from device 0 [LB-24]",
         "no capture path in the script assumes PCM device 0 any more [LB-24]",
         "resolve_capture_pcm takes the first capture PCM, whichever device number it has [LB-24]",
         "the roots default to the real /proc/asound and /dev/snd [LB-24]",
         "the wrapper checks the capture PCM's device node, so it runs when only device 0 is missing and stops when device 1 is [LB-24]",
         "without PCM directories in /proc/asound the capture device nodes are used [LB-24]"
       ],
-      "note": "fixed in software with fake /proc/asound and /dev/snd trees; real card PCM layouts, plughw behaviour and second-open of a busy device need hardware"
+      "note": "fixed in software with fake /proc/asound and /dev/snd trees; real card PCM layouts, plughw behaviour and second-open of a busy device need hardware (the ALSA-opening level probe was removed by D6, so its test went with it)"
     },
     {
       "id": "X-01",
