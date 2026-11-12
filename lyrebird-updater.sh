@@ -1749,9 +1749,9 @@ git_worktree() {
 # Git Configuration Management
 ################################################################################
 
-# core.fileMode is switched off for the length of a run: the scripts are
-# tracked as 644 but made executable on disk, which git would otherwise report
-# as local modifications. The value it had is written to GIT_CONFIG_SAVED_FILE
+# core.fileMode is switched off for the length of a run: the scripts of older tags
+# are tracked as 644 (the current ones as 755, X-56) but made executable on disk,
+# which git would otherwise report as local modifications. The value it had is written to GIT_CONFIG_SAVED_FILE
 # BEFORE the change, so a run that is killed (or exec'd into the new updater,
 # which skips the EXIT trap) cannot leave "false" behind for good: whoever
 # starts next restores the saved value first.
@@ -3459,7 +3459,7 @@ set_script_permissions() {
 
     # The known scripts plus every shell script the repository tracks. git
     # writes a changed file with the mode recorded in the repository (644 for
-    # most of the scripts) and core.fileMode is off while the updater runs, so
+    # most of the scripts of older tags) and core.fileMode is off while the updater runs, so
     # after a switch or a rollback whatever is not marked here is no longer
     # executable -- the diagnostics and mic-check scripts were not on the old
     # list of five.
