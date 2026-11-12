@@ -38,13 +38,35 @@ readonly SCRIPT_NAME
 # Configuration
 # ============================================================================
 
-# Paths
-readonly RECORDING_DIR="${LYREBIRD_RECORDING_DIR:-/var/lib/mediamtx-ffmpeg/recordings}"
-readonly LOG_DIR="${LYREBIRD_LOG_DIR:-/var/log/lyrebird}"
-readonly MEDIAMTX_LOG="${MEDIAMTX_LOG:-/var/log/mediamtx.out}"
-readonly MEDIAMTX_LOG_DIR="${MEDIAMTX_LOG%/*}" # Directory containing MediaMTX log
-readonly TEMP_DIR="${LYREBIRD_TEMP_DIR:-/tmp}"
-readonly BUFFER_DIR="${LYREBIRD_BUFFER_DIR:-/dev/shm/lyrebird-buffer}"
+# Paths. Each is made absolute here, once: a relative value is taken relative to
+# the directory the script was started in. `find` reads an argument that starts
+# with "-" as part of its expression, not as a directory, so a relative
+# LYREBIRD_RECORDING_DIR=-rec made every listing fail (hidden by 2>/dev/null) and
+# cleanup report "Cleaned 0 recording file(s)" with old files left; an absolute
+# path starts with "/".
+_absolute_path() {
+    case "$1" in
+        /*) printf '%s' "$1" ;;
+        *) printf '%s/%s' "$PWD" "$1" ;;
+    esac
+}
+
+_rec_dir="$(_absolute_path "${LYREBIRD_RECORDING_DIR:-/var/lib/mediamtx-ffmpeg/recordings}")"
+_log_dir="$(_absolute_path "${LYREBIRD_LOG_DIR:-/var/log/lyrebird}")"
+_mtx_log="$(_absolute_path "${MEDIAMTX_LOG:-/var/log/mediamtx.out}")"
+_tmp_dir="$(_absolute_path "${LYREBIRD_TEMP_DIR:-/tmp}")"
+_buf_dir="$(_absolute_path "${LYREBIRD_BUFFER_DIR:-/dev/shm/lyrebird-buffer}")"
+# The directory of the MediaMTX log (for a file directly under /, that is /)
+_mtx_log_dir="${_mtx_log%/*}"
+[[ -n "$_mtx_log_dir" ]] || _mtx_log_dir="/"
+
+readonly RECORDING_DIR="$_rec_dir"
+readonly LOG_DIR="$_log_dir"
+readonly MEDIAMTX_LOG="$_mtx_log"
+readonly MEDIAMTX_LOG_DIR="$_mtx_log_dir"
+readonly TEMP_DIR="$_tmp_dir"
+readonly BUFFER_DIR="$_buf_dir"
+unset _rec_dir _log_dir _mtx_log _mtx_log_dir _tmp_dir _buf_dir
 
 # Coerce a value to a non-negative base-10 integer, falling back to a default
 # when the input is not all digits. A non-numeric env value (e.g. an operator
