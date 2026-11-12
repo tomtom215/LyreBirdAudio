@@ -191,10 +191,10 @@ EOF
     local mgr_help inst_help
     mgr_help="$(bash "$ROOT/lyrebird-stream-manager.sh" help 2>&1)"
     inst_help="$(bash "$ROOT/install_mediamtx.sh" help 2>&1)"
-    # the updater asks for a confirmation when it runs as root, even for --help:
-    # its help text is read from the script
+    # the updater answers --help at once (no root confirmation, no lock) since X-62
     local upd_help
-    upd_help="$(sed -n '/^show_help()/,/^}/p' "$ROOT/lyrebird-updater.sh")"
+    upd_help="$(env -i PATH="$PATH" HOME="$TEST_SCRATCH" SUDO_USER=somebody bash "$ROOT/lyrebird-updater.sh" --help </dev/null 2>&1)"
+    [ -n "$upd_help" ]
     local n=0
     while IFS= read -r span; do
         case "$span" in
