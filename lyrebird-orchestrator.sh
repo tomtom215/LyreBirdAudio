@@ -234,6 +234,11 @@ fi
 declare -A SCRIPT_PATHS=()
 declare -A SCRIPT_CHECKSUMS=() # SHA256 checksums for script integrity verification
 LAST_ERROR=""
+# Real exit status of the script the last execute_script call delegated to; "" when
+# that call ran nothing (unknown script, failed integrity check). execute_script's
+# own return value collapses most failures to 1, and a caller that writes
+# `|| true` loses even that: this is what the messages that explain a failure read.
+LAST_EXIT_CODE=""
 MEDIAMTX_INSTALLED=false
 MEDIAMTX_RUNNING=false
 MEDIAMTX_VERSION="unknown"
@@ -665,10 +670,66 @@ recompute_script_checksums() {
     log "DEBUG" "Recomputed script checksums after update"
 }
 
+# One-line meaning of exit status CODE of delegated script KEY, for the messages
+# that report a failure. The stream manager's table is the one in
+# `lyrebird-stream-manager.sh --help` (docs/remediation/notes/stream-outcome.md),
+# the updater's the one in docs/remediation/notes/updater.md. Prints nothing and
+# returns 1 for a status without a documented meaning.
+describe_exit_code() {
+    local key="$1" code="$2" signal_name=""
+
+    if [[ ! "$code" =~ ^[0-9]+$ ]]; then
+        return 1
+    fi
+    if ((code > 128 && code < 160)); then
+        signal_name="$(kill -l $((code - 128)) 2>/dev/null)" || signal_name=""
+        printf 'terminated by signal %s%s' "$((code - 128))" "${signal_name:+ (SIG${signal_name})}"
+        return 0
+    fi
+
+    case "${key}:${code}" in
+        stream_manager:1) printf '%s' "general error; see the message above and the stream manager log" ;;
+        stream_manager:2) printf '%s' "critical resource state (disk, memory or file descriptors)" ;;
+        stream_manager:3) printf '%s' "a required tool or the MediaMTX binary is missing" ;;
+        stream_manager:4) printf '%s' "invalid configuration (start policy, device configuration or MediaMTX configuration)" ;;
+        stream_manager:5) printf '%s' "another lifecycle command (start, stop or restart) is running; nothing was changed, try again shortly" ;;
+        stream_manager:6) printf '%s' "no USB audio device is detected and starting without one is disabled (LYREBIRD_ALLOW_EMPTY_START=false)" ;;
+        stream_manager:7) printf '%s' "MediaMTX is not running" ;;
+        stream_manager:8) printf '%s' "another MediaMTX owns this node (for example mediamtx.service); nothing was changed" ;;
+        stream_manager:9) printf '%s' "no stream is publishing, so the start policy was not met; what the start launched was stopped again" ;;
+        stream_manager:10) printf '%s' "some streams are not publishing (monitor)" ;;
+        updater:1) printf '%s' "general error" ;;
+        updater:2) printf '%s' "prerequisites not met" ;;
+        updater:3) printf '%s' "not a git repository" ;;
+        updater:4) printf '%s' "could not reach the remote (fetch failed) or no remote is configured" ;;
+        updater:5) printf '%s' "permission problem: the repository is not writable or is owned by root, or the lock cannot be written" ;;
+        updater:6) printf '%s' "that version is not available in this clone (a rollback never uses the network)" ;;
+        updater:7) printf '%s' "another updater is running" ;;
+        updater:8) printf '%s' "unusable git state (a merge or rebase is in progress, or the update journal is unreadable)" ;;
+        updater:9) printf '%s' "cancelled (a prompt was declined, or the run was interrupted)" ;;
+        updater:10) printf '%s' "the switch is done, but your saved changes conflict with the new version and were NOT re-applied; they are in the git stash" ;;
+        updater:11) printf '%s' "the automatic rollback could not restore everything; the updater's message names the 'git checkout --force' command to run" ;;
+        *) return 1 ;;
+    esac
+}
+
+# "<script> failed (exit code: N - meaning)", the meaning only when there is one
+delegated_failure_text() {
+    local key="$1" name="$2" code="$3" meaning=""
+    meaning="$(describe_exit_code "$key" "$code")" || meaning=""
+    if [[ -n "$meaning" ]]; then
+        printf '%s failed (exit code: %s - %s)' "$name" "$code" "$meaning"
+    else
+        printf '%s failed (exit code: %s)' "$name" "$code"
+    fi
+}
+
 execute_script() {
     local script_key="$1"
     shift
     local args=("$@")
+
+    LAST_EXIT_CODE=""
 
     if [[ ! -v "SCRIPT_PATHS[$script_key]" ]]; then
         error "Unknown script key: ${script_key}"
@@ -724,12 +785,13 @@ execute_script() {
         local exit_code=0
         wait $CHILD_PID || exit_code=$?
         CHILD_PID=""
+        LAST_EXIT_CODE="$exit_code"
         if [[ $exit_code -eq 0 ]]; then
             log "INFO" "${script_name} completed successfully (privilege-dropped)"
             return 0
         else
-            error "${script_name} failed (exit code: ${exit_code})"
-            LAST_ERROR="${script_name} failed (exit code: ${exit_code})"
+            LAST_ERROR="$(delegated_failure_text "$script_key" "$script_name" "$exit_code")"
+            error "${LAST_ERROR}"
             log "ERROR" "${script_name} failed with exit code ${exit_code} (privilege-dropped)"
             return 1
         fi
@@ -745,6 +807,7 @@ execute_script() {
         local exit_code=0
         wait $CHILD_PID || exit_code=$?
         CHILD_PID=""
+        LAST_EXIT_CODE="$exit_code"
 
         case ${exit_code} in
             "${E_DIAG_SUCCESS}")
@@ -778,6 +841,7 @@ execute_script() {
         local exit_code=0
         wait $CHILD_PID || exit_code=$?
         CHILD_PID=""
+        LAST_EXIT_CODE="$exit_code"
         if [[ $exit_code -eq 0 ]]; then
             log "INFO" "${script_name} completed successfully"
         else
@@ -798,14 +862,33 @@ execute_script() {
     local exit_code=0
     wait $CHILD_PID || exit_code=$?
     CHILD_PID=""
+    LAST_EXIT_CODE="$exit_code"
     if [[ $exit_code -eq 0 ]]; then
         log "INFO" "${script_name} completed successfully"
         return 0
     else
-        error "${script_name} failed (exit code: ${exit_code})"
-        LAST_ERROR="${script_name} failed (exit code: ${exit_code})"
+        LAST_ERROR="$(delegated_failure_text "$script_key" "$script_name" "$exit_code")"
+        error "${LAST_ERROR}"
         log "ERROR" "${script_name} failed with exit code ${exit_code}"
         return 1
+    fi
+}
+
+# Say how an installer action ended. execute_script prints nothing for the
+# installer (the wizard treats its exit status 7 as data), so a failure would
+# otherwise reach the user only as "Last Error" in the next menu redraw.
+# Exit status 7 is overloaded in the installer: "already installed", but also
+# several failed install steps; its own message, printed just before, says which.
+report_installer_result() {
+    local action="$1"
+
+    if [[ -z "$LAST_EXIT_CODE" || "$LAST_EXIT_CODE" == "0" ]]; then
+        return 0
+    fi
+    if [[ "$LAST_EXIT_CODE" == "7" ]]; then
+        warning "The installer exited with code 7: MediaMTX is already installed (use Update or Reinstall), or an install step failed; the installer's message above says which"
+    else
+        error "MediaMTX ${action} failed (installer exit code: ${LAST_EXIT_CODE}); see the installer's message above"
     fi
 }
 
@@ -1128,6 +1211,7 @@ menu_mediamtx() {
                 echo
                 info "Starting MediaMTX installation..."
                 execute_script "installer" install || true
+                report_installer_result "installation"
                 echo
                 refresh_system_state
                 pause
@@ -1136,6 +1220,7 @@ menu_mediamtx() {
                 echo
                 info "Starting MediaMTX update..."
                 execute_script "installer" update || true
+                report_installer_result "update"
                 echo
                 refresh_system_state
                 pause
@@ -1156,6 +1241,7 @@ menu_mediamtx() {
                 if [[ "$REPLY" =~ ^[Yy]$ ]]; then
                     # Use -f (force) flag with install to reinstall
                     execute_script "installer" -f install || true
+                    report_installer_result "reinstallation"
                     echo
                     refresh_system_state
                 fi
@@ -1176,6 +1262,7 @@ menu_mediamtx() {
                 echo
                 if [[ "$REPLY" =~ ^[Yy]$ ]]; then
                     execute_script "installer" uninstall || true
+                    report_installer_result "uninstallation"
                     echo
                     refresh_system_state
                 fi
