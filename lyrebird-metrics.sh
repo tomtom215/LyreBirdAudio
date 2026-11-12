@@ -103,6 +103,29 @@ resolve_heartbeat_max_age() {
 HEARTBEAT_MAX_AGE="$(resolve_heartbeat_max_age)"
 readonly HEARTBEAT_MAX_AGE
 
+# The longest, in seconds, that one scrape may spend on the MediaMTX API in all,
+# every request and retry together. A MediaMTX that is hung or being restarted
+# must not stall the scrape: a Prometheus scrape gives up after its
+# scrape_timeout (10 s by default), a `--serve` response waits for the scrape and
+# a cron `--file` run would pile up behind it. Override with LYREBIRD_API_TIMEOUT
+# (a positive integer number of seconds). The limit is kept to whole seconds, so
+# a scrape can take up to one second more than this.
+resolve_api_timeout() {
+    local raw="${LYREBIRD_API_TIMEOUT-}"
+    local default=5
+
+    if [[ -z "$raw" ]]; then
+        printf '%s' "$default"
+    elif [[ "$raw" =~ ^[0-9]+$ ]] && ((10#$raw > 0)); then
+        printf '%s' "$((10#$raw))"
+    else
+        log "WARN: ignoring LYREBIRD_API_TIMEOUT='${raw}' (need a positive integer number of seconds); using ${default}"
+        printf '%s' "$default"
+    fi
+}
+API_TIMEOUT="$(resolve_api_timeout)"
+readonly API_TIMEOUT
+
 # ============================================================================
 # Process state
 # ============================================================================
@@ -630,23 +653,54 @@ collect_system_metrics() {
     return "$failed"
 }
 
-# Helper function for API calls with retry for transient network failures
-# Usage: api_call_with_retry <url> [timeout] [retries]
-api_call_with_retry() {
-    local url="$1"
-    local timeout="${2:-5}"
-    local retries="${3:-2}"
-    local attempt=0
-    local result=""
+# The scrape's time for the MediaMTX API runs out at this value of SECONDS (set by
+# collect_api_metrics); API_BODY is what api_get received; API_INCOMPLETE is 1
+# once a request of the scrape went unanswered.
+API_DEADLINE=0
+API_BODY=""
+API_INCOMPLETE=0
 
-    while ((attempt < retries)); do
-        ((attempt++)) || true
-        result=$(curl -s --connect-timeout "$timeout" "$url" 2>/dev/null) && break
-        # Brief pause before retry
-        ((attempt < retries)) && sleep 1
+# GET URL from the MediaMTX API within what is left of the scrape's budget
+# (API_TIMEOUT seconds for all requests together): every request is bounded by
+# curl's --max-time, so a MediaMTX that accepts the connection and never answers
+# cannot hold the scrape. Puts the body in API_BODY. Returns 0 for an answer,
+# else curl's exit status (28 also when no time is left).
+# A refused or unresolvable connection is final at once (nothing listens, and a
+# second attempt a moment later would only cost the scrape a pause: with the
+# API down every scrape used to wait a second); any other failure (a reset, an
+# empty reply, a timeout) is tried once more after a short pause if time is left.
+api_get() {
+    local url="$1" attempt remaining rc=0
+    API_BODY=""
+    for attempt in 1 2; do
+        remaining=$((API_DEADLINE - SECONDS))
+        if ((remaining < 1)); then
+            return 28
+        fi
+        rc=0
+        API_BODY="$(curl -s --connect-timeout "$((remaining < 2 ? remaining : 2))" --max-time "$remaining" "$url" 2>/dev/null)" || rc=$?
+        if ((rc == 0)); then
+            return 0
+        fi
+        API_BODY=""
+        case "$rc" in
+            6 | 7) return "$rc" ;;
+        esac
+        if ((attempt == 1)); then
+            sleep 0.2 2>/dev/null || true
+        fi
     done
+    return "$rc"
+}
 
-    echo "$result"
+# api_get for the optional lists after /v3/info: a request that went unanswered
+# leaves its metrics out (API_BODY is empty) and marks the scrape incomplete.
+api_list() {
+    if ! api_get "$1"; then
+        API_BODY=""
+        API_INCOMPLETE=1
+    fi
+    return 0
 }
 
 # Collect MediaMTX API metrics (if available)
@@ -660,10 +714,16 @@ collect_api_metrics() {
 
     local api_url="http://${MEDIAMTX_API_HOST}:${MEDIAMTX_API_PORT}"
 
-    # Check API availability and get instance info (with retry for transient failures)
+    # Everything this collector asks the API shares one time budget
+    API_DEADLINE=$((SECONDS + API_TIMEOUT))
+    API_INCOMPLETE=0
+
+    # Check API availability and get instance info
     local api_up=0
-    local info_json
-    info_json=$(api_call_with_retry "${api_url}/v3/info" 2 2)
+    local info_json=""
+    if api_get "${api_url}/v3/info"; then
+        info_json="$API_BODY"
+    fi
     if [[ -n "$info_json" ]] && echo "$info_json" | grep -q '"version"'; then
         api_up=1
     fi
@@ -686,7 +746,8 @@ collect_api_metrics() {
 
         # Get path count from API
         local paths_json
-        paths_json=$(curl -s --connect-timeout 5 "${api_url}/v3/paths/list" 2>/dev/null || true)
+        api_list "${api_url}/v3/paths/list"
+        paths_json="$API_BODY"
 
         if [[ -n "$paths_json" ]]; then
             # Count paths (simple grep approach for portability)
@@ -707,7 +768,8 @@ collect_api_metrics() {
 
         # Collect RTSP session metrics
         local rtsp_sessions_json
-        rtsp_sessions_json=$(curl -s --connect-timeout 5 "${api_url}/v3/rtspsessions/list" 2>/dev/null || true)
+        api_list "${api_url}/v3/rtspsessions/list"
+        rtsp_sessions_json="$API_BODY"
         if [[ -n "$rtsp_sessions_json" ]]; then
             local rtsp_session_count
             rtsp_session_count=$(echo "$rtsp_sessions_json" | grep -o '"id"' | wc -l || true)
@@ -716,7 +778,8 @@ collect_api_metrics() {
 
         # Collect RTSP connection metrics
         local rtsp_conns_json
-        rtsp_conns_json=$(curl -s --connect-timeout 5 "${api_url}/v3/rtspconns/list" 2>/dev/null || true)
+        api_list "${api_url}/v3/rtspconns/list"
+        rtsp_conns_json="$API_BODY"
         if [[ -n "$rtsp_conns_json" ]]; then
             local rtsp_conn_count
             rtsp_conn_count=$(echo "$rtsp_conns_json" | grep -o '"id"' | wc -l || true)
@@ -725,7 +788,8 @@ collect_api_metrics() {
 
         # Collect RTSPS (secure) session metrics
         local rtsps_sessions_json
-        rtsps_sessions_json=$(curl -s --connect-timeout 5 "${api_url}/v3/rtspssessions/list" 2>/dev/null || true)
+        api_list "${api_url}/v3/rtspssessions/list"
+        rtsps_sessions_json="$API_BODY"
         if [[ -n "$rtsps_sessions_json" ]]; then
             local rtsps_session_count
             rtsps_session_count=$(echo "$rtsps_sessions_json" | grep -o '"id"' | wc -l || true)
@@ -734,7 +798,8 @@ collect_api_metrics() {
 
         # Collect RTMP connection metrics
         local rtmp_conns_json
-        rtmp_conns_json=$(curl -s --connect-timeout 5 "${api_url}/v3/rtmpconns/list" 2>/dev/null || true)
+        api_list "${api_url}/v3/rtmpconns/list"
+        rtmp_conns_json="$API_BODY"
         if [[ -n "$rtmp_conns_json" ]]; then
             local rtmp_conn_count
             rtmp_conn_count=$(echo "$rtmp_conns_json" | grep -o '"id"' | wc -l || true)
@@ -743,7 +808,8 @@ collect_api_metrics() {
 
         # Collect RTMPS (secure) connection metrics
         local rtmps_conns_json
-        rtmps_conns_json=$(curl -s --connect-timeout 5 "${api_url}/v3/rtmpsconns/list" 2>/dev/null || true)
+        api_list "${api_url}/v3/rtmpsconns/list"
+        rtmps_conns_json="$API_BODY"
         if [[ -n "$rtmps_conns_json" ]]; then
             local rtmps_conn_count
             rtmps_conn_count=$(echo "$rtmps_conns_json" | grep -o '"id"' | wc -l || true)
@@ -752,7 +818,8 @@ collect_api_metrics() {
 
         # Collect WebRTC session metrics
         local webrtc_sessions_json
-        webrtc_sessions_json=$(curl -s --connect-timeout 5 "${api_url}/v3/webrtcsessions/list" 2>/dev/null || true)
+        api_list "${api_url}/v3/webrtcsessions/list"
+        webrtc_sessions_json="$API_BODY"
         if [[ -n "$webrtc_sessions_json" ]]; then
             local webrtc_session_count
             webrtc_session_count=$(echo "$webrtc_sessions_json" | grep -o '"id"' | wc -l || true)
@@ -761,7 +828,8 @@ collect_api_metrics() {
 
         # Collect SRT connection metrics
         local srt_conns_json
-        srt_conns_json=$(curl -s --connect-timeout 5 "${api_url}/v3/srtconns/list" 2>/dev/null || true)
+        api_list "${api_url}/v3/srtconns/list"
+        srt_conns_json="$API_BODY"
         if [[ -n "$srt_conns_json" ]]; then
             local srt_conn_count
             srt_conn_count=$(echo "$srt_conns_json" | grep -o '"id"' | wc -l || true)
@@ -770,7 +838,8 @@ collect_api_metrics() {
 
         # Collect HLS muxer metrics
         local hls_muxers_json
-        hls_muxers_json=$(curl -s --connect-timeout 5 "${api_url}/v3/hlsmuxers/list" 2>/dev/null || true)
+        api_list "${api_url}/v3/hlsmuxers/list"
+        hls_muxers_json="$API_BODY"
         if [[ -n "$hls_muxers_json" ]]; then
             local hls_muxer_count
             hls_muxer_count=$(echo "$hls_muxers_json" | grep -o '"path"' | wc -l || true)
@@ -779,22 +848,30 @@ collect_api_metrics() {
 
         # Collect recording metrics
         local recordings_json
-        recordings_json=$(curl -s --connect-timeout 5 "${api_url}/v3/recordings/list" 2>/dev/null || true)
+        api_list "${api_url}/v3/recordings/list"
+        recordings_json="$API_BODY"
         if [[ -n "$recordings_json" ]]; then
             local recording_count
             recording_count=$(echo "$recordings_json" | grep -o '"name"' | wc -l || true)
             emit_metric "api_recordings_total" "$recording_count" "Total recording paths"
         fi
 
-        # Calculate total connections across all protocols
-        local total_connections=0
-        [[ "${rtsp_session_count:-0}" =~ ^[0-9]+$ ]] && total_connections=$((total_connections + rtsp_session_count))
-        [[ "${rtsps_session_count:-0}" =~ ^[0-9]+$ ]] && total_connections=$((total_connections + rtsps_session_count))
-        [[ "${rtmp_conn_count:-0}" =~ ^[0-9]+$ ]] && total_connections=$((total_connections + rtmp_conn_count))
-        [[ "${rtmps_conn_count:-0}" =~ ^[0-9]+$ ]] && total_connections=$((total_connections + rtmps_conn_count))
-        [[ "${webrtc_session_count:-0}" =~ ^[0-9]+$ ]] && total_connections=$((total_connections + webrtc_session_count))
-        [[ "${srt_conn_count:-0}" =~ ^[0-9]+$ ]] && total_connections=$((total_connections + srt_conn_count))
-        emit_metric "api_total_connections" "$total_connections" "Total active connections across all protocols"
+        # Calculate total connections across all protocols. A total over lists
+        # that were not all received would be a made-up number, so it is left out.
+        if ((API_INCOMPLETE == 0)); then
+            local total_connections=0
+            [[ "${rtsp_session_count:-0}" =~ ^[0-9]+$ ]] && total_connections=$((total_connections + ${rtsp_session_count:-0}))
+            [[ "${rtsps_session_count:-0}" =~ ^[0-9]+$ ]] && total_connections=$((total_connections + ${rtsps_session_count:-0}))
+            [[ "${rtmp_conn_count:-0}" =~ ^[0-9]+$ ]] && total_connections=$((total_connections + ${rtmp_conn_count:-0}))
+            [[ "${rtmps_conn_count:-0}" =~ ^[0-9]+$ ]] && total_connections=$((total_connections + ${rtmps_conn_count:-0}))
+            [[ "${webrtc_session_count:-0}" =~ ^[0-9]+$ ]] && total_connections=$((total_connections + ${webrtc_session_count:-0}))
+            [[ "${srt_conn_count:-0}" =~ ^[0-9]+$ ]] && total_connections=$((total_connections + ${srt_conn_count:-0}))
+            emit_metric "api_total_connections" "$total_connections" "Total active connections across all protocols"
+        fi
+    fi
+    if ((API_INCOMPLETE != 0)); then
+        log "ERROR: the MediaMTX API did not answer every request within ${API_TIMEOUT}s; the API metrics missing from this scrape are unknown, not 0"
+        return 1
     fi
     return 0
 }
