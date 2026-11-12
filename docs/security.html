@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Security - LyreBirdAudio Docs</title>
-  <meta name="description" content="Optional security features for LyreBirdAudio: RTSP auth, TLS, network hardening, and field deployments.">
+  <meta name="description" content="What a LyreBirdAudio node exposes by default, what an attacker can do with it, and how to close it: RTSP authentication, TLS, firewall, metrics and alerts.">
   <link rel="stylesheet" href="css/style.css">
 </head>
 <body>
@@ -19,209 +19,332 @@
     <div class="page-header">
       <span class="page-label">Operations</span>
       <h1 class="page-title">Security</h1>
-      <p class="page-subtitle">Optional security features for sensitive or remote deployments. Home users on trusted networks typically need none of this.</p>
+      <p class="page-subtitle">What a default node exposes, what that allows, and how to close it. The full recipes are in the Security Guide in the repository.</p>
     </div>
 
-    <div class="callout tip">
-      <span class="callout-icon">💡</span>
+    <div class="callout warning">
+      <span class="callout-icon">⚠️</span>
       <div class="callout-body">
-        <strong>Default Security is Fine for Home Use</strong>
-        <p>For home users on a trusted local network, the default configuration is appropriate and secure. The features on this page are <strong>optional enhancements</strong> for remote deployments, multi-user environments, or sensitive monitoring locations.</p>
+        <strong>A default node is open on the network</strong>
+        <p>Anyone who can reach TCP port 8554 can listen to every microphone and publish streams. On a network where every device is trusted that may be acceptable. On any other network you need the firewall rule or the authentication mode below.</p>
       </div>
     </div>
 
     <div class="toc">
       <div class="toc-title">On this page</div>
       <ul class="toc-list">
-        <li><a href="#model">Security Model Overview</a></li>
-        <li><a href="#default-posture">Default Security Posture</a></li>
+        <li><a href="#model">What a default node exposes</a></li>
         <li><a href="#checklist">Security Checklist</a></li>
         <li><a href="#rtsp-auth">RTSP Authentication</a></li>
-        <li><a href="#network">Network Security</a></li>
+        <li><a href="#tls">TLS (RTSPS)</a></li>
         <li><a href="#api-security">API Security</a></li>
+        <li><a href="#network">Network Security</a></li>
+        <li><a href="#metrics-alerts">Metrics and Alerts</a></li>
         <li><a href="#file-security">File System Security</a></li>
-        <li><a href="#integrity">Library Integrity Verification</a></li>
+        <li><a href="#integrity">Library Integrity Check</a></li>
         <li><a href="#field">Field Deployment Recommendations</a></li>
+        <li><a href="#verified">What this page was checked against</a></li>
       </ul>
     </div>
 
-    <h2 id="model">Security Model Overview</h2>
-    <p>LyreBirdAudio has three main network interfaces:</p>
+    <h2 id="model">What a default node exposes</h2>
+    <p>The configuration the stream manager and the installer generate opens exactly these sockets (checked on MediaMTX 1.15.0, 1.18.0, 1.19.0, 1.21.1, 1.21.2 and 1.21.3):</p>
     <div class="table-wrapper">
       <table>
-        <thead><tr><th>Interface</th><th>Default Port</th><th>Purpose</th><th>Default Security</th></tr></thead>
+        <thead><tr><th>What</th><th>Address</th><th>Who can use it</th></tr></thead>
         <tbody>
           <tr>
             <td>RTSP</td>
-            <td>8554</td>
-            <td>Audio stream consumption</td>
-            <td>Open (no auth)</td>
+            <td>every interface, TCP 8554</td>
+            <td><strong>Anyone who can connect</strong>: read every stream, publish to any path name made of letters, digits, <code>_</code> and <code>-</code></td>
           </tr>
           <tr>
-            <td>MediaMTX API</td>
-            <td>9997</td>
-            <td>Stream management REST API</td>
-            <td>Localhost only</td>
+            <td>RTSP over UDP</td>
+            <td>every interface, UDP 8000 and 8001</td>
+            <td>Same as RTSP</td>
           </tr>
           <tr>
-            <td>WebRTC</td>
-            <td>8889</td>
-            <td>Browser-based streaming</td>
-            <td>Open (no auth)</td>
+            <td>Control API</td>
+            <td><code>127.0.0.1</code>, TCP 9997</td>
+            <td>Programs on this machine, no password. Other machines: connection refused</td>
+          </tr>
+          <tr>
+            <td>MediaMTX metrics</td>
+            <td><code>127.0.0.1</code>, TCP 9998</td>
+            <td>Programs on this machine, no password. Other machines: connection refused</td>
           </tr>
         </tbody>
       </table>
     </div>
+    <p>SRT, MoQ (MediaMTX 1.19.0 and later), RTMP, HLS and WebRTC are switched off in the generated file, and no option turns them on. <code>MEDIAMTX_API_BIND</code> and <code>MEDIAMTX_METRICS_BIND</code> change the API and metrics addresses (empty means every interface; MediaMTX still answers <code>401</code> to other machines). RTSP always listens on every interface.</p>
 
-    <h2 id="default-posture">Default Security Posture</h2>
-    <p>Out of the box, LyreBirdAudio implements:</p>
+    <h3>Check what your node exposes</h3>
+    <pre><code>sudo ss -tulpn | grep mediamtx</code></pre>
+    <p>The current configuration prints five sockets: <code>0.0.0.0:8554</code> (tcp), <code>127.0.0.1:9997</code> (tcp), <code>127.0.0.1:9998</code> (tcp), <code>0.0.0.0:8000</code> (udp) and <code>0.0.0.0:8001</code> (udp). Anything else, or 9997 or 9998 on <code>0.0.0.0</code>, means the node runs a file written by an earlier release (see below).</p>
+
+    <h3>What each kind of attacker can do on a default node</h3>
+    <p>Observed on MediaMTX 1.15.0 and 1.21.3:</p>
     <ul>
-      <li><strong>No hardcoded credentials</strong> — all authentication delegated to MediaMTX</li>
-      <li><strong>Restrictive permissions</strong> — config files mode 640, state directories 750</li>
-      <li><strong>Service user isolation</strong> — MediaMTX runs as dedicated <code>mediamtx</code> user</li>
-      <li><strong>systemd hardening</strong> — <code>NoNewPrivileges</code>, <code>PrivateTmp</code>, <code>ProtectSystem</code></li>
-      <li><strong>Input validation</strong> — all user inputs sanitized against injection</li>
-      <li><strong>Safe temp files</strong> — <code>mktemp</code> used for all temporary files</li>
-      <li><strong>Download verification</strong> — SHA256 checksums verify MediaMTX binaries</li>
-      <li><strong>API localhost-only</strong> — MediaMTX REST API bound to 127.0.0.1 by default</li>
+      <li><strong>A machine on the network that can reach TCP 8554.</strong> It can listen to every stream and publish under any matching name. Publishing to a name that is in use makes MediaMTX disconnect the current publisher, so the manager's own FFmpeg is cut off. It cannot reach the API or metrics.</li>
+      <li><strong>Any local account on the node.</strong> Everything above through <code>127.0.0.1</code>, <strong>and the API without a password</strong>: it can list streams and change MediaMTX's configuration, including a path setting that makes MediaMTX run a command as its own user (root under <code>mediamtx-audio.service</code>, <code>mediamtx</code> under <code>mediamtx.service</code>). A command started by an unprivileged account ran as uid 0.</li>
+      <li><strong>A publisher</strong> (any network client in the default mode, or a compromised process on the node). It controls the audio the node reads back: the monitor decodes every published stream with FFmpeg, as root, to measure its level (<code>AUDIO_LEVEL_CHECK_ENABLED</code>, default <code>true</code>). Whether a hostile stream can exploit FFmpeg was not tested.</li>
     </ul>
+
+    <h3>Nodes set up by an earlier release</h3>
+    <p>A configuration written by an earlier release keeps its exposed settings until it is replaced:</p>
+    <pre><code>head -n 1 /etc/mediamtx/mediamtx.yml
+grep -E '^(apiAddress|metricsAddress|srt|moq):' /etc/mediamtx/mediamtx.yml</code></pre>
+    <div class="table-wrapper">
+      <table>
+        <thead><tr><th>First line</th><th>Written by</th><th>Exposes</th></tr></thead>
+        <tbody>
+          <tr><td><code># Managed by LyreBirdAudio</code></td><td>current manager or installer</td><td>nothing beyond the table above</td></tr>
+          <tr><td><code># MediaMTX Configuration - Audio Streams</code></td><td>an earlier stream manager</td><td>API and metrics on every interface (still <code>401</code> to other machines)</td></tr>
+          <tr><td>a row of <code>#</code>, then <code># MediaMTX Configuration</code></td><td>an earlier installer</td><td>the same, plus SRT and (1.19.0+) MoQ; <code>paths: {}</code> refuses every publisher</td></tr>
+          <tr><td>anything else</td><td>you</td><td>whatever you wrote</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p><strong>Stream manager nodes:</strong> the first start that launches MediaMTX replaces the file after saving a <code>.bak</code> copy; a node that keeps running applies it without a restart of the manager's processes with:</p>
+    <pre><code>sudo ./lyrebird-stream-manager.sh reload</code></pre>
+    <p><strong>Installer nodes</strong> (<code>mediamtx.service</code>): the installer never rewrites a file without the marker unless you pass <code>--force</code>. <code>sudo ./install_mediamtx.sh --force install</code> replaces it after saving <code>mediamtx.yml.backup.&lt;date&gt;-&lt;time&gt;</code>, and also reinstalls the MediaMTX binary (add <code>-V vX.Y.Z</code> to keep your version) and the unit. Or edit three lines by hand: <code>apiAddress</code> and <code>metricsAddress</code> to <code>127.0.0.1:&lt;port&gt;</code>, add <code>srt: no</code>, and <code>moq: no</code> only on MediaMTX 1.19.0 or later.</p>
 
     <h2 id="checklist">Security Checklist</h2>
 
-    <h3>Minimal Security (Home Use)</h3>
+    <h3>Minimal (home use)</h3>
     <ul>
-      <li>☐ Keep system updated: <code>sudo apt update &amp;&amp; sudo apt upgrade</code></li>
-      <li>☐ Use firewall to block external access if streams are local-only</li>
-      <li>☐ Don't expose ports to the internet unnecessarily</li>
+      <li>☐ Keep the system updated: <code>sudo apt update &amp;&amp; sudo apt upgrade</code></li>
+      <li>☐ Do not forward port 8554 from the internet</li>
+      <li>☐ Know that everyone on your network can listen and can cut a stream off by publishing to its name</li>
+      <li>☐ Run the exposure check after every upgrade</li>
     </ul>
 
-    <h3>Standard Security (Remote Access)</h3>
+    <h3>Standard (remote access or an untrusted network)</h3>
     <ul>
-      <li>☐ All minimal items above</li>
-      <li>☐ Enable RTSP authentication</li>
-      <li>☐ Restrict API to localhost or specific IPs</li>
-      <li>☐ Configure firewall rules to limit access</li>
-      <li>☐ Enable log rotation</li>
+      <li>☐ Turn on RTSP authentication</li>
+      <li>☐ Limit TCP 8554 to the networks that need it with a firewall</li>
+      <li>☐ Keep the API and metrics on <code>127.0.0.1</code> (the default)</li>
+      <li>☐ Give nobody an account you would not trust with root, or protect the API</li>
+      <li>☐ Keep log rotation working (<code>install</code> writes <code>/etc/logrotate.d/mediamtx</code>)</li>
     </ul>
 
-    <h3>Enhanced Security (Field Deployment)</h3>
+    <h3>Enhanced (field deployment)</h3>
     <ul>
       <li>☐ All standard items above</li>
-      <li>☐ Enable TLS encryption (RTSPS)</li>
-      <li>☐ Use VPN for remote access instead of direct exposure</li>
-      <li>☐ Enable audit logging</li>
-      <li>☐ Implement physical security measures</li>
-      <li>☐ Schedule regular security update runs</li>
+      <li>☐ Reach the node through a VPN instead of exposing port 8554</li>
+      <li>☐ Enable TLS if passwords or audio cross a network you do not control and you have no VPN</li>
+      <li>☐ Protect webhook URLs and password files</li>
+      <li>☐ Plan for physical access</li>
+      <li>☐ Schedule updates</li>
     </ul>
 
     <h2 id="rtsp-auth">RTSP Authentication</h2>
+    <p>The default mode is open. Defining <code>authInternalUsers</code> <strong>replaces</strong> MediaMTX's built-in users, so every setup keeps a password-less user for this machine: the manager's publishers, health checks and the metrics exporter connect to <code>localhost</code> without credentials.</p>
 
-    <h3>Internal Authentication (Recommended)</h3>
-    <pre><code># Edit /etc/mediamtx/mediamtx.yml
+    <h3>Quick way: <code>RTSP_AUTH_MODE=local-only-publish</code></h3>
+    <p>The stream manager renders a user <code>any</code> that only <code>127.0.0.1</code> and <code>::1</code> can use (no password; publish, read, playback, API, metrics) and one read-only user per line of <code>/etc/mediamtx/rtsp-users.conf</code> (<code>RTSP_USERS_FILE</code>). Everyone else gets <code>401</code>. It needs:</p>
+    <ol>
+      <li>A users file with lines <code>user:sha256:&lt;hash&gt;</code>, the hash being the base64 of the raw SHA-256 digest of the password. A plaintext or malformed line stops the start without printing the line. The hash has no salt: use long random passwords.
+        <pre><code>printf '%s' 'the password' | openssl dgst -sha256 -binary | base64</code></pre>
+      </li>
+      <li><code>MEDIAMTX_HOST</code> must be a loopback name (the default is <code>localhost</code>).</li>
+      <li>The variable must reach <strong>every process that can start MediaMTX</strong>: the service <em>and</em> the cron monitor, which starts MediaMTX again when it has died. Neither the unit nor the cron file carries it:
+        <pre><code>sudo systemctl edit mediamtx-audio
+#   add:  [Service]
+#         Environment="RTSP_AUTH_MODE=local-only-publish"
+sudo sed -i 's/^CRON=1$/&amp;\nRTSP_AUTH_MODE=local-only-publish/' /etc/cron.d/mediamtx-monitor
+sudo systemctl restart mediamtx-audio</code></pre>
+      </li>
+    </ol>
+    <div class="callout warning">
+      <span class="callout-icon">⚠️</span>
+      <div class="callout-body">
+        <strong>The cron file is rewritten by <code>install</code></strong>
+        <p>Without the variable in the cron file, the monitor renders an open configuration when it restarts MediaMTX, and the managed file silently loses its users: after <code>kill -9</code> of MediaMTX the file had no <code>authInternalUsers</code> and anonymous remote publishing worked again. Repeat the <code>sed</code> command after every <code>install</code>, or use a file you own (below), which is never rewritten. Check with <code>grep -c authInternalUsers /etc/mediamtx/mediamtx.yml</code> (1 = users are in the file).</p>
+      </div>
+    </div>
 
+    <h3>Who owns <code>/etc/mediamtx/mediamtx.yml</code></h3>
+    <ul>
+      <li><strong>With the first line <code># Managed by LyreBirdAudio</code> the file is generated.</strong> The stream manager renders it at every start that launches MediaMTX and on <code>reload</code>; a changed rendering is saved as <code>mediamtx.yml.&lt;UTC time&gt;.&lt;nn&gt;.bak</code> first (newest five kept) and replaced atomically. <strong>An edit to a generated file is lost at the next start.</strong></li>
+      <li><strong>Without it the file is yours.</strong> It is used as it is, validated, never rewritten, with one warning per start.</li>
+      <li><strong>To keep hand edits, delete the first line.</strong> <code>sudo ./lyrebird-stream-manager.sh --regenerate-config restart</code> hands the file back after a backup.</li>
+      <li>The installer follows the same rule: <code>--force</code> is the only way to replace a file without the line.</li>
+    </ul>
+
+    <h3>Option 1: your own <code>authInternalUsers</code></h3>
+    <p>Delete the first line, then add this before <code>paths:</code>. Replace every <code>change_me</code>: it is a public example value.</p>
+    <pre><code>###############################################
+# Authentication
+###############################################
+
+# Authentication method. Available values:
+# - internal: use internal users
+# - http: use an external HTTP server
+# - jwt: use JWT tokens
 authMethod: internal
 
+# Internal users (used when authMethod is "internal")
 authInternalUsers:
-  # Admin user - can publish and read all streams
-  - user: admin
-    pass: your_secure_password_here
+  # This machine: publishers, health checks, API. No password, loopback only.
+  - user: any
+    pass:
+    ips: ['127.0.0.1', '::1']
     permissions:
       - action: publish
       - action: read
       - action: playback
       - action: api
+      - action: metrics
+      - action: pprof
 
-  # Read-only viewer
-  - user: viewer
-    pass: viewer_password_here
+  # Remote listener - can view every stream
+  - user: listener
+    pass: change_me
     permissions:
-      - action: read</code></pre>
+      - action: read
+      - action: playback
 
-    <h3>JWT Authentication</h3>
-    <pre><code># Edit /etc/mediamtx/mediamtx.yml
+  # Remote listener limited to two streams.
+  # A path that starts with '~' is a regular expression; without it, the
+  # value is a literal path name.
+  - user: birdwatcher
+    pass: change_me_too
+    permissions:
+      - action: read
+        path: '~^(mic1|mic2)$'</code></pre>
+    <p>Checked on all six MediaMTX versions: a local publisher needs no credentials; an anonymous remote reader or publisher gets <code>401</code>; <code>listener</code> can read but not publish; <code>birdwatcher</code> is refused outside the regular expression.</p>
 
-authMethod: jwt
-authJWTJWKS: https://your-auth-server/.well-known/jwks.json</code></pre>
+    <h3>Options 2 and 3: keep passwords out of the file</h3>
+    <ul>
+      <li><strong>Never write <code>pass: "${VAR}"</code>.</strong> MediaMTX does not expand it: the literal text becomes the password (verified).</li>
+      <li><strong>Option 2, environment:</strong> <code>MTX_AUTHINTERNALUSERS_1_PASS</code> overrides the password of the second user in the list. It works on MediaMTX 1.18.0 and later; <strong>1.15.0 ignores it</strong>. Set it in the unit (<code>systemctl edit mediamtx-audio</code>) and use a placeholder nobody can match (below). With <code>change_me</code> as the placeholder, a cron-driven restart (which does not see the unit's environment) silently made <code>change_me</code> the password; the unmatchable hash locks the account instead.</li>
+      <li><strong>Option 3, hash:</strong> <code>pass: sha256:&lt;output of the command above&gt;</code>. Right password accepted, wrong one <code>401</code> (verified). Keep the file readable by root only.</li>
+    </ul>
+    <pre><code>  pass: sha256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=</code></pre>
 
-    <h3>Client Usage with Authentication</h3>
-    <pre><code># VLC / FFplay with credentials
-ffplay rtsp://username:password@your-server:8554/Device_1
-vlc rtsp://username:password@your-server:8554/Device_1
+    <div class="callout danger">
+      <span class="callout-icon">🚨</span>
+      <div class="callout-body">
+        <strong>Passwords are readable on plain RTSP</strong>
+        <p>MediaMTX's default is <code>basic</code> authentication. A capture on the loopback interface showed <code>Authorization: Basic bGlzdGVuZXI6bGlzdGVuZXJwdw==</code> (base64 of <code>listener:listenerpw</code>) on plain RTSP; over RTSPS neither the header nor the password appeared. Use RTSPS or a VPN.</p>
+      </div>
+    </div>
 
-# FFmpeg recording with auth
-ffmpeg -i rtsp://viewer:pass@server:8554/Device_1 -c copy out.mkv</code></pre>
+    <h2 id="tls">TLS (RTSPS)</h2>
+    <p>RTSPS hides the password and the audio from someone who captures the traffic. It does <strong>not</strong>, with FFmpeg as the client, prove which server you reached: an <code>rtsps://</code> read succeeded against a self-signed certificate, and against an address the certificate does not name, even with <code>-tls_verify 1</code>, <code>-ca_file</code> or <code>-verifyhost</code> (the same options work for <code>https://</code>). A VPN does both. The Security Guide has the certificate commands (with the <code>subjectAltName</code> current clients want).</p>
+    <p>The generator has no TLS option: delete the first line of <code>mediamtx.yml</code> and add:</p>
+    <pre><code>###############################################
+# RTSP server (with TLS)
+###############################################
+
+# Encryption mode: "no", "optional" or "strict"
+#   no: TLS disabled
+#   optional: clients can connect with or without TLS
+#   strict: only TLS connections allowed
+rtspEncryption: optional
+
+# Path to server certificate (PEM format)
+rtspServerCert: /etc/mediamtx/certs/server.crt
+
+# Path to server private key (PEM format)
+rtspServerKey: /etc/mediamtx/certs/server.key</code></pre>
+    <p><strong>Use <code>optional</code>, not <code>strict</code>.</strong> The manager's publishers connect to plain RTSP on <code>localhost:8554</code>; with <code>strict</code> MediaMTX closed TCP 8554 and UDP 8000/8001 and nothing could publish. <code>optional</code> adds RTSPS on TCP 8322. To accept only encrypted connections from the network, keep <code>optional</code> and block TCP 8554 for everything but this machine. The key must be readable by whoever runs MediaMTX: root under the stream manager, the <code>mediamtx</code> account under <code>mediamtx.service</code> (mode 600 owned by root made it stop with <code>permission denied</code>).</p>
+
+    <h2 id="api-security">API Security</h2>
+    <p>The API listens on <code>127.0.0.1</code> only, so other machines get a refused connection. <strong>Every program on the node can use it without a password</strong>, and the manager's readiness check, stream probes and the metrics exporter rely on that. Nothing in LyreBirdAudio needs the API from another machine.</p>
+    <p>If other people have accounts on the node, give the API a password. In a file you own:</p>
+    <pre><code>authMethod: internal
+authInternalUsers:
+  # The stream manager's own publishers and readers: this machine, no password.
+  - user: any
+    pass:
+    ips: ['127.0.0.1', '::1']
+    permissions:
+      - action: publish
+      - action: read
+      - action: playback
+  # The control API and the metrics endpoint: this machine, with a password.
+  # The hash below is a placeholder nobody can match: replace it with the output
+  # of the command in Option 3 (as it stands, nobody can use this account).
+  - user: operator
+    pass: sha256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
+    ips: ['127.0.0.1', '::1']
+    permissions:
+      - action: api
+      - action: metrics</code></pre>
+    <p>Another local account then got <code>401</code> from the API, also when trying to add a path that runs a command; local publishing without credentials still worked. <strong>What it costs:</strong> <code>start</code> continues with one warning (the API requires credentials); the monitor's deep health check reports <em>unknown</em> and never restarts a stream on it; <code>lyrebird-metrics.sh</code> has no credential setting, so <code>lyrebird_api_up</code> reads 0. Any local account can still read and publish streams through <code>127.0.0.1</code>.</p>
 
     <h2 id="network">Network Security</h2>
 
-    <h3>UFW Firewall Rules</h3>
-    <pre><code># Allow RTSP only from your local network
+    <h3>Do not bind RTSP to one interface</h3>
+    <p>Setting <code>rtspAddress: 192.168.1.100:8554</code> by hand also makes MediaMTX refuse connections to <code>127.0.0.1</code>, where the manager's publishers and probes connect (observed: publishing through <code>127.0.0.1</code> was refused). Use a firewall to limit who can connect.</p>
+
+    <h3>UFW</h3>
+    <p>UFW accepts loopback traffic and drops other incoming connections by default (read from its shipped files; UFW was not run):</p>
+    <pre><code># Allow SSH (always do this first!)
+sudo ufw allow ssh
+
+# Allow RTSP only from the local network
 sudo ufw allow from 192.168.1.0/24 to any port 8554 proto tcp
 
-# Block external RTSP access entirely
-sudo ufw deny 8554
-
-# Keep API localhost-only (deny external)
-sudo ufw deny 9997
-
-# Enable UFW
+# The API and metrics listen on 127.0.0.1 only: no rule needed
 sudo ufw enable
-sudo ufw status</code></pre>
+sudo ufw status verbose</code></pre>
 
-    <h3>Bind MediaMTX to Specific Interface</h3>
-    <pre><code># /etc/mediamtx/mediamtx.yml
+    <h3>iptables</h3>
+    <p>Accept loopback <strong>first</strong>. Measured with a second host: the allow/drop pair alone refused the other host <em>and</em> the machine itself; with the loopback rule first the machine worked and a host outside the allowed network was dropped.</p>
+    <pre><code># The stream manager's publishers and probes connect to 127.0.0.1
+sudo iptables -A INPUT -i lo -j ACCEPT
 
-# Only listen on specific interface (not all)
-rtspAddress: 192.168.1.100:8554
+# Allow RTSP from the local network only
+sudo iptables -A INPUT -p tcp --dport 8554 -s 192.168.1.0/24 -j ACCEPT
+sudo iptables -A INPUT -p tcp --dport 8554 -j DROP</code></pre>
 
-# Keep API on localhost only (already default)
-apiAddress: 127.0.0.1:9997</code></pre>
+    <h3>VPN (recommended for remote monitoring)</h3>
+    <p>Instead of exposing RTSP, connect remote viewers through a VPN such as WireGuard. It covers authentication and encryption of the server and avoids certificate handling. (Not run for this page.)</p>
 
-    <h3>VPN Access (Recommended for Remote Monitoring)</h3>
-    <p>
-      Instead of exposing RTSP publicly, connect remote viewers through a VPN.
-      This is more secure and avoids the complexity of TLS certificate management.
-    </p>
-    <pre><code># Install WireGuard (recommended VPN)
-sudo apt install wireguard
+    <h3>Fail2Ban</h3>
+    <p>MediaMTX logs failed logins to <code>/var/log/mediamtx.out</code> in a different form per version, so the filter has two patterns (checked with <code>fail2ban-regex</code> against the logs of all six versions: three wrong passwords, three matches each). The earlier filter, which looked for <code>client=</code>, matched nothing. The jail and the log formats are in the Security Guide.</p>
+    <pre><code>[Definition]
+failregex = ^\s*WAR \[RTSP\] \[conn &lt;HOST&gt;:\d+\] failed to authenticate: authentication failed$
+            ^\s*INF \[RTSP\] \[conn &lt;HOST&gt;:\d+\] closed: authentication (?:error|failed: authentication failed)$
+ignoreregex =</code></pre>
 
-# All streams accessible within VPN network
-# rtsp://10.0.0.1:8554/Device_1  (VPN IP)
-# No need to expose ports to public internet</code></pre>
-
-    <h2 id="api-security">API Security</h2>
-    <p>The MediaMTX REST API should remain localhost-only unless you have specific integration needs:</p>
-    <pre><code># /etc/mediamtx/mediamtx.yml
-
-# Localhost only (default, recommended)
-apiAddress: 127.0.0.1:9997
-
-# If you need LAN access, restrict to specific IP:
-# apiAddress: 192.168.1.100:9997</code></pre>
+    <h2 id="metrics-alerts">Metrics and Alerts</h2>
+    <p><strong>The metrics exporter.</strong> <code>lyrebird-metrics.sh serve</code> listens on <code>127.0.0.1:9100</code> by default (<code>--port</code>, <code>--bind</code>), has <strong>no authentication and no TLS</strong>, and serves one connection at a time: it is made for a poller. Checked: other machines were refused by default; with <code>--bind 0.0.0.0</code> they got the metrics without credentials, and the script logged a warning. The document lists stream names, versions, memory and CPU, device counts and disk usage. For several scrapers or any exposure beyond the machine, use <code>--file</code> with node_exporter's textfile collector.</p>
+    <p><strong>Alerts.</strong> <code>lyrebird-alerts.sh</code> is off until enabled (<code>LYREBIRD_ALERT_ENABLED</code>). Its settings are in <code>/etc/lyrebird/alerts.conf</code>, written with mode 0600 by <code>lyrebird-alerts.sh config</code> and read as data.</p>
+    <ul>
+      <li><strong>The webhook URL is a secret</strong> (as are the Pushover token and user key and an ntfy topic).</li>
+      <li><strong>Local accounts can read it while an alert is sent</strong>: it is a <code>curl</code> command-line argument, and an unprivileged account read the URL, token and user key from <code>/proc/&lt;pid&gt;/cmdline</code> during delivery.</li>
+      <li><strong><code>http://</code> URLs are accepted</strong> without a warning. Use <code>https://</code>.</li>
+      <li>The destination receives the message text, the alert type, the host name, the location and the time. The default ntfy server is the third party <code>https://ntfy.sh</code>.</li>
+      <li>An identical alert is not re-sent to a destination within <code>LYREBIRD_ALERT_RATE_LIMIT</code> seconds (default 300). Nothing is signed.</li>
+    </ul>
 
     <h2 id="file-security">File System Security</h2>
-    <pre><code># Verify configuration file permissions
-stat /etc/mediamtx/audio-devices.conf
-# Should be: -rw-r----- (640) owned by root:mediamtx
+    <p>Modes observed after a first <code>start</code> as root:</p>
+    <ul>
+      <li><code>/etc/mediamtx/mediamtx.yml</code> and its <code>.bak</code> copies: 0644, or 0640 when they hold password hashes (MediaMTX configuration)</li>
+      <li><code>/etc/mediamtx/audio-devices.conf</code>: 0644 (device names and settings)</li>
+      <li><code>/etc/mediamtx/rtsp-users.conf</code>: yours (password hashes)</li>
+      <li><code>/var/log/lyrebird-stream-manager.log</code> and <code>/var/log/mediamtx.out</code>: 0644 (stream names, client IP addresses)</li>
+      <li><code>/run/lyrebird/status.json</code> and <code>/run/mediamtx-audio.pid</code>: 0644 (process IDs, per-stream state)</li>
+      <li><code>/etc/lyrebird/alerts.conf</code>: 0600 (webhook URLs and tokens), written by <code>lyrebird-alerts.sh config</code></li>
+    </ul>
+    <pre><code># The manager runs MediaMTX as root, so root-only is enough
+sudo chmod 640 /etc/mediamtx/mediamtx.yml
+sudo chmod 600 /etc/mediamtx/rtsp-users.conf
+sudo chmod 640 /var/log/lyrebird-stream-manager.log /var/log/mediamtx.out
+sudo chmod 750 /etc/mediamtx /var/log/lyrebird</code></pre>
+    <p>The manager keeps the mode you give <code>mediamtx.yml</code> when it replaces it, and logrotate (<code>copytruncate</code>) keeps the mode of the logs. A standalone <code>mediamtx.service</code> runs MediaMTX as the <code>mediamtx</code> account: use <code>sudo chown root:mediamtx</code> on the files it must read.</p>
+    <p><strong>Log rotation.</strong> <code>install</code> writes <code>/etc/logrotate.d/mediamtx</code>. Do <strong>not</strong> also install <code>config/lyrebird-logrotate.conf</code> unchanged: it lists the same logs, and logrotate 3.21.0 then reported <code>duplicate log entry</code> and skipped the file <code>install</code> wrote, so those logs were no longer rotated. Copy only the stanzas for the other scripts' logs.</p>
 
-# Fix permissions if needed
-sudo chmod 640 /etc/mediamtx/audio-devices.conf
-sudo chown root:mediamtx /etc/mediamtx/audio-devices.conf
-
-# Secure the config directory
-sudo chmod 750 /etc/mediamtx
-sudo chown root:mediamtx /etc/mediamtx</code></pre>
-
-    <h2 id="integrity">Library Integrity Verification</h2>
-    <p>For high-security deployments, verify the shared library before execution:</p>
-    <pre><code># Generate hash of lyrebird-common.sh
-HASH=$(sha256sum lyrebird-common.sh | cut -d' ' -f1)
-echo "Expected hash: $HASH"
-
-# Set in environment or systemd service override
-export LYREBIRD_COMMON_EXPECTED_HASH="$HASH"
-
-# Scripts will verify the library before sourcing it
-sudo ./lyrebird-stream-manager.sh start</code></pre>
+    <h2 id="integrity">Library Integrity Check</h2>
+    <p>The stream manager can check <code>lyrebird-common.sh</code> before it uses it. Set the hash in the service's environment (<code>systemctl edit mediamtx-audio</code>):</p>
+    <pre><code>sha256sum lyrebird-common.sh | cut -d' ' -f1
+# Environment="LYREBIRD_COMMON_EXPECTED_HASH=&lt;that value&gt;"</code></pre>
+    <p>Checked: a wrong value stopped the manager with exit 1, the right value ran it. Only the stream manager has this check, and the value must be updated with every update of the library. Run the script as <code>./lyrebird-stream-manager.sh</code> (or an absolute path): started as <code>bash lyrebird-stream-manager.sh</code> from its own directory it does not find the library at all.</p>
 
     <h2 id="field">Field Deployment Recommendations</h2>
 
@@ -229,41 +352,26 @@ sudo ./lyrebird-stream-manager.sh start</code></pre>
       <span class="callout-icon">ℹ️</span>
       <div class="callout-body">
         <strong>Wildlife Monitoring Context</strong>
-        <p>These recommendations are particularly relevant for unattended field deployments — remote wildlife monitoring stations, environmental sensors, or any system with limited physical access and potential exposure to untrusted networks.</p>
+        <p>These recommendations matter most for unattended stations: limited physical access, and a network you may not control.</p>
       </div>
     </div>
 
     <ol>
-      <li>
-        <strong>Use VPN</strong> — Connect remote units via WireGuard or OpenVPN rather than exposing RTSP directly to the internet.
-      </li>
-      <li>
-        <strong>Enable authentication</strong> — Add internal users with strong passwords to MediaMTX if VPN isn't available.
-      </li>
-      <li>
-        <strong>Regular updates</strong> — Schedule monthly: <code>./lyrebird-updater.sh</code> and <code>sudo apt upgrade</code>.
-      </li>
-      <li>
-        <strong>Review logs</strong> — Check <code>/var/log/lyrebird/</code> monthly for anomalies.
-      </li>
-      <li>
-        <strong>Physical security</strong> — Secure the device against physical access. USB port tamper detection is not built-in.
-      </li>
-      <li>
-        <strong>Emergency wipe plan</strong> — For sensitive deployments, keep a plan for remote wiping if a unit is compromised.
-      </li>
-      <li>
-        <strong>Disable unused ports</strong> — Block WebRTC (8889) if not needed: <code>sudo ufw deny 8889</code>.
-      </li>
-      <li>
-        <strong>Log rotation</strong> — Ensure logrotate is configured to prevent disk exhaustion: <code>sudo cp config/lyrebird-logrotate.conf /etc/logrotate.d/lyrebird</code>.
-      </li>
+      <li><strong>Use a VPN</strong> — Connect remote units through WireGuard or OpenVPN rather than exposing RTSP to the internet.</li>
+      <li><strong>Turn on authentication</strong> — <code>RTSP_AUTH_MODE=local-only-publish</code>, or a file you own, if a VPN is not available. Add TLS if passwords cross an untrusted network.</li>
+      <li><strong>Keep updated</strong> — <code>sudo apt upgrade</code>, <code>./lyrebird-updater.sh</code> (a menu), and <code>sudo ./install_mediamtx.sh update</code> (checksum-verified). Which release the updater offers matters: see SECURITY.md.</li>
+      <li><strong>Review logs</strong> — Check <code>/var/log/lyrebird-stream-manager.log</code> and <code>/var/log/mediamtx.out</code> for failed logins and unexpected clients.</li>
+      <li><strong>Physical security</strong> — Secure the device against physical access. USB port tamper detection is not built in.</li>
+      <li><strong>Emergency wipe plan</strong> — Keep a plan for removing the configuration, hashes, certificates and alert settings if a unit is compromised. <code>shred</code> is unreliable on flash storage; full-disk encryption protects better. The Security Guide has a script.</li>
+      <li><strong>Check exposure after every update</strong> — <code>sudo ss -tulpn | grep mediamtx</code>.</li>
     </ol>
 
+    <h2 id="verified">What this page was checked against</h2>
+    <p>The YAML on this page was loaded by real MediaMTX binaries (1.15.0, 1.18.0, 1.19.0, 1.21.1, 1.21.2, 1.21.3), and the claims about what a node exposes or refuses were observed on them with the real stream manager, installer and renderer in a private network namespace (a second address on the loopback interface stands in for a remote client). <strong>Not checked:</strong> real USB hardware, a real systemd manager (units were checked with <code>systemd-analyze verify</code> only), ARM boards, UFW, fail2ban as a service, WireGuard, certbot and VLC.</p>
     <p>
-      For comprehensive security guidance, see the full
-      <a href="https://github.com/tomtom215/LyreBirdAudio/blob/main/docs/SECURITY-GUIDE.md" target="_blank" rel="noopener">SECURITY-GUIDE.md</a>
-      in the repository.
+      Full recipes: <a href="https://github.com/tomtom215/LyreBirdAudio/blob/main/docs/SECURITY-GUIDE.md" target="_blank" rel="noopener">SECURITY-GUIDE.md</a>.
+      Which versions get fixes, how to report a vulnerability, and what is not covered:
+      <a href="https://github.com/tomtom215/LyreBirdAudio/blob/main/SECURITY.md" target="_blank" rel="noopener">SECURITY.md</a>.
     </p>
 
   </main>
