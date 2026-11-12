@@ -159,3 +159,76 @@ ffmpeg_dirs() {
     }
     grep -qxF "$FF/*.log {" "$root/etc/logrotate.d/mediamtx"
 }
+
+# The log paths a logrotate file lists, one per line (the lines before each "{", comments
+# and the directives inside the braces left out)
+stanza_logs() {
+    awk '
+        /^[[:space:]]*#/ { next }
+        /^[[:space:]]*$/ { next }
+        inside { if ($0 ~ /}/) inside = 0; next }
+        {
+            line = $0
+            if (line ~ /\{[[:space:]]*$/) { sub(/[[:space:]]*\{[[:space:]]*$/, "", line); inside = 1 }
+            n = split(line, parts, /[[:space:]]+/)
+            for (i = 1; i <= n; i++) if (parts[i] != "") print parts[i]
+        }' "$1"
+}
+
+@test "every log file is rotated by exactly one logrotate file: the shipped one and the one install writes list no log in common [X-51]" {
+    local root="$TEST_SCRATCH/lrroot" shim="$TEST_SCRATCH/lrshim2" conf="$TEST_SCRATCH/lrconf"
+    local real_logrotate
+    real_logrotate="$(command -v logrotate || true)"
+    mkdir -p "$root/etc/logrotate.d" "$root/etc/systemd/system" "$root/etc/cron.d" "$shim" "$conf"
+    printf '#!/bin/bash\nexit 0\n' >"$shim/logrotate"
+    printf '#!/bin/bash\nexit 0\n' >"$shim/systemctl"
+    chmod +x "$shim/logrotate" "$shim/systemctl"
+    # install's file for the DEFAULT locations (the ones the shipped file names): the manager
+    # sourced with its own defaults and its log silenced, so nothing is written outside the root
+    run env -u MEDIAMTX_LOG_FILE -u STREAM_MANAGER_LOG_FILE -u MEDIAMTX_FFMPEG_DIR -u MEDIAMTX_CONFIG_DIR \
+        -u MEDIAMTX_PID_FILE -u MEDIAMTX_LOCK_FILE LYREBIRD_SYSROOT="$root" PATH="$shim:$PATH" bash -c '
+        source "$PROJECT_ROOT/lyrebird-stream-manager.sh" >/dev/null 2>&1
+        log() { :; }
+        create_systemd_service >/dev/null 2>&1; echo "install rc=$?"'
+    [[ "$output" == *"install rc=0"* ]]
+    install -m 0644 "$root/etc/logrotate.d/mediamtx" "$conf/mediamtx"
+    install -m 0644 "$PROJECT_ROOT/config/lyrebird-logrotate.conf" "$conf/lyrebird"
+
+    local installed shipped
+    installed="$(stanza_logs "$conf/mediamtx")"
+    shipped="$(stanza_logs "$conf/lyrebird")"
+    [ -n "$installed" ] && [ -n "$shipped" ]
+    # no log is listed by both
+    run comm -12 <(sort <<<"$installed") <(sort <<<"$shipped")
+    [ -z "$output" ] || {
+        echo "listed by both files: $output"
+        false
+    }
+    # and none of the logs the scripts write is lost: each is listed once, by one of the two
+    local want
+    for want in /var/log/mediamtx.out /var/log/lyrebird-stream-manager.log '/var/lib/mediamtx-ffmpeg/*.log' \
+        '/var/log/lyrebird/*.log' /var/log/lyrebird-orchestrator.log /var/log/lyrebird-updater.log \
+        /var/log/lyrebird-diagnostics.log /var/log/usb-audio-mapper.log; do
+        [ "$(printf '%s\n%s\n' "$installed" "$shipped" | grep -cxF -- "$want")" -eq 1 ] || {
+            echo "$want is not listed exactly once"
+            false
+        }
+    done
+
+    # logrotate itself, where this machine has it: no duplicate entry, and each log considered once
+    if [[ -z "$real_logrotate" ]]; then
+        skip "logrotate is not installed; the lists above were compared without it"
+    fi
+    run "$real_logrotate" -d -s "$TEST_SCRATCH/logrotate.state" "$conf/mediamtx" "$conf/lyrebird"
+    [[ "$output" != *"duplicate log entry"* ]] || {
+        echo "$output"
+        false
+    }
+    for want in /var/log/mediamtx.out /var/log/lyrebird-stream-manager.log '/var/lib/mediamtx-ffmpeg/*.log' '/var/log/lyrebird/alerts.log'; do
+        [ "$(grep -cxF -- "considering log ${want}" <<<"$output")" -eq 1 ] || {
+            echo "${want} is not considered exactly once"
+            echo "$output"
+            false
+        }
+    done
+}
