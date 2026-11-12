@@ -8,10 +8,31 @@
 # Copyright: Tom F and LyreBirdAudio contributors
 # License: Apache 2.0
 #
-# Version: 2.1.3
+# Version: 2.2.0
 # Description: Production-grade orchestrator providing unified access to all
 #              LyreBirdAudio components with comprehensive functionality,
 #              intuitive navigation, and robust error handling.
+#
+# v2.2.0 Truthful outcomes (register LB-21):
+#   - Changed: Start All Streams, Restart All Streams and the Quick Setup Wizard
+#              read what the stream manager recorded (its status document:
+#              status file, else `status --json`) and show every stream and the
+#              overall state with each failed stream's reason and the next step.
+#              A start that exits 9 is "no stream is publishing" (MediaMTX up, or
+#              stopped again, as the document says); a start that exits 0 with
+#              no microphone is "waiting for devices", with what to do.
+#   - Fixed: the wizard's summary used the state read BEFORE the start step: a
+#            good start on a fresh node ended in "completed with warnings", a
+#            failed start on a streaming node in "streams are now available".
+#   - Changed: execute_script keeps the delegated script's real exit status
+#              (LAST_EXIT_CODE) and the failure line carries its meaning for the
+#              stream manager's and the updater's exit codes; installer failures
+#              are shown right after the action.
+#   - Added: Version Management 3) Show Update History and 4) Roll Back to a
+#            Previous Version (lyrebird-updater.sh --history / --rollback, with
+#            the version it will go to and a confirmation). Menu numbers 1, 2, 0
+#            are unchanged.
+#   - Fixed: get_primary_ip aborted the orchestrator on a system without `ip`.
 #
 # v2.1.3 USB mapping:
 #   - Fixed: after mapping, no longer claims names live in /dev/snd/by-id/ or
@@ -91,7 +112,7 @@ unset _LYREBIRD_COMMON
 # Constants and Configuration
 # ============================================================================
 
-readonly SCRIPT_VERSION="2.1.3"
+readonly SCRIPT_VERSION="2.2.0"
 
 # Initialize constants safely (separate declaration from assignment to catch errors)
 SCRIPT_NAME=""
@@ -234,6 +255,11 @@ fi
 declare -A SCRIPT_PATHS=()
 declare -A SCRIPT_CHECKSUMS=() # SHA256 checksums for script integrity verification
 LAST_ERROR=""
+# Real exit status of the script the last execute_script call delegated to; "" when
+# that call ran nothing (unknown script, failed integrity check). execute_script's
+# own return value collapses most failures to 1, and a caller that writes
+# `|| true` loses even that: this is what the messages that explain a failure read.
+LAST_EXIT_CODE=""
 MEDIAMTX_INSTALLED=false
 MEDIAMTX_RUNNING=false
 MEDIAMTX_VERSION="unknown"
@@ -665,10 +691,66 @@ recompute_script_checksums() {
     log "DEBUG" "Recomputed script checksums after update"
 }
 
+# One-line meaning of exit status CODE of delegated script KEY, for the messages
+# that report a failure. The stream manager's table is the one in
+# `lyrebird-stream-manager.sh --help` (docs/remediation/notes/stream-outcome.md),
+# the updater's the one in docs/remediation/notes/updater.md. Prints nothing and
+# returns 1 for a status without a documented meaning.
+describe_exit_code() {
+    local key="$1" code="$2" signal_name=""
+
+    if [[ ! "$code" =~ ^[0-9]+$ ]]; then
+        return 1
+    fi
+    if ((code > 128 && code < 160)); then
+        signal_name="$(kill -l $((code - 128)) 2>/dev/null)" || signal_name=""
+        printf 'terminated by signal %s%s' "$((code - 128))" "${signal_name:+ (SIG${signal_name})}"
+        return 0
+    fi
+
+    case "${key}:${code}" in
+        stream_manager:1) printf '%s' "general error; see the message above and the stream manager log" ;;
+        stream_manager:2) printf '%s' "critical resource state (disk, memory or file descriptors)" ;;
+        stream_manager:3) printf '%s' "a required tool or the MediaMTX binary is missing" ;;
+        stream_manager:4) printf '%s' "invalid configuration (start policy, device configuration or MediaMTX configuration)" ;;
+        stream_manager:5) printf '%s' "another lifecycle command (start, stop or restart) is running; nothing was changed, try again shortly" ;;
+        stream_manager:6) printf '%s' "no USB audio device is detected and starting without one is disabled (LYREBIRD_ALLOW_EMPTY_START=false)" ;;
+        stream_manager:7) printf '%s' "MediaMTX is not running" ;;
+        stream_manager:8) printf '%s' "another MediaMTX owns this node (for example mediamtx.service); nothing was changed" ;;
+        stream_manager:9) printf '%s' "no stream is publishing, so the start policy was not met; what the start launched was stopped again" ;;
+        stream_manager:10) printf '%s' "some streams are not publishing (monitor)" ;;
+        updater:1) printf '%s' "general error" ;;
+        updater:2) printf '%s' "prerequisites not met" ;;
+        updater:3) printf '%s' "not a git repository" ;;
+        updater:4) printf '%s' "could not reach the remote (fetch failed) or no remote is configured" ;;
+        updater:5) printf '%s' "permission problem: the repository is not writable or is owned by root, or the lock cannot be written" ;;
+        updater:6) printf '%s' "that version is not available in this clone (a rollback never uses the network)" ;;
+        updater:7) printf '%s' "another updater is running" ;;
+        updater:8) printf '%s' "unusable git state (a merge or rebase is in progress, or the update journal is unreadable)" ;;
+        updater:9) printf '%s' "cancelled (a prompt was declined, or the run was interrupted)" ;;
+        updater:10) printf '%s' "the switch is done, but your saved changes conflict with the new version and were NOT re-applied; they are in the git stash" ;;
+        updater:11) printf '%s' "the automatic rollback could not restore everything; the updater's message names the 'git checkout --force' command to run" ;;
+        *) return 1 ;;
+    esac
+}
+
+# "<script> failed (exit code: N - meaning)", the meaning only when there is one
+delegated_failure_text() {
+    local key="$1" name="$2" code="$3" meaning=""
+    meaning="$(describe_exit_code "$key" "$code")" || meaning=""
+    if [[ -n "$meaning" ]]; then
+        printf '%s failed (exit code: %s - %s)' "$name" "$code" "$meaning"
+    else
+        printf '%s failed (exit code: %s)' "$name" "$code"
+    fi
+}
+
 execute_script() {
     local script_key="$1"
     shift
     local args=("$@")
+
+    LAST_EXIT_CODE=""
 
     if [[ ! -v "SCRIPT_PATHS[$script_key]" ]]; then
         error "Unknown script key: ${script_key}"
@@ -724,12 +806,13 @@ execute_script() {
         local exit_code=0
         wait $CHILD_PID || exit_code=$?
         CHILD_PID=""
+        LAST_EXIT_CODE="$exit_code"
         if [[ $exit_code -eq 0 ]]; then
             log "INFO" "${script_name} completed successfully (privilege-dropped)"
             return 0
         else
-            error "${script_name} failed (exit code: ${exit_code})"
-            LAST_ERROR="${script_name} failed (exit code: ${exit_code})"
+            LAST_ERROR="$(delegated_failure_text "$script_key" "$script_name" "$exit_code")"
+            error "${LAST_ERROR}"
             log "ERROR" "${script_name} failed with exit code ${exit_code} (privilege-dropped)"
             return 1
         fi
@@ -745,6 +828,7 @@ execute_script() {
         local exit_code=0
         wait $CHILD_PID || exit_code=$?
         CHILD_PID=""
+        LAST_EXIT_CODE="$exit_code"
 
         case ${exit_code} in
             "${E_DIAG_SUCCESS}")
@@ -778,6 +862,7 @@ execute_script() {
         local exit_code=0
         wait $CHILD_PID || exit_code=$?
         CHILD_PID=""
+        LAST_EXIT_CODE="$exit_code"
         if [[ $exit_code -eq 0 ]]; then
             log "INFO" "${script_name} completed successfully"
         else
@@ -798,15 +883,483 @@ execute_script() {
     local exit_code=0
     wait $CHILD_PID || exit_code=$?
     CHILD_PID=""
+    LAST_EXIT_CODE="$exit_code"
     if [[ $exit_code -eq 0 ]]; then
         log "INFO" "${script_name} completed successfully"
         return 0
     else
-        error "${script_name} failed (exit code: ${exit_code})"
-        LAST_ERROR="${script_name} failed (exit code: ${exit_code})"
+        LAST_ERROR="$(delegated_failure_text "$script_key" "$script_name" "$exit_code")"
+        error "${LAST_ERROR}"
         log "ERROR" "${script_name} failed with exit code ${exit_code}"
         return 1
     fi
+}
+
+# Say how an installer action ended. execute_script prints nothing for the
+# installer (the wizard treats its exit status 7 as data), so a failure would
+# otherwise reach the user only as "Last Error" in the next menu redraw.
+# Exit status 7 is overloaded in the installer: "already installed", but also
+# several failed install steps; its own message, printed just before, says which.
+report_installer_result() {
+    local action="$1"
+
+    if [[ -z "$LAST_EXIT_CODE" || "$LAST_EXIT_CODE" == "0" ]]; then
+        return 0
+    fi
+    if [[ "$LAST_EXIT_CODE" == "7" ]]; then
+        warning "The installer exited with code 7: MediaMTX is already installed (use Update or Reinstall), or an install step failed; the installer's message above says which"
+    else
+        error "MediaMTX ${action} failed (installer exit code: ${LAST_EXIT_CODE}); see the installer's message above"
+    fi
+}
+
+# ============================================================================
+# Stream Outcome
+# What the stream manager says about the node after a start or restart, read
+# from its status document (`status --json`, or the file every start, restart,
+# stop and monitor run writes; schema_version 1, see
+# docs/remediation/notes/stream-outcome.md) instead of inferred from a process
+# list taken before the command ran. Everything here degrades: without jq, a
+# readable document or an answer from the manager the callers still have the
+# exit status, and nothing in this section can fail the orchestrator.
+# ============================================================================
+
+# At most this many streams are listed (the rest are counted): a status document
+# is data from outside this script
+readonly OUTCOME_MAX_STREAMS=100
+
+# jq program: one "H" line (overall, policy, command, MediaMTX running) and one
+# "S" line per stream (path, path_ready, bytes_flowing, last_error), fields
+# separated by the unit separator (not whitespace, so empty fields survive
+# `read`; the separator is removed from the values); null becomes an empty field.
+# Prints nothing for anything that is not a schema_version 1 document.
+readonly STATUS_JQ_FILTER='def s: if . == null then "" else tostring | gsub("\u001f"; "") end;
+def hline: ["H", .overall, (.policy | s), (.command | s), (.mediamtx.running | s)] | join("\u001f");
+def sline: ["S", (.path | s), (.path_ready | s), (.bytes_flowing | s), (.last_error | s)] | join("\u001f");
+select(type == "object" and .schema_version == 1 and (.overall | type) == "string" and (.streams | type) == "array")
+| hline, (.streams[] | sline)'
+
+# The monitor job that starts a stream for a microphone that appears later
+# (lyrebird-stream-manager.sh install writes it)
+MONITOR_CRON_FILE="/etc/cron.d/mediamtx-monitor"
+
+OUTCOME_SOURCE=""   # "status file", "status --json", or "" when nothing was readable
+OUTCOME_PROBLEM=""  # why nothing was readable
+OUTCOME_OVERALL=""  # ok | degraded | failed | waiting_for_devices | stopped | unknown
+OUTCOME_POLICY=""   # degraded | strict | unknown
+OUTCOME_MEDIAMTX="" # true | false | unknown
+OUTCOME_TOTAL=0     # streams in the document
+OUTCOME_READY=0     # of those, with path_ready true
+OUTCOME_OMITTED=0   # streams beyond OUTCOME_MAX_STREAMS: counted, not listed
+declare -a OUTCOME_S_PATH=() OUTCOME_S_READY=() OUTCOME_S_FLOW=() OUTCOME_S_ERROR=()
+LIFECYCLE_RC=""      # exit status of the last start/restart ("" = it did not run)
+LIFECYCLE_VERDICT="" # classify_lifecycle
+
+reset_outcome() {
+    OUTCOME_SOURCE=""
+    OUTCOME_PROBLEM=""
+    OUTCOME_OVERALL=""
+    OUTCOME_POLICY=""
+    OUTCOME_MEDIAMTX=""
+    OUTCOME_TOTAL=0
+    OUTCOME_READY=0
+    OUTCOME_OMITTED=0
+    OUTCOME_S_PATH=()
+    OUTCOME_S_READY=()
+    OUTCOME_S_FLOW=()
+    OUTCOME_S_ERROR=()
+}
+
+# Where the stream manager records its status (the same variables, same
+# precedence as the manager: LYREBIRD_STATUS_FILE, else LYREBIRD_STATE_DIR/status.json)
+status_file_path() {
+    printf '%s' "${LYREBIRD_STATUS_FILE:-${LYREBIRD_STATE_DIR:-/run/lyrebird}/status.json}"
+}
+
+# The status file's text; nothing when it is absent or unreadable
+status_file_content() {
+    local file
+    file="$(status_file_path)"
+    if [[ -f "$file" && -r "$file" ]]; then
+        head -c 1048576 -- "$file" 2>/dev/null || true
+    fi
+    return 0
+}
+
+# Parse the status document DOC into the OUTCOME_* variables. Returns 1 and sets
+# OUTCOME_PROBLEM when it cannot be used. Control characters are dropped from
+# everything that is later printed.
+parse_status_document() {
+    local doc="$1" parsed="" tag f1 f2 f3 f4
+
+    OUTCOME_OVERALL=""
+    OUTCOME_POLICY=""
+    OUTCOME_MEDIAMTX=""
+    OUTCOME_TOTAL=0
+    OUTCOME_READY=0
+    OUTCOME_OMITTED=0
+    OUTCOME_S_PATH=()
+    OUTCOME_S_READY=()
+    OUTCOME_S_FLOW=()
+    OUTCOME_S_ERROR=()
+
+    if ! command_exists jq; then
+        OUTCOME_PROBLEM="jq is not installed"
+        return 1
+    fi
+    if ! parsed="$(printf '%s\n' "$doc" | jq -r "$STATUS_JQ_FILTER" 2>/dev/null)" || [[ "$parsed" != H* ]]; then
+        OUTCOME_PROBLEM="the status document is not valid, or is not a schema_version 1 document"
+        return 1
+    fi
+    parsed="$(printf '%s' "$parsed" | LC_ALL=C tr -d '\000-\010\013-\036\177')"
+
+    while IFS=$'\x1f' read -r tag f1 f2 f3 f4 || [[ -n "$tag" ]]; do
+        case "$tag" in
+            H)
+                OUTCOME_OVERALL="$f1"
+                OUTCOME_POLICY="$f2"
+                OUTCOME_MEDIAMTX="$f4"
+                ;;
+            S)
+                OUTCOME_TOTAL=$((OUTCOME_TOTAL + 1))
+                if [[ "$f2" == "true" ]]; then
+                    OUTCOME_READY=$((OUTCOME_READY + 1))
+                fi
+                if ((${#OUTCOME_S_PATH[@]} < OUTCOME_MAX_STREAMS)); then
+                    OUTCOME_S_PATH+=("$f1")
+                    OUTCOME_S_READY+=("$f2")
+                    OUTCOME_S_FLOW+=("$f3")
+                    OUTCOME_S_ERROR+=("$f4")
+                else
+                    OUTCOME_OMITTED=$((OUTCOME_OMITTED + 1))
+                fi
+                ;;
+            *) ;;
+        esac
+    done <<<"$parsed"
+
+    case "$OUTCOME_OVERALL" in
+        ok | degraded | failed | waiting_for_devices | stopped) ;;
+        *) OUTCOME_OVERALL="unknown" ;;
+    esac
+    case "$OUTCOME_POLICY" in
+        degraded | strict) ;;
+        *) OUTCOME_POLICY="unknown" ;;
+    esac
+    case "$OUTCOME_MEDIAMTX" in
+        true | false) ;;
+        *) OUTCOME_MEDIAMTX="unknown" ;;
+    esac
+    return 0
+}
+
+# Ask the stream manager for its live state: `status --json`, with no terminal
+# and for at most a minute (it samples every ready stream's byte counter, a few
+# seconds, and asks the MediaMTX API once per stream)
+query_status_document() {
+    local script_path="${SCRIPT_PATHS[stream_manager]:-}" doc="" rc=0
+
+    if [[ -z "$script_path" || ! -x "$script_path" ]]; then
+        OUTCOME_PROBLEM="the stream manager script is not available"
+        return 1
+    fi
+    if ! verify_script_integrity "stream_manager"; then
+        OUTCOME_PROBLEM="the stream manager script was modified since it was validated"
+        return 1
+    fi
+    if command_exists timeout; then
+        doc="$(timeout 60 "$script_path" status --json </dev/null 2>/dev/null)" || rc=$?
+    else
+        doc="$("$script_path" status --json </dev/null 2>/dev/null)" || rc=$?
+    fi
+    if ((rc != 0)); then
+        OUTCOME_PROBLEM="status --json exited with status ${rc}"
+        return 1
+    fi
+    parse_status_document "$doc"
+}
+
+# Read what a start or restart (exit status RC) left behind. BEFORE is the status
+# file's text from before the command: the file counts only if the command, or
+# something after it, wrote it (a command that was refused writes nothing, and
+# the file then describes an earlier moment). When a command that reported
+# success left no usable status, the live state is asked for instead.
+collect_lifecycle_outcome() {
+    local before="$1" rc="$2" after=""
+
+    after="$(status_file_content)"
+    if [[ -n "$after" && "$after" != "$before" ]]; then
+        if parse_status_document "$after"; then
+            OUTCOME_SOURCE="status file"
+            return 0
+        fi
+    else
+        OUTCOME_PROBLEM="the command recorded no new status"
+    fi
+    if [[ "$rc" != "0" ]]; then
+        return 1
+    fi
+    info "No usable status was recorded; asking the stream manager for the live state..."
+    if query_status_document; then
+        OUTCOME_SOURCE="status --json"
+        OUTCOME_PROBLEM=""
+        return 0
+    fi
+    return 1
+}
+
+# How one stream is doing, from path_ready and bytes_flowing (true, false or "" = not known)
+describe_stream_state() {
+    case "$1:$2" in
+        true:true) printf '%s' "publishing, bytes flowing" ;;
+        true:false) printf '%s' "path ready, but no bytes are flowing" ;;
+        true:*) printf '%s' "publishing (byte flow not measured)" ;;
+        false:*) printf '%s' "not publishing" ;;
+        *) printf '%s' "state unknown (the MediaMTX API did not answer)" ;;
+    esac
+}
+
+# One line per stream of the document that was read, with the reason the manager
+# gives for each stream that is not publishing. The values come from a file: they
+# are printed with %s, never interpreted.
+print_outcome_streams() {
+    local i marker state
+
+    for ((i = 0; i < ${#OUTCOME_S_PATH[@]}; i++)); do
+        state="$(describe_stream_state "${OUTCOME_S_READY[i]}" "${OUTCOME_S_FLOW[i]}")"
+        if [[ "${OUTCOME_S_READY[i]}" == "true" && "${OUTCOME_S_FLOW[i]}" != "false" ]]; then
+            marker="${GREEN}[OK]${NC}"
+        elif [[ "${OUTCOME_S_READY[i]}" == "false" ]]; then
+            marker="${RED}[FAIL]${NC}"
+        else
+            marker="${YELLOW}[!]${NC}"
+        fi
+        printf '  %b %s: %s%s\n' "$marker" "${OUTCOME_S_PATH[i]}" "$state" \
+            "${OUTCOME_S_ERROR[i]:+ - ${OUTCOME_S_ERROR[i]}}"
+    done
+    if ((OUTCOME_OMITTED > 0)); then
+        echo "  ... and ${OUTCOME_OMITTED} more"
+    fi
+}
+
+# Classify a start or restart that exited with status RC ("" = it was not run),
+# given the outcome read after it (reset_outcome and collect_lifecycle_outcome):
+#   ok              exit 0, every stream publishes
+#   degraded        exit 0, some streams publish
+#   waiting         exit 0, MediaMTX is up and no device is detected (empty start)
+#   inconsistent    exit 0, but the status says the node is failed, stopped or unknown
+#   unconfirmed     exit 0, and the status could not be read
+#   streams_failed  exit 9: the start policy was not met
+#   failed          any other exit status
+#   not_run         the script was not run
+classify_lifecycle() {
+    local rc="$1"
+
+    if [[ -z "$rc" ]]; then
+        LIFECYCLE_VERDICT="not_run"
+    elif [[ "$rc" == "9" ]]; then
+        LIFECYCLE_VERDICT="streams_failed"
+    elif [[ "$rc" != "0" ]]; then
+        LIFECYCLE_VERDICT="failed"
+    elif [[ -z "$OUTCOME_SOURCE" ]]; then
+        LIFECYCLE_VERDICT="unconfirmed"
+    else
+        case "$OUTCOME_OVERALL" in
+            ok) LIFECYCLE_VERDICT="ok" ;;
+            degraded) LIFECYCLE_VERDICT="degraded" ;;
+            waiting_for_devices) LIFECYCLE_VERDICT="waiting" ;;
+            *) LIFECYCLE_VERDICT="inconsistent" ;;
+        esac
+    fi
+}
+
+# What to do next, for the verdict of the last start or restart
+print_lifecycle_next_steps() {
+    case "$LIFECYCLE_VERDICT" in
+        ok | not_run) ;;
+        waiting)
+            echo
+            info "Next steps:"
+            info "  * Plug in a USB microphone."
+            if [[ -f "$MONITOR_CRON_FILE" ]]; then
+                info "  * The monitor (cron job ${MONITOR_CRON_FILE}, every 5 minutes as shipped) starts its stream on its next run."
+            else
+                info "  * No monitor cron job is installed (${MONITOR_CRON_FILE} not found), so nothing will start the stream by itself."
+            fi
+            info "  * To start it right away: Audio Streaming Control -> Start All Streams."
+            ;;
+        failed)
+            echo
+            info "Next steps:"
+            case "$LIFECYCLE_RC" in
+                3) info "  * Install what is missing (ffmpeg, jq, arecord, curl) or MediaMTX: Main Menu -> MediaMTX Installation & Updates." ;;
+                4) info "  * Check the configuration: USB Device Management -> Validate Device Configuration; the stream manager log has the details." ;;
+                5) info "  * Wait for the other start, stop or restart to finish, then try again." ;;
+                6) info "  * Plug in a USB microphone, then start again." ;;
+                8) info "  * Stop the other MediaMTX first (for example: sudo systemctl stop mediamtx.service), then start again." ;;
+                *) info "  * Read the stream manager log: Logs & Status -> View Stream Manager Log." ;;
+            esac
+            ;;
+        unconfirmed)
+            echo
+            info "Next steps:"
+            info "  * Check what is publishing: Audio Streaming Control -> View Stream Status."
+            ;;
+        *)
+            echo
+            info "Next steps:"
+            info "  * Check that each microphone is connected: USB Device Management -> Detect Device Capabilities."
+            info "  * Read the logs: Logs & Status -> View Stream Manager Log, View Stream Logs (FFmpeg)."
+            info "  * Start again: Audio Streaming Control -> Start All Streams (a repeated start only starts what is missing)."
+            if [[ -f "$MONITOR_CRON_FILE" ]]; then
+                info "  * The monitor (cron job ${MONITOR_CRON_FILE}) also retries streams that are not publishing on each run."
+            fi
+            ;;
+    esac
+}
+
+# Tell the user what the last start or restart (COMMAND) really did: the outcome
+# the stream manager recorded, stream by stream, with the reason for each stream
+# that is not publishing; and what to do about it.
+report_lifecycle() {
+    local command="$1"
+
+    echo
+    case "$LIFECYCLE_VERDICT" in
+        ok)
+            success "All ${OUTCOME_TOTAL} stream(s) are publishing"
+            ;;
+        degraded)
+            warning "Degraded: ${OUTCOME_READY} of ${OUTCOME_TOTAL} streams are publishing"
+            ;;
+        waiting)
+            info "MediaMTX is running and waiting for devices: no USB microphone is detected, so no stream is publishing yet"
+            ;;
+        streams_failed)
+            if [[ -z "$OUTCOME_SOURCE" ]]; then
+                error "The ${command} did not meet its start policy: no stream is publishing (exit code 9)"
+            elif [[ "$OUTCOME_POLICY" == "strict" ]]; then
+                error "Not every stream is publishing, and the start policy 'strict' requires every stream: what the ${command} started was stopped again"
+            elif [[ "$OUTCOME_MEDIAMTX" == "true" ]]; then
+                error "MediaMTX is up but no stream is publishing"
+            else
+                error "No stream is publishing, and MediaMTX was stopped again: a failed ${command} takes down what it started"
+            fi
+            ;;
+        inconsistent)
+            warning "The ${command} reported success, but the stream manager now reports the node as '${OUTCOME_OVERALL}'"
+            ;;
+        unconfirmed)
+            warning "The ${command} reported success (exit code 0), but the stream state could not be read (${OUTCOME_PROBLEM}); whether streams are publishing is not confirmed here"
+            ;;
+        *) ;;
+    esac
+    if [[ -n "$OUTCOME_SOURCE" ]] && ((OUTCOME_TOTAL > 0)); then
+        print_outcome_streams
+    fi
+    print_lifecycle_next_steps
+}
+
+# Run `stream_manager start` or `restart` and report what it really did. The
+# failure itself is already shown, with its meaning, by execute_script, so the
+# `|| true` here discards nothing the user has not been told; the exit status
+# (LIFECYCLE_RC) and the outcome are read right after the command, never from the
+# state captured before it.
+run_stream_lifecycle() {
+    local command="$1" before=""
+
+    before="$(status_file_content)"
+    execute_script "stream_manager" "$command" || true
+    LIFECYCLE_RC="$LAST_EXIT_CODE"
+    reset_outcome
+    if [[ -n "$LIFECYCLE_RC" ]]; then
+        collect_lifecycle_outcome "$before" "$LIFECYCLE_RC" || true
+    fi
+    classify_lifecycle "$LIFECYCLE_RC"
+    log "INFO" "stream manager ${command}: exit status ${LIFECYCLE_RC:-none}, verdict ${LIFECYCLE_VERDICT}, state ${OUTCOME_OVERALL:-not read} (${OUTCOME_SOURCE:-no source}${OUTCOME_PROBLEM:+: ${OUTCOME_PROBLEM}})"
+    report_lifecycle "$command"
+    return 0
+}
+
+# RTSP URLs of the streams that publish, from the outcome read after the start
+print_stream_urls() {
+    local ip port="${MEDIAMTX_RTSP_PORT:-8554}" i
+
+    [[ "$port" =~ ^[0-9]{1,5}$ ]] || port=8554
+    ip="$(get_primary_ip)"
+    for ((i = 0; i < ${#OUTCOME_S_PATH[@]}; i++)); do
+        if [[ "${OUTCOME_S_READY[i]}" == "true" ]]; then
+            printf '%b   rtsp://%s:%s/%s\n' "${CYAN}[INFO]${NC}" "$ip" "$port" "${OUTCOME_S_PATH[i]}"
+        fi
+    done
+}
+
+# The last lines of the Quick Setup Wizard: what the start of step 3 achieved,
+# decided by the outcome that start left (run_stream_lifecycle), not by the
+# state the wizard captured before it ran. A start that works on a fresh node is
+# success whatever was running before it; a start that failed is not, however
+# healthy the node was before it.
+wizard_summary() {
+    local port="${MEDIAMTX_RTSP_PORT:-8554}"
+
+    [[ "$port" =~ ^[0-9]{1,5}$ ]] || port=8554
+    echo
+    case "$LIFECYCLE_VERDICT" in
+        ok)
+            success "Quick setup complete!"
+            echo
+            echo "+ Your RTSP streams are now available!"
+            echo
+            info "Stream URLs:"
+            print_stream_urls
+            ;;
+        degraded)
+            warning "Quick setup finished, but only ${OUTCOME_READY} of ${OUTCOME_TOTAL} streams are publishing"
+            echo
+            print_outcome_streams
+            echo
+            info "Stream URLs of the streams that are publishing:"
+            print_stream_urls
+            print_lifecycle_next_steps
+            ;;
+        waiting)
+            success "Quick setup complete: MediaMTX is running."
+            echo
+            info "No USB microphone is detected yet, so no stream is publishing."
+            print_lifecycle_next_steps
+            ;;
+        unconfirmed)
+            # Exit status 0 and no readable status: all there is to go on is the
+            # process list, read now, after the start
+            warning "Quick setup finished, but the stream state could not be confirmed"
+            echo
+            if [[ "$MEDIAMTX_RUNNING" == "true" ]] && ((ACTIVE_STREAMS > 0)); then
+                info "MediaMTX is running and ${ACTIVE_STREAMS} FFmpeg process(es) were found after the start."
+            else
+                warning "MediaMTX or its FFmpeg processes were not found after the start: the streams are probably not available."
+            fi
+            echo
+            info "Stream URLs follow this format:"
+            info "  rtsp://$(get_primary_ip):${port}/<stream-name>"
+            print_lifecycle_next_steps
+            ;;
+        inconsistent)
+            warning "Quick setup finished, but the stream manager reports the node as '${OUTCOME_OVERALL}'"
+            echo
+            print_outcome_streams
+            print_lifecycle_next_steps
+            ;;
+        streams_failed)
+            error "Quick setup did not finish: no stream is publishing"
+            echo
+            print_outcome_streams
+            print_lifecycle_next_steps
+            ;;
+        *)
+            error "Quick setup did not finish: the audio streams could not be started"
+            print_lifecycle_next_steps
+            ;;
+    esac
 }
 
 # ============================================================================
@@ -853,7 +1406,7 @@ display_error() {
 
 get_primary_ip() {
     # Try to get primary IP address
-    local primary_ip
+    local primary_ip=""
 
     # Try ip command first
     if command_exists ip; then
@@ -1026,23 +1579,11 @@ menu_quick_setup() {
         return
     fi
 
-    # Step 3: Start streams
+    # Step 3: Start streams. What the start achieved is read from the outcome it
+    # left (run_stream_lifecycle), not from the state refreshed before it ran.
     echo
     echo -e "${BOLD}Step 3/4: Starting audio streams...${NC}"
-    if execute_script "stream_manager" start; then
-        success "Audio streams started successfully"
-    else
-        error "Failed to start audio streams"
-        echo
-        info "Common causes:"
-        info "  * MediaMTX not running properly"
-        info "  * USB devices not yet recognized (reboot may be needed)"
-        info "  * Configuration issues"
-        echo
-        info "Next steps:"
-        info "  * Check stream status: Streaming Control -> View Status"
-        info "  * Run diagnostics: System Diagnostics -> Full Diagnostics"
-    fi
+    run_stream_lifecycle start
 
     # Step 4: Quick diagnostics
     echo
@@ -1070,24 +1611,9 @@ menu_quick_setup() {
             ;;
     esac
 
-    echo
-    success "Quick setup complete!"
-    echo
-
-    if [[ "$MEDIAMTX_RUNNING" == "true" ]] && ((ACTIVE_STREAMS > 0)); then
-        echo "+ Your RTSP streams are now available!"
-        echo
-        info "Stream URLs follow this format:"
-        info "  rtsp://$(get_primary_ip):8554/<device-name>"
-        echo
-        info "Example:"
-        info "  rtsp://192.168.1.100:8554/usb-microphone-1"
-    else
-        echo "! Setup completed with warnings"
-        echo
-        info "Your system may require a reboot before streams become available."
-        info "After reboot, start streams from: Main Menu -> Audio Streaming Control"
-    fi
+    # The state of the node after the start and the diagnostics, not before
+    refresh_system_state
+    wizard_summary
 
     echo
     pause
@@ -1128,6 +1654,7 @@ menu_mediamtx() {
                 echo
                 info "Starting MediaMTX installation..."
                 execute_script "installer" install || true
+                report_installer_result "installation"
                 echo
                 refresh_system_state
                 pause
@@ -1136,6 +1663,7 @@ menu_mediamtx() {
                 echo
                 info "Starting MediaMTX update..."
                 execute_script "installer" update || true
+                report_installer_result "update"
                 echo
                 refresh_system_state
                 pause
@@ -1156,6 +1684,7 @@ menu_mediamtx() {
                 if [[ "$REPLY" =~ ^[Yy]$ ]]; then
                     # Use -f (force) flag with install to reinstall
                     execute_script "installer" -f install || true
+                    report_installer_result "reinstallation"
                     echo
                     refresh_system_state
                 fi
@@ -1176,6 +1705,7 @@ menu_mediamtx() {
                 echo
                 if [[ "$REPLY" =~ ^[Yy]$ ]]; then
                     execute_script "installer" uninstall || true
+                    report_installer_result "uninstallation"
                     echo
                     refresh_system_state
                 fi
@@ -1515,7 +2045,7 @@ menu_streaming() {
             1)
                 echo
                 info "Starting audio streams..."
-                execute_script "stream_manager" start || true
+                run_stream_lifecycle start
                 echo
                 refresh_system_state
                 pause
@@ -1545,7 +2075,7 @@ menu_streaming() {
             3)
                 echo
                 info "Restarting audio streams..."
-                execute_script "stream_manager" restart || true
+                run_stream_lifecycle restart
                 echo
                 refresh_system_state
                 pause
@@ -1754,6 +2284,144 @@ menu_diagnostics() {
     done
 }
 
+# Where the updater keeps its state (lock, update history, transaction journal):
+# a directory inside the git directory, derived exactly as lyrebird-updater.sh does
+# for a checkout or a linked worktree. Prints nothing and returns 1 when this is
+# not a git checkout. (git itself is not asked: run as root on a checkout another
+# user owns, it refuses with "dubious ownership".)
+updater_state_dir() {
+    local dot_git="${SCRIPT_DIR}/.git" line="" gitdir=""
+
+    if [[ -d "$dot_git" ]]; then
+        gitdir="$dot_git"
+    elif [[ -f "$dot_git" ]] && IFS= read -r line <"$dot_git" && [[ "$line" == "gitdir: "* ]]; then
+        gitdir="${line#gitdir: }"
+        [[ "$gitdir" == /* ]] || gitdir="${SCRIPT_DIR}/${gitdir}"
+    else
+        return 1
+    fi
+    printf '%s/lyrebird-updater' "$gitdir"
+}
+
+# The version `lyrebird-updater.sh --rollback` with no version goes back to: the
+# one the last completed update, rollback or reset came from, read from the
+# updater's history log with the updater's own selection (history_last_change).
+# Sets ROLLBACK_FROM_COMMIT (a hash) and ROLLBACK_FROM_LABEL (tag, branch or
+# short hash, "" if none); returns 1 when there is none.
+ROLLBACK_FROM_COMMIT=""
+ROLLBACK_FROM_LABEL=""
+updater_previous_version() {
+    local dir="" file="" line=""
+
+    ROLLBACK_FROM_COMMIT=""
+    ROLLBACK_FROM_LABEL=""
+    dir="$(updater_state_dir)" || return 1
+    file="${dir}/history.log"
+    [[ -f "$file" && -r "$file" ]] || return 1
+    line="$(awk -F'\t' '$3 == "ok" && ($2 == "update" || $2 == "rollback" || $2 == "reset") {line = $0} END {if (line != "") print line}' "$file" 2>/dev/null)" || line=""
+    [[ -n "$line" ]] || return 1
+    IFS=$'\t' read -r _ _ _ ROLLBACK_FROM_COMMIT ROLLBACK_FROM_LABEL _ <<<"$line"
+    # "-" when an older updater did not record it
+    if [[ ! "$ROLLBACK_FROM_COMMIT" =~ ^[0-9a-f]{7,64}$ ]]; then
+        ROLLBACK_FROM_COMMIT=""
+        ROLLBACK_FROM_LABEL=""
+        return 1
+    fi
+    if [[ "$ROLLBACK_FROM_LABEL" == "-" || ! "$ROLLBACK_FROM_LABEL" =~ ^[A-Za-z0-9._/+-]+$ ]]; then
+        ROLLBACK_FROM_LABEL=""
+    fi
+    return 0
+}
+
+# Version Management, option 4: go back to a version that is already on this
+# node, with `lyrebird-updater.sh --rollback` (the updater's own transaction, no
+# network). Says which version it will go to and asks before it does.
+rollback_to_previous_version() {
+    local answer="" target="" have_previous=false
+    local -a version_args=()
+
+    echo
+    echo -e "${BOLD}Roll Back to a Previous Version${NC}"
+    echo
+    info "A rollback returns this installation to a release tag or commit that is already on this node."
+    info "It never uses the network. Option 3, Show Update History, lists the versions this node has run."
+    echo
+    if updater_previous_version; then
+        have_previous=true
+        info "Before the last update this node ran: ${ROLLBACK_FROM_LABEL:-${ROLLBACK_FROM_COMMIT:0:7}} (${ROLLBACK_FROM_COMMIT:0:7})"
+        echo "  Enter      roll back to that version"
+    else
+        info "No previous version is recorded in the update history."
+    fi
+    echo "  <version>  a release tag (for example v1.3.0) or a commit hash that is already on this node"
+    echo "  0          cancel"
+    echo
+
+    if ! read -rp "Version to roll back to: " answer; then
+        echo
+        warning "Input stream closed - operation cancelled"
+        return 0
+    fi
+    answer="${answer//[[:space:]]/}"
+    case "$answer" in
+        0)
+            info "Cancelled; nothing was changed"
+            return 0
+            ;;
+        "")
+            if [[ "$have_previous" != "true" ]]; then
+                error "No previous version is recorded: type the version to roll back to (a release tag such as v1.3.0, or a commit hash)"
+                return 0
+            fi
+            target="${ROLLBACK_FROM_LABEL:-${ROLLBACK_FROM_COMMIT:0:7}} (${ROLLBACK_FROM_COMMIT:0:7})"
+            ;;
+        *)
+            if [[ ! "$answer" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]*$ ]]; then
+                error "Not a valid version: use a release tag such as v1.3.0 or a commit hash"
+                return 0
+            fi
+            target="$answer"
+            version_args=("$answer")
+            ;;
+    esac
+
+    echo
+    warning "This will roll back LyreBirdAudio to: ${target}"
+    info "The updater handles it as it handles an update: it offers to save local changes first,"
+    info "stops and restarts the audio service if it is installed, and switches the files."
+    if ! read -rp "Continue? (y/n): " -n 1; then
+        echo
+        warning "Input stream closed - operation cancelled"
+        return 0
+    fi
+    flush_stdin # Consume trailing newline from -n 1 read
+    echo
+    if [[ ! "$REPLY" =~ ^[Yy]$ ]]; then
+        info "Cancelled; nothing was changed"
+        return 0
+    fi
+
+    echo
+    execute_script "updater" --rollback ${version_args[@]+"${version_args[@]}"} || true
+    # The updater rewrote the other scripts on disk: refresh the integrity
+    # baseline so later actions in THIS session do not fail the "modified since
+    # validation" check
+    recompute_script_checksums
+    case "$LAST_EXIT_CODE" in
+        0)
+            echo
+            success "The updater finished the rollback (exit code 0)"
+            info "This orchestrator may have been replaced too: leave it and start it again to run the rolled-back version."
+            ;;
+        6)
+            echo
+            info "Option 3, Show Update History, lists the versions this node has run."
+            ;;
+        *) ;;
+    esac
+    return 0
+}
+
 menu_versions() {
     while true; do
         display_header "clear"
@@ -1765,12 +2433,15 @@ menu_versions() {
         echo -e "${BOLD}Version Options:${NC}"
         echo "  1) Launch Update Manager (Interactive)"
         echo "  2) Show Component Versions"
+        echo "  3) Show Update History"
+        echo "  4) Roll Back to a Previous Version"
         echo "  0) Back to Main Menu"
         echo
 
         info "The update manager provides:"
         info "  * Interactive update workflow with safety checks"
         info "  * Automatic backup and rollback capability"
+        info "  * Update history, and rollback to a version already on this node (no network needed)"
         info "  * Component-by-component update selection"
         info "  * Git repository integration for updates"
         echo
@@ -1825,11 +2496,24 @@ menu_versions() {
                 echo "================================================================"
                 pause
                 ;;
+            3)
+                echo
+                info "Showing the update history (a local log: no network needed)..."
+                execute_script "updater" --history || true
+                echo
+                pause
+                ;;
+            4)
+                rollback_to_previous_version
+                echo
+                refresh_system_state
+                pause
+                ;;
             0)
                 return
                 ;;
             *)
-                error "Invalid option. Please select 0-2."
+                error "Invalid option. Please select 0-4."
                 sleep 1
                 ;;
         esac

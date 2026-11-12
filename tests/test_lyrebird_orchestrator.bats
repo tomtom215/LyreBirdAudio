@@ -707,6 +707,26 @@ teardown() {
     [[ "$output" == *ALLOK* ]]
 }
 
+@test "get_primary_ip survives a system without the ip command: it aborted the whole orchestrator under set -u [LB-21]" {
+    # `local primary_ip` declared it without a value, so `[[ -z "$primary_ip" ]]`
+    # was an unbound variable when `ip` is not installed (a minimal image, a
+    # container); an assignment from get_primary_ip (View Stream URLs, the
+    # wizard's URL list) then ended the orchestrator under errexit
+    run env PROJECT_ROOT="$PROJECT_ROOT" bash -c '
+        source "$PROJECT_ROOT/lyrebird-orchestrator.sh" >/dev/null 2>&1
+        command_exists() { [[ "$1" != ip ]] && command -v "$1" >/dev/null 2>&1; }
+        primary="$(get_primary_ip)"
+        echo "NO-IP primary=[$primary]"
+        command_exists() { [[ "$1" != ip && "$1" != hostname ]] && command -v "$1" >/dev/null 2>&1; }
+        primary="$(get_primary_ip)"
+        echo "NO-IP-NO-HOSTNAME primary=[$primary]"
+    '
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"NO-IP primary=["* ]]
+    [[ "$output" != *"NO-IP primary=[]"* ]]
+    [[ "$output" == *"NO-IP-NO-HOSTNAME primary=[<server-ip>]"* ]]
+}
+
 @test "orchestrator points at what usb-audio-mapper creates (/dev/sound/by-id, --list), not by-usb-port [ORCH-7 regression]" {
     # The mapper names cards (ATTR{id}) and links /dev/sound/by-id/<name>;
     # /dev/snd/by-id/ holds systemd's own usb-<serial> links, and
