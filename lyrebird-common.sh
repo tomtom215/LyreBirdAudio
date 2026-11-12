@@ -17,8 +17,17 @@
 # USAGE:
 #   Source this file at the top of any LyreBirdAudio script:
 #
-#     # Source shared library if available (backward compatible)
-#     _COMMON_LIB="${BASH_SOURCE[0]%/*}/lyrebird-common.sh"
+#     # Source shared library if available (backward compatible). A script run by
+#     # bare name (bash script.sh, in its own directory) has no slash in
+#     # BASH_SOURCE[0], so "${BASH_SOURCE[0]%/*}" would be the script's own name:
+#     # use "." then. The scripts in this repository also look beside the target
+#     # of a symlink; copy the block from lyrebird-diagnostics.sh.
+#     _COMMON_LIB="${BASH_SOURCE[0]}"
+#     if [[ "$_COMMON_LIB" == */* ]]; then
+#         _COMMON_LIB="${_COMMON_LIB%/*}/lyrebird-common.sh"
+#     else
+#         _COMMON_LIB="./lyrebird-common.sh"
+#     fi
 #     if [[ -f "$_COMMON_LIB" ]]; then
 #         source "$_COMMON_LIB"
 #     fi
