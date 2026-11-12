@@ -840,8 +840,10 @@ The manager asks the MediaMTX API where it listens (`MEDIAMTX_API_BIND`, else `M
 # Run health check
 sudo ./lyrebird-diagnostics.sh quick
 
-# Check specific components
+# What the stream manager sees, per stream, with the reason for each failure
 ./lyrebird-stream-manager.sh status
+
+# What each USB sound card supports
 ./lyrebird-mic-check.sh
 ```
 
@@ -861,23 +863,38 @@ arecord -l
 sudo ./usb-audio-mapper.sh
 ```
 
+With no microphone detected, `start` by default still brings MediaMTX up and exits 0; `status` then shows `Overall: waiting_for_devices` and the monitor starts a stream when a microphone appears. With `LYREBIRD_ALLOW_EMPTY_START=false`, `start` exits 6 instead. A USB speaker or DAC has no capture PCM and is skipped, so a node with only speakers also waits for devices.
+
 #### Streams Won't Start
 
 ```bash
-# Check logs
-sudo tail -f /var/log/lyrebird-stream-manager.log
-sudo tail -f /var/log/lyrebird/*.log
+# The exit status says what happened (see the table in "Stream Manager"):
+#   3 a dependency is missing, 4 a setting or the configuration is invalid,
+#   5 another start/stop is running, 8 another MediaMTX owns the node,
+#   9 no stream is publishing
+sudo ./lyrebird-stream-manager.sh start; echo "exit status: $?"
+
+# The reason for each stream that is not publishing
+./lyrebird-stream-manager.sh status --json | jq '.streams[] | {path, last_error}'
+
+# Logs: the manager, MediaMTX, and each stream's FFmpeg
+sudo tail -n 100 /var/log/lyrebird-stream-manager.log
+sudo tail -n 100 /var/log/mediamtx.out
+sudo tail -n 50 /var/lib/mediamtx-ffmpeg/*.log
 
 # Validate configuration
+./lyrebird-stream-manager.sh validate
 sudo ./lyrebird-mic-check.sh -V
 
-# Force restart
+# Clean restart: stops only the processes this manager started
 sudo ./lyrebird-stream-manager.sh force-stop
 sudo ./lyrebird-stream-manager.sh start
 
-# Check for device conflicts
+# Check for processes holding the capture devices
 sudo lsof /dev/snd/*
 ```
+
+Exit 8 means `mediamtx.service` is running or a MediaMTX was started by hand on the same binary and configuration; stop it (`sudo systemctl stop mediamtx`) or use it instead ([Which unit runs MediaMTX](#which-unit-runs-mediamtx)). A MediaMTX that cannot load its configuration logs the error to `/var/log/mediamtx.out` and exits.
 
 #### Device Names Change After Reboot
 
@@ -897,17 +914,9 @@ ls -la /dev/sound/by-id/
 
 #### Permission Errors
 
-```bash
-# Add user to audio group
-sudo usermod -a -G audio $USER
-
-# Fix directory permissions
-sudo mkdir -p /var/log/lyrebird
-sudo chmod 755 /var/log/lyrebird
-
-# Reboot to apply group changes
-sudo reboot
-```
+- `lyrebird-stream-manager.sh`, `install_mediamtx.sh` and `usb-audio-mapper.sh` (except `--list`) need root; run them with `sudo`. The stream manager's unit runs as root.
+- `lyrebird-updater.sh` must **not** run as root. If it says the repository is owned by root (exit 5), give the clone back to your user: `sudo chown -R $USER:$USER /path/to/LyreBirdAudio`.
+- Without root, `lyrebird-stream-manager.sh status` shows a stream wrapper it cannot identify as `Unknown (... run as root)`, and `lyrebird-metrics.sh` leaves out what it cannot read and reports `lyrebird_scrape_success 0`. Run both as root for a complete answer.
 
 #### MediaMTX Crashes
 
@@ -916,16 +925,21 @@ sudo reboot
 free -h
 df -h
 
-# View crash logs
-sudo journalctl -u mediamtx -n 100
+# MediaMTX's own output
+sudo tail -n 100 /var/log/mediamtx.out
 
-# Increase system limits
-sudo bash -c 'echo "* soft nofile 4096" >> /etc/security/limits.conf'
-sudo bash -c 'echo "* hard nofile 8192" >> /etc/security/limits.conf'
+# systemd's view of the unit that runs it
+sudo systemctl status mediamtx-audio      # or: mediamtx, for the standalone unit
+sudo journalctl -u mediamtx -n 100        # standalone unit only: its output goes to the journal
 
-# Restart service
-sudo systemctl restart mediamtx
+# The open-file limit the unit gives its process
+systemctl show mediamtx-audio -p LimitNOFILE
+
+# Restart
+sudo systemctl restart mediamtx-audio
 ```
+
+Both shipped units set `LimitNOFILE` themselves (65536 for the stream manager, 65535 for the standalone unit); `/etc/security/limits.conf` applies to login sessions, not to services that systemd starts.
 
 #### High CPU Usage
 
@@ -933,15 +947,18 @@ sudo systemctl restart mediamtx
 
 **Diagnosis:**
 ```bash
-sudo ./lyrebird-stream-manager.sh monitor
-top -p $(pgrep -f ffmpeg | tr '\n' ',')
+# MediaMTX's file descriptors, CPU and threads, and the state of every stream
+sudo ./lyrebird-stream-manager.sh status
+
+# Thresholds, warnings and restarts are logged by the monitor
+sudo grep -E 'CPU|Critical|Warning' /var/log/lyrebird-stream-manager.log | tail -n 20
 ```
 
 **Solutions:**
 - Reduce sample rate in audio-devices.conf
 - Use lower bitrate encoding
 - Reduce number of simultaneous streams
-- Check for FFmpeg process accumulation
+- Check that there are not more FFmpeg processes than streams (the monitor reports extra wrapper processes and exits 2)
 
 #### MediaMTX Won't Update
 
@@ -954,58 +971,63 @@ curl -I https://api.github.com/repos/bluenviron/mediamtx/releases/latest
 ```
 
 **Solutions:**
-- Check network connectivity
-- Verify GitHub is accessible
-- Try specific version: `sudo ./install_mediamtx.sh -V v1.15.0 update`
-- Use force flag: `sudo ./install_mediamtx.sh -f update`
+- Check network connectivity and that GitHub is reachable (exit 5 is a failed download or release lookup)
+- Try a specific version: `sudo ./install_mediamtx.sh -V v1.21.3 update`
+- A checksum mismatch (exit 6) is never accepted, not even with `--force`; `--force` only skips the check when the release has no checksum file
+- Exit 7 means the new binary did not run or the service did not come back up and the previous binary was restored; a MediaMTX that nobody supervises (started by hand) is stopped and left stopped, and the command to start it is printed
 
 #### Version Update Failed
 
-**Symptoms**: Git update errors or conflicts
+**Symptoms**: Update errors, a conflict, or an update that was interrupted
 
 **Diagnosis:**
 ```bash
-git status
-git stash list
 ./lyrebird-updater.sh --status
+./lyrebird-updater.sh --history        # shows an update that did not finish
+git status
+git stash list                         # your saved changes: entries named lyrebird-tx-... or lyrebird-recovery-...
 ```
 
 **Solutions:**
-- Stash local changes: `git stash`
-- Reset to clean state: `git reset --hard origin/main`
-- Switch to known good version via updater
-- Check repository ownership: `stat -c %U .git/config`
+- Run `./lyrebird-updater.sh` again: it finds an unfinished update and undoes it (or completes a self-update); your local changes come back from the stash
+- Exit 10 means the switch is done but your saved changes conflicted with the new version; they are in the stash (`git stash list`, then `git stash show -p` and apply what you need)
+- Go back: `./lyrebird-updater.sh --rollback`
+- Menu option 6, "Discard All Changes & Reset", resets to a clean state after a confirmation and throws local modifications away
+- Check repository ownership: `stat -c %U .git/config` must not print `root` ([Version Management](#version-management))
 
 ### Debug Procedures
 
 **Enable Verbose Logging:**
 ```bash
-export DEBUG=1
-sudo ./lyrebird-stream-manager.sh start
+sudo ./lyrebird-stream-manager.sh -d start        # debug messages
+sudo env DEBUG=true ./lyrebird-stream-manager.sh start   # also traces every command
 ```
+`DEBUG=1` does nothing: the value must be `true`.
 
 **Check All Logs:**
 ```bash
 sudo tail -f /var/log/mediamtx.out
 sudo tail -f /var/log/lyrebird-stream-manager.log
-sudo tail -f /var/log/lyrebird/*.log
+sudo tail -f /var/lib/mediamtx-ffmpeg/*.log
 ```
 
 **Validate Configuration:**
 ```bash
-/usr/local/bin/mediamtx --check /etc/mediamtx/mediamtx.yml
+# MediaMTX's own check; exists from MediaMTX 1.21.1 (older binaries have no such flag)
+/usr/local/bin/mediamtx --validate-conf=/etc/mediamtx/mediamtx.yml
+./lyrebird-stream-manager.sh validate
 cat /etc/mediamtx/audio-devices.conf
 ```
 
 **Test RTSP Manually:**
 ```bash
-ffplay -i rtsp://localhost:8554/Device_1 -loglevel debug
+ffplay -i rtsp://localhost:8554/mic-left -loglevel debug
 ```
 
 **Check System Resources:**
 ```bash
 sudo ./lyrebird-diagnostics.sh full
-sudo ./lyrebird-stream-manager.sh monitor
+sudo ./lyrebird-stream-manager.sh status
 ```
 
 ### Log Locations
@@ -1015,15 +1037,18 @@ sudo ./lyrebird-stream-manager.sh monitor
 - Stream Manager: `/var/log/lyrebird-stream-manager.log`
 - Orchestrator: `/var/log/lyrebird-orchestrator.log`
 - Diagnostics: `/var/log/lyrebird-diagnostics.log`
+- Alerts: `/var/log/lyrebird/alerts.log`
 
 **Stream logs:**
-- FFmpeg per-device: `/var/log/lyrebird/<device-name>.log`
+- FFmpeg, per stream: `/var/lib/mediamtx-ffmpeg/<stream>.log`; the runs before it are `<stream>.log.prev.1`, `.prev.2`, ... (`FFMPEG_LOG_KEEP`, default 3). `start`, `stop` and `force-stop` never delete them.
 
 **System logs:**
 ```bash
-# Systemd services
+# The standalone MediaMTX unit logs to the journal
 sudo journalctl -u mediamtx -f
-sudo journalctl -u mediamtx-audio -f
+
+# The stream manager unit logs to its file; the journal has systemd's start and stop messages
+sudo journalctl -u mediamtx-audio -n 50
 
 # USB events
 sudo dmesg | grep -i usb
@@ -1037,21 +1062,24 @@ For bug reports, collect:
 # 1. Run full diagnostics
 sudo ./lyrebird-diagnostics.sh full > diagnostics.txt 2>&1
 
-# 2. Collect logs
-tar -czf lyrebird-logs-$(date +%Y%m%d).tar.gz \
+# 2. What the stream manager sees
+./lyrebird-stream-manager.sh status --json > status.json
+
+# 3. Collect logs
+sudo tar -czf lyrebird-logs-$(date +%Y%m%d).tar.gz \
   /var/log/mediamtx.out \
   /var/log/lyrebird-stream-manager.log \
-  /var/log/lyrebird/*.log \
+  /var/lib/mediamtx-ffmpeg/*.log* \
   /etc/mediamtx/audio-devices.conf \
   /etc/udev/rules.d/99-usb-soundcards.rules
 
-# 3. System info
+# 4. System info
 cat /etc/os-release > system-info.txt
 uname -a >> system-info.txt
 lsusb >> system-info.txt
 ```
 
-Include diagnostics.txt, logs tarball, and system-info.txt in your issue report.
+Include diagnostics.txt, status.json, the logs tarball, and system-info.txt in your issue report. Do not add `/etc/mediamtx/mediamtx.yml`, `/etc/mediamtx/rtsp-users.conf` or `/etc/lyrebird/alerts.conf` unless you have removed password hashes and webhook URLs from them.
 
 **GitHub Issues:** https://github.com/tomtom215/LyreBirdAudio/issues
 
@@ -1312,24 +1340,27 @@ Read this before moving a node that already streams to the code on `main`. Do th
 
 ## Performance & Optimization
 
+No CPU, memory or bandwidth figures were measured for this release. What follows is how the settings trade quality against load, plus arithmetic you can check yourself. To measure your own node, use `lyrebird-stream-manager.sh status`, the metrics in [Prometheus Metrics](#prometheus-metrics-lyrebird-metricssh), and the soak harness in `tools/soak/`.
+
 ### Stream Optimization
 
-**Codec Selection:**
-- **Opus**: Best quality/bitrate ratio, low latency (recommended)
-- **AAC**: Wider compatibility, moderate latency
-- **PCM**: Lossless, high bandwidth
+**Codec Selection** (`CODEC`: `opus`, `aac` or `mp3`):
+- **Opus**: libopus, the default
+- **AAC**: FFmpeg's native AAC encoder
+- **MP3**: encoded with libmp3lame
+- PCM is not supported: a `CODEC` outside these three is an error and the setting keeps its default
 
 **Sample Rate Selection:**
-- **48000 Hz**: Standard for professional audio (recommended)
+- **48000 Hz**: standard for professional audio (the default)
 - **44100 Hz**: CD quality, slightly lower bandwidth
-- **96000 Hz**: High-res audio, double bandwidth
+- **96000 Hz**: high-resolution audio, double the data before encoding
 
 **Bitrate Tuning:**
-- **128k**: Good quality for speech/music (recommended)
-- **96k**: Acceptable for speech
-- **256k**: High quality music
+- **96k**: acceptable for speech
+- **128k**: the default
+- **256k**: high quality music
 
-**Example Configuration:**
+**Example Configuration** (`/etc/mediamtx/audio-devices.conf`):
 ```bash
 # High quality music streaming
 DEVICE_USB_MICROPHONE_1_SAMPLE_RATE=96000
@@ -1347,61 +1378,33 @@ DEVICE_USB_MICROPHONE_2_CODEC=opus
 ### Resource Management
 
 **CPU Usage:**
-- Monitor with: `sudo ./lyrebird-stream-manager.sh monitor`
-- Warning threshold: 20% per stream
-- Critical threshold: 40% per stream
-- Optimization: Lower sample rate or bitrate
+- Look at it with `sudo ./lyrebird-stream-manager.sh status` (MediaMTX) or `top`
+- The monitor warns above 20% and treats 40% as critical (`MAX_CPU_WARNING`, `MAX_CPU_CRITICAL`); a critical value makes it exit 2 and the cron job restart the service
+- Lowering the sample rate or the bitrate lowers the encoder's work
 
-**Memory Usage:**
-- Each FFmpeg stream uses ~50-100MB
-- MediaMTX uses ~50-100MB base + ~10MB per stream
-- Recommended: 1GB+ RAM for 10+ streams
+**Memory Usage:** not measured. The monitor reports system memory and logs when it passes `MEM_WARNING_PERCENT` (80) and `MEM_CRITICAL_PERCENT` (95); `lyrebird_stream_memory_bytes{stream=...}` and `lyrebird_mediamtx_memory_bytes` give the per-process numbers.
 
 **Network Bandwidth:**
-- 128kbps audio = ~16KB/s per stream per client
-- 256kbps audio = ~32KB/s per stream per client
-- Consider bandwidth when choosing bitrate
+- The encoded bitrate divided by 8 gives the data rate: 128 kbit/s is 16 kB/s and 256 kbit/s is 32 kB/s, per stream per client, before container and network overhead
+- Consider bandwidth when choosing a bitrate
 
 ### System Tuning
 
-**File Descriptor Limits:**
+**File Descriptor Limits:** the shipped units set `LimitNOFILE` (65536 for `mediamtx-audio.service`, 65535 for `mediamtx.service`). Check what a running unit has with `systemctl show mediamtx-audio -p LimitNOFILE`. `/etc/security/limits.conf` applies to login sessions, not to services started by systemd. To change a unit's limit use `sudo systemctl edit mediamtx-audio` and set `LimitNOFILE=` under `[Service]`.
+
+**Thread Queue Size** (FFmpeg input buffering; default 8192):
 ```bash
-# Check current limits
-ulimit -n
+# For one device, in /etc/mediamtx/audio-devices.conf
+DEVICE_USB_MICROPHONE_1_THREAD_QUEUE=16384
 
-# Increase for mediamtx user
-echo "mediamtx soft nofile 4096" | sudo tee -a /etc/security/limits.conf
-echo "mediamtx hard nofile 8192" | sudo tee -a /etc/security/limits.conf
-
-# Increase for stream manager
-echo "* soft nofile 8192" | sudo tee -a /etc/security/limits.conf
-echo "* hard nofile 16384" | sudo tee -a /etc/security/limits.conf
-
-# Reboot to apply
-sudo reboot
+# For every device: set DEFAULT_THREAD_QUEUE in the environment (see Environment Variables).
+# A DEFAULT_THREAD_QUEUE line in audio-devices.conf is an error and is ignored.
 ```
 
-**Network Buffer Sizes:**
+**Network Buffer Sizes** (not measured on this project; MediaMTX's own documentation discusses UDP receive buffers):
 ```bash
-# Increase UDP buffer sizes for streaming
 sudo sysctl -w net.core.rmem_max=26214400
-sudo sysctl -w net.core.wmem_max=26214400
-
-# Make permanent
-echo "net.core.rmem_max=26214400" | sudo tee -a /etc/sysctl.conf
-echo "net.core.wmem_max=26214400" | sudo tee -a /etc/sysctl.conf
-```
-
-**USB Latency Optimization:**
-```bash
-# Reduce USB polling interval (if supported by device)
-echo 1 | sudo tee /sys/bus/usb/devices/*/power/autosuspend
-```
-
-**Thread Queue Size:**
-```bash
-# For high stream counts (4+)
-echo 'DEFAULT_THREAD_QUEUE=16384' >> /etc/mediamtx/audio-devices.conf
+# Persist in a file under /etc/sysctl.d/ if you decide to keep it
 ```
 
 ### For Raspberry Pi
@@ -1409,48 +1412,23 @@ echo 'DEFAULT_THREAD_QUEUE=16384' >> /etc/mediamtx/audio-devices.conf
 ```bash
 # Use lower quality settings
 sudo ./lyrebird-mic-check.sh -g --quality=low
-
-# Reduce stream count to 1-2 maximum
-# Consider switching to Intel N100 mini PC for stability
 ```
+
+How many microphones a given board sustains was not measured: soak-test it ([Testing](#testing)).
 
 ### Monitoring and Alerting
 
-**Resource Monitoring:**
-```bash
-# Automated monitoring via cron (installed with systemd service)
-# Configured at: /etc/cron.d/mediamtx-monitor
-*/5 * * * * root /path/to/lyrebird-stream-manager.sh monitor
-```
+**Resource Monitoring:** `lyrebird-stream-manager.sh install` writes the cron job `/etc/cron.d/mediamtx-monitor` (every 5 minutes, under `flock`); see [The Monitor](#the-monitor) for what each run does. For metrics and alerts see [Prometheus Metrics](#prometheus-metrics-lyrebird-metricssh) and [Webhook Alerts](#webhook-alerts-lyrebird-alertssh).
 
-**Log Rotation:**
-```bash
-# Configure logrotate for MediaMTX logs (auto-configured during install)
-# Location: /etc/logrotate.d/mediamtx
+**Log Rotation:** `install` writes `/etc/logrotate.d/mediamtx` when `logrotate` is installed. It rotates three things with `copytruncate` and compression, keeping seven rotations (three for the FFmpeg logs), with these size limits:
 
-# Manual configuration:
-sudo tee /etc/logrotate.d/mediamtx << EOF
-/var/log/mediamtx*.log {
-    daily
-    rotate 7
-    compress
-    delaycompress
-    notifempty
-    create 0644 root root
-    size 100M
-}
+| Log | Size limit (variable) |
+|-----|-----------------------|
+| `MEDIAMTX_LOG_FILE` (`/var/log/mediamtx.out`) | 50 MiB (`MEDIAMTX_LOG_MAX_SIZE`) |
+| `STREAM_MANAGER_LOG_FILE` | 100 MiB (`MAIN_LOG_MAX_SIZE`) |
+| `/var/lib/mediamtx-ffmpeg/*.log` | 10 MiB (`FFMPEG_LOG_MAX_SIZE`) |
 
-/var/log/lyrebird/*.log {
-    daily
-    rotate 3
-    compress
-    delaycompress
-    notifempty
-    create 0644 root root
-    size 50M
-}
-EOF
-```
+The sizes are the values in the environment of the shell that ran `install`. `config/lyrebird-logrotate.conf` is an example you can copy to `/etc/logrotate.d/` instead; its FFmpeg stanza names `/var/log/lyrebird/`, where the stream manager does not write.
 
 ---
 
@@ -1462,24 +1440,26 @@ For system architecture diagrams, see the [System Overview](#system-overview) se
 
 **Why Bash?**
 
-Bash provides universal availability, zero runtime dependencies, and eliminates entire classes of deployment failures. No pip/npm/gem conflicts, no version mismatches, no build processes. Deployment is: copy, chmod +x, run.
+Bash is on every target system and needs no runtime beyond the tools listed under [System Requirements](#system-requirements): no pip/npm/gem conflicts, no build process. Deployment is: clone, `chmod +x`, run.
 
 **Why No Docker?**
 
-USB device management requires host-level udev rule creation and direct USB subsystem access. Containers add complexity that conflicts with physical USB port mapping (a core feature). Designed for dedicated bare-metal hosts where simple systemd services provide sufficient process isolation.
+USB device management requires host-level udev rule creation and direct USB subsystem access. Containers add complexity that conflicts with physical USB port mapping (a core feature). Designed for dedicated hosts where simple systemd services provide the process management.
 
 **Single-Responsibility Principle:**
 
 Each script handles one specific domain:
-- Orchestrator: User interface and delegation only
+- Orchestrator: user interface and delegation only
 - Installer: MediaMTX installation lifecycle
-- Stream Manager: FFmpeg process management
-- USB Mapper: Device persistence via udev
-- Mic Check: Hardware capability detection
-- Updater: Version management
-- Diagnostics: System health validation
+- Stream Manager: MediaMTX and FFmpeg process management
+- USB Mapper: device persistence via udev
+- Mic Check: hardware capability detection
+- Updater: version management
+- Diagnostics: system health validation
+- Metrics, Storage, Alerts: optional tools next to the stream path
+- `lyrebird-common.sh`: the code the scripts share (logging, atomic and durable file writes, the MediaMTX configuration renderer)
 
-This modular design prevents duplicate business logic and ensures maintainability.
+Some design rules the code follows, with the decision numbers of `docs/REMEDIATION-2026-11.md`: one owner of MediaMTX (D1); locks are `flock` on files that are never deleted (D2); configuration files are parsed as data and never sourced (D3); `start` reports what is publishing, not what was launched (D4); processes are identified by executable, argument and start time, never by name (D11); there is one canonical stream name (D13); files are replaced with write, `fsync`, rename, `fsync` of the directory (D14).
 
 ---
 
@@ -1514,24 +1494,28 @@ Versions are the values in the scripts (`grep -m1 VERSION= <script>`).
 
 ### Orchestrator (lyrebird-orchestrator.sh)
 
-**Purpose:** Interactive menu-driven management interface
+**Purpose:** a menu that runs the other scripts and explains what they report.
 
 **Usage:**
 ```bash
 sudo ./lyrebird-orchestrator.sh
 ```
+Options: `-h, --help`, `-v, --version`. It must run as root; it starts the updater as the user who invoked `sudo`.
 
 **Features:**
-- Quick Setup Wizard for initial configuration
-- Device capability inspection and configuration generation
-- Real-time system status display
-- SHA256 integrity checking for external scripts
-- EOF/stdin handling for all interactive menus
-- Comprehensive logging with automatic rotation
+- Quick Setup Wizard: install MediaMTX, map devices, start streams, quick diagnostics. Its closing summary is decided by what the start reported (the status document and exit status), not by a process count
+- After Start All Streams or Restart All Streams: one line per stream (publishing, bytes flowing or not, the manager's `last_error`) and the next step for the exit status
+- When a delegated script fails, shows its exit status with a meaning: the stream manager's 1 to 10 and signals, the updater's 1 to 11, the installer's 7
+- Device capability inspection and configuration generation (USB Device Management)
+- Version Management: launch the updater, show component versions, show the update history, roll back to a previous version
+- SHA256 integrity check of the scripts it delegates to (the baseline is refreshed after an update or rollback)
+- Handles end of input on every menu; its log is rotated at 1 MiB
 
-**When to Use:** Initial setup, interactive troubleshooting, log viewing
+**Limits:** the `MediaMTX:` and `Active Streams:` lines in the menu header come from a process-name scan (a process called `mediamtx`; every `ffmpeg` on the host counts as a stream), so another FFmpeg on the machine is counted. The status document is the authoritative state. The "View Stream URLs" entry prints port 8554 whatever `MEDIAMTX_RTSP_PORT` says, and "View Stream Logs (FFmpeg)" looks in `/var/log/lyrebird`, while the manager keeps those logs in `/var/lib/mediamtx-ffmpeg`.
 
-**Exit Codes:**
+**When to Use:** initial setup, interactive troubleshooting, log viewing
+
+**Exit Codes** (of the orchestrator itself):
 - 0: Success
 - 1: General error
 - 2: Permission denied
@@ -1542,44 +1526,21 @@ sudo ./lyrebird-orchestrator.sh
 
 ### Version Manager (lyrebird-updater.sh)
 
-**Purpose:** Safe version management with git-based rollback
+**Purpose:** switch a git clone between versions, with history and rollback. [Version Management](#version-management) has the commands, the menu, what an update does, the lock and every exit code (0 to 12).
 
 **Usage:**
 ```bash
-# Interactive menu
-sudo ./lyrebird-updater.sh
-
-# Check status
-./lyrebird-updater.sh --status
-
-# List versions
-./lyrebird-updater.sh --list
+./lyrebird-updater.sh                  # interactive menu
+./lyrebird-updater.sh --status         # current version and sync state
+./lyrebird-updater.sh --list           # list versions (needs the network)
+./lyrebird-updater.sh --history        # past updates (local)
+./lyrebird-updater.sh --rollback       # back to the previous version
 ```
 
-**Features:**
-- Switch between branches and tags
-- Transaction-based updates with automatic rollback
-- Systemd service coordination
-- Self-update with syntax validation
-- Stash management for local changes
-- Lock file protection against concurrent execution
-
-**Exit Codes:**
-- 0: Success
-- 1: General error
-- 2: Prerequisites not met
-- 3: Not a git repository
-- 4: No remote configured
-- 5: Permission error
-- 7: Locked (another instance running)
-- 8: Bad git state
-- 9: User aborted
-
 **Requirements:**
-- Git 2.0+ installed
-- Must run from within git clone (not standalone installation)
-- Repository must have remote origin configured
-- Recommended to run as normal user (not root)
+- `git` 2.0 or newer, `flock`, `awk`, `sed`, `grep`, `tput`
+- A git clone of this repository with a remote `origin` (not a tarball install)
+- Run as the clone's owner, not as root
 
 ---
 
@@ -1773,6 +1734,10 @@ sudo ./usb-audio-mapper.sh --remove mic-left
 - `-r, --remove <name>`: Remove a mapping
 - `--dry-run`, `--no-apply`: Print rules only / write without triggering udev
 - `-D, --debug`: Enable debug output
+- `--rules-file <path>`: Rules file (default `/etc/udev/rules.d/99-usb-soundcards.rules`)
+- `-V, --version`, `-h, --help`
+
+**Exit status:** 0 ok, 1 error, 2 usage, 3 permission, 4 missing dependency (or not Linux), 5 device not found or ambiguous, 6 rule written but not applied by the kernel.
 
 **Features:**
 - Names follow the physical USB port, so identical devices are told apart (also behind hubs)
@@ -1802,32 +1767,32 @@ sudo ./usb-audio-mapper.sh --remove mic-left
 # Generate config
 sudo ./lyrebird-mic-check.sh -g --quality=normal
 
-# Validate config
+# Validate config against the hardware
 sudo ./lyrebird-mic-check.sh -V
 
 # JSON output
-./lyrebird-mic-check.sh --json
+./lyrebird-mic-check.sh --format=json
 
-# Restore from backup
-sudo ./lyrebird-mic-check.sh --restore
+# List and restore backups
+./lyrebird-mic-check.sh --list-backups
+sudo ./lyrebird-mic-check.sh --restore=20251111_123456
 ```
 
-**Quality Tiers:**
-- `low`: 16kHz sample rate, 64kbps bitrate (speech/monitoring)
-- `normal`: 48kHz sample rate, 128kbps bitrate (default, balanced)
-- `high`: 48kHz+ sample rate, 256kbps+ bitrate (music/high-quality)
+Options: `-g, --generate-config`, `-f, --force` (with `-g`: no prompt), `--no-backup`, `--quality=low|normal|high`, `-V, --validate`, `-q, --quiet`, `--format=text|json`, `--list-backups`, `--restore[=TIMESTAMP]`, `--version`, `-h, --help`. The optional timestamp must be attached with `=`.
+
+**Quality tiers:** what each picks is in the table under [Audio Device Configuration](#audio-device-configuration).
 
 **Features:**
-- Non-invasive detection via `/proc/asound`
+- Non-invasive detection via `/proc/asound`; it needs ALSA's proc files, so it exits 1 on a machine without `/proc/asound` (even for `--help`)
 - Device busy detection without opening hardware
-- Automatic backup and restore
+- Automatic backup and restore of the device configuration
 - JSON output support
 - USB audio adapter chip detection with warnings
-- Comprehensive capability reporting (formats, sample rates, channels)
+- Capability reporting (formats, sample rates, channels)
 - Configuration validation against hardware capabilities
 
 **Technical Approach:**
-- Uses ALSA proc filesystem (`/proc/asound`) for capability enumeration
+- Uses the ALSA proc filesystem (`/proc/asound`) for capability enumeration
 - Parses stream* files for hardware parameter specifications
 - Checks hw_params for current device state (busy detection)
 - Validates USB devices via usbid files
@@ -1844,71 +1809,45 @@ For USB audio adapters with 3.5mm inputs, detected capabilities reflect the USB 
 
 ### Diagnostics (lyrebird-diagnostics.sh)
 
-**Purpose:** Comprehensive system health checks
+**Purpose:** Read-only health checks with a PASS/WARN/FAIL summary. The checks, the exit codes and the monitor are described under [Diagnostics & Monitoring](#diagnostics--monitoring).
 
 **Usage:**
 ```bash
-# Quick check
 sudo ./lyrebird-diagnostics.sh quick
-
-# Full diagnostics
 sudo ./lyrebird-diagnostics.sh full
-
-# Debug mode
 sudo ./lyrebird-diagnostics.sh debug
 ```
 
 **Options:**
-- `--config <path>`: Specify alternate MediaMTX config file
-- `--timeout <seconds>`: Set command timeout (default: 30)
-- `--debug`: Enable verbose debug output
-- `--quiet`: Suppress non-error output
+- `-c, --config <file>`: Use an alternate MediaMTX configuration file
+- `--timeout <seconds>`: Set the operation timeout (default 30, 1 to 3600)
+- `-d, --debug`: Verbose debug output
+- `-q, --quiet`: Suppress non-error output
 - `--no-color`: Disable color output
+- `-v, --version`
 
-**Exit Codes:**
-- 0: All checks passed
-- 1: Warnings detected
-- 2: Failures detected
-- 127: Prerequisites missing
+**Exit Codes:** 0 passed, 1 warnings, 2 failures, 127 the script could not run.
 
-**Features:**
-- 20+ diagnostic checks
-- Three diagnostic modes (quick/full/debug)
-- Resource constraint detection
-- Process stability analysis
-- Audio subsystem conflict detection
-- Actionable error reporting
-- GitHub issue submission guidance
-
-**Check Categories:**
-- System information (OS, kernel, uptime)
-- Required utilities (ffmpeg, arecord, jq)
-- USB audio devices (detection, ALSA status)
-- MediaMTX installation (binary, config, service)
-- Stream status (active streams, FFmpeg processes)
-- RTSP connectivity (port availability, connection testing)
-- System resources (CPU, memory, file descriptors)
-- Log analysis (error detection, recent issues)
-- Time synchronization (NTP/Chrony status)
+**Settings it reads:** `MEDIAMTX_CONFIG_DIR`, `MEDIAMTX_BINARY`, `MEDIAMTX_PORT` (the RTSP port, default 8554; not `MEDIAMTX_RTSP_PORT`), `FFMPEG_LOG_DIR` (default `/var/log/lyrebird`), `DIAGNOSTIC_LOG_FILE`, `DIAGNOSTIC_TIMEOUT`, `NO_COLOR`. It supports systemd fully, and OpenRC and other init systems with limits.
 
 ---
 
 ### MediaMTX Installer (install_mediamtx.sh)
 
-**Purpose:** Install/update MediaMTX with rollback capability
+**Purpose:** Install, update and remove MediaMTX with checksum verification and rollback
 
 **Usage:**
 ```bash
-# Install latest version
+# Install latest version (writes the binary, the configuration and mediamtx.service)
 sudo ./install_mediamtx.sh install
 
 # Install specific version
-sudo ./install_mediamtx.sh -V v1.15.0 install
+sudo ./install_mediamtx.sh -V v1.21.3 install
 
-# Update existing installation
+# Update an existing installation (verified download, atomic replace, rollback)
 sudo ./install_mediamtx.sh update
 
-# Check status
+# Check status (as root it also names who runs MediaMTX)
 ./install_mediamtx.sh status
 
 # Verify installation
@@ -1919,32 +1858,34 @@ sudo ./install_mediamtx.sh uninstall
 ```
 
 **Options:**
-- `-V <version>`: Install specific MediaMTX version
-- `-p <prefix>`: Custom installation prefix (default: /usr/local)
-- `-c <config>`: Load configuration from file
-- `-f, --force`: Force installation and skip verification
+- `-V, --target-version <version>`: Install a specific MediaMTX version
+- `-p, --prefix <dir>`: Installation prefix (default: /usr/local)
+- `-c, --config <file>`: Load settings from a file
+- `-f, --force`: Replace an existing installation, and a configuration file that is not LyreBirdAudio's (after a backup). Skips the checksum check only when the release has no checksum file; a mismatch is never accepted
 - `-n, --dry-run`: Show what would be done without making changes
 - `-q, --quiet`: Suppress non-error output
 - `-v, --verbose`: Enable debug output
-- `--no-service`: Skip systemd service creation
+- `--no-service`: Skip systemd unit creation
+- `--no-config`: Skip configuration file creation
+- `--version`: Print the script version
 
-**Features:**
-- Platform-aware installation (Linux/Darwin/FreeBSD, x86_64/ARM64/ARMv7/ARMv6)
-- Automatic platform detection
-- GitHub release fetching with fallback parsers
-- SHA256 checksum verification
-- Atomic updates with automatic rollback
-- Built-in upgrade support for MediaMTX 1.15.0+
-- Systemd service creation and management
-- Configuration file generation
-- Service user creation
-- Dry-run mode for testing
+**What it does:**
+- Downloads the release tarball for this machine from GitHub and verifies it against the release's `checksums.sha256` (a mismatch is fatal)
+- Installs the binary atomically; creates the service user `mediamtx`
+- Writes `/etc/mediamtx/mediamtx.yml` with the same generator the stream manager uses: managed marker first line, API and metrics on `127.0.0.1`, every other protocol off ([Configuration ownership](#configuration-ownership)). A file that is not LyreBirdAudio's is left alone without `--force`
+- Writes `/etc/systemd/system/mediamtx.service` rendered from `config/mediamtx.service`; it conflicts with `mediamtx-audio.service`. It does not enable or start it. `install` therefore needs `lyrebird-common.sh` and `config/` next to the script: run it from the checkout (`--no-config --no-service` needs neither)
+- `update` downloads and verifies before it stops MediaMTX, stops it through its owner (systemd, the stream manager unit, or the stream manager), installs the new binary, starts it again and checks that it came up; if the new binary does not run or the service does not return, the previous binary is restored. MediaMTX's own `--upgrade` is not used, because it replaces the executable without a checksum check. A MediaMTX that nobody supervises (started by hand) is stopped and not started again; the command is printed and the exit status is 0. `update` does not rewrite the configuration or the unit, except that crossing MediaMTX 1.19 adds `moq: no` to a generated configuration
+- `uninstall` stops MediaMTX the same way and removes the unit, the binary and its backups; it asks before it removes the configuration directory (which also holds `audio-devices.conf` and `rtsp-users.conf`), the state directory and the service user, or removes them without asking with `--force`
+- Never selects a process by name: it signals only a process whose executable is the installed binary and whose first argument is the installed configuration, and never signals FFmpeg. If it cannot stop an active unit it stops with exit 7 instead
+- Platform detection maps the machine to the release asset name ([System Requirements](#system-requirements)); only Linux is supported by the rest of the suite
+
+**Exit Codes:** 0 success; 1 general error (unknown option or command, a write failed); 2 root required; 3 unsupported operating system or architecture; 4 a required command or `lyrebird-common.sh` is missing, or Bash older than 4; 5 download or release lookup failed; 6 checksum file missing (without `--force`) or checksum mismatch; 7 already installed, not installed, a step of the install or update failed, MediaMTX could not be stopped, or the update was rolled back; 8 the installation prefix cannot be created or written; 9 the configuration file given with `-c` is missing, or MediaMTX rejected the generated configuration; 10 an invalid port, path, account name, version or prefix.
 
 ---
 
 ### Webhook Alerts (lyrebird-alerts.sh)
 
-**Purpose:** Remote monitoring via webhook notifications (pure bash, no new dependencies)
+**Purpose:** Webhook notifications from your own scripts (pure Bash, `curl` only). **Nothing else in the suite calls it**: the stream manager, the monitor, the storage script and the orchestrator send no alerts. You call `lyrebird-alerts.sh` or source it, for example from a cron job or from the exit-status handling in your own monitoring script.
 
 **Usage:**
 ```bash
@@ -1964,156 +1905,167 @@ sudo ./install_mediamtx.sh uninstall
 ./lyrebird-alerts.sh config
 ```
 
+`send` takes `--level info|warning|error|critical`, `--title`, `--message` and `--type` (the type is part of the duplicate key).
+
 **Supported Webhook Types:**
 - **Discord** - Discord channel webhooks
 - **Slack** - Slack incoming webhooks
-- **ntfy.sh** - Free, open-source notification service
-- **Pushover** - Mobile push notifications
+- **ntfy.sh** - Free, open-source notification service (`LYREBIRD_NTFY_TOPIC`, `LYREBIRD_NTFY_SERVER`)
+- **Pushover** - Mobile push notifications (`LYREBIRD_PUSHOVER_TOKEN`, `LYREBIRD_PUSHOVER_USER`)
 - **Generic** - Any HTTP POST endpoint
 
-**Configuration:** `/etc/lyrebird/alerts.conf`
+All deliveries were checked against a stand-in for `curl`; no real webhook endpoint was used.
+
+**Configuration:** `/etc/lyrebird/alerts.conf` (`LYREBIRD_ALERT_CONFIG` names another)
 ```bash
 LYREBIRD_ALERT_ENABLED=true
 LYREBIRD_WEBHOOK_URL="https://your-webhook-url"
 LYREBIRD_WEBHOOK_TYPE="discord"  # discord, slack, ntfy, pushover, generic
-LYREBIRD_ALERT_RATE_LIMIT=300    # Seconds between duplicate alerts
+LYREBIRD_ALERT_RATE_LIMIT=300    # Seconds a destination is not sent the same alert again
 LYREBIRD_HOSTNAME="field-unit-1"
 LYREBIRD_LOCATION="North Forest"
 ```
+Also read: `LYREBIRD_WEBHOOK_URLS` (more URLs, space separated), `LYREBIRD_ALERT_DEDUP_WINDOW` (3600: how long delivery state is kept; the larger of it and the rate limit applies), `LYREBIRD_ALERT_TIMEOUT` (30, limited to 5 to 120 s), `LYREBIRD_ALERT_RETRIES` (3), `LYREBIRD_ALERT_STATE_DIR` (`/var/lib/lyrebird/alerts`), `LYREBIRD_ALERT_LOG` (`/var/log/lyrebird/alerts.log`). Alerts are off until `LYREBIRD_ALERT_ENABLED=true`; while they are off, or no destination is configured, `send` returns 0 without sending anything.
 
-**Features:**
-- Rate limiting prevents alert spam
-- Alert deduplication within configurable window
-- Multiple webhook destinations
-- Pre-built functions for common alerts:
-  - `alert_stream_down` / `alert_stream_up`
-  - `alert_device_disconnect` / `alert_device_connect`
-  - `alert_disk_warning` / `alert_disk_critical`
-  - `alert_mediamtx_down` / `alert_mediamtx_up`
-  - `alert_network_down` / `alert_network_up`
+**How repeats are handled (per destination):**
+- An identical alert (same type and same message text) is not sent again to a destination that already confirmed it (HTTP 2xx) within `LYREBIRD_ALERT_RATE_LIMIT` seconds. A destination that failed has no record and is retried by the next identical alert; destinations that succeeded are not sent it again
+- Identical alerts sent at the same moment are delivered once per destination: a destination is claimed with `flock` before the first request, and a second sender that finds it claimed skips it
+- A message that differs ("87%" and "88%") is a different alert
+- Without `flock` or a usable state directory, alerts are still sent, without duplicate protection, with a warning
 
-**Integration with other scripts:**
+**Exit status of `send` and of `send_alert`:** 0 delivered (every destination that needed the alert received it; also returned when alerts are disabled); 1 usage error; 3 total failure (no destination has it and at least one failed; nothing is recorded, the next identical alert retries); 4 suppressed (every destination already has it within the window, or another process is delivering it); 5 partial failure (some destinations have it, at least one failed; the failure is logged with the URL masked). `test` returns 0 or 1.
+
+**Calling it from a script:**
 ```bash
-# Source alerts in your monitoring script
-source ./lyrebird-alerts.sh
+#!/bin/bash
+# Sourcing defines the functions. send_alert returns 3, 4 or 5 in the cases above, so a
+# script running under "set -e" must not call it bare: use "|| rc=$?".
+source /path/to/LyreBirdAudio/lyrebird-alerts.sh
 
-# Send alert when stream fails
-if ! check_stream_health "mic1"; then
-    alert_stream_down "mic1" "FFmpeg process died"
+overall="$(/path/to/LyreBirdAudio/lyrebird-stream-manager.sh status --json | jq -r .overall)"
+if [[ "$overall" != "ok" ]]; then
+    rc=0
+    alert_stream_down "all streams" "The stream manager reports: ${overall}" || rc=$?
 fi
 ```
+
+Ready-made functions (they call `send_alert` with a level, a title and a type): `alert_stream_down` / `alert_stream_up`, `alert_device_disconnect` / `alert_device_connect`, `alert_disk_warning` / `alert_disk_critical`, `alert_mediamtx_down` / `alert_mediamtx_up`, `alert_network_down` / `alert_network_up`, `alert_memory_warning`, `alert_cpu_warning`.
 
 ---
 
 ### Prometheus Metrics (lyrebird-metrics.sh)
 
-**Purpose:** Export system and stream metrics in Prometheus format
+**Purpose:** Export node and stream metrics in the Prometheus text format
 
 **Usage:**
 ```bash
-# One-time metrics output
+# One document on stdout
 ./lyrebird-metrics.sh
 
-# Start HTTP metrics server (for Prometheus scraping)
+# HTTP server for Prometheus to scrape (127.0.0.1:9100 by default)
 ./lyrebird-metrics.sh serve --port 9100
 
-# Output specific metrics only
-./lyrebird-metrics.sh --streams-only
-./lyrebird-metrics.sh --system-only
+# The same on every interface (no authentication, no TLS: trusted networks only)
+./lyrebird-metrics.sh serve --port 9100 --bind 0.0.0.0
+
+# A file for node_exporter's textfile collector (replaced atomically)
+./lyrebird-metrics.sh --file /var/lib/node_exporter/textfile_collector/lyrebird.prom
 ```
 
-**Metrics Exported:**
-```
-# MediaMTX service status
-lyrebird_mediamtx_up 1
-lyrebird_mediamtx_uptime_seconds 3600
+`--serve [PORT]` is the older spelling of `serve --port PORT`. There are no `--streams-only` or `--system-only` options. `--port` and `--bind` without `serve` are errors.
 
-# Stream status (per stream)
-lyrebird_stream_active{name="mic1"} 1
-lyrebird_stream_uptime_seconds{name="mic1"} 1800
+**Run it as root** (a cron job or a root unit) for a complete answer: an unprivileged exporter cannot look at root's processes closely enough, so what it cannot read is left out of the document, its collector is reported failed (`lyrebird_collector_success`), and the exit status is 3.
 
-# USB audio devices
-lyrebird_usb_devices_total 3
-lyrebird_usb_device_connected{name="mic1"} 1
+**Metrics** (every name starts with `lyrebird_`):
 
-# System resources
-lyrebird_cpu_usage_percent 15.5
-lyrebird_memory_usage_percent 45.2
-lyrebird_disk_usage_percent{mount="/"} 62
-lyrebird_load_average_1m 0.5
-```
+| Collector | Metrics |
+|-----------|---------|
+| (document) | `build_info{version}`, `scrape_timestamp_seconds`, `scrape_success` (1 only if every collector completed: alert on `== 0`), `collector_success{collector}` |
+| `mediamtx` | `mediamtx_up`, `mediamtx_memory_bytes`, `mediamtx_cpu_percent`, `mediamtx_open_fds`, `mediamtx_uptime_seconds` (this installation's MediaMTX: the configured binary run on the configured configuration, not any process called "mediamtx") |
+| `stream_manager` | `stream_manager_up` (whether the MediaMTX process the manager recorded in its PID file is running; the name is historical), `active_streams`, `configured_devices`, `heartbeat_age_seconds` (-1 when there is no file), `heartbeat_healthy` (1 if the monitor ran within `LYREBIRD_HEARTBEAT_MAX_AGE`, 900 s: it proves only that the monitor ran) |
+| `usb_audio` | `usb_audio_devices`, `total_audio_cards` |
+| `system` | `disk_usage_percent{mount}`, `system_memory_total_bytes`, `system_memory_available_bytes`, `system_load_1m`, `system_entropy_available` |
+| `api` | `api_up`, `api_info{version}`, `api_uptime_seconds`, `api_paths_total`, `api_paths_ready`, `api_rtsp_sessions`, `api_rtsp_connections`, `api_rtsps_sessions`, `api_rtmp_connections`, `api_rtmps_connections`, `api_webrtc_sessions`, `api_srt_connections`, `api_hls_muxers`, `api_recordings_total`, `api_total_connections` |
+| `streams` | `stream_up{stream}`, `stream_memory_bytes{stream}`, `stream_cpu_percent{stream}` |
+
+A source that cannot be read leaves its metrics out (they are not published as 0) and makes its collector fail, so an alert on `lyrebird_mediamtx_up == 0` does not fire for an unreadable source; use `lyrebird_scrape_success == 0` for that. The HTTP server's `/metrics` is generated when the request arrives.
 
 **Prometheus Configuration:**
 ```yaml
-# prometheus.yml
+# prometheus.yml: Prometheus on the same machine
 scrape_configs:
   - job_name: 'lyrebird'
     static_configs:
-      - targets: ['field-unit-1:9100']
+      - targets: ['localhost:9100']
     scrape_interval: 30s
 ```
+For a Prometheus on another host, either start the server with `--bind <address of this machine>` (and firewall the port), or use `--file` with node_exporter's textfile collector, which needs no listening port.
 
-**Features:**
-- Prometheus-compatible text format
-- HTTP server mode for remote scraping
-- Per-stream metrics with labels
-- System resource monitoring
-- MediaMTX API integration
+**The HTTP server** answers `GET /` and `GET /metrics`; any other path gets 404 and any other method 405. It is made for a poller (Prometheus scrapes every few seconds): it serves one connection at a time, each from its own `nc`, so a client that connects while another is being served, or within a few milliseconds after it, can be reset and has to try again. It needs a netcat (OpenBSD `nc`, `ncat`, traditional/GNU `nc` or BusyBox `nc`; only OpenBSD `nc` was tested against real connections), `SIGTERM` or `SIGINT` stops it, and a port that is already in use ends it with exit 2 after five attempts. For several scrapers, or anything beyond loopback, prefer `--file`.
+
+**Settings:** `LYREBIRD_API_TIMEOUT` (seconds all MediaMTX API requests of one scrape may take together; default 5; keep it below Prometheus's `scrape_timeout`), `LYREBIRD_HEARTBEAT_MAX_AGE` (900), `MEDIAMTX_BINARY`, `MEDIAMTX_CONFIG_FILE` (else `MEDIAMTX_CONFIG_DIR`/`mediamtx.yml`), `PID_FILE` (else `MEDIAMTX_PID_FILE`), `HEARTBEAT_FILE`, `FFMPEG_PID_DIR`. The exporter reads `FFMPEG_PID_DIR` while the stream manager's variable is `MEDIAMTX_FFMPEG_DIR`: if you moved that directory, set both, or the exporter finds no streams.
+
+**Exit status:** 0 every collector completed (the server: stopped by a signal); 1 command-line error; 2 nothing could be delivered (`--file` could not publish, in which case the previous file is kept; or the server cannot run); 3 the output was delivered but at least one collector failed.
 
 ---
 
 ### Storage Management (lyrebird-storage.sh)
 
-**Purpose:** Manage disk space and recording retention for long-term deployments
+**Purpose:** Disk space and retention for long-term deployments
 
 **Usage:**
 ```bash
 # Check storage status
 ./lyrebird-storage.sh status
 
-# Clean up old recordings (respects retention policy)
+# Clean up old recordings and logs (retention policy); --dry-run only lists
 sudo ./lyrebird-storage.sh cleanup
+sudo ./lyrebird-storage.sh --dry-run cleanup
 
-# Emergency cleanup (aggressive, ignores some limits)
+# Emergency cleanup (deletes the oldest recordings and rotated logs)
 sudo ./lyrebird-storage.sh emergency
 
-# Monitor mode (continuous)
-./lyrebird-storage.sh monitor --interval 300
+# One disk check, acting if a threshold is passed (run it from cron; it never loops)
+sudo ./lyrebird-storage.sh monitor --once
 ```
 
-**Configuration:** Environment variables or `/etc/lyrebird/storage.conf`
+`-q, --quiet` (for `cleanup` and `monitor`) prints only warnings, errors and one summary line per run, all to stderr. There is no `--interval` option and no way to make `monitor` loop: run it from cron or a timer. `monitor` prints nothing while the disk is fine.
+
+**Configuration:** environment variables, or the file `/etc/lyrebird/storage.conf` (`LYREBIRD_STORAGE_CONFIG=FILE` names another; empty means none). The file is read as data, never run: `KEY=value` lines, `#` comments, values bare or in quotes and taken literally. An environment variable wins over the file, and the file over the default. The file is not read when anyone can write it or when it belongs to a user other than root or the one running the script. A line that is not accepted is reported and ignored and the run finishes with exit 4.
+
 ```bash
-# Retention settings
-RECORDING_RETENTION_DAYS=30      # Keep recordings for 30 days
-LOG_RETENTION_DAYS=7             # Keep logs for 7 days
+# /etc/lyrebird/storage.conf
+RECORDING_RETENTION_DAYS=30      # Keep recordings for 30 days (default)
+LOG_RETENTION_DAYS=7             # Keep logs for 7 days (default)
+DISK_WARNING_PERCENT=80          # Warn at 80% usage (default)
+DISK_CRITICAL_PERCENT=90         # Critical at 90% usage (default)
+DISK_EMERGENCY_PERCENT=95        # Emergency at 95% usage (default)
+MIN_FREE_SPACE_MB=500            # Emergency below this much free space (default)
 
-# Disk thresholds
-DISK_WARNING_PERCENT=80          # Warn at 80% usage
-DISK_CRITICAL_PERCENT=90         # Critical at 90% usage
-
-# Directories to manage
-RECORDING_DIR="/var/recordings"
+# Directories to manage (absolute paths in the file); the defaults are shown
+RECORDING_DIR="/var/lib/mediamtx-ffmpeg/recordings"
 LOG_DIR="/var/log/lyrebird"
 ```
 
-**Features:**
-- Configurable retention policies
-- Automatic cleanup of old recordings and logs
-- Disk usage monitoring with thresholds — including **inode** exhaustion,
-  which many small recording files can hit long before disk space runs out
-- Emergency cleanup mode for critical situations
-- Integration with alerting system
-- Dry-run mode for testing
-- **Broken-clock protection**: a Pi without a battery-backed clock boots
-  thinking it is 1970 until it gets network time. Recordings captured in that
-  window are never deleted as "too old" once the clock corrects itself, and
-  age-based cleanup waits until the clock is sane
+The keys are the names of the script's environment variables, with one difference: `RECORDING_DIR` and `LOG_DIR` are accepted **only in the file**, as other names for `LYREBIRD_RECORDING_DIR` and `LYREBIRD_LOG_DIR`. As environment variables use the `LYREBIRD_` names, together with `LYREBIRD_TEMP_DIR`, `LYREBIRD_BUFFER_DIR`, `MEDIAMTX_LOG`, `TEMP_RETENTION_HOURS`, `MAX_LOG_SIZE`, `LYREBIRD_CLOCK_SANE_EPOCH` and `LYREBIRD_ACTIVE_SEGMENT_SECONDS` (`--help` lists them). `lyrebird-storage.sh status` prints which file it read.
 
-**Automated Cleanup via Cron:**
+**What the stream manager's recording means for it:** with `AUDIO_LOCAL_RECORDING=true` the manager writes a ring of 12 segments per stream to `AUDIO_RECORDING_PATH` (default `/dev/shm/lyrebird-buffer`, RAM) and FFmpeg overwrites them in place, so that directory never holds more than the last hour per stream and the retention days do not govern it. The storage script never reads `AUDIO_RECORDING_PATH`: retention works on `LYREBIRD_RECORDING_DIR`, and the emergency clearing of the ring on `LYREBIRD_BUFFER_DIR` (which must resolve under `/dev/shm`, `/tmp`, `/var/tmp` or `/run`). If you move `AUDIO_RECORDING_PATH`, set the matching storage variable.
+
+**Features:**
+- Recordings are files ending in `opus ogg aac adts m4a mp3 flac wav`; nothing else in those directories is touched
+- Retention by age for recordings, logs and temporary files; empty segments left by a killed FFmpeg are removed
+- `monitor` checks the filesystem mounted at `/` (blocks, inodes and free space): above `DISK_WARNING_PERCENT` it removes temporary files and truncates very large logs, above `DISK_CRITICAL_PERCENT` it runs the standard cleanup, and above `DISK_EMERGENCY_PERCENT`, or below `MIN_FREE_SPACE_MB`, the emergency cleanup. A recording volume mounted elsewhere is not watched
+- Emergency cleanup deletes up to 100 empty segments, then up to 100 of the oldest non-empty recordings, per run, never a file written within `LYREBIRD_ACTIVE_SEGMENT_SECONDS` (900); then rotated logs and temporary files
+- Broken-clock protection: a Pi without a battery-backed clock boots thinking it is 1970. Recordings with a modification time before `LYREBIRD_CLOCK_SANE_EPOCH` (2025-01-01) are never deleted as too old, and age-based cleanup waits until the clock is sane
+- `--dry-run` lists what would be removed and changes nothing
+- It has no connection to `lyrebird-alerts.sh`: nothing is sent when a threshold is passed
+
+**Exit status:** 0 success; 1 usage error; 3 finished, but a deletion failed or a directory could not be listed; 4 finished, but lines of the configuration file were ignored.
+
+**Automated cleanup via cron** (`/etc/cron.d/lyrebird-storage`; the output of a run is its log, so send it to a file outside `LYREBIRD_LOG_DIR`):
 ```bash
-# Add to /etc/cron.d/lyrebird-storage
-0 3 * * * root /path/to/lyrebird-storage.sh cleanup --quiet
-*/15 * * * * root /path/to/lyrebird-storage.sh monitor --once
+0 3 * * * root /path/to/lyrebird-storage.sh cleanup --quiet >>/var/log/lyrebird-storage.log 2>&1
+*/15 * * * * root /path/to/lyrebird-storage.sh monitor --once >>/var/log/lyrebird-storage.log 2>&1
 ```
 
 ---
@@ -2122,64 +2074,55 @@ LOG_DIR="/var/log/lyrebird"
 
 ### Custom Integration
 
-**Automation Example:**
+**Reading the node's state from a script:**
 ```bash
 #!/bin/bash
-# Auto-restart on USB disconnect
+# overall is one of: ok, degraded, failed, waiting_for_devices, stopped
+overall="$(./lyrebird-stream-manager.sh status --json | jq -r .overall)"
+echo "Node state: ${overall}"
 
-while true; do
-    if ! ./lyrebird-stream-manager.sh status | grep -q "running"; then
-        echo "Streams down, restarting..."
-        sudo ./lyrebird-stream-manager.sh restart
-    fi
-    sleep 30
-done
+# Every stream that is not publishing, with the reason
+./lyrebird-stream-manager.sh status --json | jq -r '.streams[] | select(.path_ready != true) | "\(.path): \(.last_error)"'
 ```
+A `status` run takes `LYREBIRD_FLOW_SAMPLE_SECONDS` (3) seconds longer when a stream is ready; set it to 0 to skip the byte-flow sample (`bytes_flowing` is then `null`). Restarting failed streams is the monitor's job ([The Monitor](#the-monitor)); do not add a second restart loop next to it. To be told when something is wrong, send an alert from your script ([Webhook Alerts](#webhook-alerts-lyrebird-alertssh)).
 
-**API Integration:**
+**API Integration** (from the machine itself: the API listens on `127.0.0.1`):
 ```bash
-# Check MediaMTX API
-curl http://localhost:9997/v3/paths/list
+# Paths MediaMTX knows
+curl -s http://127.0.0.1:9997/v3/paths/list | jq .
 
-# Stream statistics
-curl http://localhost:9997/v3/paths/get/device-name
-
-# Programmatic stream control
-curl -X POST http://localhost:9997/v3/config/paths/patch \
-  -H "Content-Type: application/json" \
-  -d '{"device-name": {"source": "publisher"}}'
+# One stream. While nobody publishes it, MediaMTX answers 404 {"status":"error","error":"path not found"}
+curl -s http://127.0.0.1:9997/v3/paths/get/mic-left | jq .
 ```
+Use `MEDIAMTX_API_PORT` if you changed the port. The field names in the answers differ between MediaMTX versions (`ready` and `available`; `bytesReceived` and `inboundBytes`). The control API can also change configuration (see MediaMTX's own documentation), but changing paths behind the stream manager's back is not supported: the manager rewrites a generated configuration.
 
 ### Custom Audio Configuration
 
-Edit device configuration:
+Edit the device configuration:
 ```bash
 sudo nano /etc/mediamtx/audio-devices.conf
+./lyrebird-stream-manager.sh validate
 ```
 
-Format: Device-specific settings override defaults
+Format: `DEVICE_<NAME>_<SETTING>=value` ([Audio Device Configuration](#audio-device-configuration)); device-specific settings override the defaults.
 
-After editing, restart streams:
+After editing, restart so the streams pick the settings up (`reload` does not apply them):
 ```bash
-sudo ./lyrebird-stream-manager.sh restart
+sudo ./lyrebird-stream-manager.sh restart      # or: sudo systemctl restart mediamtx-audio
 ```
 
 ### MediaMTX Configuration
 
-Edit main configuration:
+A generated file (first line `# Managed by LyreBirdAudio`) is rewritten whenever the manager's rendering changes, so an edit you want to keep needs the first line deleted first ([Configuration ownership](#configuration-ownership)). MediaMTX applies a changed file by itself, and a file it cannot load makes the running MediaMTX log the error and exit, so check an edit before it goes live:
+
 ```bash
-sudo nano /etc/mediamtx/mediamtx.yml
+sudo cp /etc/mediamtx/mediamtx.yml /root/mediamtx.yml.new
+sudo nano /root/mediamtx.yml.new                      # delete the first line to keep your edits
+# MediaMTX 1.21.1 and later; older versions have no such flag
+/usr/local/bin/mediamtx --validate-conf=/root/mediamtx.yml.new && sudo cp /root/mediamtx.yml.new /etc/mediamtx/mediamtx.yml
 ```
 
-Validate configuration:
-```bash
-/usr/local/bin/mediamtx --check /etc/mediamtx/mediamtx.yml
-```
-
-Apply changes:
-```bash
-sudo ./lyrebird-stream-manager.sh restart
-```
+For a generated file, `sudo ./lyrebird-stream-manager.sh reload` applies a change to the settings the manager owns (ports, bind addresses, `RTSP_AUTH_MODE`) without restarting the streams; see [Reload](#reload) for which changes disconnect publishers.
 
 ### Backup and Restore
 
@@ -2187,26 +2130,32 @@ sudo ./lyrebird-stream-manager.sh restart
 # Backup configuration
 sudo tar -czf lyrebird-backup-$(date +%Y%m%d).tar.gz \
   /etc/mediamtx/ \
+  /etc/lyrebird/ \
   /etc/udev/rules.d/99-usb-soundcards.rules \
-  /var/lib/mediamtx/
+  /etc/systemd/system/mediamtx-audio.service \
+  /etc/cron.d/mediamtx-monitor
 
-# Restore from backup
+# Restore from backup (use the file name of your backup)
 sudo tar -xzf lyrebird-backup-20250101.tar.gz -C /
 sudo udevadm control --reload-rules
 sudo udevadm trigger
-sudo ./lyrebird-stream-manager.sh restart
+sudo systemctl daemon-reload
+sudo systemctl restart mediamtx-audio
 ```
+
+`/etc/lyrebird/` may not exist on your node (it holds the optional alerts and storage configuration); remove it from the list if `tar` complains. Add `/etc/systemd/system/mediamtx.service` on a standalone installation. Recordings are not part of this backup.
 
 ### Debug Mode
 
-Enable debug output for all scripts:
+Enable debug output for the scripts that support it:
 ```bash
-export DEBUG=1
+export DEBUG=true      # "1" does not enable it
 
 # Now run any command
-sudo ./lyrebird-stream-manager.sh status
-sudo ./usb-audio-mapper.sh --test
+./lyrebird-stream-manager.sh status
+sudo ./usb-audio-mapper.sh --debug --test    # the mapper has its own option
 ```
+In the stream manager `DEBUG=true` also prints a trace of every command; its `-d` option prints the debug messages only.
 
 ---
 
