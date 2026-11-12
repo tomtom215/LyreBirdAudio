@@ -24,10 +24,15 @@
 #                                    STUB_RC_updater___rollback=6 (non-letters become _),
 #                                    STUB_RC_stream_manager_status_json for `status --json`
 #   STUB_RC_default                  exit status of everything else (default 0)
-#   STUB_DOC_start / STUB_DOC_restart / STUB_DOC_live
+#   STUB_DOC_start / STUB_DOC_restart / STUB_DOC_status_json
 #                                    a status document the manager writes into
 #                                    $LYREBIRD_STATUS_FILE for start / restart, or prints for
 #                                    `status --json` (unset: nothing is written / printed)
+#   STUB_PGREP_MEDIAMTX=1, STUB_PGREP_FFMPEG=N
+#                                    the pgrep stand-in sees MediaMTX / N FFmpeg processes;
+#                                    with STUB_PGREP_ONLY_AFTER_START=1 only once a stream
+#                                    manager `start` has been run (the state changes under
+#                                    the orchestrator, as it does on a real node)
 
 ORCH_HELPER_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ORCH_ROOT="$(cd "$ORCH_HELPER_DIR/.." && pwd)"
@@ -50,6 +55,9 @@ key="$1"
 shift
 printf '%s %s\n' "$key" "$*" >>"$ORCH_CALLS"
 cmd="${1:-none}"
+if [[ "$key" == stream_manager && "$cmd" == start ]]; then
+    : >"$ORCH_DIR/started"
+fi
 if [[ "$cmd" == status && "${2:-}" == --json ]]; then
     cmd=status_json
 fi
@@ -91,13 +99,19 @@ if [[ "$*" == *--help* ]]; then
     echo "usage: pgrep [-c] [-x] PATTERN"
     exit 0
 fi
+mtx="${STUB_PGREP_MEDIAMTX:-0}"
+ff="${STUB_PGREP_FFMPEG:-0}"
+if [[ -n "${STUB_PGREP_ONLY_AFTER_START:-}" && ! -e "$ORCH_DIR/started" ]]; then
+    mtx=0
+    ff=0
+fi
 case "$*" in
     *mediamtx*)
-        [[ "${STUB_PGREP_MEDIAMTX:-0}" == 1 ]] && { echo 4242; exit 0; }
+        [[ "$mtx" == 1 ]] && { echo 4242; exit 0; }
         exit 1
         ;;
     *ffmpeg*)
-        n="${STUB_PGREP_FFMPEG:-0}"
+        n="$ff"
         if [[ "$*" == *-c* ]]; then
             echo "$n"
             ((n > 0)) && exit 0

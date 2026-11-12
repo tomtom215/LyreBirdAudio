@@ -1260,6 +1260,87 @@ run_stream_lifecycle() {
     return 0
 }
 
+# RTSP URLs of the streams that publish, from the outcome read after the start
+print_stream_urls() {
+    local ip port="${MEDIAMTX_RTSP_PORT:-8554}" i
+
+    [[ "$port" =~ ^[0-9]{1,5}$ ]] || port=8554
+    ip="$(get_primary_ip)"
+    for ((i = 0; i < ${#OUTCOME_S_PATH[@]}; i++)); do
+        if [[ "${OUTCOME_S_READY[i]}" == "true" ]]; then
+            printf '%b   rtsp://%s:%s/%s\n' "${CYAN}[INFO]${NC}" "$ip" "$port" "${OUTCOME_S_PATH[i]}"
+        fi
+    done
+}
+
+# The last lines of the Quick Setup Wizard: what the start of step 3 achieved,
+# decided by the outcome that start left (run_stream_lifecycle), not by the
+# state the wizard captured before it ran. A start that works on a fresh node is
+# success whatever was running before it; a start that failed is not, however
+# healthy the node was before it.
+wizard_summary() {
+    local port="${MEDIAMTX_RTSP_PORT:-8554}"
+
+    [[ "$port" =~ ^[0-9]{1,5}$ ]] || port=8554
+    echo
+    case "$LIFECYCLE_VERDICT" in
+        ok)
+            success "Quick setup complete!"
+            echo
+            echo "+ Your RTSP streams are now available!"
+            echo
+            info "Stream URLs:"
+            print_stream_urls
+            ;;
+        degraded)
+            warning "Quick setup finished, but only ${OUTCOME_READY} of ${OUTCOME_TOTAL} streams are publishing"
+            echo
+            print_outcome_streams
+            echo
+            info "Stream URLs of the streams that are publishing:"
+            print_stream_urls
+            print_lifecycle_next_steps
+            ;;
+        waiting)
+            success "Quick setup complete: MediaMTX is running."
+            echo
+            info "No USB microphone is detected yet, so no stream is publishing."
+            print_lifecycle_next_steps
+            ;;
+        unconfirmed)
+            # Exit status 0 and no readable status: all there is to go on is the
+            # process list, read now, after the start
+            warning "Quick setup finished, but the stream state could not be confirmed"
+            echo
+            if [[ "$MEDIAMTX_RUNNING" == "true" ]] && ((ACTIVE_STREAMS > 0)); then
+                info "MediaMTX is running and ${ACTIVE_STREAMS} FFmpeg process(es) were found after the start."
+            else
+                warning "MediaMTX or its FFmpeg processes were not found after the start: the streams are probably not available."
+            fi
+            echo
+            info "Stream URLs follow this format:"
+            info "  rtsp://$(get_primary_ip):${port}/<stream-name>"
+            print_lifecycle_next_steps
+            ;;
+        inconsistent)
+            warning "Quick setup finished, but the stream manager reports the node as '${OUTCOME_OVERALL}'"
+            echo
+            print_outcome_streams
+            print_lifecycle_next_steps
+            ;;
+        streams_failed)
+            error "Quick setup did not finish: no stream is publishing"
+            echo
+            print_outcome_streams
+            print_lifecycle_next_steps
+            ;;
+        *)
+            error "Quick setup did not finish: the audio streams could not be started"
+            print_lifecycle_next_steps
+            ;;
+    esac
+}
+
 # ============================================================================
 # Display Functions
 # ============================================================================
@@ -1477,23 +1558,11 @@ menu_quick_setup() {
         return
     fi
 
-    # Step 3: Start streams
+    # Step 3: Start streams. What the start achieved is read from the outcome it
+    # left (run_stream_lifecycle), not from the state refreshed before it ran.
     echo
     echo -e "${BOLD}Step 3/4: Starting audio streams...${NC}"
-    if execute_script "stream_manager" start; then
-        success "Audio streams started successfully"
-    else
-        error "Failed to start audio streams"
-        echo
-        info "Common causes:"
-        info "  * MediaMTX not running properly"
-        info "  * USB devices not yet recognized (reboot may be needed)"
-        info "  * Configuration issues"
-        echo
-        info "Next steps:"
-        info "  * Check stream status: Streaming Control -> View Status"
-        info "  * Run diagnostics: System Diagnostics -> Full Diagnostics"
-    fi
+    run_stream_lifecycle start
 
     # Step 4: Quick diagnostics
     echo
@@ -1521,24 +1590,9 @@ menu_quick_setup() {
             ;;
     esac
 
-    echo
-    success "Quick setup complete!"
-    echo
-
-    if [[ "$MEDIAMTX_RUNNING" == "true" ]] && ((ACTIVE_STREAMS > 0)); then
-        echo "+ Your RTSP streams are now available!"
-        echo
-        info "Stream URLs follow this format:"
-        info "  rtsp://$(get_primary_ip):8554/<device-name>"
-        echo
-        info "Example:"
-        info "  rtsp://192.168.1.100:8554/usb-microphone-1"
-    else
-        echo "! Setup completed with warnings"
-        echo
-        info "Your system may require a reboot before streams become available."
-        info "After reboot, start streams from: Main Menu -> Audio Streaming Control"
-    fi
+    # The state of the node after the start and the diagnostics, not before
+    refresh_system_state
+    wizard_summary
 
     echo
     pause
