@@ -4826,11 +4826,17 @@ resolve_stream_settings() {
     return 0
 }
 
+# Write the default device configuration template to DEVICE_CONFIG_FILE: through
+# lyrebird_atomic_write (D14, LB-23), so the file is either absent or complete, also
+# after a power cut (temp file in the same directory, fsync, rename, fsync of the
+# directory). The file is mode 0644 and belongs to whoever runs this, as before.
+# Returns 1, with an error in the log and nothing written, when that is not possible.
 save_device_config() {
-    local tmp_config
-    tmp_config="$(mktemp -p "$(dirname "${DEVICE_CONFIG_FILE}")" "$(basename "${DEVICE_CONFIG_FILE}").XXXXXX")"
-
-    cat >"$tmp_config" <<'EOF'
+    if ! declare -F lyrebird_atomic_write >/dev/null; then
+        log ERROR "lyrebird-common.sh with lyrebird_atomic_write is required next to ${SCRIPT_NAME}"
+        return 1
+    fi
+    if ! lyrebird_atomic_write "${DEVICE_CONFIG_FILE}" 0644 <<'EOF'; then
 # Audio device configuration
 # Format: DEVICE_<name>_<setting>=value, one per line
 #
@@ -4870,9 +4876,9 @@ save_device_config() {
 # DEVICE_BLUE_YETI_BITRATE=256k
 # DEVICE_BLUE_YETI_PCM=1
 EOF
-
-    mv -f "$tmp_config" "${DEVICE_CONFIG_FILE}"
-    chmod 644 "${DEVICE_CONFIG_FILE}"
+        log ERROR "Failed to write the default device configuration ${DEVICE_CONFIG_FILE}"
+        return 1
+    fi
 }
 
 sanitize_device_name() {
@@ -6785,7 +6791,8 @@ generate_mediamtx_config() {
     log INFO "Generating MediaMTX configuration"
 
     if [[ ! -f "${DEVICE_CONFIG_FILE}" ]]; then
-        save_device_config
+        # Only a template of comments: without it every setting keeps its default
+        save_device_config || log WARN "The default device configuration could not be written; every setting uses its default"
     fi
 
     load_device_config
@@ -8365,7 +8372,7 @@ show_config() {
 
     if [[ ! -f "${DEVICE_CONFIG_FILE}" ]]; then
         echo "Creating default configuration..."
-        save_device_config
+        save_device_config || return 1
     fi
 
     cat "${DEVICE_CONFIG_FILE}"
