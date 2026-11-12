@@ -6722,6 +6722,25 @@ mediamtx_config_is_managed() {
     [[ "$first" == "${LYREBIRD_MEDIAMTX_CONFIG_MARKER:-# Managed by LyreBirdAudio}" ]]
 }
 
+# The first line of the configuration an EARLIER release of this script wrote. That
+# release regenerated the file on every start, so no edit an operator made to it ever
+# survived: the file is the manager's, not the operator's, and after an upgrade it is
+# adopted (replaced by the current rendering, after the usual backup) instead of being
+# treated as operator-owned for ever, which kept the API and the metrics listening on
+# every interface and warned on every start (X-38). Exactly this line: the file
+# install_mediamtx.sh writes starts with another line and is edited by operators, so
+# it is never adopted.
+LEGACY_MEDIAMTX_CONFIG_FIRST_LINE="# MediaMTX Configuration - Audio Streams"
+
+# Is the first line of $1 the one an earlier release's generator wrote? (Trailing
+# blanks and the CR of a CRLF line ending do not count, as for the marker.)
+mediamtx_config_is_legacy_generated() {
+    local first=""
+    IFS= read -r first <"$1" || [[ -n "$first" ]] || return 1
+    first="${first%"${first##*[![:space:]]}"}"
+    [[ "$first" == "${LEGACY_MEDIAMTX_CONFIG_FIRST_LINE}" ]]
+}
+
 # Save a timestamped copy of ${CONFIG_FILE} next to it (same mode and owner)
 # and keep only the newest MEDIAMTX_CONFIG_BACKUPS of them. Prints the path.
 # Returns: 0 = saved, 1 = could not save (the caller must not replace the file)
@@ -6793,10 +6812,11 @@ generate_mediamtx_config() {
 # Bring ${CONFIG_FILE} to the rendered configuration, under the config lock.
 #
 # Ownership (D10): the file is rewritten only when it does not exist or its
-# first line is the "# Managed by LyreBirdAudio" marker. Any other file belongs
-# to the operator: it is validated and used as it is, never rewritten (one
-# warning says how to hand it over: --regenerate-config, which saves a
-# timestamped backup first). A rendered configuration identical to the file
+# first line is the "# Managed by LyreBirdAudio" marker, or exactly the first line
+# an earlier release's generator wrote (adopted once, X-38, see
+# LEGACY_MEDIAMTX_CONFIG_FIRST_LINE). Any other file belongs to the operator: it is
+# validated and used as it is, never rewritten (one warning says how to hand it
+# over: --regenerate-config, which saves a timestamped backup first). A rendered configuration identical to the file
 # leaves the file untouched (no new mtime); a different one is validated by
 # MediaMTX first, the old file is backed up, and the replacement is atomic and
 # durable (lyrebird_atomic_write, D14). The mode and owner of an existing file
@@ -6809,6 +6829,10 @@ mediamtx_config_apply() {
     if [[ -s "${CONFIG_FILE}" ]]; then
         if mediamtx_config_is_managed "${CONFIG_FILE}"; then
             state=managed
+        elif mediamtx_config_is_legacy_generated "${CONFIG_FILE}"; then
+            # Managed like a marked file from here on: backup, then the current rendering
+            state=managed
+            log INFO "MediaMTX configuration ${CONFIG_FILE} was written by an earlier release of ${SCRIPT_NAME} (first line '${LEGACY_MEDIAMTX_CONFIG_FIRST_LINE}'), which regenerated it on every start (no edit of yours could have survived it): replacing it with the current rendering (API and metrics on the loopback address by default), after a timestamped backup"
         elif [[ "${REGENERATE_CONFIG}" == "true" ]]; then
             state=takeover
         else
@@ -6819,11 +6843,7 @@ mediamtx_config_apply() {
     fi
 
     if [[ "$state" == operator ]]; then
-        local origin=""
-        if [[ "$(head -n 1 "${CONFIG_FILE}" 2>/dev/null)" == "# MediaMTX Configuration - Audio Streams" ]]; then
-            origin=" (it looks like the file an earlier release of this script wrote: its API and metrics listen on every interface)"
-        fi
-        log WARN "MediaMTX configuration ${CONFIG_FILE} does not start with the line '${LYREBIRD_MEDIAMTX_CONFIG_MARKER:-# Managed by LyreBirdAudio}'${origin}: it is treated as yours and used as it is, never rewritten. To let ${SCRIPT_NAME} manage it, run '${SCRIPT_NAME} --regenerate-config start' (a timestamped backup is saved first)"
+        log WARN "MediaMTX configuration ${CONFIG_FILE} does not start with the line '${LYREBIRD_MEDIAMTX_CONFIG_MARKER:-# Managed by LyreBirdAudio}': it is treated as yours and used as it is, never rewritten. To let ${SCRIPT_NAME} manage it, run '${SCRIPT_NAME} --regenerate-config start' (a timestamped backup is saved first)"
         if [[ "${RTSP_AUTH_MODE}" != "open" ]]; then
             log WARN "RTSP_AUTH_MODE=${RTSP_AUTH_MODE} has no effect on a configuration you manage yourself"
         fi

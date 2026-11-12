@@ -415,3 +415,59 @@ manager_generate() {
         fi
     done
 }
+
+@test "the configuration an earlier release wrote is adopted on the first start: the replacement loads in every real MediaMTX, with the API on the loopback address, and the backup holds the old file [X-38]" {
+    require_live
+    local bin dir
+    for bin in $LYREBIRD_TEST_MEDIAMTX_BINS; do
+        each_binary_begin "$bin"
+        dir="$TEST_SCRATCH/mg"
+        rm -rf "$dir"
+        mkdir -p "$dir/cfg"
+        # what the generator of the earlier releases wrote (its first line is what identifies it)
+        cat >"$dir/cfg/mediamtx.yml" <<'YAML'
+# MediaMTX Configuration - Audio Streams
+logLevel: info
+readTimeout: 30s
+writeTimeout: 30s
+
+api: yes
+apiAddress: :9997
+
+metrics: yes
+metricsAddress: :9998
+
+rtsp: yes
+rtspAddress: :8554
+rtspTransports: [tcp, udp]
+
+rtmp: no
+hls: no
+webrtc: no
+srt: no
+
+paths:
+  '~^[a-zA-Z0-9_-]+$':
+    source: publisher
+    sourceProtocol: automatic
+    sourceOnDemand: no
+YAML
+        cp -p "$dir/cfg/mediamtx.yml" "$dir/legacy.yml"
+        manager_generate "$dir" "$bin" >"$TEST_SCRATCH/gen.out" || {
+            cat "$TEST_SCRATCH/gen.out"
+            false
+        }
+        [ "$(head -n 1 "$dir/cfg/mediamtx.yml")" = "# Managed by LyreBirdAudio" ]
+        grep -q 'was written by an earlier release' "$dir/log"
+        [ "$(ls "$dir/cfg"/mediamtx.yml.*.bak | wc -l)" -eq 1 ]
+        cmp "$(ls "$dir/cfg"/mediamtx.yml.*.bak)" "$dir/legacy.yml"
+        # the replacement is a configuration this MediaMTX runs on, with the API and the metrics
+        # on the loopback address and nowhere else (the old file had them on every interface)
+        mtx_start "$bin" "$dir/cfg/mediamtx.yml"
+        [ "$(mtx_http_status "http://127.0.0.1:${P_API}/v3/paths/list")" = 200 ]
+        mtx_listeners "$MTX_PID" | grep -qx "tcp 127.0.0.1:${P_API}"
+        mtx_listeners "$MTX_PID" | grep -qx "tcp 127.0.0.1:${P_METRICS}"
+        ! mtx_listeners "$MTX_PID" | grep -q "0.0.0.0:${P_API}"
+        mtx_stop
+    done
+}
