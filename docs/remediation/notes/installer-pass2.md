@@ -276,6 +276,15 @@ Suggested, by finding (test names exact; all in `tests/test_install_mediamtx.bat
 `apiAddress: :PORT` and `metricsAddress: :PORT` (every interface). They now assert `127.0.0.1:PORT`; the
 port assertions and the test names (the register names them) are unchanged.
 
+## What was run
+
+Gates on `install_mediamtx.sh` (`bash -n`, ShellCheck 0.11.0 at warning severity and at default severity,
+`shfmt -d -i 4 -bn -ci`, `bashate`): no finding. The whole suite through `tests/check_tmp_leaks.sh`: **1496
+tests, 1496 ok, 0 failed, 42 skipped** (the live files without `LYREBIRD_TEST_MEDIAMTX_BINS`, and the tests
+that were skipped before), no temp file left behind; 1459 before this pass (+32 in `test_install_mediamtx.bats`,
++5 live). `tests/test_install_mediamtx_live.bats` with all six real MediaMTX binaries: 5 of 5, about 2.5 minutes.
+Mutation checks are in the commit messages.
+
 ## Not verified here (HW) and residual risk
 
 - No real systemd manager ran: the unit was parsed by `systemd-analyze verify` only. Not run: `Conflicts=`
@@ -286,7 +295,9 @@ port assertions and the test names (the register names them) are unchanged.
   documentation, not run.
 - `useradd`/`adduser`, `userdel`, the real `/etc/systemd/system` and macOS/BSD were not touched or run (tests
   use the root account as the service user and `MEDIAMTX_SERVICE_DIR`/`MEDIAMTX_CONFIG_DIR` in temp dirs).
-  Bash 4.2 itself was not run (constructs avoided: `${var@Q}`, associative-array defaults, `mapfile -d`).
+  Bash 4.2 itself was not run (the new code avoids what came after it: `${var@Q}`, `mapfile -d`, `declare -n`,
+  `${var^^}`, negative array subscripts; it uses `mapfile`, `local -A` and the `${arr[@]+"${arr[@]}"}` idiom, all
+  available in 4.0+).
 - `update` downloads and verifies **after** it has stopped MediaMTX (pass 1 order, a pass 1 test pins it):
   on a slow uplink MediaMTX is down for the length of the download, up to the retry budget (3 attempts of
   up to 300 s). Moving the download before the stop would shorten the outage; it changes that test.
