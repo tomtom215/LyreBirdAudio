@@ -152,7 +152,7 @@ SUDO_EOF
     [[ "$output" == *"lyrebird-updater.sh failed (exit code: 6 - that version is not available in this clone"* ]]
 }
 
-@test "no menu action that delegates swallows the failure of the script it ran (guard for the \`|| true\` that remain) [LB-21]" {
+@test "no menu action that delegates swallows the failure of the script it ran (guard for the '|| true' that remain) [LB-21]" {
     # The remaining `execute_script ... || true` are where a failure is not fatal
     # for the menu; each must still have been reported, with its exit status
     export STUB_RC_default=3
