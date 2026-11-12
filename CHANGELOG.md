@@ -45,6 +45,18 @@ those found while checking, `DOC-` for documentation) are the ones in
   loopback name (`MEDIAMTX_HOST` of `localhost`, `127.x` or `::1`; the manager
   warns otherwise). `lyrebird-stream-manager.sh help` shows the file format;
   `docs/SECURITY-GUIDE.md` covers authentication. [LB-06]
+- **A cron restart no longer loses the authentication mode or the ports.**
+  `lyrebird-stream-manager.sh install` wrote only the stream mode into the unit
+  and the cron file, and the monitor that cron runs brings a MediaMTX that has
+  died back by rendering `mediamtx.yml` again, from the defaults. With
+  `RTSP_AUTH_MODE=local-only-publish` the file then had no `authInternalUsers`
+  and anonymous remote publishing worked again (seen after `kill -9` of
+  MediaMTX); a node with its own ports and bind addresses was put back on 8554,
+  9997, 9998 and `127.0.0.1`. `install` now writes the nine settings that decide
+  this into both files, and the updater's service reinstall keeps them (see
+  "The unit and the cron monitor" below). A node installed before this release
+  has none of them in its files: see "Upgrading an existing node".
+  [X-58, X-52]
 - **A `mediamtx.yml` you edited is no longer overwritten.** The manager
   regenerated the file on every start, so a password, bind address or file
   mode you set was lost. Only a file whose first line is
@@ -191,9 +203,9 @@ those found while checking, `DOC-` for documentation) are the ones in
   readiness and stream probes, the port check, the wrappers' publish URL and
   every URL the manager prints; the manager hard-coded 8554 and 9997 before. A
   value that is not an integer from 1 to 65535 ends every command with exit 4.
-  The unit and the cron file do not carry them: set them in both (see
-  Upgrading). The port check no longer counts a client socket that merely uses
-  the number. [X-19]
+  `install` writes them into the unit and the cron file when they are not the
+  defaults. The port check no longer counts a client socket that merely uses
+  the number. [X-19, X-58]
 - **The capture device is not assumed to be PCM 0.** The manager lists a card's
   capture PCMs; `DEVICE_<NAME>_PCM` picks one if there are several. [LB-24]
 - **Multiplex mode asks FFmpeg before it starts.** The amix `normalize` option
@@ -220,6 +232,18 @@ those found while checking, `DOC-` for documentation) are the ones in
   `<stream>.log.prev.1` and shifts older ones up; `FFMPEG_LOG_KEEP` (default 3,
   at most 20) bounds them. `start`, `stop` and `force-stop` no longer delete
   logs. [X-25]
+- **One directory for the FFmpeg logs, and each log rotated once.** The manager
+  writes them to `/var/lib/mediamtx-ffmpeg/<stream>.log` (`MEDIAMTX_FFMPEG_DIR`).
+  The diagnostics' FFmpeg log directory and the orchestrator's "View Stream Logs
+  (FFmpeg)" looked in `/var/log/lyrebird` and now default to that directory
+  (`FFMPEG_LOG_DIR` still overrides them; the manager never read it).
+  `config/lyrebird-logrotate.conf` and the file `install` writes,
+  `/etc/logrotate.d/mediamtx`, both listed the MediaMTX and the manager log, and
+  logrotate refuses a log that two files list (checked with logrotate 3.21.0:
+  `duplicate log entry`, and the log was not rotated). `install` owns
+  `MEDIAMTX_LOG_FILE`, `STREAM_MANAGER_LOG_FILE` and the FFmpeg logs; the shipped
+  file now covers only `/var/log/lyrebird/*.log` and the orchestrator, updater,
+  diagnostics and USB mapper logs. [X-51]
 - **`reload` is a real command.**
   `lyrebird-stream-manager.sh reload` re-renders the MediaMTX configuration
   and lets the running MediaMTX apply it; the manager stops nothing. Changes to
@@ -254,11 +278,21 @@ those found while checking, `DOC-` for documentation) are the ones in
   reload: MediaMTX re-reads a changed configuration file by itself (checked on
   1.15.0 and 1.21.1), and SIGHUP ends it. A node keeps its unit until
   `install_mediamtx.sh --force install`. [LB-02, X-12, LB-12]
-- **The cron monitor runs in the unit's stream mode.** `install` writes
-  `STREAM_MODE`, `MULTIPLEX_FILTER_TYPE` and `MULTIPLEX_STREAM_NAME` into
+- **The unit and the cron monitor get the node's mode and settings.** `install`
+  writes `STREAM_MODE`, `MULTIPLEX_FILTER_TYPE` and `MULTIPLEX_STREAM_NAME` into
   `/etc/cron.d/mediamtx-monitor`; before, the monitor of a multiplex node ran
   in individual mode and started per-device streams next to the multiplexed
-  one. Run `install` again to change the mode. [X-32]
+  one. It also writes, as `Environment=` lines in the unit and as `NAME=value`
+  lines in the cron file, the settings that decide where MediaMTX listens and
+  who may connect, when they are set and differ from their defaults:
+  `MEDIAMTX_RTSP_PORT`, `MEDIAMTX_API_PORT`, `MEDIAMTX_METRICS_PORT`,
+  `MEDIAMTX_API_BIND`, `MEDIAMTX_METRICS_BIND`, `RTSP_AUTH_MODE`,
+  `RTSP_USERS_FILE`, `MEDIAMTX_HOST` and `MEDIAMTX_BINARY`. A value the files
+  cannot carry stops `install` with exit 4 before anything is written; with
+  none of them set the two files are what they were. `install` writes what it
+  is given and the defaults for the rest, so give it the options and settings
+  every time you run it. Not carried: the path variables and the audio
+  settings. [X-32, X-58]
 
 **Installer** (`install_mediamtx.sh` 2.1.0)
 
@@ -271,6 +305,13 @@ those found while checking, `DOC-` for documentation) are the ones in
   `mediamtx.yml.backup.<time>`; a file without the marker is left alone
   unless `--force`, which saves a backup first. Exit 9: MediaMTX rejected the
   generated file (1.21.1 and later); nothing is written. [LB-06, LB-22]
+- **Exit 11 is the binary steps.** An archive that does not extract or holds no
+  binary, and a copy or an atomic move into place that fails, exit 11 (`install`
+  and `update`). They exited 7, which also means "already installed", "not
+  installed" and "could not stop MediaMTX", so the wizard of the orchestrator,
+  which carries on after 7, carried on after a failed install. 7 still ends an
+  update that was rolled back because the new binary does not run or the
+  service did not come back. `--help` lists the codes 0 to 11. [X-57]
 - **Ports are validated before anything is downloaded or written**: a
   `MEDIAMTX_*_PORT` that is not an integer from 1 to 65535, or two equal
   ones, ends `install` with exit 10 and names the variable. [X-43]
@@ -307,6 +348,14 @@ those found while checking, `DOC-` for documentation) are the ones in
   never deleted; it is no longer an untracked directory in the working tree.
   `flock` (util-linux) is now a prerequisite (exit 2 without it). Migrations
   now also run after a self-update. [X-31]
+- **A service reinstall keeps the node as it is.** When the manager script
+  changed, the updater runs `install` again. It ran it with no options, which put
+  the cron file of a multiplex node back to individual mode. It now gives
+  `install` the stream mode, filter and name and the nine settings above as the
+  installed unit sets them (the cron file's value for one the unit does not
+  set), so the unit and the cron file keep the node's mode, ports and
+  authentication. `Environment=` lines you added are kept, as before.
+  [X-52, X-58]
 - **Exit codes**: 6 (the version is not in the clone), 10 (switched, but your
   saved changes conflict and are in the stash), 11 (the automatic rollback
   could not restore everything), 12 (input ended at a menu prompt). A switch
@@ -325,6 +374,18 @@ those found while checking, `DOC-` for documentation) are the ones in
   Update History and 4) Roll Back to a Previous Version. Listing stream URLs
   no longer ends the orchestrator on a system without the `ip` command.
   [LB-21, X-21]
+- **It finds MediaMTX and the streams by identity.** The menu header's
+  `MediaMTX:` line is the program at `MEDIAMTX_BINARY` running the manager's
+  configuration file, not any process called `mediamtx`, and `Active Streams:`
+  counts the manager's wrapper processes, not every `ffmpeg` on the host. The
+  orchestrator no longer needs `pgrep`. The diagnostics find MediaMTX the same
+  way. The two lookups are `lyrebird_mediamtx_pids` and
+  `lyrebird_stream_wrapper_pids` in `lyrebird-common.sh` 1.2.0. [X-54]
+- **It follows the manager's port.** "View Stream URLs" prints
+  `MEDIAMTX_RTSP_PORT` (it printed 8554), and the diagnostics read
+  `MEDIAMTX_RTSP_PORT` too, with `MEDIAMTX_PORT` only as the fallback. [X-55]
+- **It explains installer exit 11** as a failed binary installation, and no
+  longer says that exit 7 can mean a failed install step. [X-57]
 
 **Metrics** (`lyrebird-metrics.sh` 1.4.0)
 
@@ -347,6 +408,10 @@ those found while checking, `DOC-` for documentation) are the ones in
   as degraded (exit 3). One scrape spends at most `LYREBIRD_API_TIMEOUT`
   seconds (default 5) on the MediaMTX API; a refused API costs 20 ms, not
   1 second. [X-30]
+- **The exporter follows the manager's FFmpeg directory.** It reads
+  `MEDIAMTX_FFMPEG_DIR`, the manager's variable, and `FFMPEG_PID_DIR` only as the
+  fallback; before, a node that moved the directory with `MEDIAMTX_FFMPEG_DIR`
+  showed no streams unless `FFMPEG_PID_DIR` was set too. [X-55]
 
 **Storage** (`lyrebird-storage.sh` 1.3.0)
 
@@ -393,6 +458,12 @@ those found while checking, `DOC-` for documentation) are the ones in
   upstream release. A tag runs the whole pipeline before a release is
   published, with a source tarball and `SHA256SUMS`; publishing can be
   repeated. [LB-19, LB-20, X-22, X-16]
+- **The live steps run `tests/test_stream_names.bats` and
+  `tests/test_docs_security.bats` too**, once per pinned MediaMTX version and in
+  the canary. The four live tests of the first (the stream-name matrix,
+  `runOnInit` injection, quoted keys and `all_others`) had never run against a
+  real MediaMTX in CI; the second loads every YAML block of the security guide
+  into each binary that has `--validate-conf`. [X-60]
 
 **Stream manager exit codes** (`lyrebird-stream-manager.sh help` has the same
 list; 8 and 9 are new, 5, 6 and 7 changed)
@@ -458,6 +529,34 @@ list; 8 and 9 are new, 5, 6 and 7 changed)
   left armed; seen in 6 of 480 shutdowns under load). [X-44]
 - **`usb-audio-mapper.sh` could read a directory above its sysfs root as a USB
   port.** Real sysfs was not affected; the mapper is 4.0.1. [X-45]
+- **A script started by its bare name could not find `lyrebird-common.sh`.**
+  `bash lyrebird-stream-manager.sh help` in the repository's directory failed
+  because the library, which this release made mandatory, was looked up by a
+  path that lost the directory. Every script that loads the library now looks
+  beside the script, or beside the target of a symlink to it, and the manager
+  still verifies `LYREBIRD_COMMON_EXPECTED_HASH` when it is started that way.
+  [X-50]
+- **`lyrebird-mic-check.sh --restore VALUE` and a bare `--restore` failed to
+  parse, and `--help` needed `/proc/asound`.** `--restore TIMESTAMP`,
+  `--restore=TIMESTAMP` and a bare `--restore` (it offers the list) all work, and
+  `--help` and `--version` exit 0 on a machine with no `/proc/asound`; what reads
+  the hardware still exits 1 with a message. [X-53]
+- **`lyrebird-updater.sh --help` and `--version` did not answer first.** They
+  asked for the root confirmation, took the lock (waiting up to 30 seconds for a
+  running updater) and checked the repository; as root without a terminal they
+  ended in "Cancelled by user", exit 9. They answer at once now, with no
+  confirmation, lock or network. [X-62]
+- **`lyrebird-mic-check.sh` needed Bash 4.3** (negative array subscripts) while
+  the project said Bash 4.x. They are replaced, and
+  `tests/test_bash_features.bats` keeps every script free of features newer than
+  Bash 4.2; nothing here runs Bash 4.2 itself. [X-63]
+- **The soak observer's header claimed Linux or macOS and Bash 3.2.** It was
+  only run on Linux with Bash 5.2; the header and `tools/soak/README.md` now say
+  so. [X-64]
+- **Scripts were committed without the executable bit** (seven of the eleven in
+  v1.3.0), so a fresh clone needed `chmod +x *.sh`. Every script that is run
+  directly is mode 100755 now (`git ls-files -s '*.sh'`); the tag `v1.3.0` keeps
+  its old modes. [X-56]
 - **`tools/soak/README.md` claimed more than had been checked.** It said that
   LyreBirdAudio's own silence detection covered a muted microphone (nothing ran
   it) and listed macOS for the observer (it has not been run there). It now
@@ -498,6 +597,9 @@ list; 8 and 9 are new, 5, 6 and 7 changed)
 - **Stream manager commands**: `reload`, `validate`, `status --json`,
   `force-stop --kill-all [--yes]` and the option `--regenerate-config`.
   [LB-11, LB-08, LB-03, LB-10, LB-22]
+- **`--version` and `-V`** for `lyrebird-stream-manager.sh` and `lyrebird-alerts.sh`
+  (they print the script's name and version and exit 0), as the other scripts
+  have. [X-61]
 - **A status file**, `/run/lyrebird/status.json` (`LYREBIRD_STATUS_FILE`), and
   `status --json`. Per stream: `configured`, `process_alive`, `path_ready`,
   `bytes_flowing` (each true, false or null for "not known") and
@@ -522,9 +624,9 @@ list; 8 and 9 are new, 5, 6 and 7 changed)
   12, and the settings `LYREBIRD_FETCH_TIMEOUT`, `LYREBIRD_FETCH_RETRIES`,
   `LYREBIRD_FETCH_RETRY_DELAY`, `LYREBIRD_REMOTE_PROBE_TIMEOUT`,
   `LYREBIRD_UPDATER_LOCK_WAIT` and `LYREBIRD_UPDATER_STATE_DIR`. [X-21]
-- **Installer**: exit codes 4, 9 and 10, and the settings `MEDIAMTX_SERVICE_DIR`,
+- **Installer**: exit codes 4, 9, 10 and 11, and the settings `MEDIAMTX_SERVICE_DIR`,
   `MEDIAMTX_UNIT_TEMPLATE`, `MEDIAMTX_STOP_TIMEOUT` and `MEDIAMTX_PID_FILE`.
-  [LB-22, X-43]
+  [LB-22, X-43, X-57]
 - **Metrics**: `serve`, `--port`, `--bind`, `lyrebird_scrape_success`,
   `lyrebird_collector_success`, `LYREBIRD_HEARTBEAT_MAX_AGE` and
   `LYREBIRD_API_TIMEOUT`. [LB-18, X-13, X-30]
@@ -541,7 +643,9 @@ Which command refreshes which file:
 - **`/etc/systemd/system/mediamtx-audio.service`,
   `/etc/cron.d/mediamtx-monitor` and `/etc/logrotate.d/mediamtx`**:
   `sudo ./lyrebird-stream-manager.sh install`. The updater runs it when the
-  manager script changed and the service is installed.
+  manager script changed and the service is installed. A node installed before
+  this release carries none of the nine settings `install` now writes: run
+  `install` once with the ones the node uses (step 6).
 - **`/etc/mediamtx/mediamtx.yml` of a manager node**: the first `start`, if an
   earlier manager wrote it; otherwise
   `sudo ./lyrebird-stream-manager.sh --regenerate-config restart`.
@@ -564,7 +668,8 @@ In this order:
    tag) to the release that contains this section; v1.3.0 does not. When
    `mediamtx-audio.service` is installed and the manager script changed, the
    updater stops the service, runs `install` (keeping the `Environment=` lines
-   you added to the unit), reloads systemd and starts the service. Without the
+   you added to the unit and the mode and settings the unit or the cron file
+   already carries), reloads systemd and starts the service. Without the
    updater, run `sudo ./lyrebird-stream-manager.sh install` with the `-m`, `-f`
    and `-n` options you used before (it rewrites the unit, so keep local
    settings in `systemctl edit mediamtx-audio`), then
@@ -584,13 +689,18 @@ In this order:
    its API and metrics stay on every interface, SRT (and MoQ) stay on, and
    `paths: {}` still refuses every publisher.
 6. Move settings. A node that set `MEDIAMTX_LOG_FILE` and relied on the manager
-   log being in the same file must also set `STREAM_MANAGER_LOG_FILE`.
-   `install` writes no port settings: a non-default `MEDIAMTX_RTSP_PORT`,
-   `MEDIAMTX_API_PORT` or `MEDIAMTX_METRICS_PORT` must be in the unit's
-   environment (`systemctl edit mediamtx-audio`) and, as `NAME=value` lines
-   before the job line, in `/etc/cron.d/mediamtx-monitor`, which every `install`
-   rewrites, so add them again afterwards. Delete the removed settings (see
-   Removed) from the unit; until then every run logs one warning.
+   log being in the same file must also set `STREAM_MANAGER_LOG_FILE`. A node
+   that uses `MEDIAMTX_RTSP_PORT`, `MEDIAMTX_API_PORT`, `MEDIAMTX_METRICS_PORT`,
+   `MEDIAMTX_API_BIND`, `MEDIAMTX_METRICS_BIND`, `RTSP_AUTH_MODE`,
+   `RTSP_USERS_FILE`, `MEDIAMTX_HOST` or `MEDIAMTX_BINARY` must run `install`
+   again with them exported, for example
+   `sudo env RTSP_AUTH_MODE=local-only-publish ./lyrebird-stream-manager.sh install`
+   (with `-m`, `-f` and `-n` on a multiplex node): until then the unit and the
+   cron file carry none of them, and a cron restart of MediaMTX renders the
+   defaults. Lines you added by hand to `/etc/cron.d/mediamtx-monitor` for other
+   settings are rewritten by every `install`, so add them again afterwards.
+   Delete the removed settings (see Removed) from the unit; until then every run
+   logs one warning.
 7. If the service was not restarted in step 2, restart it:
    `sudo systemctl restart mediamtx-audio`. On a node started by hand with the
    old code, the first `stop` or `force-stop` can wait `STOP_LOCK_TIMEOUT`
@@ -610,6 +720,9 @@ What changes without your doing anything:
   so the first identical alert after the upgrade can be delivered once more.
 - An `/etc/lyrebird/storage.conf` written from the old documentation, which
   was never read, now takes effect.
+- A script that reads the exit status of `install_mediamtx.sh` sees 11 where it
+  saw 7 for an archive that did not extract, a missing binary or a failed copy
+  into place.
 - Each monitor run opens a short RTSP read session per published stream. A
   MediaMTX that requires authentication to read refuses it (401): the failed
   probe is logged every run and never counted as silence.
@@ -642,9 +755,18 @@ What changes without your doing anything:
   1.21.1; before that an unknown key or an invalid path name is found only when
   MediaMTX refuses to start (the reason is in `/var/log/mediamtx.out`).
   [LB-22]
-- **`install` writes no port settings** into the unit or the cron file, and
-  rewrites the cron file every time, so a node with non-default ports must
-  repeat step 6 above after each `install`. [X-19]
+- **`install` carries nine settings, no more.** The path variables
+  (`MEDIAMTX_CONFIG_DIR`, the PID, lock and log files, `MEDIAMTX_FFMPEG_DIR`)
+  and the audio and policy settings are not written into the unit or the cron
+  file, and the service is never given them. The unit's `PIDFile=`,
+  `StandardOutput=append:` and `ReadWritePaths=` are rendered from the path
+  variables of the shell that ran `install`, so a non-default
+  `MEDIAMTX_PID_FILE` makes the unit name a PID file the manager does not
+  write. Leave the paths at their defaults, or set them for the service
+  (`systemctl edit mediamtx-audio`) and the cron file by hand; `install`
+  rewrites the cron file, so repeat the lines after each run. Not carrying
+  paths is a recorded decision (`wontfix` in `docs/remediation-status.json`).
+  [X-59]
 - **RTSP has no authentication unless you configure it**, and the metrics
   server none at all (one connection at a time; for several scrapers use
   `--file` and node_exporter's textfile collector). [LB-06]
@@ -657,11 +779,7 @@ What changes without your doing anything:
   monitor, and with it late-device recovery and the silence check, is the cron
   job `lyrebird-stream-manager.sh install` writes, and the wizard does not run
   it. [LB-07, LB-21]
-- **Known smaller defects, not fixed**: the orchestrator's header counts every
-  `ffmpeg` process on the host and finds MediaMTX by name, and "View Stream
-  URLs" prints port 8554 whatever `MEDIAMTX_RTSP_PORT` says; the installer
-  uses exit 7 for "already installed" and for some failed install steps, which
-  the wizard reads as "already installed"; a second updater started in the
+- **Known smaller defects, not fixed**: a second updater started in the
   instant of a self-update's `exec` could take its lock; non-root `status`
   prints a garbled `Resources:` line for MediaMTX; the failure counter of the
   network check is the fixed file `/run/mediamtx-network-failures`; a card whose
@@ -1148,7 +1266,7 @@ v1.3.0 and as it is in this tree, which is not released:
 | lyrebird-diagnostics.sh | 1.0.2 | 1.0.2 |
 | install_mediamtx.sh | 2.0.1 | 2.1.0 |
 | lyrebird-mic-check.sh | 1.0.0 | 1.0.2 |
-| lyrebird-common.sh | 1.0.0 | 1.1.0 |
+| lyrebird-common.sh | 1.0.0 | 1.2.0 |
 | lyrebird-metrics.sh | 1.1.0 | 1.4.0 |
 | lyrebird-storage.sh | 1.0.0 | 1.3.0 |
 | lyrebird-alerts.sh | 1.0.0 | 1.1.0 |

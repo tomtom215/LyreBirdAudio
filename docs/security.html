@@ -76,7 +76,7 @@
         </tbody>
       </table>
     </div>
-    <p>SRT, MoQ (MediaMTX 1.19.0 and later), RTMP, HLS and WebRTC are switched off in the generated file, and no option turns them on. <code>MEDIAMTX_API_BIND</code> and <code>MEDIAMTX_METRICS_BIND</code> change the API and metrics addresses (empty means every interface; MediaMTX still answers <code>401</code> to other machines). RTSP always listens on every interface.</p>
+    <p>SRT, MoQ (MediaMTX 1.19.0 and later), RTMP, HLS and WebRTC are switched off in the generated file, and no option turns them on. <code>MEDIAMTX_API_BIND</code> and <code>MEDIAMTX_METRICS_BIND</code> change the API and metrics addresses (empty means every interface; MediaMTX still answers <code>401</code> to other machines). RTSP always listens on every interface. The service and the cron monitor do not inherit your shell's environment: give the ports and bind addresses to <code>lyrebird-stream-manager.sh install</code> (<code>sudo env MEDIAMTX_API_PORT=19997 ./lyrebird-stream-manager.sh install</code>), which writes them into the unit and the cron file, then restart the service.</p>
 
     <h3>Check what your node exposes</h3>
     <pre><code>sudo ss -tulpn | grep mediamtx</code></pre>
@@ -148,19 +148,18 @@ grep -E '^(apiAddress|metricsAddress|srt|moq):' /etc/mediamtx/mediamtx.yml</code
         <pre><code>printf '%s' 'the password' | openssl dgst -sha256 -binary | base64</code></pre>
       </li>
       <li><code>MEDIAMTX_HOST</code> must be a loopback name (the default is <code>localhost</code>).</li>
-      <li>The variable must reach <strong>every process that can start MediaMTX</strong>: the service <em>and</em> the cron monitor, which starts MediaMTX again when it has died. Neither the unit nor the cron file carries it:
-        <pre><code>sudo systemctl edit mediamtx-audio
-#   add:  [Service]
-#         Environment="RTSP_AUTH_MODE=local-only-publish"
-sudo sed -i 's/^CRON=1$/&amp;\nRTSP_AUTH_MODE=local-only-publish/' /etc/cron.d/mediamtx-monitor
-sudo systemctl restart mediamtx-audio</code></pre>
+      <li>The variable must reach <strong>every process that can start MediaMTX</strong>: the service <em>and</em> the cron monitor, which starts MediaMTX again when it has died by rendering the configuration again. <code>install</code> writes it into both the unit and the cron file, so give it to <code>install</code>:
+        <pre><code>sudo env RTSP_AUTH_MODE=local-only-publish ./lyrebird-stream-manager.sh install   # add -m, -f, -n on a multiplex node
+sudo systemctl restart mediamtx-audio
+grep -n RTSP_AUTH_MODE /etc/systemd/system/mediamtx-audio.service /etc/cron.d/mediamtx-monitor</code></pre>
       </li>
     </ol>
     <div class="callout warning">
       <span class="callout-icon">⚠️</span>
       <div class="callout-body">
-        <strong>The cron file is rewritten by <code>install</code></strong>
-        <p>Without the variable in the cron file, the monitor renders an open configuration when it restarts MediaMTX, and the managed file silently loses its users: after <code>kill -9</code> of MediaMTX the file had no <code>authInternalUsers</code> and anonymous remote publishing worked again. Repeat the <code>sed</code> command after every <code>install</code>, or use a file you own (below), which is never rewritten. Check with <code>grep -c authInternalUsers /etc/mediamtx/mediamtx.yml</code> (1 = users are in the file).</p>
+        <strong><code>install</code> writes what it is given</strong>
+        <p>Run <code>install</code> again without the variable and both files silently go back to <code>open</code>: give it the options and settings every time. The updater's service reinstall reads them from the installed unit (or the cron file) and passes them on. A node installed before this release has the setting in neither file: run the command above once. A value other than <code>open</code> or <code>local-only-publish</code> stops <code>install</code> with exit 4 and nothing is written. Without the variable in the cron file the monitor renders an open configuration when it restarts MediaMTX, and the managed file silently loses its users: that was the behaviour before <code>install</code> carried the setting (after <code>kill -9</code> of MediaMTX the file had no <code>authInternalUsers</code> and anonymous remote publishing worked again). The tests start the monitor with only the cron file's assignments against a dead MediaMTX (a stand-in starts the process) and check that the rendered file keeps <code>authInternalUsers</code> and the node's RTSP port; the <code>kill -9</code> against a live MediaMTX was not repeated with <code>install</code> carrying the setting. Check with <code>grep -c authInternalUsers /etc/mediamtx/mediamtx.yml</code> (1 = users are in the file).</p>
+        <p>The same applies to the ports and bind addresses (<code>MEDIAMTX_RTSP_PORT</code>, <code>MEDIAMTX_API_PORT</code>, <code>MEDIAMTX_METRICS_PORT</code>, <code>MEDIAMTX_API_BIND</code>, <code>MEDIAMTX_METRICS_BIND</code>), <code>RTSP_USERS_FILE</code>, <code>MEDIAMTX_HOST</code> and <code>MEDIAMTX_BINARY</code>: <code>install</code> carries these nine settings and no others. A file you own (below) is never rewritten, whatever the environment says.</p>
       </div>
     </div>
 
@@ -338,13 +337,13 @@ sudo chmod 600 /etc/mediamtx/rtsp-users.conf
 sudo chmod 640 /var/log/lyrebird-stream-manager.log /var/log/mediamtx.out
 sudo chmod 750 /etc/mediamtx /var/log/lyrebird</code></pre>
     <p>The manager keeps the mode you give <code>mediamtx.yml</code> when it replaces it, and logrotate (<code>copytruncate</code>) keeps the mode of the logs. A standalone <code>mediamtx.service</code> runs MediaMTX as the <code>mediamtx</code> account: use <code>sudo chown root:mediamtx</code> on the files it must read.</p>
-    <p><strong>Log rotation.</strong> <code>install</code> writes <code>/etc/logrotate.d/mediamtx</code>. Do <strong>not</strong> also install <code>config/lyrebird-logrotate.conf</code> unchanged: it lists the same logs, and logrotate 3.21.0 then reported <code>duplicate log entry</code> and skipped the file <code>install</code> wrote, so those logs were no longer rotated. Copy only the stanzas for the other scripts' logs.</p>
+    <p><strong>Log rotation.</strong> <code>install</code> writes <code>/etc/logrotate.d/mediamtx</code> for the MediaMTX log, the manager log and the FFmpeg logs in <code>/var/lib/mediamtx-ffmpeg</code>. <code>config/lyrebird-logrotate.conf</code> covers the other logs (<code>/var/log/lyrebird/*.log</code>, the alert log, and the orchestrator, updater, diagnostics and USB mapper logs) and lists none of the logs of the first file, so you can copy it to <code>/etc/logrotate.d/lyrebird</code> and each log still has one owner (the tests check that the two files name no log in common; <code>logrotate</code> itself was not run). logrotate refuses a log that two files list: checked with logrotate 3.21.0 on the earlier shipped file, both files together gave <code>duplicate log entry</code> and the file <code>install</code> wrote was skipped. Keep that in mind if you add stanzas of your own.</p>
 
     <h2 id="integrity">Library Integrity Check</h2>
     <p>The stream manager can check <code>lyrebird-common.sh</code> before it uses it. Set the hash in the service's environment (<code>systemctl edit mediamtx-audio</code>):</p>
     <pre><code>sha256sum lyrebird-common.sh | cut -d' ' -f1
 # Environment="LYREBIRD_COMMON_EXPECTED_HASH=&lt;that value&gt;"</code></pre>
-    <p>Checked: a wrong value stopped the manager with exit 1, the right value ran it. Only the stream manager has this check, and the value must be updated with every update of the library. Run the script as <code>./lyrebird-stream-manager.sh</code> (or an absolute path): started as <code>bash lyrebird-stream-manager.sh</code> from its own directory it does not find the library at all.</p>
+    <p>Checked: a wrong value stopped the manager with exit 1, the right value ran it. Only the stream manager has this check, and the value must be updated with every update of the library. The check also runs when the script is started by its bare name from its own directory (<code>bash lyrebird-stream-manager.sh status</code>).</p>
 
     <h2 id="field">Field Deployment Recommendations</h2>
 

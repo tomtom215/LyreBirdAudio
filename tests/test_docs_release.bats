@@ -90,9 +90,17 @@ m = re.search(r"^## \[Unreleased\]\n(.*?)^## ", text, re.S | re.M)
 section = re.sub(r"\s+", " ", m.group(1)) if m else ""
 register = {i["id"]: i for i in json.load(open(sys.argv[2], encoding="utf-8"))["items"]}
 
-cited = set()
-for group in re.findall(r"\[((?:(?:LB|X|DOC)-\d+)(?:, (?:LB|X|DOC)-\d+)*)\]", section):
-    cited.update(group.split(", "))
+def ids_in(text):
+    found = set()
+    for group in re.findall(r"\[((?:(?:LB|X|DOC)-\d+)(?:, (?:LB|X|DOC)-\d+)*)\]", text):
+        found.update(group.split(", "))
+    return found
+
+cited = ids_in(section)
+# a finding that is not going to be fixed (status wontfix) is a known limit: it may be cited
+# in the Known limits group, and nowhere else
+head, _, tail = section.partition("#### Known limits")
+limits_only = ids_in(tail) - ids_in(head)
 
 problems = []
 # items whose remaining work is the documentation pass this section belongs to
@@ -101,6 +109,9 @@ for i in sorted(cited):
     item = register.get(i)
     if item is None:
         problems.append("%s is not in the register" % i)
+    elif item["status"] == "wontfix":
+        if i not in limits_only:
+            problems.append("%s is wontfix and is cited outside the Known limits group" % i)
     elif item["status"] not in ("fixed", "documented-hw") and not (item["status"] == "open" and i in docs_pass):
         problems.append("%s has status %s" % (i, item["status"]))
 if not cited:
@@ -180,10 +191,10 @@ EOF
     local mgr_help inst_help
     mgr_help="$(bash "$ROOT/lyrebird-stream-manager.sh" help 2>&1)"
     inst_help="$(bash "$ROOT/install_mediamtx.sh" help 2>&1)"
-    # the updater asks for a confirmation when it runs as root, even for --help:
-    # its help text is read from the script
+    # the updater answers --help at once (no root confirmation, no lock) since X-62
     local upd_help
-    upd_help="$(sed -n '/^show_help()/,/^}/p' "$ROOT/lyrebird-updater.sh")"
+    upd_help="$(env -i PATH="$PATH" HOME="$TEST_SCRATCH" SUDO_USER=somebody bash "$ROOT/lyrebird-updater.sh" --help </dev/null 2>&1)"
+    [ -n "$upd_help" ]
     local n=0
     while IFS= read -r span; do
         case "$span" in
@@ -755,14 +766,20 @@ EOF
     grep -qF 'Bash 5.2' <<<"$flat"
 }
 
-@test "CONTRIBUTING says how many scripts are committed without the executable bit, and runs the commands it shows with bash [CONTRIB]" {
-    local contrib="$DOCS/CONTRIBUTING.md" n
+@test "CONTRIBUTING says every script is committed executable, as git has it, and no longer says some are not [CONTRIB]" {
+    local contrib="$DOCS/CONTRIBUTING.md" n total
     git -C "$ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1 || skip "not a git checkout"
+    total="$(git -C "$ROOT" ls-files -s -- '*.sh' | wc -l)"
+    [ "$total" -ge 11 ]
+    # X-56: every script the repository tracks is 100755 (the helpers under tests/ are not *.sh)
     n="$(git -C "$ROOT" ls-files -s -- '*.sh' | awk '$1 == "100644"' | wc -l)"
-    [ "$n" -eq 6 ] || { echo "$n scripts are committed without the executable bit; CONTRIBUTING says six"; return 1; }
-    tr '\n' ' ' <"$contrib" | tr -s ' ' | grep -qF 'Six of the scripts are committed without the executable bit'
-    # the commands it shows for a clone are run with bash, not ./
-    ! grep -qE '^[[:space:]]+\./lyrebird-[a-z-]+\.sh' "$contrib" || { echo "CONTRIBUTING runs a script as ./script.sh"; return 1; }
+    [ "$n" -eq 0 ] || { echo "$n scripts are committed without the executable bit; CONTRIBUTING says every script has it"; return 1; }
+    tr '\n' ' ' <"$contrib" | tr -s ' ' | grep -qF 'Every script is committed with the executable bit'
+    ! grep -qiE '(six|seven|some) of the scripts are committed without the executable bit' "$contrib" || { echo "CONTRIBUTING still says scripts lack the executable bit"; return 1; }
+    ! grep -qF 'run them as `bash script.sh`' "$contrib" || { echo "CONTRIBUTING still tells you to run scripts with bash for want of the bit"; return 1; }
+    # v1.3.0 is the tag the paragraph calls older: it does have scripts without the bit
+    git -C "$ROOT" rev-parse -q --verify 'refs/tags/v1.3.0^{commit}' >/dev/null 2>&1 || skip "tag v1.3.0 is not in this clone"
+    [ "$(git -C "$ROOT" ls-tree v1.3.0 | awk '$1 == "100644" && $4 ~ /[.]sh$/' | wc -l)" -eq 7 ]
 }
 
 # ---------------------------------------------------------------------------

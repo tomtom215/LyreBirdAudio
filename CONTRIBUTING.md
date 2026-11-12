@@ -28,8 +28,9 @@ This project follows a simple code of conduct:
 
 - Bash (check with `bash --version`). Most scripts refuse to start below 4.0,
   but the test suite and CI have only run on Bash 5.2, so they cannot catch a
-  script that needs a newer Bash than it checks for (ADR-001 in `docs/ADR.md`
-  names one)
+  script that needs a newer Bash than it checks for. The README's Bash table
+  says what each script uses, and `tests/test_bash_features.bats` keeps every
+  script to Bash 4.2 or older features
 - Git 2.0+
 - ShellCheck, shfmt and bashate, the linters CI runs (CI pins ShellCheck
   0.11.0, shfmt 3.13.1 and bashate 2.1.1; other versions can report
@@ -48,9 +49,10 @@ use `flock`. Nothing in the repository runs them on macOS or BSD.
    git clone https://github.com/YOUR_USERNAME/LyreBirdAudio.git
    cd LyreBirdAudio
    ```
-   Six of the scripts are committed without the executable bit, so run them as
-   `bash script.sh` in a clone (the README's `chmod +x` shows up in `git status`
-   as a mode change).
+   Every script is committed with the executable bit (`git ls-files -s '*.sh'`
+   shows mode 100755 for all of them), so `./script.sh` works in a clone of
+   `main` without a `chmod`. The tag `v1.3.0` is older: its scripts need
+   `chmod +x *.sh`, which shows up in `git status` as a mode change.
 3. Add upstream remote:
    ```bash
    git remote add upstream https://github.com/tomtom215/LyreBirdAudio.git
@@ -690,7 +692,7 @@ Include the following in your bug report:
    ```bash
    git describe --tags               # the release your checkout is based on
    bash lyrebird-orchestrator.sh --version
-   bash lyrebird-stream-manager.sh help | head -n 1
+   bash lyrebird-stream-manager.sh --version
    ```
 
 3. **Diagnostic Output**:

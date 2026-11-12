@@ -245,8 +245,12 @@ table_firsts() { jq -r --arg h2 "$2" --arg h3 "$3" '.tables[] | select(.h2 == $h
 # the real --help of a script
 help_of() { "${CLEAN[@]}" bash "$ROOT/$1" --help 2>&1 || true; }
 
-# the real usage text of lyrebird-mic-check.sh (its --help needs /proc/asound; the function does not)
-mic_usage() { "${CLEAN[@]}" bash -c 'source "$1"; show_usage' _ "$ROOT/lyrebird-mic-check.sh" 2>&1; }
+# the real --help of lyrebird-mic-check.sh (it needs no /proc/asound since X-53, and exits 0)
+mic_usage() {
+    local out
+    out="$("${CLEAN[@]}" bash "$ROOT/lyrebird-mic-check.sh" --help 2>&1)" || { echo "lyrebird-mic-check.sh --help failed: $out"; return 1; }
+    printf '%s\n' "$out"
+}
 
 # value of variables of the stream manager after sourcing it with nothing set
 manager_vars() { env -i "PATH=$PATH" "HOME=$TEST_SCRATCH" bash -c 'source "$1"; shift; for v in "$@"; do printf "%s=%s\n" "$v" "${!v-}"; done' _ "$ROOT/lyrebird-stream-manager.sh" "$@"; }
@@ -378,13 +382,29 @@ manager_vars() { env -i "PATH=$PATH" "HOME=$TEST_SCRATCH" bash -c 'source "$1"; 
 }
 
 @test "no page names a variable or a log path the stream manager does not have [DOC-02]" {
-    local t
+    local t p
     t="$(all_text)"
-    # FFMPEG_LOG_DIR belongs to the orchestrator's log viewer, not to the stream manager
-    [[ "$t" != *"FFMPEG_LOG_DIR"* ]]
+    # FFMPEG_LOG_DIR is an override that the orchestrator's log viewer and the diagnostics read; the stream
+    # manager never reads it, and a page may not hand it to the manager
+    absent 'FFMPEG_LOG_DIR' "$ROOT/lyrebird-stream-manager.sh"
+    grep -qF 'FFMPEG_LOG_DIR:-${MEDIAMTX_FFMPEG_DIR' "$ROOT/lyrebird-diagnostics.sh"
+    grep -qF 'FFMPEG_LOG_DIR:-${MEDIAMTX_FFMPEG_DIR' "$ROOT/lyrebird-orchestrator.sh"
+    absent 'FFMPEG_LOG_DIR=[^ ]+ +(sudo +)?(\./)?lyrebird-stream-manager' <<<"$(all_code)"
+    absent 'env +([A-Z_]+=[^ ]+ +)*FFMPEG_LOG_DIR=[^ ]+ +(\./)?lyrebird-stream-manager' <<<"$(all_code)"
+    # a page that names it also names the variable that is its default
+    for p in $PAGES; do
+        [[ "$(page_text "$p")" != *"FFMPEG_LOG_DIR"* || "$(page_text "$p")" == *"MEDIAMTX_FFMPEG_DIR"* ]] || { echo "$p names FFMPEG_LOG_DIR without MEDIAMTX_FFMPEG_DIR"; return 1; }
+    done
     # FFmpeg's per-stream logs are in the state directory, where the manager writes them
     grep -q 'ffmpeg_log="${FFMPEG_PID_DIR}/${stream_path}.log"' "$ROOT/lyrebird-stream-manager.sh"
-    absent '/var/log/lyrebird/(\*|<)' <<<"$t"
+    # /var/log/lyrebird/ holds the alert log (the shipped logrotate file covers it): a page may name it
+    # as that, never as the place of a per-stream FFmpeg log
+    absent '/var/log/lyrebird/<' <<<"$t"
+    local m
+    while IFS= read -r m; do
+        [[ "$m" == *alert* ]] || { echo "/var/log/lyrebird/* is named without saying it is the alert log: $m"; return 1; }
+        [[ ! "$m" =~ FFmpeg[^.]{0,30}/var/log/lyrebird ]] || { echo "an FFmpeg log is put in /var/log/lyrebird: $m"; return 1; }
+    done < <(grep -oE '.{0,70}/var/log/lyrebird/[*].{0,70}' <<<"$t")
     [[ "$(page_text troubleshooting)" == *"/var/lib/mediamtx-ffmpeg/<stream>.log"* ]]
     # no page puts a DEFAULT_* line into audio-devices.conf (the parser rejects it)
     absent '^DEFAULT_[A-Z_]+=' <<<"$(all_code)"
@@ -427,10 +447,19 @@ manager_vars() { env -i "PATH=$PATH" "HOME=$TEST_SCRATCH" bash -c 'source "$1"; 
 
 @test "nothing in the suite sends an alert by itself, and the pages say so [DOC-02]" {
     local f
+    # a call is not a comment: the lines of a script or a config file that start with # are not scanned
+    # (config/lyrebird-logrotate.conf says in a comment that lyrebird-alerts.sh writes alerts.log)
     for f in "$ROOT"/*.sh "$ROOT"/config/*; do
         [[ "$f" == */lyrebird-alerts.sh ]] && continue
-        absent 'lyrebird-alerts|send_alert|alert_(stream|device|disk|mediamtx|network|memory|cpu)_' "$f" || { echo "$f calls the alert script"; return 1; }
+        grep -vE '^[[:space:]]*#' "$f" | absent 'lyrebird-alerts|send_alert|alert_(stream|device|disk|mediamtx|network|memory|cpu)_' || { echo "$f calls the alert script"; return 1; }
     done
+    # the scan still sees a call, in a script and in a config file, and still skips a comment
+    printf 'systemctl start x\n/path/lyrebird-alerts.sh send --level info\n' >"$TEST_SCRATCH/call.conf"
+    printf '# lyrebird-alerts.sh appends alerts.log here\n/var/log/lyrebird/*.log {\n}\n' >"$TEST_SCRATCH/comment.conf"
+    run bash -c 'grep -vE "^[[:space:]]*#" "$1" | grep -qE "lyrebird-alerts|send_alert"' _ "$TEST_SCRATCH/call.conf"
+    [ "$status" -eq 0 ]
+    run bash -c 'grep -vE "^[[:space:]]*#" "$1" | grep -qE "lyrebird-alerts|send_alert"' _ "$TEST_SCRATCH/comment.conf"
+    [ "$status" -eq 1 ]
     [[ "$(page_text components)" == *"no other LyreBirdAudio script"* ]]
     [[ "$(page_text monitoring)" == *"Nothing sends an alert unless you wire it up"* ]]
     [[ "$(page_text monitoring)" != *"What Events Trigger Alerts"* ]]

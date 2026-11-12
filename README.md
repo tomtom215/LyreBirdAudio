@@ -48,7 +48,6 @@ If you are using it in a cool or interesting way or at a large scale, please tel
 git clone https://github.com/tomtom215/LyreBirdAudio.git
 cd LyreBirdAudio
 git checkout main
-chmod +x *.sh
 
 # 2. Run guided setup (installs MediaMTX, maps devices, starts streams)
 sudo ./lyrebird-orchestrator.sh
@@ -281,10 +280,10 @@ Every script that checks its Bash version checks for 4.0 or newer (the diagnosti
 | `lyrebird-alerts.sh`, `lyrebird-storage.sh` | none | 4.2 (`declare -gA`) |
 | `lyrebird-stream-manager.sh` | none | 4.2 (`declare -g`, `[[ -v`), 4.1 (`{fd}`) |
 | `lyrebird-orchestrator.sh` | 4.0 | 4.2 (`[[ -v`) |
-| `lyrebird-mic-check.sh` | none | 4.3 (`${array[-1]}`) |
+| `lyrebird-mic-check.sh` | none | 4.2 (`declare -g`) |
 | `lyrebird-diagnostics.sh` | 4.4 | 4.2 (`declare -g`) |
 
-Treat 4.4 as the lowest version for the whole suite and 5.2 as the only one that has been run. Check yours with `bash --version`.
+`tests/test_bash_features.bats` keeps every script free of features newer than 4.2: negative array subscripts, namerefs, `wait -n`, `mapfile -d`, `${var@X}` transforms and `$EPOCHSECONDS`. Treat 4.4 as the lowest version for the whole suite and 5.2 as the only one that has been run. Check yours with `bash --version`.
 
 ### Software
 
@@ -328,7 +327,7 @@ command -v lsusb udevadm git ffmpeg arecord jq curl flock
 
 The orchestrator is a menu that runs the other scripts. Its Quick Setup Wizard has four steps:
 
-1. Install MediaMTX (`install_mediamtx.sh install`). An installer exit status of 7 ("already installed") does not stop the wizard.
+1. Install MediaMTX (`install_mediamtx.sh install`). An installer exit status of 7 ("already installed") does not stop the wizard; every other non-zero status, such as 11 (the binary could not be extracted or put in place), does.
 2. Map the USB audio devices (`usb-audio-mapper.sh`, interactive).
 3. Start the streams (`lyrebird-stream-manager.sh start`) and report the outcome per stream.
 4. Run quick diagnostics.
@@ -338,7 +337,6 @@ The orchestrator is a menu that runs the other scripts. Its Quick Setup Wizard h
 git clone https://github.com/tomtom215/LyreBirdAudio.git
 cd LyreBirdAudio
 git checkout main
-chmod +x *.sh
 
 # 2. Launch the orchestrator
 sudo ./lyrebird-orchestrator.sh
@@ -348,7 +346,7 @@ sudo ./lyrebird-orchestrator.sh
 
 The wizard does not generate an audio device configuration, does not detect hardware capabilities (both are in the menu under USB Device Management, options 4 to 6), and does not install the systemd unit or the monitor cron job. Streams it starts stop at the next reboot unless you run the `install` step below.
 
-The scripts need to be executable after a clone (`chmod +x *.sh`): the repository does not store the executable bit for all of them.
+No `chmod` is needed after a clone of `main`: every script that is run directly is committed executable (`git ls-files -s '*.sh'` shows mode 100755 for all of them). The newest tag, `v1.3.0`, was made before that: seven of its scripts are mode 100644 (`git ls-tree v1.3.0`), so after checking out that tag run `chmod +x *.sh`.
 
 ### Manual Installation
 
@@ -376,7 +374,9 @@ Notes on `install`:
 
 - It writes `/etc/systemd/system/mediamtx-audio.service` and `/etc/cron.d/mediamtx-monitor`, both rendered from `config/` next to the script, and `/etc/logrotate.d/mediamtx` when `logrotate` is installed. It stops with exit 4 if `config/mediamtx-audio.service` is missing, so run it from the checkout.
 - The unit and the cron job name the script by its absolute path at the time of `install`. If you move the checkout, run `install` again.
-- It carries `-m`, `-f` and `-n` (stream mode, multiplex filter, multiplex name) into both files. Other settings (the ports, `RTSP_AUTH_MODE`, `LYREBIRD_START_POLICY` and so on) are not written into either file; [Environment Variables](#environment-variables) says how to give them to the service and to the cron job.
+- It carries `-m`, `-f` and `-n` (stream mode, multiplex filter, multiplex name) into both files, and so it does these nine settings when they are set and differ from their defaults: `MEDIAMTX_RTSP_PORT`, `MEDIAMTX_API_PORT`, `MEDIAMTX_METRICS_PORT`, `MEDIAMTX_API_BIND`, `MEDIAMTX_METRICS_BIND`, `RTSP_AUTH_MODE`, `RTSP_USERS_FILE`, `MEDIAMTX_HOST` and `MEDIAMTX_BINARY`. They become `Environment=` lines in the unit and `NAME=value` lines in the cron file, because the service and the cron job do not inherit your shell's environment. The cron job needs them most: it brings a crashed MediaMTX back by rendering `mediamtx.yml` again, and without them it renders the defaults (port 8554, `open` authentication). Give them to `install` through `sudo env`: `sudo env RTSP_AUTH_MODE=local-only-publish MEDIAMTX_RTSP_PORT=31554 ./lyrebird-stream-manager.sh install`. A value the files cannot carry (a port that is not a number, an authentication mode other than `open` and `local-only-publish`, a path with a character outside letters, digits and `_ . / + -`) stops `install` with exit 4 before anything is written; with none of the nine set, the two files are what a plain `install` always wrote.
+- `install` writes what it is given and the defaults for the rest: it does not read the files it replaces, so a plain `install` on a node that was installed with options or settings puts the defaults back. Run it again with all of them each time. The updater's reinstall of the service does read the installed unit and cron file and passes the same settings on ([The updater](#the-updater)).
+- It does not carry the path variables (`MEDIAMTX_CONFIG_DIR`, `MEDIAMTX_PID_FILE`, `MEDIAMTX_LOCK_FILE`, the log files, `MEDIAMTX_FFMPEG_DIR`) or the audio, policy and timing settings (`AUDIO_*`, `LYREBIRD_START_POLICY` and so on). The unit's `PIDFile=`, `StandardOutput=append:` and `ReadWritePaths=` are rendered from the path variables of the shell that ran `install`, but the service itself is never given those variables, so a non-default path makes the unit name a file the manager does not use. Leave the paths at their defaults, or set them for the service and the cron job by hand ([Environment Variables](#environment-variables)).
 - `install` does not enable or start anything. The standalone `mediamtx.service` that step 1 wrote and `mediamtx-audio.service` cannot run together ([MediaMTX Integration](#which-unit-runs-mediamtx)).
 
 ### Verification
@@ -520,7 +520,7 @@ What each tier picks (read from `lyrebird-mic-check.sh`; it chooses only from wh
 | `normal` (default) | 48000 if offered, else 44100, else the highest up to 48000 | 2 if offered | 192k / 128k (256k / 192k from 96 kHz) |
 | `high` | 192000 if offered, else 96000, else 48000, else the highest | 2 if offered | 192k / 128k at 48 kHz, 256k / 160k at 96 kHz, 320k / 192k at 192 kHz |
 
-`-g` backs up an existing file first as `audio-devices.conf.backup.<YYYYmmdd_HHMMSS>` (mode 0600) and writes the new one atomically; `--list-backups` and `--restore=<timestamp>` use those backups.
+`-g` backs up an existing file first as `audio-devices.conf.backup.<YYYYmmdd_HHMMSS>` (mode 0600) and writes the new one atomically; `--list-backups` and `--restore <timestamp>` use those backups.
 
 **Manual configuration format:**
 ```bash
@@ -595,8 +595,8 @@ sudo ./lyrebird-mic-check.sh -V           # checks the file against what the car
 The stream manager reads these from its environment. Set them in one of three places, depending on how it runs:
 
 - A manual run: `sudo env STREAM_STARTUP_DELAY=20 ./lyrebird-stream-manager.sh start`.
-- The systemd service: `sudo systemctl edit mediamtx-audio`, then `[Service]` and `Environment="NAME=value"` lines, then `sudo systemctl restart mediamtx-audio`. `install` writes only `STREAM_MODE`, `MULTIPLEX_FILTER_TYPE` and `MULTIPLEX_STREAM_NAME` into the unit.
-- The monitor cron job: `NAME=value` lines above the job line of `/etc/cron.d/mediamtx-monitor`. The cron job does not inherit the unit's environment. A stream the monitor restarts is rebuilt from the monitor's environment, so a setting that changes what streams or MediaMTX do (the ports, `RTSP_AUTH_MODE`, `AUDIO_*`, `LYREBIRD_START_POLICY`) belongs in both places, or a restarted stream would use the defaults. Running `install` again (the updater does it after an update that changes the manager) rewrites the cron file, so add the lines again afterwards.
+- The systemd service: run `install` with the setting for the nine that `install` carries ([Manual Installation](#manual-installation)); for any other, `sudo systemctl edit mediamtx-audio`, then `[Service]` and `Environment="NAME=value"` lines, then `sudo systemctl restart mediamtx-audio`.
+- The monitor cron job: `NAME=value` lines above the job line of `/etc/cron.d/mediamtx-monitor`. The cron job does not inherit the unit's environment. A stream the monitor restarts is rebuilt from the monitor's environment, so a setting that changes what streams or MediaMTX do (`AUDIO_*` and the other settings `install` does not carry) belongs in both places, or a restarted stream would use the defaults. The nine settings `install` carries are written to this file by `install` itself. Running `install` again (the updater does it after an update that changes the manager) rewrites the cron file and drops the lines you added by hand, so add them again afterwards.
 
 | Variable | Default | Meaning |
 |----------|---------|---------|
@@ -1119,7 +1119,7 @@ The full and debug runs print 24 numbered sections:
 - Time and clock synchronization (NTP, chrony)
 - Process stability and crash detection; file descriptor leak detection; audio subsystem conflicts; inotify and entropy; network resources
 
-The RTSP port checked is `MEDIAMTX_PORT` (default 8554). The diagnostics do not read `MEDIAMTX_RTSP_PORT`, which the other scripts use, so on a node with a different RTSP port set both. The FFmpeg log directory it looks at (`FFMPEG_LOG_DIR`, default `/var/log/lyrebird`) is not where the stream manager writes the FFmpeg logs (`/var/lib/mediamtx-ffmpeg/`).
+The RTSP port checked is `MEDIAMTX_RTSP_PORT` (default 8554), the variable the other scripts use; `MEDIAMTX_PORT`, which only the diagnostics read, is still honoured when `MEDIAMTX_RTSP_PORT` is not set. The FFmpeg log directory it looks at is `MEDIAMTX_FFMPEG_DIR` (default `/var/lib/mediamtx-ffmpeg/`, where the stream manager writes those logs); `FFMPEG_LOG_DIR` overrides it for the diagnostics alone. It finds MediaMTX by identity (the program at `MEDIAMTX_BINARY` running the configuration file), not by a process called `mediamtx`.
 
 ### Diagnostic Exit Codes
 
@@ -1240,7 +1240,7 @@ A release built by the current release workflow carries a source tarball (`LyreB
 ./lyrebird-updater.sh                 # the interactive menu
 ```
 
-Run it as the user who owns the clone, not with `sudo`: started as root it asks for confirmation (declining exits with 9), and a clone owned by root is refused (exit 5). The menu:
+Run it as the user who owns the clone, not with `sudo`: started as root it asks for confirmation (declining exits with 9), and a clone owned by root is refused (exit 5). `--help` and `--version` answer at once, without the confirmation. The menu:
 
 | Key | Action |
 |-----|--------|
@@ -1257,7 +1257,7 @@ To follow `main`, use 2.
 **What an update does**
 
 - Asks to save your local changes in a git stash (`lyrebird-tx-...`), switches, and puts them back. If they conflict with the new version they stay in the stash and the exit status is 10; declining the question changes nothing and exits 9.
-- Stops `mediamtx-audio` first when it is running, and starts it afterwards. When `lyrebird-stream-manager.sh` changed between the two versions, it runs that script's `install` again (keeping `Environment=` lines you added to the unit). That `install` is run without `-m`, `-f` and `-n`, so on a multiplex node run it again by hand with them afterwards, or the cron file is left in individual mode.
+- Stops `mediamtx-audio` first when it is running, and starts it afterwards. When `lyrebird-stream-manager.sh` changed between the two versions, it runs that script's `install` again and keeps the node as it is: it gives `install` the stream mode, filter and name and the nine settings of [Manual Installation](#manual-installation) that the installed unit sets (for one the unit does not set, the value in the cron file), so a multiplex node stays multiplex and a node with its own ports or `RTSP_AUTH_MODE` keeps them in both files. `Environment=` lines you added to the unit are kept too. A node installed before this release has none of the nine in its files: run `install` once with them (step 4 of [Upgrading an Existing Node](#upgrading-an-existing-node)).
 - Makes every tracked `*.sh` executable, and runs the migrations for renamed files (below).
 - Keeps a journal in `<git-dir>/lyrebird-updater/` while it works. If it is killed or the power fails, the next run undoes the unfinished update (or, for a self-update, completes it). Your uncommitted changes are never discarded.
 - Checks that the files it wrote match the target version, and syntax-checks its own new version before it re-runs itself.
@@ -1266,7 +1266,7 @@ The service handling was tested against a stand-in `systemctl`; it has not run a
 
 **Rollback and history.** `--history` reads `<git-dir>/lyrebird-updater/history.log` (UTC time, kind, result, from, to). `--rollback` with no argument goes back to the version the last completed update came from; with an argument it goes to that release tag or commit, which must already be in the clone (a branch name is refused: exit 1; not in the clone: exit 6; no network is used). It is the update's own transaction, so it stops and restarts the service the same way. Rolling back to a release whose updater is older than 1.7.0 (`v1.3.0` ships 1.6.0) puts that updater in place, and that one has neither `--history` nor `--rollback`.
 
-**Lock.** Every command except `--history` takes a kernel `flock` on `<git-dir>/lyrebird-updater/updater.lock` (never removed: there is no stale lock to clean up). "Lock held by process ..." means another updater is running; wait or stop that process. After `LYREBIRD_UPDATER_LOCK_WAIT` seconds (30) the run exits 7. `flock` must be installed (exit 2 if not).
+**Lock.** Every command except `--history`, `--help` and `--version` takes a kernel `flock` on `<git-dir>/lyrebird-updater/updater.lock` (never removed: there is no stale lock to clean up). "Lock held by process ..." means another updater is running; wait or stop that process. After `LYREBIRD_UPDATER_LOCK_WAIT` seconds (30) the run exits 7. `flock` must be installed (exit 2 if not).
 
 **Network.** `--list` and the menu's checks fetch from `origin` (30 s per attempt, three attempts; `LYREBIRD_FETCH_TIMEOUT`, `LYREBIRD_FETCH_RETRIES`, `LYREBIRD_FETCH_RETRY_DELAY`). Offline, `--list` shows what the last fetch found and exits 4. `--version`, `--help`, `--status`, `--migrate`, `--history` and `--rollback` do not use the network.
 
@@ -1300,10 +1300,9 @@ Releases before the rename called the stream manager `mediamtx-stream-manager.sh
 # The updater handles the stash, the service and the checks above; by hand:
 git fetch origin
 git checkout main && git pull --ff-only     # or: git checkout <tag>
-chmod +x *.sh
 ```
 
-A manual checkout does not stop or restart the service and does not run the migrations. After it, follow [Upgrading an Existing Node](#upgrading-an-existing-node).
+A manual checkout does not stop or restart the service and does not run the migrations. After it, follow [Upgrading an Existing Node](#upgrading-an-existing-node). `v1.3.0` was made before the scripts were committed executable and also needs `chmod +x *.sh`; the updater does that itself.
 
 ---
 
@@ -1313,9 +1312,8 @@ Read this before moving a node that already streams to the code on `main`. Do th
 
 1. **Find out who runs MediaMTX now.** `systemctl is-active mediamtx mediamtx-audio` and, as root, `./install_mediamtx.sh status` (`Running (systemd)` is the standalone `mediamtx.service`, `Running (stream manager service)` is `mediamtx-audio.service`). Only one of them should be active ([Which unit runs MediaMTX](#which-unit-runs-mediamtx)).
 2. **Keep a copy of what you have**: `sudo cp -a /etc/mediamtx /root/mediamtx.before-upgrade`, and a copy of `/etc/systemd/system/mediamtx-audio.service` (or `mediamtx.service`) and `/etc/cron.d/mediamtx-monitor`.
-3. **Get the code**, as the clone's owner: `./lyrebird-updater.sh` and key `2`, or `git fetch origin && git checkout main && git pull --ff-only` followed by `chmod +x *.sh`. The newest tag does not have these changes.
-4. **Refresh the unit and the cron job** (nodes run by the stream manager). Neither is rewritten by anything but `install`:
-   `sudo ./lyrebird-stream-manager.sh install` (add `-m multiplex -f amix -n NAME` on a multiplex node), then `sudo systemctl restart mediamtx-audio`. The restart interrupts the streams for the length of a start. The new unit has `Conflicts=mediamtx.service`, `Restart=always` and a real `ExecReload` (`systemctl reload mediamtx-audio` applies a changed MediaMTX configuration without a restart).
+3. **Get the code**, as the clone's owner: `./lyrebird-updater.sh` and key `2`, or `git fetch origin && git checkout main && git pull --ff-only`. The newest tag does not have these changes.
+4. **Refresh the unit and the cron job** (nodes run by the stream manager). Neither is rewritten by anything but `install`, and a node installed before this release has none of the nine settings `install` carries (the ports, the two bind addresses, `RTSP_AUTH_MODE`, `RTSP_USERS_FILE`, `MEDIAMTX_HOST`, `MEDIAMTX_BINARY`) in them. If the node uses any of them, give them to `install`, for example `sudo env RTSP_AUTH_MODE=local-only-publish ./lyrebird-stream-manager.sh install`; add `-m multiplex -f amix -n NAME` on a multiplex node. Then `sudo systemctl restart mediamtx-audio`. The restart interrupts the streams for the length of a start. The new unit has `Conflicts=mediamtx.service`, `Restart=always` and a real `ExecReload` (`systemctl reload mediamtx-audio` applies a changed MediaMTX configuration without a restart).
 5. **Refresh the standalone `mediamtx.service`** (nodes without the stream manager). `install_mediamtx.sh update` replaces the binary only. To get the new unit and configuration run `sudo ./install_mediamtx.sh --force install` (add `-V vX.Y.Z` to keep your MediaMTX version, otherwise it installs the latest), then `sudo systemctl restart mediamtx`. The old configuration and unit are saved as `mediamtx.yml.backup.<time>` and `mediamtx.service.backup.<time>`.
 6. **Know what happens to `/etc/mediamtx/mediamtx.yml`** ([Configuration ownership](#configuration-ownership)):
    - Written by an earlier stream manager (first line `# MediaMTX Configuration - Audio Streams`): the first `start` or `reload` replaces it with the current rendering after a timestamped backup (`mediamtx.yml.<UTC time>.<nn>.bak`). Edits you made to it by hand are in the backup, not in the new file.
@@ -1325,6 +1323,7 @@ Read this before moving a node that already streams to the code on `main`. Do th
 **What can break after an upgrade**
 
 - Anything that used MediaMTX's API (port 9997) or metrics (9998) from another host. They listen on `127.0.0.1` now. `lyrebird-metrics.sh serve` also listens on `127.0.0.1` by default; a Prometheus on another host needs `--bind` ([Prometheus Metrics](#prometheus-metrics-lyrebird-metricssh)).
+- Scripts that read the exit status of `install_mediamtx.sh`. A failed extraction, an archive without the binary and a failed copy or move into place now exit `11` (they were `7`); `7` is only "already installed", "not installed", "could not stop MediaMTX" and an update that was rolled back.
 - Scripts that read the exit status of `start`. `0` now means the start policy is met; `9` is new and means no stream is publishing (before, `start` printed `[FAIL]` and still exited `0`). With no microphone plugged in, `start` used to exit `6` and not start MediaMTX; it now exits `0`, starts MediaMTX and reports `waiting_for_devices` (set `LYREBIRD_ALLOW_EMPTY_START=false` for the old behaviour). `monitor` with no microphone likewise exits `0`, not `6`. See [Stream Manager exit codes](#stream-manager-lyrebird-stream-managersh).
 - `/etc/lyrebird/storage.conf`. Earlier releases documented it but never read it; `lyrebird-storage.sh` reads it now, so retention and directory settings in an old file start to apply. Run `lyrebird-storage.sh --dry-run cleanup` before the next cron run.
 - `AUDIO_DISK_PERSIST`, `AUDIO_DISK_PATH`, `HEARTBEAT_INTERVAL`, `HARDWARE_WATCHDOG_*` and `ENABLE_HARDWARE_WATCHDOG` no longer exist. If one is set, every run logs one warning and ignores it.
@@ -1428,7 +1427,7 @@ How many microphones a given board sustains was not measured: soak-test it ([Tes
 | `STREAM_MANAGER_LOG_FILE` | 100 MiB (`MAIN_LOG_MAX_SIZE`) |
 | `/var/lib/mediamtx-ffmpeg/*.log` | 10 MiB (`FFMPEG_LOG_MAX_SIZE`) |
 
-The sizes are the values in the environment of the shell that ran `install`. `config/lyrebird-logrotate.conf` is an example you can copy to `/etc/logrotate.d/` instead; its FFmpeg stanza names `/var/log/lyrebird/`, where the stream manager does not write.
+The sizes are the values in the environment of the shell that ran `install`. `config/lyrebird-logrotate.conf` covers the logs `install` does not: `/var/log/lyrebird/*.log` (where `lyrebird-alerts.sh` writes `alerts.log`), and the orchestrator, updater, diagnostics and USB mapper logs. Copy it to `/etc/logrotate.d/lyrebird` if you want them rotated. It lists none of the three logs above, so each log has one owner; the tests check that the two files name no log in common, they do not run `logrotate`.
 
 ---
 
@@ -1440,7 +1439,7 @@ For system architecture diagrams, see the [System Overview](#system-overview) se
 
 **Why Bash?**
 
-Bash is on every target system and needs no runtime beyond the tools listed under [System Requirements](#system-requirements): no pip/npm/gem conflicts, no build process. Deployment is: clone, `chmod +x`, run.
+Bash is on every target system and needs no runtime beyond the tools listed under [System Requirements](#system-requirements): no pip/npm/gem conflicts, no build process. Deployment is: clone, run.
 
 **Why No Docker?**
 
@@ -1481,7 +1480,7 @@ Versions are the values in the scripts (`grep -m1 VERSION= <script>`).
 | lyrebird-metrics.sh | 1.4.0 | Prometheus metrics export |
 | lyrebird-storage.sh | 1.3.0 | Storage management & cleanup |
 | lyrebird-alerts.sh | 1.1.0 | Webhook alerting (called by you; nothing else in the suite sends alerts) |
-| lyrebird-common.sh | 1.1.0 | Shared library (logging, atomic writes, the MediaMTX configuration renderer) |
+| lyrebird-common.sh | 1.2.0 | Shared library (logging, atomic writes, the MediaMTX configuration renderer) |
 
 ### Configuration Files
 
@@ -1489,7 +1488,7 @@ Versions are the values in the scripts (`grep -m1 VERSION= <script>`).
 |------|---------|
 | `config/mediamtx.service` | Template of the standalone MediaMTX unit (`mediamtx.service`); `install_mediamtx.sh` renders it |
 | `config/mediamtx-audio.service` | Template of the stream manager unit (`mediamtx-audio.service`); `lyrebird-stream-manager.sh install` renders it. No watchdog (see [Reliability](#reliability-what-recovers-and-what-does-not)) |
-| `config/lyrebird-logrotate.conf` | Log rotation example for `/etc/logrotate.d/`. Its FFmpeg stanza names `/var/log/lyrebird/*.log`, but the stream manager keeps FFmpeg logs in `/var/lib/mediamtx-ffmpeg/`; the file `install` writes (`/etc/logrotate.d/mediamtx`) names the right directory |
+| `config/lyrebird-logrotate.conf` | Log rotation for `/etc/logrotate.d/` of the logs `install` does not cover: `/var/log/lyrebird/*.log` (the alert log), the orchestrator, updater, diagnostics and USB mapper logs. The MediaMTX, manager and FFmpeg logs are rotated by the file `install` writes (`/etc/logrotate.d/mediamtx`) |
 | `docs/SECURITY-GUIDE.md` | Security configuration guide (optional features) |
 
 ### Orchestrator (lyrebird-orchestrator.sh)
@@ -1505,13 +1504,13 @@ Options: `-h, --help`, `-v, --version`. It must run as root; it starts the updat
 **Features:**
 - Quick Setup Wizard: install MediaMTX, map devices, start streams, quick diagnostics. Its closing summary is decided by what the start reported (the status document and exit status), not by a process count
 - After Start All Streams or Restart All Streams: one line per stream (publishing, bytes flowing or not, the manager's `last_error`) and the next step for the exit status
-- When a delegated script fails, shows its exit status with a meaning: the stream manager's 1 to 10 and signals, the updater's 1 to 11, the installer's 7
+- When a delegated script fails, shows its exit status with a meaning: the stream manager's 1 to 10 and signals, the updater's 1 to 11, the installer's 7 and 11
 - Device capability inspection and configuration generation (USB Device Management)
 - Version Management: launch the updater, show component versions, show the update history, roll back to a previous version
 - SHA256 integrity check of the scripts it delegates to (the baseline is refreshed after an update or rollback)
 - Handles end of input on every menu; its log is rotated at 1 MiB
 
-**Limits:** the `MediaMTX:` and `Active Streams:` lines in the menu header come from a process-name scan (a process called `mediamtx`; every `ffmpeg` on the host counts as a stream), so another FFmpeg on the machine is counted. The status document is the authoritative state. The "View Stream URLs" entry prints port 8554 whatever `MEDIAMTX_RTSP_PORT` says, and "View Stream Logs (FFmpeg)" looks in `/var/log/lyrebird`, while the manager keeps those logs in `/var/lib/mediamtx-ffmpeg`.
+**What the menu header counts:** the `MediaMTX:` line is this installation's MediaMTX, found by identity (the program at `MEDIAMTX_BINARY` running the manager's configuration file), and `Active Streams:` is the number of the manager's stream wrapper processes in `MEDIAMTX_FFMPEG_DIR`; another MediaMTX or another FFmpeg on the machine is not counted, and the orchestrator needs no `pgrep`. The status document is still the authoritative state. "View Stream URLs" prints the port in `MEDIAMTX_RTSP_PORT` (8554 by default), and "View Stream Logs (FFmpeg)" in Logs & Status lists the FFmpeg logs in `MEDIAMTX_FFMPEG_DIR` (`/var/lib/mediamtx-ffmpeg` by default; `FFMPEG_LOG_DIR` overrides it).
 
 **When to Use:** initial setup, interactive troubleshooting, log viewing
 
@@ -1579,7 +1578,7 @@ sudo ./lyrebird-stream-manager.sh install
 | `monitor` | The cron job's command ([The Monitor](#the-monitor)) |
 | `install` | Writes the systemd unit and the monitor cron job ([Systemd Service Installation](#systemd-service-installation)) |
 
-**Options:** `-m, --mode individual|multiplex`, `-f, --filter amix|amerge`, `-n, --name NAME` (multiplex stream name), `--regenerate-config` (with `start` or `restart`: replace a MediaMTX configuration that is not managed, after a backup), `-d, --debug`, `-h, --help`.
+**Options:** `-m, --mode individual|multiplex`, `-f, --filter amix|amerge`, `-n, --name NAME` (multiplex stream name), `--regenerate-config` (with `start` or `restart`: replace a MediaMTX configuration that is not managed, after a backup), `-d, --debug`, `-V, --version` (prints the script's name and version, exit 0), `-h, --help`.
 
 **Start policy.** `LYREBIRD_START_POLICY` decides when `start` counts as successful. `degraded` (the default): at least one stream is publishing. `strict`: the stream of every detected device is. "Publishing" means MediaMTX's API says the path is ready after the stream had `STREAM_VALIDATION_ATTEMPTS` x `STREAM_VALIDATION_DELAY` seconds (15 by default) to appear: a running FFmpeg is not enough. A USB speaker or DAC without a capture PCM is not counted. Any other value stops the run with exit 4.
 
@@ -1665,7 +1664,7 @@ sudo systemctl enable --now mediamtx-audio
 sudo systemctl status mediamtx-audio
 ```
 
-For a multiplex node give the options to `install`: `sudo ./lyrebird-stream-manager.sh -m multiplex -f amix -n studio install`. To change the mode later, run `install` again with the new options and restart the service. `systemctl edit mediamtx-audio` is for local overrides such as extra `Environment=` lines ([Environment Variables](#environment-variables)).
+For a multiplex node give the options to `install`: `sudo ./lyrebird-stream-manager.sh -m multiplex -f amix -n studio install`. To change the mode later, run `install` again with the new options and restart the service. A node with its own ports or `RTSP_AUTH_MODE` gives those to `install` the same way (`sudo env MEDIAMTX_RTSP_PORT=31554 ./lyrebird-stream-manager.sh install`): they land in the unit and in the cron file. `systemctl edit mediamtx-audio` is for local overrides such as extra `Environment=` lines for the settings `install` does not carry ([Environment Variables](#environment-variables)).
 
 **Service Management:**
 ```bash
@@ -1683,7 +1682,7 @@ sudo systemctl disable --now mediamtx-audio
 ```
 
 **Cron Monitoring:**
-`install` also writes `/etc/cron.d/mediamtx-monitor`. It runs `monitor` every 5 minutes under `flock -n /run/mediamtx-monitor.lock`, restarts `mediamtx-audio` when the monitor exits 2, and logs other non-zero exits with `logger -t mediamtx-monitor`. The file carries `STREAM_MODE`, `MULTIPLEX_FILTER_TYPE` and `MULTIPLEX_STREAM_NAME` as `NAME=value` lines so that the monitor runs in the unit's mode.
+`install` also writes `/etc/cron.d/mediamtx-monitor`. It runs `monitor` every 5 minutes under `flock -n /run/mediamtx-monitor.lock`, restarts `mediamtx-audio` when the monitor exits 2, and logs other non-zero exits with `logger -t mediamtx-monitor`. The file carries `STREAM_MODE`, `MULTIPLEX_FILTER_TYPE` and `MULTIPLEX_STREAM_NAME` as `NAME=value` lines so that the monitor runs in the unit's mode, and the settings of [Manual Installation](#manual-installation) that differ from their defaults (the ports, the bind addresses, `RTSP_AUTH_MODE`, ...), so that a MediaMTX the monitor starts again is rendered with the node's ports and authentication, not the defaults.
 
 **Not tested:** the unit has been parsed by `systemd-analyze verify` and its write paths exercised in a mount-namespace emulation of `ProtectSystem=strict`; it has not been run by a real systemd manager (boot ordering, `Conflicts=`, `StateDirectory=`, the start limit with a late USB hub).
 
@@ -1775,15 +1774,16 @@ sudo ./lyrebird-mic-check.sh -V
 
 # List and restore backups
 ./lyrebird-mic-check.sh --list-backups
-sudo ./lyrebird-mic-check.sh --restore=20251111_123456
+sudo ./lyrebird-mic-check.sh --restore 20251111_123456   # or --restore=20251111_123456
+sudo ./lyrebird-mic-check.sh --restore                   # offers the list and asks
 ```
 
-Options: `-g, --generate-config`, `-f, --force` (with `-g`: no prompt), `--no-backup`, `--quality=low|normal|high`, `-V, --validate`, `-q, --quiet`, `--format=text|json`, `--list-backups`, `--restore[=TIMESTAMP]`, `--version`, `-h, --help`. The optional timestamp must be attached with `=`.
+Options: `-g, --generate-config`, `-f, --force` (with `-g`: no prompt), `--no-backup`, `--quality=low|normal|high`, `-V, --validate`, `-q, --quiet`, `--format=text|json`, `--list-backups`, `--restore [TIMESTAMP]`, `--version`, `-h, --help`. The timestamp is the next word or attached with `=`; without one, `--restore` offers the backups and asks.
 
 **Quality tiers:** what each picks is in the table under [Audio Device Configuration](#audio-device-configuration).
 
 **Features:**
-- Non-invasive detection via `/proc/asound`; it needs ALSA's proc files, so it exits 1 on a machine without `/proc/asound` (even for `--help`)
+- Non-invasive detection via `/proc/asound`; whatever reads the hardware exits 1 with a message on a machine without `/proc/asound`, while `--help` and `--version` do not look at the hardware and exit 0 there
 - Device busy detection without opening hardware
 - Automatic backup and restore of the device configuration
 - JSON output support
@@ -1828,7 +1828,7 @@ sudo ./lyrebird-diagnostics.sh debug
 
 **Exit Codes:** 0 passed, 1 warnings, 2 failures, 127 the script could not run.
 
-**Settings it reads:** `MEDIAMTX_CONFIG_DIR`, `MEDIAMTX_BINARY`, `MEDIAMTX_PORT` (the RTSP port, default 8554; not `MEDIAMTX_RTSP_PORT`), `FFMPEG_LOG_DIR` (default `/var/log/lyrebird`), `DIAGNOSTIC_LOG_FILE`, `DIAGNOSTIC_TIMEOUT`, `NO_COLOR`. It supports systemd fully, and OpenRC and other init systems with limits.
+**Settings it reads:** `MEDIAMTX_CONFIG_DIR`, `MEDIAMTX_BINARY`, `MEDIAMTX_RTSP_PORT` (the RTSP port, default 8554; `MEDIAMTX_PORT` is the fallback), `MEDIAMTX_FFMPEG_DIR` (the FFmpeg log directory, default `/var/lib/mediamtx-ffmpeg`; `FFMPEG_LOG_DIR` overrides it for this script), `DIAGNOSTIC_LOG_FILE`, `DIAGNOSTIC_TIMEOUT`, `NO_COLOR`. It supports systemd fully, and OpenRC and other init systems with limits.
 
 ---
 
@@ -1879,7 +1879,7 @@ sudo ./install_mediamtx.sh uninstall
 - Never selects a process by name: it signals only a process whose executable is the installed binary and whose first argument is the installed configuration, and never signals FFmpeg. If it cannot stop an active unit it stops with exit 7 instead
 - Platform detection maps the machine to the release asset name ([System Requirements](#system-requirements)); only Linux is supported by the rest of the suite
 
-**Exit Codes:** 0 success; 1 general error (unknown option or command, a write failed); 2 root required; 3 unsupported operating system or architecture; 4 a required command or `lyrebird-common.sh` is missing, or Bash older than 4; 5 download or release lookup failed; 6 checksum file missing (without `--force`) or checksum mismatch; 7 already installed, not installed, a step of the install or update failed, MediaMTX could not be stopped, or the update was rolled back; 8 the installation prefix cannot be created or written; 9 the configuration file given with `-c` is missing, or MediaMTX rejected the generated configuration; 10 an invalid port, path, account name, version or prefix.
+**Exit Codes:** 0 success; 1 general error (unknown option or command, a write failed); 2 root required; 3 unsupported operating system or architecture; 4 a required command or `lyrebird-common.sh` is missing, or Bash older than 4; 5 download or release lookup failed; 6 checksum file missing (without `--force`) or checksum mismatch; 7 already installed (`install`), not installed (`update`, `uninstall`), MediaMTX could not be stopped, or an update was rolled back because the new binary does not run or the service did not come back; 8 the installation prefix cannot be created or written; 9 the configuration file given with `-c` is missing, or MediaMTX rejected the generated configuration; 10 an invalid port, path, account name, version or prefix; 11 the binary could not be put in place: the archive does not extract or holds no binary, or the copy or the atomic move into the installation directory failed (`install` and `update`). The wizard of the orchestrator carries on after 7 from `install` and stops at any other non-zero status.
 
 ---
 
@@ -1903,6 +1903,9 @@ sudo ./install_mediamtx.sh uninstall
 
 # Show current configuration
 ./lyrebird-alerts.sh config
+
+# Print the version (also --version and -V)
+./lyrebird-alerts.sh version
 ```
 
 `send` takes `--level info|warning|error|critical`, `--title`, `--message` and `--type` (the type is part of the duplicate key).
@@ -2003,7 +2006,7 @@ For a Prometheus on another host, either start the server with `--bind <address 
 
 **The HTTP server** answers `GET /` and `GET /metrics`; any other path gets 404 and any other method 405. It is made for a poller (Prometheus scrapes every few seconds): it serves one connection at a time, each from its own `nc`, so a client that connects while another is being served, or within a few milliseconds after it, can be reset and has to try again. It needs a netcat (OpenBSD `nc`, `ncat`, traditional/GNU `nc` or BusyBox `nc`; only OpenBSD `nc` was tested against real connections), `SIGTERM` or `SIGINT` stops it, and a port that is already in use ends it with exit 2 after five attempts. For several scrapers, or anything beyond loopback, prefer `--file`.
 
-**Settings:** `LYREBIRD_API_TIMEOUT` (seconds all MediaMTX API requests of one scrape may take together; default 5; keep it below Prometheus's `scrape_timeout`), `LYREBIRD_HEARTBEAT_MAX_AGE` (900), `MEDIAMTX_BINARY`, `MEDIAMTX_CONFIG_FILE` (else `MEDIAMTX_CONFIG_DIR`/`mediamtx.yml`), `PID_FILE` (else `MEDIAMTX_PID_FILE`), `HEARTBEAT_FILE`, `FFMPEG_PID_DIR`. The exporter reads `FFMPEG_PID_DIR` while the stream manager's variable is `MEDIAMTX_FFMPEG_DIR`: if you moved that directory, set both, or the exporter finds no streams.
+**Settings:** `LYREBIRD_API_TIMEOUT` (seconds all MediaMTX API requests of one scrape may take together; default 5; keep it below Prometheus's `scrape_timeout`), `LYREBIRD_HEARTBEAT_MAX_AGE` (900), `MEDIAMTX_BINARY`, `MEDIAMTX_CONFIG_FILE` (else `MEDIAMTX_CONFIG_DIR`/`mediamtx.yml`), `PID_FILE` (else `MEDIAMTX_PID_FILE`), `HEARTBEAT_FILE`, `MEDIAMTX_FFMPEG_DIR` (the manager's directory of PID files and wrappers; `FFMPEG_PID_DIR` is the fallback). The exporter reads these in its own environment, so a node whose directory was moved gives the exporter the same `MEDIAMTX_FFMPEG_DIR` as the manager.
 
 **Exit status:** 0 every collector completed (the server: stopped by a signal); 1 command-line error; 2 nothing could be delivered (`--file` could not publish, in which case the previous file is kept; or the server cannot run); 3 the output was delivered but at least one collector failed.
 
@@ -2182,7 +2185,7 @@ The generated configuration is only as strict as these defaults. A configuration
 - **Device configuration, `storage.conf` and `alerts.conf` are read as data, never run as shell.** Wrapper scripts are generated with every value quoted and syntax-checked before they are used; stream names are reduced to `a-z 0-9 _ -` and quoted in the YAML; the unit and cron file generators refuse paths and names they cannot carry safely.
 - **Processes are identified by executable, arguments and start time**, and only processes the manager started are signalled (the one broad kill, `force-stop --kill-all --yes`, shows its list first).
 - **Downloads are verified.** `install_mediamtx.sh` checks the SHA256 checksum published with the release; a mismatch is fatal. `tests/fetch_mediamtx.sh` and the CI tools are pinned to checksums.
-- **Atomic writes.** Configuration, unit and state files are replaced by write, `fsync`, rename.
+- **Atomic writes.** The MediaMTX and device configuration files are replaced by write, `fsync`, rename; the stream manager's unit and cron file, the status document and the heartbeat by a temporary file and rename alone, so a reader never sees half a file (`docs/ADR.md`, ADR-017, says what a power cut can still do).
 - **systemd sandboxing**, with different users: the standalone `mediamtx.service` runs as the unprivileged `mediamtx` user the installer creates (`NoNewPrivileges`, `ProtectSystem=strict`, `ProtectHome`, `PrivateTmp`, a memory limit). `mediamtx-audio.service` runs **as root** (the manager signals its processes and opens `/dev/snd`) with `NoNewPrivileges`, `ProtectSystem=strict`, `PrivateTmp` and other directives; FFmpeg therefore also runs as root there.
 
 **What it does not restrict:** `mediamtx.yml` is mode 0644 (0640 when it carries password hashes), `audio-devices.conf`, the manager log and `status.json` are 0644: any local user can read them. Webhook URLs in `/etc/lyrebird/alerts.conf` are secrets; keep that file readable by root only.
@@ -2199,7 +2202,7 @@ printf '%s:sha256:%s\n' viewer "$(printf '%s' 'the password' | openssl dgst -sha
   | sudo tee /etc/mediamtx/rtsp-users.conf >/dev/null
 # keep the file readable by root only: it holds password hashes
 ```
-Then give the setting to the service and to the monitor ([Environment Variables](#environment-variables)): `RTSP_AUTH_MODE=local-only-publish` in a `systemctl edit mediamtx-audio` drop-in and as a line in `/etc/cron.d/mediamtx-monitor`, and restart the service. What to know:
+Then run `install` with the setting, which writes it into the unit and into the monitor's cron file, and restart the service: `sudo env RTSP_AUTH_MODE=local-only-publish ./lyrebird-stream-manager.sh install` (add `-m`, `-f` and `-n` on a multiplex node), then `sudo systemctl restart mediamtx-audio`. Both files need it: the monitor starts MediaMTX again when it has died, and a monitor that did not have the setting would render an open configuration. What to know:
 - A user name is `A-Za-z0-9._@-` up to 64 characters; `any` is reserved. A plaintext password, a bad hash or a duplicate stops `start` without echoing the line. A missing users file is a warning and leaves only this machine with access.
 - Publishers must connect from loopback, so `MEDIAMTX_HOST` must be `localhost`, `127.x` or `::1`; otherwise the manager warns that MediaMTX will refuse them.
 - It applies to a generated file only. For a file of your own, write MediaMTX's `authInternalUsers` yourself and **keep a password-less user restricted to `127.0.0.1` and `::1`** with publish, read, API and metrics permissions: the manager's own publishers and probes connect without credentials, and a configuration without that user stops them. [docs/SECURITY-GUIDE.md](docs/SECURITY-GUIDE.md) shows a verified example.
@@ -2335,7 +2338,7 @@ If you are in the field without internet access:
 1. **Use local backups.** Keep a USB drive with a copy of `/etc/mediamtx/`, `/etc/lyrebird/` and the udev rules file.
 2. **Backups the software makes itself:**
    - `/etc/mediamtx/mediamtx.yml.<UTC time>.<nn>.bak`: the stream manager saves the old file whenever it replaces a generated one (the newest `MEDIAMTX_CONFIG_BACKUPS`, default 5)
-   - `/etc/mediamtx/audio-devices.conf.backup.<YYYYmmdd_HHMMSS>`: `lyrebird-mic-check.sh -g` saves the old file first; `--list-backups` lists them, `--restore=<timestamp>` restores one
+   - `/etc/mediamtx/audio-devices.conf.backup.<YYYYmmdd_HHMMSS>`: `lyrebird-mic-check.sh -g` saves the old file first; `--list-backups` lists them, `--restore <timestamp>` restores one
    - `mediamtx.yml.backup.<time>` and `mediamtx.service.backup.<time>`, written by `install_mediamtx.sh` next to what it replaced; `/usr/local/bin/mediamtx.backup.<time>` (the last three) before an update
 3. **Restore a MediaMTX configuration:** `sudo cp /etc/mediamtx/mediamtx.yml.<time>.<nn>.bak /etc/mediamtx/mediamtx.yml`. A restored copy of a generated file still carries the managed marker, so the manager rewrites it again when its rendering differs; delete the first line if the restored file must stay as it is.
 4. **Restart the service:** `sudo systemctl restart mediamtx-audio`
@@ -2541,7 +2544,7 @@ For version history and release notes, see **[CHANGELOG.md](CHANGELOG.md)**.
 
 ### Testing
 
-The tests are [bats](https://github.com/bats-core/bats-core) files in `tests/`. At the time of this README, `tests/` held **1732 tests in 85 files**, not counting the documentation checks in `tests/test_docs_*.bats` (`bats --count tests/` gives the current number including them). They run the real scripts: against fake `/proc/asound`, `/dev/snd` and sysfs trees, stand-ins for `systemctl`, `curl` and `arecord`, real `git` repositories with injected failures, real FFmpeg, and, in the live tests, real MediaMTX binaries.
+The tests are [bats](https://github.com/bats-core/bats-core) files in `tests/`. At the time of this README, `tests/` held **1790 tests in 95 files**, not counting the documentation checks in `tests/test_docs_*.bats` (`bats --count tests/` gives the current number including them). They run the real scripts: against fake `/proc/asound`, `/dev/snd` and sysfs trees, stand-ins for `systemctl`, `curl` and `arecord`, real `git` repositories with injected failures, real FFmpeg, and, in the live tests, real MediaMTX binaries.
 
 ```bash
 bats tests/                                      # everything that does not need the live setup
@@ -2553,9 +2556,10 @@ LYREBIRD_LEAK_CHECK_HOST=1 tests/check_tmp_leaks.sh   # also fails if the run ch
 ```bash
 LYREBIRD_TEST_MEDIAMTX_BINS="$(tests/fetch_mediamtx.sh)" bats tests/test_mediamtx_live.bats tests/test_soak_live.bats \
     tests/test_soak_observer.bats tests/test_mediamtx_config_live.bats tests/test_mediamtx_api_live.bats \
-    tests/test_mediamtx_e2e_ports.bats tests/test_install_mediamtx_live.bats
+    tests/test_mediamtx_e2e_ports.bats tests/test_install_mediamtx_live.bats tests/test_stream_names.bats \
+    tests/test_docs_security.bats
 ```
-`tests/fetch_mediamtx.sh` downloads MediaMTX 1.15.0, 1.18.0, 1.19.0, 1.21.1, 1.21.2 and 1.21.3 for linux/amd64 and checks each against a pinned SHA-256; with `latest` it fetches the newest upstream release and verifies it against the checksum file published with that release. The live tests need `ffmpeg`, `curl`, `jq`, `openssl` and `python3`. Some also need root or passwordless `sudo` for `unshare --net --pid --fork --mount-proc` and overlay mounts, and skip with a message without them. The two soak live files need the default ports 8554 and 9997 free and refuse to run while another MediaMTX or RTSP FFmpeg is running; the other live files take free ports (`LYREBIRD_TEST_PORT_BASE=N` pins them to `N`..`N+12`).
+`tests/fetch_mediamtx.sh` downloads MediaMTX 1.15.0, 1.18.0, 1.19.0, 1.21.1, 1.21.2 and 1.21.3 for linux/amd64 and checks each against a pinned SHA-256; with `latest` it fetches the newest upstream release and verifies it against the checksum file published with that release. `tests/test_stream_names.bats` (four of its tests are live: the stream-name matrix, `runOnInit` injection, quoted keys and `all_others`) and `tests/test_docs_security.bats` (it loads every YAML block of the security guide into each binary that has `--validate-conf`) run in CI once per pinned version too; without the variable their live parts do not run. The live tests need `ffmpeg`, `curl`, `jq`, `openssl` and `python3`. Some also need root or passwordless `sudo` for `unshare --net --pid --fork --mount-proc` and overlay mounts, and skip with a message without them. The two soak live files need the default ports 8554 and 9997 free and refuse to run while another MediaMTX or RTSP FFmpeg is running; the other live files take free ports (`LYREBIRD_TEST_PORT_BASE=N` pins them to `N`..`N+12`).
 
 **The host-state check.** `LYREBIRD_LEAK_CHECK_HOST=1` makes `tests/check_tmp_leaks.sh` record the LyreBird paths of the machine (`/var/log/lyrebird*`, `/var/log/mediamtx*`, `/var/lib/lyrebird`, `/var/lib/mediamtx-ffmpeg`, `/run/lyrebird*`, `/run/mediamtx*`, `/etc/lyrebird`, `/etc/mediamtx`, `/etc/cron.d/mediamtx*`, `/etc/systemd/system/mediamtx*`, `/etc/logrotate.d/*`, `/dev/shm/lyrebird*`, the repository working tree) before and after the run and fail with a diff if anything changed. It cannot tell the suite's writes from anyone else's, so use it on CI and disposable machines; it refuses to run (exit 2) where a LyreBird unit is active or the monitor cron job is installed. Any value other than unset, `0` or `1` is refused.
 
@@ -2598,9 +2602,6 @@ done
 for script in *.sh; do
     bash -n "$script" || echo "$script has syntax errors"
 done
-
-# Make scripts executable
-chmod +x *.sh
 ```
 
 ### Code Style Guidelines

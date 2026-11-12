@@ -164,24 +164,84 @@ squeeze() {
     grep -qF 'plaintext' "$GUIDE"
 }
 
-@test "the guide says the unit and the cron file do not carry the authentication variables, and the generated unit and cron file really do not [DOC-01]" {
-    run bash -c 'source "$1/lyrebird-stream-manager.sh" >/dev/null 2>&1; render_monitor_cron; render_systemd_unit' _ "$ROOT"
-    [ "$status" -eq 0 ]
-    local var
-    for var in RTSP_AUTH_MODE RTSP_USERS_FILE MEDIAMTX_API_BIND MEDIAMTX_METRICS_BIND MEDIAMTX_RTSP_PORT; do
-        ! grep -qF "$var" <<<"$output" || {
-            echo "$var is now carried by the unit or the cron file: update the guide's instructions for it"
-            return 1
-        }
-    done
+# scratch_install [NAME=value ...]: the stream manager's own `install` command, with the given settings in its
+# environment (what `sudo env NAME=value ./lyrebird-stream-manager.sh install` does), writing under a scratch
+# system root: a copy of the script, the library and the unit template; without root the copy skips the one
+# root check. Sets $status and $output (run) and SCRATCH_UNIT and SCRATCH_CRON, the two files it writes.
+scratch_install() {
+    local d="$TEST_SCRATCH/inst" root="$TEST_SCRATCH/sysroot"
+    rm -rf "$d" "$root"
+    mkdir -p "$d/config" "$d/shim" "$root/etc/systemd/system" "$root/etc/cron.d" "$TEST_SCRATCH/cfg"
+    cp "$ROOT/lyrebird-stream-manager.sh" "$ROOT/lyrebird-common.sh" "$d/"
+    cp "$ROOT/config/mediamtx-audio.service" "$d/config/"
+    if [[ "$EUID" -ne 0 ]]; then
+        sed -i 's/if \[\[ \${EUID} -ne 0 \]\]; then/if false; then/' "$d/lyrebird-stream-manager.sh"
+        grep -q 'if false; then' "$d/lyrebird-stream-manager.sh"
+    fi
+    printf '#!/bin/bash\ncase "$1" in is-active | is-enabled) exit 3 ;; *) exit 0 ;; esac\n' >"$d/shim/systemctl"
+    chmod +x "$d/lyrebird-stream-manager.sh" "$d/shim/systemctl"
+    run env -u RTSP_AUTH_MODE -u RTSP_USERS_FILE -u MEDIAMTX_HOST -u MEDIAMTX_BINARY -u MEDIAMTX_RTSP_PORT -u MEDIAMTX_API_PORT \
+        -u MEDIAMTX_METRICS_PORT -u MEDIAMTX_API_BIND -u MEDIAMTX_METRICS_BIND -u STREAM_MODE \
+        PATH="$d/shim:$PATH" LYREBIRD_SYSROOT="$root" "$@" bash "$d/lyrebird-stream-manager.sh" install </dev/null
+    SCRATCH_UNIT="$root/etc/systemd/system/mediamtx-audio.service"
+    SCRATCH_CRON="$root/etc/cron.d/mediamtx-monitor"
+}
+
+@test "the guides tell the reader to give RTSP_AUTH_MODE to install, which writes it into the unit and the cron file, and the documented command really does [DOC-01]" {
+    # the documented invocation, as the guide and the page show it
+    scratch_install RTSP_AUTH_MODE=local-only-publish
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    grep -qxF 'Environment="RTSP_AUTH_MODE=local-only-publish"' "$SCRATCH_UNIT"
+    grep -qxF 'RTSP_AUTH_MODE=local-only-publish' "$SCRATCH_CRON"
+    # the cron file is what cron puts into the monitor's environment: the variable is one of its assignments
+    sed -n '/^CRON=1$/,/^$/p' "$SCRATCH_CRON" | grep -qxF 'RTSP_AUTH_MODE=local-only-publish'
+    grep -qF 'sudo env RTSP_AUTH_MODE=local-only-publish ./lyrebird-stream-manager.sh install' "$GUIDE"
+    grep -qF 'sudo env RTSP_AUTH_MODE=local-only-publish ./lyrebird-stream-manager.sh install' "$HTML"
+    grep -qF 'grep -n RTSP_AUTH_MODE /etc/systemd/system/mediamtx-audio.service /etc/cron.d/mediamtx-monitor' "$GUIDE"
+    grep -qF 'grep -n RTSP_AUTH_MODE /etc/systemd/system/mediamtx-audio.service /etc/cron.d/mediamtx-monitor' "$HTML"
+    # install writes what it is given: the same command without the variable puts both files back to the default
+    scratch_install
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    no_match -F RTSP_AUTH_MODE "$SCRATCH_UNIT" "$SCRATCH_CRON"
+    grep -qF 'writes what it is given' "$GUIDE"
+    grep -qF 'writes what it is given' "$HTML"
+    # a mode install does not know stops it, with exit 4 and nothing written
+    scratch_install RTSP_AUTH_MODE=everyone
+    [ "$status" -eq 4 ]
+    [ ! -e "$SCRATCH_UNIT" ] && [ ! -e "$SCRATCH_CRON" ]
+    grep -qF 'exit 4' "$GUIDE"
+    grep -qF 'exit 4' "$HTML"
+    # and the claims of the earlier text are gone: no drop-in plus sed pair, no "neither file carries it"
+    no_match -F 'do **not** carry this variable' "$GUIDE"
+    no_match -F 'CRON=1' "$GUIDE" "$HTML"
+    no_match -F 'Neither the unit nor the cron file carries it' "$HTML"
+    no_match -F 'Repeat the <code>sed</code> command' "$HTML"
+    no_match -F 'repeat the second command' "$GUIDE"
     grep -qF '/etc/cron.d/mediamtx-monitor' "$GUIDE"
-    grep -qF 'rewrites the cron file' "$GUIDE"
-    grep -qF 'systemctl edit mediamtx-audio' "$GUIDE"
     grep -qF '/etc/cron.d/mediamtx-monitor' "$HTML"
-    # the sed command of the guide edits the line the generated cron file really has
-    run bash -c 'source "$1/lyrebird-stream-manager.sh" >/dev/null 2>&1; render_monitor_cron' _ "$ROOT"
-    grep -qx 'CRON=1' <<<"$output"
-    grep -qF "s/^CRON=1\$/&\\nRTSP_AUTH_MODE=local-only-publish/" "$GUIDE"
+}
+
+@test "the guides name the nine settings the manager's install carries, the updater passes the same ones, and each reaches both files [DOC-01]" {
+    local names n updater_list
+    names="$(bash -c 'source "$1/lyrebird-stream-manager.sh" >/dev/null 2>&1; printf "%s\n" "${UNIT_CARRIED_SETTINGS[@]}"' _ "$ROOT")"
+    [ "$(wc -l <<<"$names")" -eq 9 ] || { echo "the manager carries $(wc -l <<<"$names") settings, the guides say nine: $names"; return 1; }
+    updater_list="$(sed -n '/^readonly INSTALL_SETTING_VARS=(/,/)$/p' "$ROOT/lyrebird-updater.sh")"
+    for n in $names; do
+        grep -qF "$n" "$GUIDE" || { echo "the guide does not name $n"; return 1; }
+        grep -qF "$n" "$HTML" || { echo "security.html does not name $n"; return 1; }
+        grep -qw "$n" <<<"$updater_list" || { echo "the updater does not pass $n to install"; return 1; }
+    done
+    grep -qF 'carries these nine settings and no others' "$GUIDE"
+    grep -qF 'carries these nine settings and no others' "$HTML"
+    # each of them, at a non-default value, is in the unit and in the cron file
+    scratch_install MEDIAMTX_RTSP_PORT=41554 MEDIAMTX_API_PORT=41997 MEDIAMTX_METRICS_PORT=41998 MEDIAMTX_API_BIND=127.0.0.2 \
+        MEDIAMTX_METRICS_BIND= RTSP_AUTH_MODE=local-only-publish "RTSP_USERS_FILE=$TEST_SCRATCH/users.conf" MEDIAMTX_HOST=127.0.0.1 \
+        "MEDIAMTX_BINARY=$TEST_SCRATCH/no-mediamtx"
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    for n in $names; do
+        grep -qE "^Environment=\"${n}=" "$SCRATCH_UNIT" || { echo "the unit does not carry $n"; return 1; }
+        grep -qE "^${n}=" "$SCRATCH_CRON" || { echo "the cron file does not carry $n"; return 1; }
+    done
 }
 
 @test "Option 2 states which MediaMTX versions honour the MTX_ override and uses a placeholder nobody can match [DOC-01]" {
@@ -490,4 +550,20 @@ PY
     grep -qE '^## Reporting a Vulnerability$' "$POLICY"
     grep -qE '^## What Is Not Covered$' "$POLICY"
     [ -f "$ROOT/CHANGELOG.md" ]
+}
+
+@test "SECURITY.md says a restart by cron keeps the node's settings, and install really writes them into both files [DOC-04]" {
+    local flat
+    flat="$(tr '\n' ' ' <"$POLICY" | tr -s ' ')"
+    grep -qF 'A restart by cron keeps the node' <<<"$flat"
+    grep -qF 'into both the service unit and the monitor' <<<"$flat"
+    grep -qF 'must run `install` again with them' <<<"$flat"
+    grep -qF 'RTSP_AUTH_MODE' "$POLICY"
+    # the claim: the settings reach the unit and the cron file, so the monitor's restart keeps them
+    scratch_install RTSP_AUTH_MODE=local-only-publish MEDIAMTX_API_PORT=41997 MEDIAMTX_METRICS_BIND=127.0.0.2
+    [ "$status" -eq 0 ] || { echo "$output"; return 1; }
+    grep -qxF 'Environment="RTSP_AUTH_MODE=local-only-publish"' "$SCRATCH_UNIT"
+    grep -qxF 'RTSP_AUTH_MODE=local-only-publish' "$SCRATCH_CRON"
+    grep -qxF 'MEDIAMTX_API_PORT=41997' "$SCRATCH_CRON"
+    grep -qxF 'MEDIAMTX_METRICS_BIND=127.0.0.2' "$SCRATCH_CRON"
 }

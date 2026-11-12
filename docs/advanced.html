@@ -93,7 +93,7 @@ sudo ./lyrebird-stream-manager.sh start</code></pre>
     <h3>Emergency Field Recovery (No Internet)</h3>
     <p>If in the field without internet access:</p>
     <ul>
-      <li><strong>Per-device configuration backups</strong>: <code>lyrebird-mic-check.sh</code> saves <code>/etc/mediamtx/audio-devices.conf.backup.&lt;YYYYmmdd_HHMMSS&gt;</code> before it overwrites the file. <code>sudo ./lyrebird-mic-check.sh --list-backups</code> lists them and <code>sudo ./lyrebird-mic-check.sh --restore</code> restores one. No script creates an <code>audio-devices.conf.bak</code>.</li>
+      <li><strong>Per-device configuration backups</strong>: <code>lyrebird-mic-check.sh</code> saves <code>/etc/mediamtx/audio-devices.conf.backup.&lt;YYYYmmdd_HHMMSS&gt;</code> before it overwrites the file. <code>sudo ./lyrebird-mic-check.sh --list-backups</code> lists them and <code>sudo ./lyrebird-mic-check.sh --restore TIMESTAMP</code> restores that one (without a timestamp it lists them and asks). No script creates an <code>audio-devices.conf.bak</code>.</li>
       <li><strong>MediaMTX configuration backups</strong>: when the stream manager replaces a generated <code>mediamtx.yml</code> it keeps the old one as <code>mediamtx.yml.&lt;UTC stamp&gt;.&lt;nn&gt;.bak</code> (the newest 5); the installer saves <code>mediamtx.yml.backup.&lt;YYYYmmdd-HHMMSS&gt;</code>. Copy one back over <code>/etc/mediamtx/mediamtx.yml</code> and restart.</li>
       <li><strong>Software versions</strong>: <code>./lyrebird-updater.sh --history</code> and <code>./lyrebird-updater.sh --rollback [VERSION]</code> need no network when the version is already in the clone.</li>
       <li><strong>Keep your own copy</strong> of a known-good configuration on a USB drive (see <a href="#backup">Backup &amp; Restore</a>).</li>
@@ -148,8 +148,8 @@ sudo ./lyrebird-stream-manager.sh start</code></pre>
 # Or by hand (no service handling, no rollback)
 git fetch --tags origin
 git checkout main
-git pull --ff-only
-chmod +x *.sh</code></pre>
+git pull --ff-only</code></pre>
+    <p>No <code>chmod</code> is needed: the scripts are committed executable. The tag <code>v1.3.0</code> predates that (seven of its scripts are mode 100644), so run <code>chmod +x *.sh</code> after checking it out; the updater does that for you.</p>
 
     <h3>Switch to a Specific Version</h3>
     <pre><code># Via the updater
@@ -159,8 +159,7 @@ chmod +x *.sh</code></pre>
 
 # Or by hand
 git fetch --tags
-git checkout vX.Y.Z
-chmod +x *.sh</code></pre>
+git checkout vX.Y.Z</code></pre>
 
     <h3>History and Rollback</h3>
     <pre><code># What was installed when, and any update that did not finish (local, no network)

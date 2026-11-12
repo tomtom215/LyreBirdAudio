@@ -119,9 +119,11 @@
       </table>
     </div>
     <p>
-      The RTSP port it uses comes from <code>MEDIAMTX_PORT</code> (default 8554). It ignores <code>MEDIAMTX_RTSP_PORT</code>, so on a node
-      with another RTSP port set both, or the port checks look at the wrong port. It finds the MediaMTX process by matching the
-      binary path against every command line (<code>pgrep -f</code>), so a process that merely mentions that path is reported as MediaMTX.
+      The RTSP port it uses comes from <code>MEDIAMTX_RTSP_PORT</code> (default 8554), the variable the other scripts use; <code>MEDIAMTX_PORT</code>
+      is the fallback when <code>MEDIAMTX_RTSP_PORT</code> is not set. The FFmpeg log directory it checks is <code>MEDIAMTX_FFMPEG_DIR</code>
+      (default <code>/var/lib/mediamtx-ffmpeg</code>, where the manager writes those logs); <code>FFMPEG_LOG_DIR</code> overrides it. It finds the MediaMTX
+      process by identity, the program at <code>MEDIAMTX_BINARY</code> running the configuration file, so a process that merely mentions that path or is
+      called <code>mediamtx</code> is not taken for it.
     </p>
 
     <h2 id="monitor">The Cron Monitor</h2>
@@ -129,6 +131,8 @@
       <code>sudo ./lyrebird-stream-manager.sh install</code> writes <code>/etc/cron.d/mediamtx-monitor</code>, which runs
       <code>lyrebird-stream-manager.sh monitor</code> every 5 minutes under <code>flock</code>. The cron line acts on the exit status:
       2 restarts <code>mediamtx-audio</code>; any other non-zero status is only logged with <code>logger</code>. The wizard does not write this file.
+      The file also carries the stream mode and, when they differ from the defaults, the ports, bind addresses and <code>RTSP_AUTH_MODE</code> the node was installed with
+      (see <a href="configuration.html#env-vars">Configuration</a>), because the monitor starts a MediaMTX that has died by rendering its configuration again.
     </p>
 
     <h3>What One Run Does</h3>
@@ -231,8 +235,9 @@
     <p>
       <code>sudo ./lyrebird-stream-manager.sh install</code> writes <code>/etc/logrotate.d/mediamtx</code> (when logrotate is installed), which
       rotates the MediaMTX log, the manager log and the FFmpeg logs in <code>/var/lib/mediamtx-ffmpeg</code>. The file
-      <code>config/lyrebird-logrotate.conf</code> is an alternative that lists the same MediaMTX and manager logs as well as the other scripts' logs;
-      install one of the two, not both, since they name the same files.
+      <code>config/lyrebird-logrotate.conf</code> covers the logs that file does not: <code>/var/log/lyrebird/*.log</code> (the alert log) and the orchestrator,
+      updater, diagnostics and USB mapper logs. Copy it to <code>/etc/logrotate.d/lyrebird</code> if you want those rotated; it lists none of the logs of the
+      first file, so each log has one owner (the tests check that the two files name no log in common; they do not run <code>logrotate</code>).
     </p>
 
     <h2 id="prometheus">Prometheus Metrics</h2>

@@ -6,7 +6,7 @@ This document records significant architectural decisions made during the develo
 
 **Date**: April 2025
 **Status**: Accepted
-**Note (2026-11)**: Most scripts refuse to start on a Bash older than 4.0, the soak harness on one older than 4.2, and the diagnostics report one older than 4.4 as a failure. `lyrebird-mic-check.sh` uses `${array[-1]}`, which needs Bash 4.3. Only Bash 5.2 has been run by the test suite and CI, so nothing proves the older range.
+**Note (2026-11)**: Most scripts refuse to start on a Bash older than 4.0, the soak harness on one older than 4.2, and the diagnostics report one older than 4.4 as a failure. Several scripts use features from Bash 4.1 and 4.2 that a 4.0 check does not cover (the README's table lists them); a static test, `tests/test_bash_features.bats`, keeps every script free of anything newer than 4.2 (negative array subscripts, namerefs, `wait -n`, `mapfile -d`, `${var@X}` transforms, `$EPOCHSECONDS`). Only Bash 5.2 has been run by the test suite and CI, so nothing proves the older range.
 
 ### Context
 We needed to choose an implementation language for LyreBirdAudio's automation and management scripts.
@@ -314,6 +314,7 @@ The stream manager owns MediaMTX and its FFmpeg children through one unit, `medi
 - On a node started by code from before this change, the first `stop` can refuse because MediaMTX and FFmpeg hold the old lock; `systemctl restart` works.
 - After a SIGKILL of the manager the lock is free at once, except while an external command it was running at that instant (`sleep`, `curl`) still holds the descriptor.
 - Without `/proc` nothing can be proven, so the installer signals nothing there. The metrics exporter needs root to identify other users' processes.
+- The orchestrator's header and the diagnostics find MediaMTX by the same rule, and the orchestrator counts the manager's wrappers by it: `lyrebird_mediamtx_pids` and `lyrebird_stream_wrapper_pids` in `lyrebird-common.sh` (X-54). The orchestrator no longer needs `pgrep`, and another FFmpeg on the host is not counted as a stream.
 
 ---
 
@@ -426,7 +427,9 @@ The three variables are read once and used by the renderer, the readiness and st
 - **Rejected: falling back to the default on an invalid value.** A typo would move a listener without a word.
 
 ### Consequences
-- `lyrebird-stream-manager.sh install` writes no port variable into the unit or the cron file, and rewrites the cron file each time: a node with other ports must repeat that by hand after each `install`.
+- `lyrebird-stream-manager.sh install` writes the three ports, `MEDIAMTX_API_BIND`, `MEDIAMTX_METRICS_BIND`, `RTSP_AUTH_MODE`, `RTSP_USERS_FILE`, `MEDIAMTX_HOST` and `MEDIAMTX_BINARY` into the unit (`Environment=`) and the cron file (`NAME=value`) when they differ from their defaults (X-58). The service and the cron monitor do not inherit the shell's environment, and a cron restart of a crashed MediaMTX renders the configuration again: without the settings it rendered the defaults, which put the ports back and dropped `RTSP_AUTH_MODE=local-only-publish`. A value the two files cannot carry stops `install` with exit 4 before anything is written; with none of the settings given the two files are what a plain `install` always wrote.
+- `install` writes what it is given and does not read the files it replaces, so a plain `install` writes the defaults: it keeps no earlier mode or setting. The updater's service reinstall is the command that keeps a node's mode and settings: it reads them from the installed unit, or the cron file, and passes them back to `install` (X-52).
+- Not carried: the path variables (`MEDIAMTX_CONFIG_DIR`, the PID, lock and log files, `MEDIAMTX_FFMPEG_DIR`) and the audio and policy settings. The unit's `PIDFile=`, `StandardOutput=append:` and `ReadWritePaths=` are rendered from the path variables of the shell that ran `install`, but the service never receives those variables, so a non-default path makes the unit name files the manager does not use (X-59, `wontfix` in the register).
 - Live tests allocate free ports per test (`tests/mediamtx_live_helper.bash`) and move MediaMTX's other listeners with its `MTX_*` environment overrides; only the two soak live test files still bind 8554 and 9997.
 
 ---

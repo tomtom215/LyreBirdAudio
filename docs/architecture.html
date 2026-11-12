@@ -42,7 +42,7 @@
     <p>
       Bash is pre-installed on virtually every Linux system. Choosing Bash means: no pip/npm/gem
       conflicts, no build processes, no containers. Deployment is:
-      <em>git clone, chmod +x, run</em>. The scripts check for Bash 4.0 or newer (the diagnostics for 4.4); the project's tests run on Bash 5.2 only.
+      <em>git clone, run</em>. The scripts check for Bash 4.0 or newer (the diagnostics for 4.4); the project's tests run on Bash 5.2 only.
     </p>
 
     <h3>Why Not Docker?</h3>
@@ -192,7 +192,7 @@ Run on their own (the orchestrator does not call them, and neither does the moni
       <li><strong>MediaMTX configuration.</strong> One generator (<code>lyrebird_render_mediamtx_config</code> in the shared library) serves the stream manager and the installer. A file whose first line is <code># Managed by LyreBirdAudio</code> is ours and is rewritten, validated first, after a timestamped backup; any other file is the operator's and is never written. The rules are on <a href="configuration.html#mediamtx-config">Configuration</a>.</li>
       <li><strong>Device configuration.</strong> <code>audio-devices.conf</code> is parsed as data by an allowlist parser: unknown keys, bad values and shell syntax are reported with file, line and key, and never executed. One parser serves <code>validate</code>, <code>start</code>, <code>restart</code> and <code>monitor</code>.</li>
       <li><strong>Generated wrapper scripts.</strong> Every value reaches a wrapper through <code>printf %q</code>, so a value is a quoted word and never code. The wrapper is checked with <code>bash -n</code> and installed by rename, so a running wrapper is never rewritten under its feet.</li>
-      <li><strong>Durable writes.</strong> Files the suite replaces (MediaMTX configuration, device configuration, the unit and cron files) go through <code>lyrebird_atomic_write</code>: a temporary file in the same directory, fsync, rename, fsync of the directory. Whether a power cut leaves the file intact depends on the storage and was not tested.</li>
+      <li><strong>Durable writes.</strong> The MediaMTX configuration and the device configuration go through <code>lyrebird_atomic_write</code>: a temporary file in the same directory, fsync, rename, fsync of the directory. The stream manager's unit and cron files, the status document and the heartbeat are written to a temporary file and renamed, without fsync, so a reader never sees half a file. Whether a power cut leaves a file intact depends on the storage and was not tested.</li>
     </ul>
 
     <h2 id="data-flow">Data Flow</h2>
