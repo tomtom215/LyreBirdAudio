@@ -28,6 +28,8 @@
 #                                    a status document the manager writes into
 #                                    $LYREBIRD_STATUS_FILE for start / restart, or prints for
 #                                    `status --json` (unset: nothing is written / printed)
+#   STUB_UPDATER_REWRITES=FILE       an updater `--rollback` appends a line to FILE (it rewrites
+#                                    the scripts on disk, as a real rollback does)
 #   STUB_PGREP_MEDIAMTX=1, STUB_PGREP_FFMPEG=N
 #                                    the pgrep stand-in sees MediaMTX / N FFmpeg processes;
 #                                    with STUB_PGREP_ONLY_AFTER_START=1 only once a stream
@@ -57,6 +59,9 @@ printf '%s %s\n' "$key" "$*" >>"$ORCH_CALLS"
 cmd="${1:-none}"
 if [[ "$key" == stream_manager && "$cmd" == start ]]; then
     : >"$ORCH_DIR/started"
+fi
+if [[ "$key" == updater && "$cmd" == --rollback && -n "${STUB_UPDATER_REWRITES:-}" ]]; then
+    echo "# rewritten by the updater" >>"$STUB_UPDATER_REWRITES"
 fi
 if [[ "$cmd" == status && "${2:-}" == --json ]]; then
     cmd=status_json
@@ -177,5 +182,5 @@ orch_run() {
         done
         printf '%s\n' "$1"
     } >"$ORCH_DIR/harness.sh"
-    run python3 -I "$ORCH_ROOT/tests/helpers/pty_run.py" --timeout 90 "${steps[@]}" -- /bin/bash "$ORCH_DIR/harness.sh"
+    run python3 -I "$ORCH_ROOT/tests/helpers/pty_run.py" --timeout "${ORCH_PTY_TIMEOUT:-90}" "${steps[@]}" -- /bin/bash "$ORCH_DIR/harness.sh"
 }

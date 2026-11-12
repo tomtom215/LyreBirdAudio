@@ -2263,6 +2263,144 @@ menu_diagnostics() {
     done
 }
 
+# Where the updater keeps its state (lock, update history, transaction journal):
+# a directory inside the git directory, derived exactly as lyrebird-updater.sh does
+# for a checkout or a linked worktree. Prints nothing and returns 1 when this is
+# not a git checkout. (git itself is not asked: run as root on a checkout another
+# user owns, it refuses with "dubious ownership".)
+updater_state_dir() {
+    local dot_git="${SCRIPT_DIR}/.git" line="" gitdir=""
+
+    if [[ -d "$dot_git" ]]; then
+        gitdir="$dot_git"
+    elif [[ -f "$dot_git" ]] && IFS= read -r line <"$dot_git" && [[ "$line" == "gitdir: "* ]]; then
+        gitdir="${line#gitdir: }"
+        [[ "$gitdir" == /* ]] || gitdir="${SCRIPT_DIR}/${gitdir}"
+    else
+        return 1
+    fi
+    printf '%s/lyrebird-updater' "$gitdir"
+}
+
+# The version `lyrebird-updater.sh --rollback` with no version goes back to: the
+# one the last completed update, rollback or reset came from, read from the
+# updater's history log with the updater's own selection (history_last_change).
+# Sets ROLLBACK_FROM_COMMIT (a hash) and ROLLBACK_FROM_LABEL (tag, branch or
+# short hash, "" if none); returns 1 when there is none.
+ROLLBACK_FROM_COMMIT=""
+ROLLBACK_FROM_LABEL=""
+updater_previous_version() {
+    local dir="" file="" line=""
+
+    ROLLBACK_FROM_COMMIT=""
+    ROLLBACK_FROM_LABEL=""
+    dir="$(updater_state_dir)" || return 1
+    file="${dir}/history.log"
+    [[ -f "$file" && -r "$file" ]] || return 1
+    line="$(awk -F'\t' '$3 == "ok" && ($2 == "update" || $2 == "rollback" || $2 == "reset") {line = $0} END {if (line != "") print line}' "$file" 2>/dev/null)" || line=""
+    [[ -n "$line" ]] || return 1
+    IFS=$'\t' read -r _ _ _ ROLLBACK_FROM_COMMIT ROLLBACK_FROM_LABEL _ <<<"$line"
+    # "-" when an older updater did not record it
+    if [[ ! "$ROLLBACK_FROM_COMMIT" =~ ^[0-9a-f]{7,64}$ ]]; then
+        ROLLBACK_FROM_COMMIT=""
+        ROLLBACK_FROM_LABEL=""
+        return 1
+    fi
+    if [[ "$ROLLBACK_FROM_LABEL" == "-" || ! "$ROLLBACK_FROM_LABEL" =~ ^[A-Za-z0-9._/+-]+$ ]]; then
+        ROLLBACK_FROM_LABEL=""
+    fi
+    return 0
+}
+
+# Version Management, option 4: go back to a version that is already on this
+# node, with `lyrebird-updater.sh --rollback` (the updater's own transaction, no
+# network). Says which version it will go to and asks before it does.
+rollback_to_previous_version() {
+    local answer="" target="" have_previous=false
+    local -a version_args=()
+
+    echo
+    echo -e "${BOLD}Roll Back to a Previous Version${NC}"
+    echo
+    info "A rollback returns this installation to a release tag or commit that is already on this node."
+    info "It never uses the network. Option 3, Show Update History, lists the versions this node has run."
+    echo
+    if updater_previous_version; then
+        have_previous=true
+        info "Before the last update this node ran: ${ROLLBACK_FROM_LABEL:-${ROLLBACK_FROM_COMMIT:0:7}} (${ROLLBACK_FROM_COMMIT:0:7})"
+        echo "  Enter      roll back to that version"
+    else
+        info "No previous version is recorded in the update history."
+    fi
+    echo "  <version>  a release tag (for example v1.3.0) or a commit hash that is already on this node"
+    echo "  0          cancel"
+    echo
+
+    if ! read -rp "Version to roll back to: " answer; then
+        echo
+        warning "Input stream closed - operation cancelled"
+        return 0
+    fi
+    answer="${answer//[[:space:]]/}"
+    case "$answer" in
+        0)
+            info "Cancelled; nothing was changed"
+            return 0
+            ;;
+        "")
+            if [[ "$have_previous" != "true" ]]; then
+                error "No previous version is recorded: type the version to roll back to (a release tag such as v1.3.0, or a commit hash)"
+                return 0
+            fi
+            target="${ROLLBACK_FROM_LABEL:-${ROLLBACK_FROM_COMMIT:0:7}} (${ROLLBACK_FROM_COMMIT:0:7})"
+            ;;
+        *)
+            if [[ ! "$answer" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]*$ ]]; then
+                error "Not a valid version: use a release tag such as v1.3.0 or a commit hash"
+                return 0
+            fi
+            target="$answer"
+            version_args=("$answer")
+            ;;
+    esac
+
+    echo
+    warning "This will roll back LyreBirdAudio to: ${target}"
+    info "The updater handles it as it handles an update: it offers to save local changes first,"
+    info "stops and restarts the audio service if it is installed, and switches the files."
+    if ! read -rp "Continue? (y/n): " -n 1; then
+        echo
+        warning "Input stream closed - operation cancelled"
+        return 0
+    fi
+    flush_stdin # Consume trailing newline from -n 1 read
+    echo
+    if [[ ! "$REPLY" =~ ^[Yy]$ ]]; then
+        info "Cancelled; nothing was changed"
+        return 0
+    fi
+
+    echo
+    execute_script "updater" --rollback ${version_args[@]+"${version_args[@]}"} || true
+    # The updater rewrote the other scripts on disk: refresh the integrity
+    # baseline so later actions in THIS session do not fail the "modified since
+    # validation" check
+    recompute_script_checksums
+    case "$LAST_EXIT_CODE" in
+        0)
+            echo
+            success "The updater finished the rollback (exit code 0)"
+            info "This orchestrator may have been replaced too: leave it and start it again to run the rolled-back version."
+            ;;
+        6)
+            echo
+            info "Option 3, Show Update History, lists the versions this node has run."
+            ;;
+        *) ;;
+    esac
+    return 0
+}
+
 menu_versions() {
     while true; do
         display_header "clear"
@@ -2274,12 +2412,15 @@ menu_versions() {
         echo -e "${BOLD}Version Options:${NC}"
         echo "  1) Launch Update Manager (Interactive)"
         echo "  2) Show Component Versions"
+        echo "  3) Show Update History"
+        echo "  4) Roll Back to a Previous Version"
         echo "  0) Back to Main Menu"
         echo
 
         info "The update manager provides:"
         info "  * Interactive update workflow with safety checks"
         info "  * Automatic backup and rollback capability"
+        info "  * Update history, and rollback to a version already on this node (no network needed)"
         info "  * Component-by-component update selection"
         info "  * Git repository integration for updates"
         echo
@@ -2334,11 +2475,24 @@ menu_versions() {
                 echo "================================================================"
                 pause
                 ;;
+            3)
+                echo
+                info "Showing the update history (a local log: no network needed)..."
+                execute_script "updater" --history || true
+                echo
+                pause
+                ;;
+            4)
+                rollback_to_previous_version
+                echo
+                refresh_system_state
+                pause
+                ;;
             0)
                 return
                 ;;
             *)
-                error "Invalid option. Please select 0-2."
+                error "Invalid option. Please select 0-4."
                 sleep 1
                 ;;
         esac

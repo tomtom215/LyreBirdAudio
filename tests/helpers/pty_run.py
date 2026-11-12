@@ -10,8 +10,9 @@ command wrote.
 usage: python3 -I pty_run.py [--timeout SECONDS] [--step REGEX TEXT]... -- COMMAND [ARGS...]
 
   --step REGEX TEXT   once REGEX matches the output the command has written since
-                      the previous step, send TEXT (the escapes \\n and \\t are
-                      decoded). Steps are consumed in order.
+                      the previous step, send TEXT (the escapes \\n, \\t and \\xNN
+                      are decoded; \\x04 is end of file at an empty line). Steps are
+                      consumed in order.
   --timeout SECONDS   kill the command after this long (default 60), exit 124.
 
 Output (stdout): the command's output with ANSI colour sequences and carriage
@@ -36,6 +37,7 @@ def clean(text):
 
 
 def decode(text):
+    text = re.sub(r"\\x([0-9a-fA-F]{2})", lambda m: chr(int(m.group(1), 16)), text)
     return text.replace("\\n", "\n").replace("\\t", "\t")
 
 
