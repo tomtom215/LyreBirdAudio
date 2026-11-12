@@ -111,6 +111,26 @@ EOF
     python3 -c 'import json,sys; json.load(open(sys.argv[1])); print("valid json")' "$E2E_TMP/payload.json"
 }
 
+# X-35: the delivery test above ran send_alert with only the state directory
+# moved, so every run appended to the host's real /var/log/lyrebird/alerts.log.
+# The suite now sets LYREBIRD_ALERT_LOG; the proof is that the alert's log line
+# is in that file.
+@test "E2E: an alert's log line goes to the scratch directory the suite set, never to /var/log/lyrebird [X-35]" {
+    mkdir -p "$E2E_TMP/bin"
+    printf '#!/bin/bash\necho 200\n' >"$E2E_TMP/bin/curl"
+    chmod +x "$E2E_TMP/bin/curl"
+
+    run env PROJECT_ROOT="$PROJECT_ROOT" E2E_TMP="$E2E_TMP" PATH="$E2E_TMP/bin:$PATH" \
+        LYREBIRD_ALERT_ENABLED=true \
+        LYREBIRD_WEBHOOK_URL="http://webhook.example/hook" \
+        LYREBIRD_WEBHOOK_TYPE=generic \
+        LYREBIRD_ALERT_STATE_DIR="$(mktemp -d)" \
+        bash -c 'set +euo pipefail; source "$PROJECT_ROOT/lyrebird-alerts.sh"; send_alert "critical" "Stream Down: mic1" "no data from mic1" "stream_down"; printf "%s" "$ALERT_LOG_FILE" >"$E2E_TMP/alert-log-path"'
+    [ "$status" -eq 0 ]
+    [ "$(cat "$E2E_TMP/alert-log-path")" = "$TEST_SCRATCH/lyrebird-alerts.log" ]
+    grep -q 'no data from mic1' "$TEST_SCRATCH/lyrebird-alerts.log"
+}
+
 # ---------------------------------------------------------------------------
 # mic-check config  ->  stream-manager consumption (the C4 contract)
 # ---------------------------------------------------------------------------

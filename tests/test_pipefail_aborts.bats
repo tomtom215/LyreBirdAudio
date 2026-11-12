@@ -7,7 +7,13 @@
 # handle the empty-variable case. Every test here drives a REAL function into
 # its documented fallback path; before the guards, each one aborted instead.
 
+# scratch_setup also points DIAGNOSTIC_LOG_FILE and the manager's log at the
+# scratch directory: sourcing those scripts and running their functions wrote
+# the real /var/log/lyrebird-diagnostics.log (X-35)
+load scratch_tmpdir
+
 setup() {
+    scratch_setup
     TEST_DIR="$( cd "$( dirname "$BATS_TEST_FILENAME" )" && pwd )"
     PROJECT_ROOT="$( cd "$TEST_DIR/.." && pwd )"
     PA_TMP="$(mktemp -d)"
@@ -16,6 +22,7 @@ setup() {
 
 teardown() {
     rm -rf "$PA_TMP" 2>/dev/null || true
+    scratch_teardown
 }
 
 @test "diagnostics: NTP offset probe survives an UNSYNCED ntpd (the normal pre-sync field state)" {
@@ -226,4 +233,18 @@ EOF
     [ "$status" -eq 0 ]
     [[ "$output" == *"MERGE-COMPLETE"* ]]
     grep -q 'Environment=LYREBIRD_CUSTOM=yes' "$PA_TMP/test.service"
+}
+
+# X-35: the diagnostics tests above ran the script against the host's real
+# /var/log/lyrebird-diagnostics.log. The script logs as soon as it is sourced,
+# so the proof that the location is the scratch directory is that the log it
+# wrote is there.
+@test "sourcing the diagnostics script logs to the scratch directory the suite set, never to /var/log [X-35]" {
+    run env PROJECT_ROOT="$PROJECT_ROOT" bash -c '
+        source "$PROJECT_ROOT/lyrebird-diagnostics.sh" >/dev/null 2>&1
+        printf "%s" "$DIAGNOSTIC_LOG_FILE"
+    '
+    [ "$status" -eq 0 ]
+    [ "$output" = "$TEST_SCRATCH/lyrebird-diagnostics.log" ]
+    [ -s "$TEST_SCRATCH/lyrebird-diagnostics.log" ]
 }

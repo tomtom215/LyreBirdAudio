@@ -583,6 +583,9 @@ jobs:
           sudo apt-get install -y -qq bats jq python3-yaml
 
       - name: Run bats test suite
+        env:
+          # Also fail when the suite changes host state outside TMPDIR (see the header of tests/check_tmp_leaks.sh)
+          LYREBIRD_LEAK_CHECK_HOST: '1'
         run: |
           echo "============================================"
           echo "Bats Test Suite: $(bats --version)"

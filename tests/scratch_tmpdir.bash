@@ -22,6 +22,17 @@ scratch_setup() {
     # must not depend on, or be changed by, the file of the machine it runs on
     # (the empty value means "no configuration file"; a test of the file sets it)
     export LYREBIRD_STORAGE_CONFIG=""
+
+    # The same goes for the logs and state the scripts append to by default:
+    # a test that sources a script and runs one of its functions (or starts it)
+    # would otherwise write the real /var/log or /var/lib of the machine it
+    # runs on (X-35; tests/check_tmp_leaks.sh with LYREBIRD_LEAK_CHECK_HOST=1
+    # catches what this list misses). A test that needs another location sets
+    # its own value.
+    export STREAM_MANAGER_LOG_FILE="$TEST_SCRATCH/lyrebird-stream-manager.log"
+    export DIAGNOSTIC_LOG_FILE="$TEST_SCRATCH/lyrebird-diagnostics.log"
+    export LYREBIRD_ALERT_LOG="$TEST_SCRATCH/lyrebird-alerts.log"
+    export LYREBIRD_ALERT_STATE_DIR="$TEST_SCRATCH/lyrebird-alert-state"
 }
 
 scratch_teardown() {
