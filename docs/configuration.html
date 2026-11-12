@@ -251,7 +251,7 @@ sudo ./lyrebird-mic-check.sh -V
           <tr><td><code>STREAM_STARTUP_DELAY</code></td><td><code>10</code></td><td>Seconds a started stream is given before its first check (plus 3)</td></tr>
           <tr><td><code>STREAM_VALIDATION_ATTEMPTS</code></td><td><code>3</code></td><td>Checks per stream after start; with <code>STREAM_VALIDATION_DELAY</code> (<code>5</code> seconds) this is how long a stream has to become ready</td></tr>
           <tr><td><code>STREAM_VALIDATION_DELAY</code></td><td><code>5</code></td><td>Seconds between those checks</td></tr>
-          <tr><td><code>USB_STABILIZATION_DELAY</code></td><td><code>5</code></td><td>Seconds to wait for the USB device list to settle</td></tr>
+          <tr><td><code>USB_STABILIZATION_DELAY</code></td><td><code>5</code></td><td>Seconds to wait for the USB device list to settle (the unit file sets it to 10)</td></tr>
           <tr><td><code>RESTART_STABILIZATION_DELAY</code></td><td><code>15</code></td><td>The same wait after a restart</td></tr>
           <tr><td><code>LOCK_ACQUISITION_TIMEOUT</code></td><td><code>30</code></td><td>Seconds <code>start</code> and <code>restart</code> wait for the lifecycle lock</td></tr>
           <tr><td><code>STOP_LOCK_TIMEOUT</code></td><td><code>5</code></td><td>Seconds <code>stop</code> and <code>force-stop</code> wait for it, then refuse with exit 5</td></tr>
