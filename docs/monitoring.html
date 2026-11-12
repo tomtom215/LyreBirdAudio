@@ -3,8 +3,8 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Monitoring & Diagnostics - LyreBirdAudio Docs</title>
-  <meta name="description" content="Health monitoring, diagnostics, performance optimization, and alerting for LyreBirdAudio.">
+  <title>Monitoring &amp; Diagnostics - LyreBirdAudio Docs</title>
+  <meta name="description" content="Diagnostics, the cron monitor, the status document, Prometheus metrics, alerting and tuning.">
   <link rel="stylesheet" href="css/style.css">
 </head>
 <body>
@@ -19,7 +19,7 @@
     <div class="page-header">
       <span class="page-label">Operations</span>
       <h1 class="page-title">Monitoring &amp; Diagnostics</h1>
-      <p class="page-subtitle">Health checks, metrics, alerting, performance tuning, and long-term monitoring best practices.</p>
+      <p class="page-subtitle">What the diagnostics check, what the cron monitor does, where the stream state is recorded, and how to export metrics and send alerts.</p>
     </div>
 
     <div class="toc">
@@ -27,7 +27,9 @@
       <ul class="toc-list">
         <li><a href="#health-checking">Health Checking</a></li>
         <li><a href="#check-categories">What Gets Checked</a></li>
-        <li><a href="#monitoring-best-practices">Monitoring Best Practices</a></li>
+        <li><a href="#monitor">The Cron Monitor</a></li>
+        <li><a href="#status-file">The Status Document</a></li>
+        <li><a href="#monitoring-best-practices">Scheduling</a></li>
         <li><a href="#prometheus">Prometheus Metrics</a></li>
         <li><a href="#alerts">Webhook Alerting</a></li>
         <li><a href="#performance">Performance &amp; Optimization</a></li>
@@ -38,36 +40,38 @@
 
     <h2 id="health-checking">Health Checking</h2>
     <p>
-      The <code>lyrebird-diagnostics.sh</code> script provides three diagnostic modes with increasing depth:
+      <code>lyrebird-diagnostics.sh</code> runs read-only checks in three modes. It looks at the node, not at your audio:
+      to see whether streams are publishing, use <code>lyrebird-stream-manager.sh status</code> (below) or the metrics.
     </p>
 
     <div class="table-wrapper">
       <table>
         <thead>
-          <tr><th>Mode</th><th>Command</th><th>Use Case</th><th>Duration</th></tr>
+          <tr><th>Mode</th><th>Command</th><th>Check groups</th><th>Use Case</th></tr>
         </thead>
         <tbody>
           <tr>
             <td><strong>Quick</strong></td>
             <td><code>sudo ./lyrebird-diagnostics.sh quick</code></td>
-            <td>Daily automated checks, pre-operation verification</td>
-            <td>~10 seconds</td>
+            <td>8</td>
+            <td>Pre-operation verification, the wizard's last step</td>
           </tr>
           <tr>
-            <td><strong>Full</strong></td>
+            <td><strong>Full</strong> (default)</td>
             <td><code>sudo ./lyrebird-diagnostics.sh full</code></td>
-            <td>Weekly review, after configuration changes</td>
-            <td>~30 seconds</td>
+            <td>25</td>
+            <td>After configuration changes, periodic review</td>
           </tr>
           <tr>
-            <td><strong>Debug</strong></td>
+            <td><strong>Debug</strong> (alias <code>verbose</code>)</td>
             <td><code>sudo ./lyrebird-diagnostics.sh debug</code></td>
-            <td>Troubleshooting failures, maximum verbosity</td>
-            <td>~60 seconds</td>
+            <td>24, with log analysis</td>
+            <td>Troubleshooting, more output</td>
           </tr>
         </tbody>
       </table>
     </div>
+    <p>Run it as root: without root, file permission, log and service checks can report false problems (the script says so when it starts).</p>
 
     <h3>Diagnostic Exit Codes</h3>
     <div class="table-wrapper">
@@ -75,126 +79,230 @@
         <thead><tr><th>Exit Code</th><th>Meaning</th><th>Action Required</th></tr></thead>
         <tbody>
           <tr><td>0</td><td>All checks passed</td><td>None</td></tr>
-          <tr><td>1</td><td>Warnings detected — system functional</td><td>Review warnings, plan maintenance</td></tr>
-          <tr><td>2</td><td>Failures detected — system degraded</td><td>Investigate and fix immediately</td></tr>
-          <tr><td>127</td><td>Prerequisites missing</td><td>Install missing dependencies</td></tr>
+          <tr><td>1</td><td>Some checks warned; the system works</td><td>Review the warnings</td></tr>
+          <tr><td>2</td><td>Some checks failed</td><td>Investigate</td></tr>
+          <tr><td>127</td><td>Script error (missing dependencies, permissions)</td><td>Install what it names</td></tr>
         </tbody>
       </table>
     </div>
 
     <h3>Orchestrator Integration</h3>
-    <p>Diagnostics are accessible from the Orchestrator menu without remembering commands:</p>
+    <p>The same checks are in the Orchestrator menu:</p>
     <ul>
-      <li><strong>Main Menu → 5 → 1</strong>: Quick health check</li>
-      <li><strong>Main Menu → 5 → 2</strong>: Full diagnostic</li>
-      <li><strong>Main Menu → 5 → 3</strong>: Debug diagnostic</li>
+      <li><strong>Main Menu → 5 → 1</strong>: Quick diagnostics</li>
+      <li><strong>Main Menu → 5 → 2</strong>: Full system diagnostics</li>
+      <li><strong>Main Menu → 5 → 3</strong>: Verbose diagnostics</li>
+      <li><strong>Main Menu → 5 → 4</strong>: Export a diagnostic report to <code>/tmp</code></li>
     </ul>
 
     <h2 id="check-categories">What Gets Checked</h2>
+    <p>The check groups, by the section titles the script prints:</p>
 
     <div class="table-wrapper">
       <table>
-        <thead><tr><th>Category</th><th>What's Verified</th></tr></thead>
+        <thead><tr><th>Section</th><th>What it covers</th></tr></thead>
         <tbody>
-          <tr>
-            <td><strong>System</strong></td>
-            <td>OS type, kernel version, uptime, load average, memory &amp; CPU utilization</td>
-          </tr>
-          <tr>
-            <td><strong>Dependencies</strong></td>
-            <td>ffmpeg, arecord, jq, curl, lsusb, udevadm</td>
-          </tr>
-          <tr>
-            <td><strong>USB Audio Devices</strong></td>
-            <td>Detection, ALSA card availability, mapping status, port path validation, busy state</td>
-          </tr>
-          <tr>
-            <td><strong>MediaMTX Service</strong></td>
-            <td>Binary installation, config file validity, service status, API accessibility, port 8554 &amp; 9997</td>
-          </tr>
-          <tr>
-            <td><strong>Stream Status</strong></td>
-            <td>Active stream count, FFmpeg process validation, stream health &amp; uptime, per-stream resource usage</td>
-          </tr>
-          <tr>
-            <td><strong>RTSP Connectivity</strong></td>
-            <td>Port 8554 listening, protocol validation, test connection</td>
-          </tr>
-          <tr>
-            <td><strong>System Resources</strong></td>
-            <td>File descriptor usage, CPU per process, memory availability, disk space</td>
-          </tr>
-          <tr>
-            <td><strong>Log Analysis</strong></td>
-            <td>Error detection in recent logs, warnings, access patterns</td>
-          </tr>
-          <tr>
-            <td><strong>Time Sync</strong></td>
-            <td>NTP / Chrony service status, time drift detection</td>
-          </tr>
+          <tr><td><strong>1. Prerequisites &amp; dependencies</strong></td><td>Bash version (4.4 or newer), init system, required and optional tools, log directory, user context</td></tr>
+          <tr><td><strong>2, 2b, 2c. Project information, project files &amp; git status, log files</strong></td><td>Versions of the scripts and MediaMTX, configured devices, files present, repository state, whether the log locations are accessible</td></tr>
+          <tr><td><strong>3. System information</strong></td><td>Operating system, kernel, architecture, CPU count, uptime, total memory</td></tr>
+          <tr><td><strong>4. USB audio devices</strong></td><td>ALSA status, USB devices and USB audio devices detected, audio cards, persistence (the mapper's rules)</td></tr>
+          <tr><td><strong>5. Audio capabilities</strong></td><td>ALSA mixer, audio formats, codecs</td></tr>
+          <tr><td><strong>6. MediaMTX service</strong></td><td>Binary present and executable, configuration file readable and the number of paths in it, MediaMTX process, whether the RTSP port is listening</td></tr>
+          <tr><td><strong>7. Stream health &amp; status</strong></td><td>Only the MediaMTX log: its size and the number of recent lines that contain "error" or "fail". It does not ask whether any stream is publishing</td></tr>
+          <tr><td><strong>8. RTSP connectivity</strong></td><td>Whether the RTSP port accepts a connection; kernel multicast support</td></tr>
+          <tr><td><strong>9. Resource usage</strong></td><td>MediaMTX memory, CPU and file descriptors</td></tr>
+          <tr><td><strong>10. Log analysis</strong></td><td>Debug mode only</td></tr>
+          <tr><td><strong>11-14. System limits, disk &amp; storage, configuration validation, time &amp; clock synchronization</strong></td><td>File-descriptor and port limits, disk space, the MediaMTX configuration's YAML syntax and configured paths, NTP state and timezone</td></tr>
+          <tr><td><strong>15-18. Service status, file permissions, process stability, resource constraints</strong></td><td>Init-system state of the MediaMTX and stream manager services, ownership and modes of the binary, configuration, log directory and udev rules, restarts and crash indicators, memory, TCP backlog and inotify limits</td></tr>
+          <tr><td><strong>19-24. File descriptor leaks, audio subsystem conflicts, inotify &amp; entropy, network resources, time &amp; clock health, service dependencies</strong></td><td>MediaMTX descriptor use, PulseAudio and ALSA lock files and modules, entropy pool, ephemeral ports and TIME-WAIT sockets, clock offset, optional services</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p>
+      The RTSP port it uses comes from <code>MEDIAMTX_PORT</code> (default 8554). It ignores <code>MEDIAMTX_RTSP_PORT</code>, so on a node
+      with another RTSP port set both, or the port checks look at the wrong port. It finds the MediaMTX process by matching the
+      binary path against every command line (<code>pgrep -f</code>), so a process that merely mentions that path is reported as MediaMTX.
+    </p>
+
+    <h2 id="monitor">The Cron Monitor</h2>
+    <p>
+      <code>sudo ./lyrebird-stream-manager.sh install</code> writes <code>/etc/cron.d/mediamtx-monitor</code>, which runs
+      <code>lyrebird-stream-manager.sh monitor</code> every 5 minutes under <code>flock</code>. The cron line acts on the exit status:
+      2 restarts <code>mediamtx-audio</code>; any other non-zero status is only logged with <code>logger</code>. The wizard does not write this file.
+    </p>
+
+    <h3>What One Run Does</h3>
+    <ol>
+      <li><strong>Resource checks.</strong> MediaMTX over the file-descriptor limit (1000) or the CPU limit (40 %), or more wrapper processes than PID files, is critical: the monitor exits 2. High disk use (80 / 95 %), system memory (80 / 95 %) and a failing gateway ping are logged and never cause a restart, because restarting frees no disk. Each run also writes the heartbeat file.</li>
+      <li><strong>Silence probe.</strong> For each stream that MediaMTX reports ready, the monitor reads <code>AUDIO_LEVEL_SAMPLE_DURATION</code> (3) seconds of it back over RTSP, at most every <code>AUDIO_LEVEL_CHECK_INTERVAL</code> (240) seconds, and measures the level. No ALSA device is opened. When the maximum level stays at or below <code>AUDIO_SILENCE_THRESHOLD_DB</code> (-60 dB) for <code>AUDIO_SILENCE_WARN_DURATION</code> (60) seconds, one <code>DEAD MIC</code> error is logged for that silence episode, and one <code>Audio recovered</code> line when sound returns. The log is the only signal: there is no metric and no alert for it. The -60 dB default was checked against digital silence and a test tone only, not against real microphones. If you have configured RTSP read authentication, the probe gets a 401 and logs a probe error on every run; it never counts that as silence.</li>
+      <li><strong>Stream checks</strong>, while holding the lifecycle lock (if a <code>start</code>, <code>stop</code> or <code>restart</code> is running the monitor logs that and exits 0 without touching anything). It starts the stream of a device that has appeared or whose wrapper died; restarts a stream whose path MediaMTX reports not ready for <code>DEEP_HEALTH_MAX_STRIKES</code> (3) runs in a row (an API that does not answer, or answers 401/403, never counts as a strike); in multiplex mode restarts the stream when the set of devices changed; and, when MediaMTX is gone while the node is meant to run (<code>start</code> was run and <code>stop</code> was not), starts it again.</li>
+      <li><strong>Status.</strong> It rewrites <code>/run/lyrebird/status.json</code>.</li>
+    </ol>
+
+    <h3>Restart Budget</h3>
+    <p>
+      Restarts are bounded: at most <code>CRON_RESTART_MAX_PER_HOUR</code> (6) per stream per rolling hour, and the same budget for MediaMTX itself.
+      A restart is only charged when it is really attempted: a card that is detected but cannot be opened (ALSA reports it unavailable), or a
+      playback-only card, does not use up the budget. When the budget is used up the monitor logs it and leaves the stream down until the hour rolls over.
+    </p>
+
+    <h3>Exit Codes of <code>monitor</code></h3>
+    <div class="table-wrapper">
+      <table>
+        <thead><tr><th>Code</th><th>Meaning</th><th>What cron does</th></tr></thead>
+        <tbody>
+          <tr><td>0</td><td>Healthy, waiting for devices, or skipped because a lifecycle command was running</td><td>nothing</td></tr>
+          <tr><td>2</td><td>Critical resource state</td><td>restarts <code>mediamtx-audio</code></td></tr>
+          <tr><td>6</td><td>No USB devices, only with <code>LYREBIRD_ALLOW_EMPTY_START=false</code></td><td>logs it</td></tr>
+          <tr><td>7</td><td>MediaMTX not running, and the monitor may not or could not start it (no desired-running marker, budget used up, or the start failed)</td><td>logs it</td></tr>
+          <tr><td>10</td><td>Some streams are not publishing</td><td>logs it</td></tr>
         </tbody>
       </table>
     </div>
 
-    <h2 id="monitoring-best-practices">Monitoring Best Practices</h2>
+    <h3>What It Does Not Do</h3>
+    <ul>
+      <li>It sends no alerts: no LyreBirdAudio script calls <code>lyrebird-alerts.sh</code> (see <a href="#alerts">Webhook Alerting</a>).</li>
+      <li>It does not clean up storage; schedule <code>lyrebird-storage.sh</code> separately.</li>
+      <li>The heartbeat file (<code>/run/mediamtx-audio.heartbeat</code>) holds the Unix time of the last monitor run. It proves that the monitor ran, not that MediaMTX or any stream is up.</li>
+      <li>There is no software watchdog. The settings that once suggested one (<code>HEARTBEAT_INTERVAL</code>, <code>HARDWARE_WATCHDOG_*</code>, <code>ENABLE_HARDWARE_WATCHDOG</code>) are ignored. Recovery is <code>Restart=always</code> on the unit and this monitor. For a hardware watchdog use systemd's <code>RuntimeWatchdogSec=</code> in <code>/etc/systemd/system.conf</code> (with the driver your board needs) or a watchdog daemon; the project neither implements nor tests that.</li>
+    </ul>
+
+    <h2 id="status-file">The Status Document</h2>
+    <p>
+      <code>start</code>, <code>stop</code>, <code>force-stop</code>, <code>monitor</code> and <code>status</code> write
+      <code>/run/lyrebird/status.json</code> (<code>LYREBIRD_STATUS_FILE</code>), atomically, mode 0644. It describes the node as of the last of those commands, and
+      the monitor refreshes it every cycle, so use <code>timestamp_epoch</code> to judge freshness and treat a missing file as "unknown".
+      <code>status --json</code> prints the same document, computed live.
+    </p>
+    <pre id="example-status-json"><code>{
+  "schema_version": 1,
+  "timestamp": "2026-11-11T22:10:44Z",
+  "timestamp_epoch": 1794435044,
+  "command": "monitor",
+  "overall": "degraded",
+  "policy": "degraded",
+  "stream_mode": "individual",
+  "mediamtx": { "running": true, "pid": 1234 },
+  "streams": [
+    { "device": "usb-Blue_Yeti", "card": "3", "path": "mic-left",
+      "configured": true, "process_alive": true, "path_ready": true,
+      "bytes_flowing": true, "last_error": null },
+    { "device": "usb-Mic2", "card": "4", "path": "mic-right",
+      "configured": false, "process_alive": false, "path_ready": false,
+      "bytes_flowing": false,
+      "last_error": "no stream wrapper is running for this stream" }
+  ]
+}</code></pre>
+
+    <div class="table-wrapper">
+      <table>
+        <thead><tr><th>Field</th><th>Meaning</th></tr></thead>
+        <tbody>
+          <tr><td><code>overall</code></td><td><code>ok</code>: every expected stream publishes. <code>degraded</code>: some do. <code>failed</code>: none does, or MediaMTX is down although the node is meant to run. <code>waiting_for_devices</code>: MediaMTX is up and no capture device is detected. <code>stopped</code>: down on purpose. It does not depend on the start policy</td></tr>
+          <tr><td><code>configured</code>, <code>process_alive</code>, <code>path_ready</code>, <code>bytes_flowing</code></td><td>The wrapper was launched; the wrapper is running and provably this manager's; MediaMTX's API reports the path ready; the path's inbound byte counter grew between two samples <code>LYREBIRD_FLOW_SAMPLE_SECONDS</code> (3) apart. Each is <code>true</code>, <code>false</code> or <code>null</code> (not known: the API did not answer)</td></tr>
+          <tr><td><code>last_error</code></td><td><code>null</code> while the stream publishes with bytes flowing; otherwise a sentence for a human, from the command that wrote the file. Not an enumeration</td></tr>
+          <tr><td><code>skipped</code></td><td>Present, as <code>true</code>, only on a card with no capture PCM (a speaker or DAC). It is listed but is not a stream; ignore entries with <code>skipped</code> when counting</td></tr>
+          <tr><td><code>policy</code>, <code>stream_mode</code>, <code>command</code></td><td>The start policy in force, <code>individual</code> or <code>multiplex</code>, and the command that wrote the file</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p>
+      The orchestrator reads this document after a start or restart. <code>lyrebird-metrics.sh</code> does not. A script of your own can decide on it:
+      <code>./lyrebird-stream-manager.sh status --json | jq -e '.overall == "ok"'</code> exits non-zero unless every expected stream publishes.
+    </p>
+
+    <h2 id="monitoring-best-practices">Scheduling</h2>
 
     <h3>Recommended Schedule</h3>
-    <pre><code># Add to /etc/cron.d/lyrebird-monitoring
-
-# Quick check every 5 minutes (via stream manager's install command)
-*/5 * * * * root /path/to/lyrebird-stream-manager.sh monitor
+    <p>The monitor is already scheduled by <code>install</code>; do not add a second job for it. Add the other recurring jobs yourself:</p>
+    <pre><code># /etc/cron.d/lyrebird-monitoring
 
 # Full diagnostic daily at 6 AM
 0 6 * * * root /path/to/lyrebird-diagnostics.sh full >> /var/log/lyrebird-daily-check.log 2>&1
 
-# Storage cleanup daily at 3 AM
-0 3 * * * root /path/to/lyrebird-storage.sh cleanup --quiet</code></pre>
+# Storage cleanup daily at 3 AM (one summary line per run)
+0 3 * * * root /path/to/lyrebird-storage.sh cleanup --quiet >>/var/log/lyrebird-storage.log 2>&1
 
-    <div class="callout info">
-      <span class="callout-icon">ℹ️</span>
-      <div class="callout-body">
-        <strong>Auto-Installed Cron Job</strong>
-        <p>When you run <code>sudo ./lyrebird-stream-manager.sh install</code>, a cron job is automatically created at <code>/etc/cron.d/mediamtx-monitor</code> that runs health checks every 5 minutes. You don't need to set this up manually.</p>
-      </div>
-    </div>
+# Disk check every 15 minutes (silent while the disk is fine)
+*/15 * * * * root /path/to/lyrebird-storage.sh monitor --once >>/var/log/lyrebird-storage.log 2>&1</code></pre>
 
     <h3>Log Rotation</h3>
-    <p>Install the provided logrotate configuration to prevent log files from filling the disk:</p>
-    <pre><code># Install log rotation
-sudo cp config/lyrebird-logrotate.conf /etc/logrotate.d/lyrebird
-
-# Test configuration
-sudo logrotate -d /etc/logrotate.d/lyrebird
-
-# Force rotation (for testing)
-sudo logrotate -f /etc/logrotate.d/lyrebird</code></pre>
+    <p>
+      <code>sudo ./lyrebird-stream-manager.sh install</code> writes <code>/etc/logrotate.d/mediamtx</code> (when logrotate is installed), which
+      rotates the MediaMTX log, the manager log and the FFmpeg logs in <code>/var/lib/mediamtx-ffmpeg</code>. The file
+      <code>config/lyrebird-logrotate.conf</code> is an alternative that lists the same MediaMTX and manager logs as well as the other scripts' logs;
+      install one of the two, not both, since they name the same files.
+    </p>
 
     <h2 id="prometheus">Prometheus Metrics</h2>
-    <p>Export metrics for Grafana dashboards and alerting:</p>
+    <p>Export metrics for Grafana dashboards and alerting. Run the exporter as root for a complete scrape.</p>
 
-    <pre><code># Start HTTP metrics server
+    <pre><code># HTTP server on 127.0.0.1:9100
 ./lyrebird-metrics.sh serve --port 9100
 
-# Or use as a textfile collector for node_exporter
-./lyrebird-metrics.sh > /var/lib/node_exporter/textfile_collector/lyrebird.prom</code></pre>
+# Or a file for node_exporter's textfile collector, replaced atomically (cron, every minute)
+* * * * * root /path/to/lyrebird-metrics.sh --file /var/lib/node_exporter/textfile_collector/lyrebird.prom</code></pre>
+    <p>
+      Do not redirect the output with <code>&gt;</code> into the collector directory: a scrape can read a half-written file. <code>--file</code> writes a hidden
+      temporary file and renames it, and keeps the previous file if anything fails.
+    </p>
 
-    <h3>Grafana Dashboard Setup</h3>
-    <ol>
-      <li>Start the metrics server on port 9100</li>
-      <li>Add a Prometheus scrape job pointing to your server</li>
-      <li>Import a dashboard in Grafana using the <code>lyrebird_*</code> metrics</li>
-    </ol>
-
-    <p>Key metrics to dashboard:</p>
+    <h3>The HTTP Server</h3>
     <ul>
-      <li><code>lyrebird_stream_active</code> — Alert when 0</li>
-      <li><code>lyrebird_mediamtx_up</code> — Alert when 0</li>
-      <li><code>lyrebird_disk_usage_percent</code> — Alert when &gt; 80%</li>
-      <li><code>lyrebird_cpu_usage_percent</code> — Alert when &gt; 80%</li>
-      <li><code>lyrebird_usb_device_connected</code> — Alert when 0</li>
+      <li>It listens on <code>127.0.0.1</code> unless you pass <code>--bind</code>. It has no authentication and no TLS, so a Prometheus on another host needs <code>--bind ADDR</code> (or <code>0.0.0.0</code>) and a firewall, and <code>targets: ['field-unit-1:9100']</code> works only that way.</li>
+      <li>It serves <code>GET /</code> and <code>GET /metrics</code>, one connection at a time, and generates the metrics after the request arrives. It needs a netcat (OpenBSD <code>nc</code>, <code>ncat</code>, traditional or BusyBox).</li>
+      <li>It is made for one poller. A second client that connects while one is being served, or within milliseconds after it, can be reset and must retry. For several scrapers, or anything beyond loopback, use <code>--file</code> with the textfile collector.</li>
+    </ul>
+
+    <h3>Metrics</h3>
+    <p>Metric names are prefixed <code>lyrebird_</code>. These are the families the script can emit; the per-stream and API ones appear only while there is something to report.</p>
+    <div class="table-wrapper">
+      <table>
+        <thead><tr><th>Metric</th><th>Meaning</th></tr></thead>
+        <tbody>
+          <tr><td><code>lyrebird_scrape_success</code></td><td>1 only if all six collectors completed. Alert on <code>== 0</code></td></tr>
+          <tr><td><code>lyrebird_collector_success{collector}</code></td><td>Per collector: <code>mediamtx</code>, <code>stream_manager</code>, <code>usb_audio</code>, <code>system</code>, <code>api</code>, <code>streams</code></td></tr>
+          <tr><td><code>lyrebird_mediamtx_up</code></td><td>This installation's MediaMTX is running: the process that runs <code>MEDIAMTX_BINARY</code> on the configured configuration file, as the stream manager decides it. A process that only has "mediamtx" in its name or command line does not count</td></tr>
+          <tr><td><code>lyrebird_mediamtx_memory_bytes</code>, <code>_cpu_percent</code>, <code>_open_fds</code>, <code>_uptime_seconds</code></td><td>MediaMTX process figures</td></tr>
+          <tr><td><code>lyrebird_stream_manager_up</code></td><td>The MediaMTX PID the manager recorded in <code>/run/mediamtx-audio.pid</code> is alive (the name is historical)</td></tr>
+          <tr><td><code>lyrebird_active_streams</code>, <code>lyrebird_configured_devices</code></td><td>Stream wrappers that are running (counted from the PID files); lines of the device configuration that start with <code>DEVICE_</code>, which is one per setting, not one per device</td></tr>
+          <tr><td><code>lyrebird_stream_up{stream}</code>, <code>lyrebird_stream_memory_bytes{stream}</code>, <code>lyrebird_stream_cpu_percent{stream}</code></td><td>Per stream; derived from the wrapper process, not from whether MediaMTX sees audio</td></tr>
+          <tr><td><code>lyrebird_heartbeat_age_seconds</code>, <code>lyrebird_heartbeat_healthy</code></td><td>Age of the monitor heartbeat (-1 when there is no file); 1 when the monitor ran within <code>LYREBIRD_HEARTBEAT_MAX_AGE</code> (900) seconds. It proves only that the monitor ran</td></tr>
+          <tr><td><code>lyrebird_usb_audio_devices</code>, <code>lyrebird_total_audio_cards</code></td><td>USB audio devices and all ALSA cards</td></tr>
+          <tr><td><code>lyrebird_disk_usage_percent{mount}</code></td><td>Disk use of <code>/</code>, <code>/var</code>, <code>/tmp</code> where they exist</td></tr>
+          <tr><td><code>lyrebird_system_memory_total_bytes</code>, <code>_memory_available_bytes</code>, <code>_load_1m</code>, <code>_entropy_available</code></td><td>System figures</td></tr>
+          <tr><td><code>lyrebird_api_up</code>, <code>lyrebird_api_info{version}</code>, <code>lyrebird_api_uptime_seconds</code>, <code>lyrebird_api_paths_total</code>, <code>_paths_ready</code>, <code>_rtsp_sessions</code>, <code>_rtsp_connections</code> and the other <code>lyrebird_api_*</code> connection counts</td><td>From MediaMTX's API</td></tr>
+          <tr><td><code>lyrebird_build_info{version}</code>, <code>lyrebird_scrape_timestamp_seconds</code></td><td>Exporter version, time of the scrape</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h3>Behaviour to Know</h3>
+    <ul>
+      <li>A source that cannot be read makes its metrics <em>absent</em>, not 0, and its collector 0 (exit status 3). So <code>lyrebird_mediamtx_up == 0</code> does not fire for an unreadable state; <code>lyrebird_scrape_success == 0</code> does.</li>
+      <li>As a non-root user the exporter sees another user's processes only partly: it reports the affected collectors failed. Run it as root.</li>
+      <li>All MediaMTX API requests of one scrape share <code>LYREBIRD_API_TIMEOUT</code> (5 seconds); keep it below Prometheus's <code>scrape_timeout</code>. A refused connection is final at once; the API being down does not delay the scrape.</li>
+      <li>There is no metric for silent microphones; see the silence probe above.</li>
+    </ul>
+
+    <h3>Suggested Alert Rules</h3>
+    <ul>
+      <li><code>lyrebird_scrape_success == 0</code>: a collector failed or a source could not be read</li>
+      <li><code>lyrebird_mediamtx_up == 0</code>, <code>lyrebird_api_up == 0</code>: MediaMTX or its API is down</li>
+      <li><code>lyrebird_stream_up == 0</code>, or <code>lyrebird_active_streams</code> below the number you expect</li>
+      <li><code>lyrebird_heartbeat_healthy == 0</code>: the cron monitor has not run for 15 minutes</li>
+      <li><code>lyrebird_disk_usage_percent &gt; 80</code></li>
     </ul>
 
     <h2 id="alerts">Webhook Alerting</h2>
+    <div class="callout warning">
+      <span class="callout-icon">⚠️</span>
+      <div class="callout-body">
+        <strong>Nothing sends an alert unless you wire it up</strong>
+        <p>No LyreBirdAudio script (the monitor, the storage script, the diagnostics, the metrics exporter) calls <code>lyrebird-alerts.sh</code>. The script and its <code>alert_*</code> functions are there for your own cron jobs and scripts. Prometheus alert rules (above) are the other route.</p>
+      </div>
+    </div>
 
     <h3>Setup</h3>
     <pre><code># Interactive webhook setup
@@ -203,110 +311,74 @@ sudo logrotate -f /etc/logrotate.d/lyrebird</code></pre>
 # Test your webhook
 ./lyrebird-alerts.sh test</code></pre>
 
-    <h3>What Events Trigger Alerts</h3>
-    <ul>
-      <li>Stream goes down or comes back up</li>
-      <li>USB device disconnects or reconnects</li>
-      <li>Disk usage exceeds warning/critical thresholds</li>
-      <li>MediaMTX service goes down or recovers</li>
-      <li>Network connectivity lost or restored</li>
-    </ul>
+    <h3>An Example Alert You Can Schedule</h3>
+    <p>Tell the webhook when the stream manager does not report <code>ok</code> (every 5 minutes, for instance):</p>
+    <pre><code>#!/bin/bash
+# /usr/local/bin/lyrebird-check-streams.sh
+state=$(/path/to/lyrebird-stream-manager.sh status --json | jq -r .overall)
+if [[ "$state" != "ok" ]]; then
+    /path/to/lyrebird-alerts.sh send --level error --type streams \
+        --title "Streams not ok" --message "overall state: $state" || true
+fi</code></pre>
 
     <h3>Rate Limiting</h3>
     <p>
-      Alerts are rate-limited by default to prevent spam. Duplicate alerts within the configured window
-      (default: 300 seconds) are suppressed. Adjust in <code>/etc/lyrebird/alerts.conf</code>:
+      An identical alert (same type and message text) is not sent again to a destination that already confirmed it within
+      <code>LYREBIRD_ALERT_RATE_LIMIT</code> seconds (default 300). The check is per destination: a destination that failed is retried by the next
+      identical alert, and one that succeeded is not sent it again. The exit status says which case happened (0 delivered, 3 total failure, 4 suppressed, 5 partial failure; see
+      <a href="components.html#alerts">Webhook Alerts</a>).
     </p>
-    <pre><code>LYREBIRD_ALERT_RATE_LIMIT=300  # Seconds between duplicate alerts</code></pre>
+    <pre><code>LYREBIRD_ALERT_RATE_LIMIT=300  # Seconds an identical alert is suppressed, per destination</code></pre>
 
     <hr>
     <h2 id="performance">Performance &amp; Optimization</h2>
+    <p>
+      The project has not measured CPU or memory use per stream. Use <code>lyrebird_mediamtx_memory_bytes</code> and
+      <code>lyrebird_stream_memory_bytes{stream}</code> on your own hardware.
+    </p>
 
     <h3>Codec Selection</h3>
     <div class="table-wrapper">
       <table>
-        <thead><tr><th>Codec</th><th>Efficiency</th><th>Latency</th><th>Best For</th></tr></thead>
+        <thead><tr><th>Codec</th><th>Notes</th></tr></thead>
         <tbody>
-          <tr><td>Opus</td><td>Best quality/bitrate ratio</td><td>Very low</td><td>All use cases (recommended)</td></tr>
-          <tr><td>AAC</td><td>Good</td><td>Moderate</td><td>Wide client compatibility</td></tr>
-          <tr><td>PCM</td><td>Lossless (highest bandwidth)</td><td>Lowest</td><td>Post-processing pipelines</td></tr>
+          <tr><td>Opus</td><td>Default. Best quality for the bitrate; very low latency. FFmpeg's libopus refuses some channel counts</td></tr>
+          <tr><td>AAC</td><td>Widest client compatibility</td></tr>
+          <tr><td>MP3</td><td>Accepted by the manager (<code>mp3</code>)</td></tr>
         </tbody>
       </table>
     </div>
+    <p><code>pcm</code> is not an accepted codec.</p>
 
-    <h3>Sample Rate Selection</h3>
+    <h3>Bitrate and Bandwidth</h3>
+    <p>The encoder bitrate sets the audio payload for each client; RTSP and RTP overhead come on top.</p>
     <div class="table-wrapper">
       <table>
-        <thead><tr><th>Sample Rate</th><th>CPU Impact</th><th>Bandwidth</th><th>Use Case</th></tr></thead>
+        <thead><tr><th>Bitrate</th><th>Payload per stream per client</th></tr></thead>
         <tbody>
-          <tr><td>16,000 Hz</td><td>Lowest</td><td>Lowest</td><td>Speech, monitoring</td></tr>
-          <tr><td>44,100 Hz</td><td>Low</td><td>Low</td><td>CD quality, general</td></tr>
-          <tr><td>48,000 Hz</td><td>Normal</td><td>Moderate</td><td>Professional standard (default)</td></tr>
-          <tr><td>96,000 Hz</td><td>High</td><td>High</td><td>High-res audio</td></tr>
-        </tbody>
-      </table>
-    </div>
-
-    <h3>Bitrate Tuning</h3>
-    <div class="table-wrapper">
-      <table>
-        <thead><tr><th>Bitrate</th><th>Bandwidth per Stream per Client</th><th>Quality</th></tr></thead>
-        <tbody>
-          <tr><td>64 kbps</td><td>~8 KB/s</td><td>Acceptable for speech</td></tr>
-          <tr><td>96 kbps</td><td>~12 KB/s</td><td>Good for speech</td></tr>
-          <tr><td>128 kbps</td><td>~16 KB/s</td><td>Good for speech &amp; music (default)</td></tr>
-          <tr><td>192 kbps</td><td>~24 KB/s</td><td>High quality</td></tr>
-          <tr><td>256 kbps</td><td>~32 KB/s</td><td>Very high quality</td></tr>
-        </tbody>
-      </table>
-    </div>
-
-    <h3>Resource Usage Estimates</h3>
-    <div class="table-wrapper">
-      <table>
-        <thead><tr><th>Component</th><th>Base RAM</th><th>Per Stream</th></tr></thead>
-        <tbody>
-          <tr><td>MediaMTX</td><td>~50–100 MB</td><td>~10 MB per active path</td></tr>
-          <tr><td>FFmpeg</td><td>—</td><td>~50–100 MB per stream</td></tr>
+          <tr><td>64 kbps</td><td>~8 KB/s</td></tr>
+          <tr><td>96 kbps</td><td>~12 KB/s</td></tr>
+          <tr><td>128 kbps (default)</td><td>~16 KB/s</td></tr>
+          <tr><td>192 kbps</td><td>~24 KB/s</td></tr>
+          <tr><td>256 kbps</td><td>~32 KB/s</td></tr>
         </tbody>
       </table>
     </div>
 
     <h3>Thread Queue Tuning</h3>
-    <p>For high stream counts (4+), increase the thread queue size to reduce buffer underruns:</p>
-    <pre><code># In /etc/mediamtx/audio-devices.conf
-DEFAULT_THREAD_QUEUE=16384  # Default is 8192</code></pre>
+    <p>If FFmpeg logs buffer underruns with several streams, raise the thread queue per device in <code>/etc/mediamtx/audio-devices.conf</code> (the default is 8192), or for all devices with the <code>DEFAULT_THREAD_QUEUE</code> environment variable:</p>
+    <pre><code># /etc/mediamtx/audio-devices.conf
+DEVICE_MIC_LEFT_THREAD_QUEUE=16384</code></pre>
 
     <h2 id="system-tuning">System Tuning</h2>
-
-    <h3>File Descriptor Limits</h3>
-    <pre><code># Check current limits
-ulimit -n
-
-# Increase limits (add to /etc/security/limits.conf)
-echo "* soft nofile 8192" | sudo tee -a /etc/security/limits.conf
-echo "* hard nofile 16384" | sudo tee -a /etc/security/limits.conf
-echo "mediamtx soft nofile 4096" | sudo tee -a /etc/security/limits.conf
-echo "mediamtx hard nofile 8192" | sudo tee -a /etc/security/limits.conf
-
-# Apply (requires reboot)
-sudo reboot</code></pre>
-
-    <h3>Network Buffer Sizes</h3>
-    <pre><code># Increase UDP buffer sizes for streaming
-sudo sysctl -w net.core.rmem_max=26214400
-sudo sysctl -w net.core.wmem_max=26214400
-
-# Make permanent
-echo "net.core.rmem_max=26214400" | sudo tee -a /etc/sysctl.conf
-echo "net.core.wmem_max=26214400" | sudo tee -a /etc/sysctl.conf
-sudo sysctl -p</code></pre>
+    <p>
+      File-descriptor limits are set by the unit (<code>LimitNOFILE=65536</code> for the stream manager's service); <code>/etc/security/limits.conf</code>
+      does not apply to systemd services. The manager's own warning and critical levels are <code>MAX_FD_WARNING</code> and <code>MAX_FD_CRITICAL</code>.
+    </p>
 
     <h3>USB Power Management</h3>
-    <pre><code># Disable USB auto-suspend (prevents devices going to sleep)
-echo -1 | sudo tee /sys/bus/usb/devices/*/power/autosuspend
-
-# Make permanent via udev rule
+    <p>General Linux advice that this project has not tested: a USB device that is suspended can stop delivering audio.</p>
+    <pre><code># Disable USB auto-suspend for one vendor's devices via a udev rule
 echo 'ACTION=="add", SUBSYSTEM=="usb", ATTR{idVendor}=="YOUR_VID", ATTR{power/autosuspend}="-1"' \
   | sudo tee /etc/udev/rules.d/50-usb-power.rules</code></pre>
 
@@ -316,25 +388,20 @@ echo 'ACTION=="add", SUBSYSTEM=="usb", ATTR{idVendor}=="YOUR_VID", ATTR{power/au
       <span class="callout-icon">⚠️</span>
       <div class="callout-body">
         <strong>USB Bandwidth Limitations</strong>
-        <p>Raspberry Pi shares USB bandwidth across all ports. This limits reliable operation to 1–2 USB microphones. For 4+ microphones, use an Intel N100 or similar mini PC ($100–150) with proper USB controller topology.</p>
+        <p>A Raspberry Pi shares USB bandwidth across its ports. The project's advice is one or two microphones per board; the test suite has not been run on a Raspberry Pi.</p>
       </div>
     </div>
 
-    <pre><code># Use low-quality settings for Raspberry Pi
-sudo ./lyrebird-mic-check.sh -g --quality=low
+    <pre><code># Generate low-quality settings (mono where the card offers it, lower bitrate)
+sudo ./lyrebird-mic-check.sh -g --quality=low</code></pre>
 
-# Consider mono recording to halve bandwidth
-DEFAULT_CHANNELS=1
-
-# Reduce stream count to 1-2 maximum</code></pre>
-
-    <h3>Raspberry Pi Recommended Settings</h3>
-    <pre><code># /etc/mediamtx/audio-devices.conf (Raspberry Pi)
-DEFAULT_SAMPLE_RATE=16000    # or 44100 at most
-DEFAULT_CHANNELS=1           # Mono to reduce CPU
-DEFAULT_BITRATE=64k          # Low bitrate
-DEFAULT_CODEC=opus
-DEFAULT_THREAD_QUEUE=4096    # Smaller queue to reduce memory</code></pre>
+    <h3>Example Per-Device Settings</h3>
+    <pre><code># /etc/mediamtx/audio-devices.conf
+DEVICE_MIC_LEFT_SAMPLE_RATE=44100
+DEVICE_MIC_LEFT_CHANNELS=1
+DEVICE_MIC_LEFT_BITRATE=64k
+DEVICE_MIC_LEFT_CODEC=opus
+DEVICE_MIC_LEFT_THREAD_QUEUE=4096</code></pre>
 
   </main>
   <nav id="page-nav" class="page-nav"></nav>
