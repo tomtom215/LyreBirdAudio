@@ -39,10 +39,18 @@ readonly MEDIAMTX_API_PORT="${MEDIAMTX_API_PORT:-9997}"
 # shellcheck disable=SC2034  # Exported for use by install_mediamtx.sh and external scripts
 readonly MEDIAMTX_RTSP_PORT="${MEDIAMTX_PORT:-8554}"
 readonly HEARTBEAT_FILE="${HEARTBEAT_FILE:-/run/mediamtx-audio.heartbeat}"
-readonly PID_FILE="${PID_FILE:-/run/mediamtx-audio.pid}"
+# The PID file of the stream manager's MediaMTX: PID_FILE, else the variable the
+# manager itself reads (MEDIAMTX_PID_FILE)
+readonly PID_FILE="${PID_FILE:-${MEDIAMTX_PID_FILE:-/run/mediamtx-audio.pid}}"
 readonly FFMPEG_PID_DIR="${FFMPEG_PID_DIR:-/var/lib/mediamtx-ffmpeg}"
 readonly CONFIG_DIR="${MEDIAMTX_CONFIG_DIR:-/etc/mediamtx}"
 readonly DEVICE_CONFIG="${CONFIG_DIR}/audio-devices.conf"
+# The MediaMTX this installation runs, named by the variables the stream manager
+# reads: a process is this MediaMTX when its executable is MEDIAMTX_BIN and its
+# first argument is MEDIAMTX_CONFIG_FILE (that is how the manager and the
+# mediamtx.service unit start it)
+readonly MEDIAMTX_BIN="${MEDIAMTX_BINARY:-/usr/local/bin/mediamtx}"
+readonly MEDIAMTX_CONFIG_FILE="${MEDIAMTX_CONFIG_FILE:-${CONFIG_DIR}/mediamtx.yml}"
 
 # Metric prefix
 readonly METRIC_PREFIX="lyrebird"
@@ -167,6 +175,114 @@ pid_file_process_state() {
     proc_check "$2" "$_REC_START"
 }
 
+# Which process is MediaMTX is decided by identity, as the stream manager does it
+# (is_managed_mediamtx_pid), never by a name or command-line pattern: a pattern
+# such as `pgrep -f mediamtx` also matches an editor on mediamtx.yml, a
+# mediamtx-exporter, `tail -f /var/log/mediamtx.log` and another installation's
+# MediaMTX, whose memory and uptime were then published as ours.
+
+_ARGV1=""  # set by proc_argv
+MTX_PID="" # set by mediamtx_locate
+_MTX_WANT_EXE=""
+
+# Set _ARGV1 to the first argument of process $1 (the one after the program name;
+# cmdline is NUL-separated and, unlike /proc/PID/exe, readable by every user).
+# Returns 0 when read, 1 when there is no such process, 2 when there is one whose
+# cmdline cannot be read.
+proc_argv() {
+    _ARGV1=""
+    if ! {
+        IFS= read -r -d '' _ || true
+        IFS= read -r -d '' _ARGV1 || true
+    } 2>/dev/null <"/proc/$1/cmdline"; then
+        [[ -d "/proc/$1" ]] && return 2
+        return 1
+    fi
+    return 0
+}
+
+# Is PID $1 this installation's MediaMTX: running, the executable is MEDIAMTX_BIN
+# (an upgrade may have replaced the file since: the kernel then reports
+# "<path> (deleted)", still the same program) and argv[1] is MEDIAMTX_CONFIG_FILE?
+# $2 is the start time the manager recorded for the PID, if any.
+#   0  yes
+#   1  no (not running, another program, another configuration)
+#   2  cannot tell: the executable of another user's process cannot be read and
+#      there is no recorded start time to go by instead
+mediamtx_verify_pid() {
+    local pid="$1" recorded="${2-}" rc=0 exe="" deleted_suffix=" (deleted)"
+    proc_check "$pid" "$recorded" || rc=$?
+    ((rc == 0)) || return "$rc"
+    # argv[1] first: it is read without forking and rules out almost everything
+    proc_argv "$pid" || rc=$?
+    ((rc == 0)) || return "$rc"
+    [[ "$_ARGV1" == "$MEDIAMTX_CONFIG_FILE" ]] || return 1
+    if exe="$(readlink "/proc/${pid}/exe" 2>/dev/null)" && [[ -n "$exe" ]]; then
+        [[ "${exe%"${deleted_suffix}"}" == "$_MTX_WANT_EXE" ]]
+        return
+    fi
+    [[ -d "/proc/${pid}" ]] || return 1
+    # The process started at the recorded time and runs the configuration, which
+    # is the one the manager recorded after it had started MediaMTX itself
+    [[ -n "$recorded" ]] && return 0
+    return 2
+}
+
+# Look through every process for this installation's MediaMTX. Sets MTX_PID.
+# 0 = found, 1 = no such process, 2 = not found but not ruled out either: a
+# process that runs the configuration has an executable that cannot be read.
+mediamtx_scan() {
+    local dir pid rc unknown=0
+    MTX_PID=""
+    for dir in /proc/[0-9]*; do
+        pid="${dir#/proc/}"
+        rc=0
+        proc_argv "$pid" || rc=$?
+        if ((rc == 2)); then
+            unknown=1
+            continue
+        elif ((rc != 0)); then
+            continue
+        fi
+        [[ "$_ARGV1" == "$MEDIAMTX_CONFIG_FILE" ]] || continue
+        rc=0
+        mediamtx_verify_pid "$pid" || rc=$?
+        if ((rc == 0)); then
+            MTX_PID="$pid"
+            return 0
+        elif ((rc == 2)); then
+            unknown=1
+        fi
+    done
+    ((unknown == 0)) || return 2
+    return 1
+}
+
+# Find MediaMTX: the process the stream manager recorded in PID_FILE (with its
+# start-time record) if that is verified, else the scan above, which is also what
+# finds a stand-alone MediaMTX (mediamtx.service) and one the manager's PID file
+# no longer names. Sets MTX_PID; 0 = running, 1 = not running, 2 = cannot tell.
+mediamtx_locate() {
+    local raw="" pid="" rc=0
+    MTX_PID=""
+    _MTX_WANT_EXE="$(readlink -f -- "$MEDIAMTX_BIN" 2>/dev/null)" || _MTX_WANT_EXE=""
+    [[ -n "$_MTX_WANT_EXE" ]] || _MTX_WANT_EXE="$MEDIAMTX_BIN"
+    if [[ -f "$PID_FILE" ]] && raw="$(cat "$PID_FILE" 2>/dev/null)"; then
+        pid="${raw%%[[:space:]]*}"
+        if [[ "$pid" =~ ^[1-9][0-9]*$ ]]; then
+            pid_file_recorded_start "$PID_FILE" "$pid"
+            mediamtx_verify_pid "$pid" "$_REC_START" || rc=$?
+            if ((rc == 0)); then
+                MTX_PID="$pid"
+                return 0
+            fi
+        fi
+    fi
+    rc=0
+    mediamtx_scan || rc=$?
+    return "$rc"
+}
+
 # ============================================================================
 # Metric Collection Functions
 # ============================================================================
@@ -237,22 +353,22 @@ emit_help_type() {
     echo "# TYPE ${METRIC_PREFIX}_${name} ${type}"
 }
 
-# Collect MediaMTX service metrics
+# Collect MediaMTX service metrics. The process is this installation's MediaMTX
+# by identity (mediamtx_locate); when that cannot be settled (another user's
+# processes cannot be looked at) mediamtx_up is left out and the collector fails,
+# instead of publishing a false lyrebird_mediamtx_up 0.
 collect_mediamtx_metrics() {
     local mediamtx_running=0
     local mediamtx_pid=0
+    local failed=0 located=0
 
-    # Without pgrep "not running" cannot be told from "cannot tell"; report the
-    # collector as failed instead of publishing a false lyrebird_mediamtx_up 0.
-    if ! has_command pgrep; then
-        log "ERROR: pgrep not found; cannot tell whether MediaMTX is running (install procps)"
+    mediamtx_locate || located=$?
+    if ((located == 2)); then
+        log "ERROR: cannot tell whether MediaMTX (${MEDIAMTX_BIN} ${MEDIAMTX_CONFIG_FILE}) is running: the executable of a process that runs that configuration cannot be read (run as root)"
         return 1
-    fi
-
-    # Check if MediaMTX is running
-    if pgrep -f "mediamtx" >/dev/null 2>&1; then
+    elif ((located == 0)); then
         mediamtx_running=1
-        mediamtx_pid=$(pgrep -f "mediamtx" | head -1) || true
+        mediamtx_pid="$MTX_PID"
     fi
 
     emit_metric "mediamtx_up" "$mediamtx_running" "MediaMTX server running (1=up, 0=down)"
@@ -275,11 +391,17 @@ collect_mediamtx_metrics() {
             emit_metric "mediamtx_cpu_percent" "${cpu_usage%.*}" "MediaMTX CPU usage percentage"
         fi
 
-        # File descriptors
+        # File descriptors. /proc/PID/fd can be listed by the process's own user
+        # and by root only: where it cannot, the count is unknown (the glob stays
+        # unexpanded), not 0.
         if [[ -d "/proc/${mediamtx_pid}/fd" ]]; then
-            local fd_count
-            fd_count=$(find "/proc/${mediamtx_pid}/fd" -maxdepth 1 -type l 2>/dev/null | wc -l || true)
-            emit_metric "mediamtx_open_fds" "$fd_count" "MediaMTX open file descriptors"
+            local -a fds=("/proc/${mediamtx_pid}"/fd/*)
+            if [[ -L "${fds[0]}" ]]; then
+                emit_metric "mediamtx_open_fds" "${#fds[@]}" "MediaMTX open file descriptors"
+            else
+                log "ERROR: cannot list /proc/${mediamtx_pid}/fd; the number of open file descriptors of MediaMTX is unknown (run as root)"
+                failed=1
+            fi
         fi
 
         # Process uptime
@@ -298,7 +420,7 @@ collect_mediamtx_metrics() {
             fi
         fi
     fi
-    return 0
+    return "$failed"
 }
 
 # Collect stream manager metrics

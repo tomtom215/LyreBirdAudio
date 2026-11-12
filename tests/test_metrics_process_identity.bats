@@ -235,3 +235,232 @@ EOF
     # what could be read is still there
     grep -q '^lyrebird_system_load_1m ' "$TEST_SCRATCH/out"
 }
+
+# ---------------------------------------------------------------------------
+# (a) MediaMTX is found by identity, not by a name pattern
+# ---------------------------------------------------------------------------
+
+# Start this installation's MediaMTX: the configured binary run on the configured
+# file, which keeps six extra file descriptors open so that its descriptor count
+# differs from that of every look-alike
+start_our_mediamtx() {
+    cat >"$MEDIAMTX_CONFIG_FILE" <<SCRIPT
+exec 9<>$DECOY_DIR/hold
+exec 10</dev/null 11</dev/null 12</dev/null 13</dev/null 14</dev/null 15</dev/null
+read -r -t 300 -u 9 || true
+SCRIPT
+    decoy_spawn mtx "$MEDIAMTX_BINARY" "$MEDIAMTX_CONFIG_FILE"
+    local i
+    for ((i = 0; i < 100; i++)); do
+        [[ -e "/proc/$(decoy_pid mtx)/fd/15" ]] && return 0
+        sleep 0.05
+    done
+    echo "the MediaMTX stand-in never opened its descriptors" >&2
+    return 1
+}
+
+# The number of entries in /proc/PID/fd, as the exporter should count them
+fd_count() {
+    local fds=(/proc/"$1"/fd/*)
+    echo "${#fds[@]}"
+}
+
+# A look-alike: a copy of bash at $2 run as argv[0] $3 on the arguments after
+spawn_lookalike() {
+    local label="$1" exe="$2" argv0="$3"
+    shift 3
+    decoy_bash_copy "$exe"
+    decoy_spawn_as "$label" "$argv0" "$exe" "$@"
+}
+
+@test "a process that only has mediamtx in its command line is not MediaMTX: mediamtx_up is 0 and nothing of it is reported [X-30]" {
+    spawn_lookalike exporter "$MX/other/mediamtx-exporter" mediamtx-exporter "$HOLD"
+    spawn_lookalike tailer "$MX/other/tail" tail "$HOLD" /var/log/mediamtx.log
+    run_exporter
+    [ "$(sample lyrebird_mediamtx_up)" = "0" ] || { cat "$TEST_SCRATCH/out"; return 1; }
+    ! grep -q '^lyrebird_mediamtx_\(memory_bytes\|cpu_percent\|open_fds\|uptime_seconds\)' "$TEST_SCRATCH/out" || false
+    [ "$(collector_ok mediamtx)" = "1" ]
+}
+
+@test "another installation's MediaMTX (the same binary on another configuration) and an editor on this configuration are not this MediaMTX [X-30]" {
+    decoy_hold_script "$MX/other/mediamtx.yml"
+    decoy_spawn other "$MEDIAMTX_BINARY" "$MX/other/mediamtx.yml"
+    spawn_lookalike editor "$MX/other/vim" vim "$MEDIAMTX_CONFIG_FILE"
+    run_exporter
+    [ "$(sample lyrebird_mediamtx_up)" = "0" ] || { cat "$TEST_SCRATCH/out"; return 1; }
+    ! grep -q '^lyrebird_mediamtx_\(memory_bytes\|cpu_percent\|open_fds\|uptime_seconds\)' "$TEST_SCRATCH/out" || false
+    [ "$(collector_ok mediamtx)" = "1" ]
+}
+
+@test "the exact-identity MediaMTX is found among look-alikes that started before it, and its own memory, descriptors and uptime are reported [X-30]" {
+    spawn_lookalike exporter "$MX/other/mediamtx-exporter" mediamtx-exporter "$HOLD"
+    decoy_hold_script "$MX/other/mediamtx.yml"
+    decoy_spawn other "$MEDIAMTX_BINARY" "$MX/other/mediamtx.yml"
+    start_our_mediamtx
+    local pid
+    pid="$(decoy_pid mtx)"
+    run_exporter
+    [ "$RUN_RC" -eq 0 ] || { cat "$TEST_SCRATCH/err"; return 1; }
+    [ "$(sample lyrebird_mediamtx_up)" = "1" ]
+    # the look-alikes hold 4 descriptors, this one 10
+    [ "$(sample lyrebird_mediamtx_open_fds)" = "$(fd_count "$pid")" ]
+    [ "$(sample lyrebird_mediamtx_open_fds)" -ge 10 ]
+    local rss
+    rss="$(awk '/^VmRSS:/ {print $2}' "/proc/$pid/status")"
+    [ "$(sample lyrebird_mediamtx_memory_bytes)" = "$((rss * 1024))" ]
+    [ "$(sample lyrebird_mediamtx_uptime_seconds)" -le 5 ]
+}
+
+@test "a stand-alone MediaMTX with no PID file of the manager is found by identity, and a stale PID file does not hide it [X-30]" {
+    start_our_mediamtx
+    run_exporter
+    [ "$(sample lyrebird_mediamtx_up)" = "1" ] || { cat "$TEST_SCRATCH/out"; return 1; }
+    # the manager's PID file names a process that is gone
+    local gone
+    sleep 0 &
+    gone=$!
+    wait "$gone" || true
+    printf '%s\n' "$gone" >"$PID_FILE"
+    run_exporter
+    [ "$(sample lyrebird_mediamtx_up)" = "1" ]
+    [ "$(sample lyrebird_mediamtx_open_fds)" = "$(fd_count "$(decoy_pid mtx)")" ]
+}
+
+@test "the manager's PID file names the process and its start-time record vouches for it; a PID file naming a look-alike, or a reused PID, is not trusted [X-30]" {
+    spawn_lookalike exporter "$MX/other/mediamtx-exporter" mediamtx-exporter "$HOLD"
+    # the PID file names the look-alike, there is no MediaMTX: it is down
+    record_pid "$PID_FILE" "$(decoy_pid exporter)"
+    run_exporter
+    [ "$(sample lyrebird_mediamtx_up)" = "0" ] || { cat "$TEST_SCRATCH/out"; return 1; }
+
+    start_our_mediamtx
+    local pid
+    pid="$(decoy_pid mtx)"
+    # it names the look-alike while MediaMTX runs: the scan finds the real one
+    run_exporter
+    [ "$(sample lyrebird_mediamtx_up)" = "1" ]
+    [ "$(sample lyrebird_mediamtx_open_fds)" = "$(fd_count "$pid")" ]
+    # it names MediaMTX with the record of another start time (a reused PID): the
+    # process is not the recorded one, and is found by identity all the same
+    printf '%s\n' "$pid" >"$PID_FILE"
+    printf '%s %s\n' "$pid" "$(($(decoy_starttime "$pid") + 1))" >"$PID_FILE.id"
+    run_exporter
+    [ "$(sample lyrebird_mediamtx_up)" = "1" ]
+    # and named properly
+    record_pid "$PID_FILE" "$pid"
+    run_exporter
+    [ "$(sample lyrebird_mediamtx_up)" = "1" ]
+    [ "$(collector_ok mediamtx)" = "1" ]
+}
+
+@test "the running MediaMTX is still recognised after an upgrade replaced its binary, and when the binary is configured through a symlink [X-30]" {
+    start_our_mediamtx
+    # an upgrade: the file at the path is replaced, the running image is now "(deleted)"
+    rm -f "$MEDIAMTX_BINARY"
+    cp "$BASH_REAL" "$MEDIAMTX_BINARY"
+    [[ "$(readlink "/proc/$(decoy_pid mtx)/exe")" == *"(deleted)" ]]
+    run_exporter
+    [ "$(sample lyrebird_mediamtx_up)" = "1" ] || { cat "$TEST_SCRATCH/out"; return 1; }
+    # the configured path is a symlink to the image that runs
+    local real="$MX/bin/mediamtx-1.2.3"
+    cp "$BASH_REAL" "$real"
+    ln -s "$real" "$MX/bin/mediamtx-current"
+    decoy_hold_script "$MX/cfg/second.yml"
+    decoy_spawn second "$real" "$MX/cfg/second.yml"
+    run_exporter MEDIAMTX_BINARY="$MX/bin/mediamtx-current" MEDIAMTX_CONFIG_FILE="$MX/cfg/second.yml"
+    [ "$(sample lyrebird_mediamtx_up)" = "1" ] || { cat "$TEST_SCRATCH/out"; return 1; }
+}
+
+@test "the exporter reads the manager's variables: the configuration is MEDIAMTX_CONFIG_FILE or MEDIAMTX_CONFIG_DIR/mediamtx.yml, the PID file is PID_FILE, else MEDIAMTX_PID_FILE [X-30]" {
+    start_our_mediamtx
+    local pid
+    pid="$(decoy_pid mtx)"
+    # the default configuration file name inside MEDIAMTX_CONFIG_DIR
+    run_exporter MEDIAMTX_CONFIG_FILE= MEDIAMTX_CONFIG_DIR="$MX/cfg"
+    [ "$(sample lyrebird_mediamtx_up)" = "1" ] || { cat "$TEST_SCRATCH/out"; return 1; }
+    run_exporter MEDIAMTX_CONFIG_FILE= MEDIAMTX_CONFIG_DIR="$MX/other"
+    [ "$(sample lyrebird_mediamtx_up)" = "0" ]
+    # the PID file: the manager's variable when PID_FILE is not set, PID_FILE when both are
+    record_pid "$MX/named.pid" "$pid"
+    run_exporter PID_FILE= MEDIAMTX_PID_FILE="$MX/named.pid"
+    [ "$(sample lyrebird_stream_manager_up)" = "1" ] || { cat "$TEST_SCRATCH/out"; return 1; }
+    run_exporter PID_FILE="$MX/absent.pid" MEDIAMTX_PID_FILE="$MX/named.pid"
+    [ "$(sample lyrebird_stream_manager_up)" = "0" ]
+}
+
+@test "without readlink the executable of a process that runs MediaMTX's configuration cannot be checked: the collector fails visibly and no false lyrebird_mediamtx_up 0 is published [X-30]" {
+    # a directory of the tools a scrape needs, minus readlink
+    local t src
+    mkdir -p "$MX/toolbox"
+    for t in date grep awk cat find wc ps df getconf head tr cut basename dirname sleep mktemp mv rm chmod id uname; do
+        src="$(command -v "$t" 2>/dev/null)" || continue
+        [[ "$src" == /* ]] && ln -sf "$src" "$MX/toolbox/$t"
+    done
+    cp "$MX/stubs/curl" "$MX/toolbox/curl"
+    start_our_mediamtx
+    run_exporter PATH="$MX/toolbox"
+    ! grep -q '^lyrebird_mediamtx_up' "$TEST_SCRATCH/out" || false
+    [ "$(collector_ok mediamtx)" = "0" ]
+    [ "$(collector_ok system)" = "1" ]
+    [ "$RUN_RC" -eq 3 ]
+    grep -q 'cannot tell whether MediaMTX' "$TEST_SCRATCH/err"
+    # with a MediaMTX that is not running there is nothing to look at: not a failure
+    builtin kill "$(decoy_pid mtx)"
+    local i
+    for ((i = 0; i < 100; i++)); do
+        decoy_alive mtx || break
+        sleep 0.05
+    done
+    run_exporter PATH="$MX/toolbox"
+    [ "$(sample lyrebird_mediamtx_up)" = "0" ]
+    [ "$(collector_ok mediamtx)" = "1" ]
+}
+
+@test "an unprivileged exporter finds the manager's MediaMTX by its PID file and start-time record, and reports its descriptor count as unknown, not 0 [X-30]" {
+    unpriv_prepare
+    start_our_mediamtx
+    local pid
+    pid="$(decoy_pid mtx)"
+    require_foreign_root_process "$pid"
+    record_pid "$PID_FILE" "$pid"
+    chmod -R a+rX "$MX"
+    run_exporter_as_nobody
+    [ "$(sample lyrebird_mediamtx_up)" = "1" ] || { cat "$TEST_SCRATCH/out" "$TEST_SCRATCH/err"; return 1; }
+    grep -q '^lyrebird_mediamtx_memory_bytes ' "$TEST_SCRATCH/out"
+    grep -q '^lyrebird_mediamtx_uptime_seconds ' "$TEST_SCRATCH/out"
+    # root's descriptor table cannot be listed: unknown, not "0"
+    ! grep -q '^lyrebird_mediamtx_open_fds' "$TEST_SCRATCH/out" || false
+    [ "$(collector_ok mediamtx)" = "0" ]
+    [ "$RUN_RC" -eq 3 ]
+    grep -q "cannot list /proc/${pid}/fd" "$TEST_SCRATCH/err"
+}
+
+@test "an unprivileged exporter cannot tell whether a stand-alone MediaMTX of root runs, and says so; with nothing running that configuration it is a definite 0 [X-30]" {
+    unpriv_prepare
+    start_our_mediamtx
+    local pid
+    pid="$(decoy_pid mtx)"
+    require_foreign_root_process "$pid"
+    # no PID file of the manager, or one without a start-time record: nothing
+    # tells root's MediaMTX from a look-alike with the same arguments
+    run_exporter_as_nobody
+    ! grep -q '^lyrebird_mediamtx_up' "$TEST_SCRATCH/out" || false
+    [ "$(collector_ok mediamtx)" = "0" ]
+    grep -q 'cannot tell whether MediaMTX' "$TEST_SCRATCH/err"
+    printf '%s\n' "$pid" >"$PID_FILE"
+    chmod -R a+rX "$MX"
+    run_exporter_as_nobody
+    ! grep -q '^lyrebird_mediamtx_up' "$TEST_SCRATCH/out" || false
+    [ "$(collector_ok mediamtx)" = "0" ]
+    # nothing runs this configuration: that is known, with or without privilege
+    builtin kill "$pid"
+    local i
+    for ((i = 0; i < 100; i++)); do
+        decoy_alive mtx || break
+        sleep 0.05
+    done
+    rm -f "$PID_FILE"
+    run_exporter_as_nobody
+    [ "$(sample lyrebird_mediamtx_up)" = "0" ] || { cat "$TEST_SCRATCH/out" "$TEST_SCRATCH/err"; return 1; }
+    [ "$(collector_ok mediamtx)" = "1" ]
+}
