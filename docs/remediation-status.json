@@ -146,7 +146,6 @@
         "the API and the metrics endpoint cannot be reached from a remote address; bound to every interface they answer 401 there, 200 here [LB-06, D9]",
         "the default configuration starts on every MediaMTX version and opens exactly the sockets it names, no SRT, MoQ, RTMP, HLS or WebRTC [LB-06]",
         "the default users file is rtsp-users.conf in the MediaMTX configuration directory [LB-06]",
-        "the warning says when the operator-owned file is the one an earlier release wrote, whose API is on every interface [LB-06]",
         "create_config leaves the moq key to the installed binary's version, and says so when it cannot tell [LB-06 installer]",
         "the file an earlier release of this installer wrote is recognised as such, kept without --force and replaced with it [LB-06 installer, LB-22 installer]",
         "update adds moq: no to a generated configuration when it crosses MediaMTX 1.19, and stays quiet when there is nothing to add [LB-06 installer]",
@@ -154,7 +153,12 @@
         "a rolled-back update puts the generated configuration back: the older binary rejects the moq key it had added [LB-06 installer, N-1]",
         "install writes a configuration every MediaMTX version accepts and opens exactly the sockets it names: no SRT, MoQ, RTMP, HLS or WebRTC [LB-06 installer, LB-22 installer]",
         "through the installed configuration a publisher without credentials publishes and a client without credentials reads, from this machine [LB-06 installer]",
-        "the API and the metrics endpoint of the installed configuration cannot be reached from a remote address, and answer on this machine's loopback address [LB-06 installer, D9]"
+        "the API and the metrics endpoint of the installed configuration cannot be reached from a remote address, and answer on this machine's loopback address [LB-06 installer, D9]",
+        "the configuration an earlier release wrote is adopted on the first start: the replacement loads in every real MediaMTX, with the API on the loopback address, and the backup holds the old file [X-38]",
+        "the file an earlier release generated is adopted on the first start: backed up, replaced by the current rendering, one INFO, managed from then on [X-38]",
+        "the earlier release's first line is adopted with a CRLF line ending or trailing blanks, and the file keeps its mode [X-38]",
+        "a file that only looks like the earlier release's is the operator's and is left alone: installer file, other first lines, the text on a later line [X-38]",
+        "a rendering MediaMTX rejects never replaces the earlier release's file; once it is accepted the file is adopted [X-38]"
       ],
       "note": "manager and installer render the same loopback-API/metrics configuration with SRT/MoQ off, verified on six real MediaMTX versions; nodes installed by an earlier installer keep their file until install --force; the SECURITY-GUIDE text is a phase 7 gate"
     },
@@ -715,12 +719,22 @@
       "title": "atomic write without fsync in manager",
       "severity": "P2",
       "phase": 4,
-      "status": "open",
+      "status": "documented-hw",
       "tests": [
         "an empty file, what a power cut during an old non-durable write leaves behind, is replaced rather than treated as the operator's [LB-23]",
-        "the replacement is flushed to disk: the temp file before the rename, the directory after it [LB-23, D14]"
+        "the replacement is flushed to disk: the temp file before the rename, the directory after it [LB-23, D14]",
+        "save_device_config flushes the temp file before the rename and the directory after it [LB-23, D14]",
+        "save_device_config writes the same template, mode 0644, that the parser reads without a problem [LB-23, D14]",
+        "a write that fails leaves the old config as it was, removes the temp file and says so [LB-23]",
+        "a start whose default device config cannot be written goes on with the defaults; the config command fails [LB-23]",
+        "generate_config flushes the staged config before the rename and the directory after it [LB-23, D14]",
+        "what generate_config writes round-trips through the manager's parser [LB-23, D3]",
+        "a generate_config whose write fails leaves the old config as it was and no temp file [LB-23]",
+        "without lyrebird-common.sh next to it, generate_config still replaces the config atomically (no fsync) [LB-23]",
+        "restore_config_backup flushes the config before the rename and the directory after it, and keeps the backup's mode [LB-23, D14]",
+        "a restore whose write fails leaves the live config as it was [LB-23]"
       ],
-      "note": "manager MediaMTX config write is durable-atomic (verified call order); save_device_config still uses mktemp+mv without fsync; real power-cut durability needs hardware"
+      "note": "the manager's MediaMTX config, save_device_config, and mic-check's generator and restore all go through lyrebird_atomic_write (fsync order verified); a real power cut on real storage is not testable here"
     },
     {
       "id": "LB-24",
@@ -862,9 +876,23 @@
       "title": "YAML and systemd Environment injection via stream name",
       "severity": "P2",
       "phase": 4,
-      "status": "open",
-      "tests": [],
-      "note": "YAML key side fixed (canonical name, quoted scalar, newline injection tested on real MediaMTX: see the [LB-04] live tests); the systemd Environment= quoting is in the unit phase"
+      "status": "fixed",
+      "tests": [
+        "a hostile multiplex name cannot add a systemd directive, a cron line or a YAML key: it is made canonical once and the unit, the cron file and the MediaMTX config carry that one name [X-11]",
+        "multiplex mode renders one quoted path; a stream name that is not a plain scalar cannot inject YAML [LB-04, LB-22]",
+        "any printable stream name comes back from a YAML parser as exactly that one path name [LB-04]",
+        "a stream name with a control character, a line break or a non-ASCII byte is refused, so it cannot inject YAML [LB-04]",
+        "render_systemd_unit: stream mode, filter and name reach the unit, the name escaped for systemd (round trip) [LB-11, X-11]",
+        "render_systemd_unit refuses what the unit file cannot carry and prints no unit: a newline in the name, a bad mode or filter, a path with a space [LB-11, X-11]",
+        "install is repeatable and replaces the unit atomically; a value it cannot carry stops it with exit 4 and changes nothing [LB-11, X-11]",
+        "the cron file sets the stream mode, the filter and the multiplex name, and keeps its restart policy: only exit status 2 restarts the service [LB-11, X-11]",
+        "the cron file carries only values that need no quoting: the name is limited to letters, digits, _ and - [LB-11, X-11]",
+        "a cron monitor on a multiplex node restarts the multiplex stream and never starts per-device streams; on an individual node the reverse [LB-11, X-11]",
+        "a name with a newline and YAML syntax becomes one harmless line [LB-04]",
+        "a hostile name cannot add a YAML key to the generated config [LB-04]",
+        "a name with a newline and a runOnInit line starts MediaMTX without running the injected command [LB-04, live]"
+      ],
+      "note": "stream name canonical once; YAML, systemd Environment and cron carry only that name: tests across names, config render, unit and a real-MediaMTX injection test"
     },
     {
       "id": "X-12",
@@ -1065,8 +1093,39 @@
       "title": "tests re-define functions inline instead of testing real code",
       "severity": "P3",
       "phase": 6,
-      "status": "open",
-      "tests": []
+      "status": "fixed",
+      "tests": [
+        "sanitize stream name removes special characters",
+        "sanitize stream name handles empty input",
+        "sanitize stream name keeps a name within MAX_STREAM_NAME_LENGTH and shortens a longer one to exactly that length with a hash suffix",
+        "check_version_compatibility accepts the required version exactly",
+        "check_version_compatibility accepts a newer library, by any of major, minor and patch",
+        "check_version_compatibility refuses an older library with a warning that names both versions",
+        "PID validation accepts valid PID",
+        "PID validation rejects negative PID",
+        "PID validation rejects non-numeric PID",
+        "PID validation rejects zero and a PID above the system maximum",
+        "device info parsing extracts name and card",
+        "device info parsing skips an entry with no card",
+        "default values are set for timeouts",
+        "environment variables override defaults",
+        "reserved name check rejects 'control'",
+        "reserved name check allows 'mic1'",
+        "gateway IP extraction: the next hop of the default route is what the connectivity check pings",
+        "gateway IP extraction: with no default route the check is skipped and nothing is pinged",
+        "disk space check returns percentage",
+        "disk space warning threshold check",
+        "rtbufsize calculation",
+        "wrapper wait preserves exit code without tripping errexit [C2 regression]",
+        "safe wait idiom survives a non-zero child under set -e [C2 mechanism]",
+        "old bare-wait idiom aborts under set -e [C2 characterization]",
+        "wrapper does not tie its lifetime to the transient launcher PID [C3 regression]",
+        "cron resurrection is bounded per stream per hour [SM-2/H8 regression]",
+        "non-cron (service/interactive) restart is always permitted [SM-2 regression]",
+        "disk-full alone is degraded, NOT a service-restart trigger [SM-4 regression]",
+        "our-process resource exhaustion IS a restart trigger [SM-4 regression]"
+      ],
+      "note": "28 of 36 inline-copy tests found; 9 removed with the covering test named, 19 converted to call the real functions"
     },
     {
       "id": "X-19",
@@ -1428,16 +1487,36 @@
       "title": "individual wrapper with AUDIO_LOCAL_RECORDING puts AUDIO_RECORDING_PATH into the tee muxer argument unescaped (| [ ] : change what tee writes; root-controlled)",
       "severity": "P3",
       "phase": 5,
-      "status": "open",
-      "tests": []
+      "status": "fixed",
+      "tests": [
+        "tee_segment_dir escapes exactly the characters that change what the tee muxer writes [X-33]",
+        "the wrapper header carries the raw recording path and the escaped directory, and the segment spec uses the escaped one [X-33]",
+        "a recording path with any of | [ ] : \\\\ ' % or a space records into exactly that directory, and nowhere else [X-33]",
+        "a relative recording path whose first component has a colon is a directory, not a protocol [X-33]",
+        "recording to a plain path still produces the segments the storage code looks for [X-33]"
+      ],
+      "note": "tee_segment_dir escapes | \\ ' and % and prefixes ./ to relative paths; measured with real ffmpeg 6.1.1: [ ] : and spaces were harmless"
     },
     {
       "id": "X-34",
       "title": "a card with no capture PCM (e.g. a USB speaker) makes start_ffmpeg_stream return 1, so the start summary counts it as a failed stream instead of skipped",
       "severity": "P2",
       "phase": 3,
-      "status": "open",
-      "tests": []
+      "status": "fixed",
+      "tests": [
+        "one microphone and one speaker satisfy strict policy: the speaker is skipped, not counted as a failed stream [X-34]",
+        "the speaker is logged once per start, at INFO, with the reason [X-34]",
+        "status.json lists the speaker as skipped with its reason; overall and the policy count only the microphone [X-34, D4]",
+        "status shows the speaker as skipped with the reason and does not call it a failed stream [X-34]",
+        "a node with only a speaker is a node waiting for devices: exit 0, or 6 when empty start is disabled [X-34, D5]",
+        "a speaker next to a failing microphone does not hide the failure: strict still exits 9 [X-34, D4]",
+        "the monitor does not restart the speaker, charges no restart budget for it and reports a healthy node [X-34, X-04]",
+        "the monitor on a node with only a speaker is waiting for devices (exit 0), not degraded [X-34, D5]",
+        "when the speaker is replaced by a microphone the monitor starts its stream [X-34, D5]",
+        "multiplex mode mixes the microphones only and lists the speaker as skipped [X-34]",
+        "multiplex start passes only the microphones to the multiplex stream and counts one stream [X-34]"
+      ],
+      "note": "a card with no capture PCM is skipped (logged once, [SKIP], status.json configured:false and skipped:true), left out of the policy and of the monitor; hot-plug window (usbid before PCM entries) is HW"
     },
     {
       "id": "X-35",
@@ -1476,16 +1555,28 @@
       "title": "non-root `status` prints stream wrappers as Not running (kill -0 gives EPERM in show_status)",
       "severity": "P3",
       "phase": 3,
-      "status": "open",
-      "tests": []
+      "status": "fixed",
+      "tests": [
+        "status as another user shows a stream wrapper started by root as running or unknown, never Not running [X-36]",
+        "status as another user still says Not running for a wrapper that is really gone [X-36]",
+        "status as another user shows the multiplex wrapper as running or unknown, and does not fall back to the per-device listing [X-36]"
+      ],
+      "note": "show_status uses the identity check; a wrapper it cannot read is Unknown, never Not running"
     },
     {
       "id": "X-38",
       "title": "a managed-by-old-release config (first line '# MediaMTX Configuration - Audio Streams') is treated as operator-owned after upgrade: API/metrics stay on every interface and the node warns on every start",
       "severity": "P2",
       "phase": 4,
-      "status": "open",
-      "tests": []
+      "status": "fixed",
+      "tests": [
+        "the configuration an earlier release wrote is adopted on the first start: the replacement loads in every real MediaMTX, with the API on the loopback address, and the backup holds the old file [X-38]",
+        "the file an earlier release generated is adopted on the first start: backed up, replaced by the current rendering, one INFO, managed from then on [X-38]",
+        "the earlier release's first line is adopted with a CRLF line ending or trailing blanks, and the file keeps its mode [X-38]",
+        "a file that only looks like the earlier release's is the operator's and is left alone: installer file, other first lines, the text on a later line [X-38]",
+        "a rendering MediaMTX rejects never replaces the earlier release's file; once it is accepted the file is adopted [X-38]"
+      ],
+      "note": "a first line of exactly '# MediaMTX Configuration - Audio Streams' is adopted (validated, backed up, rewritten); the installer's own earlier file is not that first line and is left alone"
     },
     {
       "id": "X-43",
@@ -1578,6 +1669,64 @@
         "usb-mapper: card_usb_port reads a port only from the path below the sysfs root, never from a directory above it [X-45]"
       ],
       "note": "found by the hygiene worker: a scratch directory named like <bus>-<port> above the fake sysfs; real sysfs was not affected; the walk now stops at the root"
+    },
+    {
+      "id": "X-46",
+      "title": "manager SIGHUP handler ran restart_mediamtx under a comment that said reload: a terminal hang-up stopped every stream",
+      "severity": "P3",
+      "phase": 6,
+      "status": "fixed",
+      "tests": [
+        "SIGHUP runs the reload and never the full restart [SIGHUP reload]",
+        "a reload that fails after SIGHUP is logged and the process goes on; nothing was stopped [SIGHUP reload]",
+        "while this process runs a lifecycle command (it holds the lock) SIGHUP is logged and ignored, and reloads again once the lock is released [SIGHUP reload]",
+        "SIGHUP through the real reload_mediamtx stops nothing and restarts nothing; the idempotent start reconciles [SIGHUP reload]",
+        "the handler is the same function wherever the HUP trap is set again: after the critical section the trap is still on_sighup [SIGHUP reload]"
+      ],
+      "note": "on_sighup runs reload_mediamtx and ignores the signal while the process holds the lifecycle lock; a real tty hang-up is not tested"
+    },
+    {
+      "id": "X-47",
+      "title": "a stream that failed its own validation was killed with a bare kill: PID file, start-time record and wrapper left behind",
+      "severity": "P3",
+      "phase": 6,
+      "status": "fixed",
+      "tests": [
+        "a stream that fails its own validation is stopped by identity before start_ffmpeg_stream returns: no wrapper, no FFmpeg, no PID file, no start-time record [8b]",
+        "a wrapper that cannot be stopped after a failed validation keeps its PID file, and the failure is logged [8b]"
+      ],
+      "note": "start_ffmpeg_stream stops it by identity and removes the files"
+    },
+    {
+      "id": "X-48",
+      "title": "the multiplex monitor charged the cron restart budget for restarts no card could serve",
+      "severity": "P3",
+      "phase": 6,
+      "status": "fixed",
+      "tests": [
+        "a multiplex stream whose cards ALSA cannot open does not use up the cron restart budget; the restart goes ahead once one can [8c, X-04]",
+        "a multiplex stream with no PID file is not restarted, and the budget is not charged, while no card can be opened [8c, X-04]",
+        "a multiplex PID file that names a process that is not the wrapper is not acted on, and the budget is not charged, while no card can be opened [8c, X-04]",
+        "a multiplex wrapper that is alive but whose path is stuck is not killed, and the budget is not charged, while no card can be opened [8c, X-04]",
+        "a multiplex wrapper that does not have a new device is not restarted, and the budget is not charged, while no card can be opened [8c, X-04]"
+      ],
+      "note": "all five multiplex decision sites ask monitor_multiplex_cards_available first"
+    },
+    {
+      "id": "X-49",
+      "title": "an individual stream's CHANNELS that its codec cannot encode failed after the wrapper was written, with FFmpeg's error buried in a log",
+      "severity": "P3",
+      "phase": 6,
+      "status": "fixed",
+      "tests": [
+        "check_individual_encoding asks FFmpeg: 4 channels as opus is refused with an error naming channels and codec, the counts opus can encode and aac are not [8d]",
+        "a stream with 4 channels and opus is not started: the error names the channels and the codec and nothing is written or launched [8d]",
+        "the same device with 4 channels as aac starts, and so does 2 channels as opus [8d]",
+        "a check that cannot be made does not stop the stream: no lavfi, a timeout, no ffmpeg [8d]",
+        "a question that cannot be put to FFmpeg (a channel count or rate that is not a number, a codec with no encoder arguments) is a check that cannot be made, not a refusal [8d]",
+        "the encoder arguments the check uses are the words of the wrapper's own codec arms, for every codec [8d]"
+      ],
+      "note": "check_individual_encoding asks FFmpeg before the wrapper is written; a check that cannot be made never stops a stream"
     }
   ]
 }

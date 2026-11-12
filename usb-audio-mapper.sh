@@ -60,7 +60,7 @@ set -euo pipefail
 # Byte-wise, locale-independent behavior for tr/sort/awk and regex ranges.
 export LC_ALL=C
 
-readonly SCRIPT_VERSION="4.0.0"
+readonly SCRIPT_VERSION="4.0.1"
 
 SCRIPT_NAME="$(basename "$0")"
 readonly SCRIPT_NAME

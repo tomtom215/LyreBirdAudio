@@ -60,21 +60,24 @@ teardown() {
 # systemd. The copy has its final `main "$@"` replaced by a printout of the traps; everything
 # before it, the code under test, is the real script.
 @test "the manager installs its HUP/USR1 handlers only when it is not run by systemd, and sets no USR2 handler [LB-11, LB-15]" {
+    # a shell cannot trap a signal that was ignored when it started (nohup does that to
+    # SIGHUP), so the copy is started with SIGHUP at its default, whatever the suite's own is
+    hup_default() { python3 -I -c 'import os, signal, sys; signal.signal(signal.SIGHUP, signal.SIG_DFL); os.execvp(sys.argv[1], sys.argv[1:])' "$@"; }
     mkdir -p "$UN/copy"
     cp "$PROJECT_ROOT/lyrebird-common.sh" "$UN/copy/"
     sed 's/^    main "\$@"$/    trap -p HUP USR1 USR2/' "$SCRIPT" >"$UN/copy/lyrebird-stream-manager.sh"
     ! cmp -s "$SCRIPT" "$UN/copy/lyrebird-stream-manager.sh"
-    run env -u INVOCATION_ID -u LYREBIRD_UNDER_SYSTEMD bash "$UN/copy/lyrebird-stream-manager.sh"
+    run hup_default env -u INVOCATION_ID -u LYREBIRD_UNDER_SYSTEMD bash "$UN/copy/lyrebird-stream-manager.sh"
     [ "$status" -eq 0 ]
     [[ "$output" == *"SIGHUP"* && "$output" == *"SIGUSR1"* ]]
     [[ "$output" != *"SIGUSR2"* ]]
 
-    run env -u INVOCATION_ID LYREBIRD_UNDER_SYSTEMD=1 bash "$UN/copy/lyrebird-stream-manager.sh"
+    run hup_default env -u INVOCATION_ID LYREBIRD_UNDER_SYSTEMD=1 bash "$UN/copy/lyrebird-stream-manager.sh"
     [ "$status" -eq 0 ]
     [ -z "$output" ]
 
     # a unit from an older version, which set INVOCATION_ID by hand, behaves as before
-    run env -u LYREBIRD_UNDER_SYSTEMD INVOCATION_ID=systemd bash "$UN/copy/lyrebird-stream-manager.sh"
+    run hup_default env -u LYREBIRD_UNDER_SYSTEMD INVOCATION_ID=systemd bash "$UN/copy/lyrebird-stream-manager.sh"
     [ "$status" -eq 0 ]
     [ -z "$output" ]
 }

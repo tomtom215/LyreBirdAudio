@@ -8,7 +8,9 @@
 # Author: Tom F (https://github.com/tomtom215)
 # License: Apache 2.0
 #
-# Version: 1.0.1
+# Version: 1.0.2
+# (1.0.2: the device configuration it writes and the backup it restores go through
+#  lyrebird_atomic_write: written to a temporary file, flushed, renamed, directory flushed)
 #
 #
 # DESCRIPTION:
@@ -127,7 +129,7 @@ if ! declare -F lyrebird_atomic_write >/dev/null 2>&1; then
 fi
 
 # Version
-readonly VERSION="1.0.1"
+readonly VERSION="1.0.2"
 SCRIPT_NAME="$(basename "${BASH_SOURCE[0]}")"
 readonly SCRIPT_NAME
 

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
 # MediaMTX Installation Manager - Production-Ready Install/Update/Uninstall
-# Version: 2.0.1
+# Version: 2.1.0
 # Part of LyreBirdAudio - RTSP Audio Streaming Suite
 # https://github.com/tomtom215/LyreBirdAudio
 #
@@ -10,6 +10,18 @@
 # License: Apache 2.0
 #
 # Changelog:
+#   v2.1.0: Remediation of the 2026-11 audit (docs/REMEDIATION-2026-11.md). One MediaMTX
+#           configuration generator, shared with the stream manager (lyrebird-common.sh): API
+#           and metrics listen on 127.0.0.1, SRT and MoQ are off, a "Managed by LyreBirdAudio"
+#           first line marks the file as ours (a file without it is yours and is kept unless
+#           --force; timestamped backups, durable atomic writes; the generated file is
+#           validated by the binary that will run it, exit 9 if it rejects it); ports are
+#           validated (exit 10); the systemd unit is rendered from config/mediamtx.service;
+#           update never runs MediaMTX's own --upgrade (no checksum): it downloads and verifies
+#           first, stops MediaMTX only then, installs atomically and rolls back; a MediaMTX
+#           started by hand is left stopped with the command to start it (exit 0), and an update
+#           across 1.19 adds "moq: no" to a generated file; processes are stopped by identity,
+#           never by name; MEDIAMTX_INSTALLER_LOCK_FILE moves the lock file
 #   v2.0.1: Security and robustness improvements - fixed lock file cleanup (prevents accumulation),
 #           SemVer pre-release comparison (correctly handles numeric identifiers), state directory
 #           permissions hardened to 750, uninstall now stops all instances, automatic cleanup of
@@ -38,7 +50,7 @@ _LYREBIRD_COMMON="${BASH_SOURCE[0]%/*}/lyrebird-common.sh"
 unset _LYREBIRD_COMMON
 
 # Script metadata
-readonly SCRIPT_VERSION="2.0.1"
+readonly SCRIPT_VERSION="2.1.0"
 
 SCRIPT_NAME=""
 SCRIPT_NAME="$(basename "${BASH_SOURCE[0]}")"

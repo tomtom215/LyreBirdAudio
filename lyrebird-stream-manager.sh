@@ -10,17 +10,38 @@
 # This script automatically detects USB microphones and creates MediaMTX
 # configurations for continuous 24/7 RTSP audio streams.
 #
-# Version: 1.5.1
-# Compatible with MediaMTX v1.15.0 through at least v1.21.1. The generated
+# Version: 2.0.0
+# Compatible with MediaMTX v1.15.0 through at least v1.21.3. The generated
 # mediamtx.yml, stream start-up and readiness probing are tested against the
-# real 1.15.0, 1.18.0, 1.19.0 and 1.21.1 binaries (tests/test_mediamtx_live.bats;
-# 1.16.0, 1.17.0, 1.20.0 and 1.21.0 were also run once). NOTE: the path status
+# real 1.15.0, 1.18.0, 1.19.0, 1.21.1, 1.21.2 and 1.21.3 binaries
+# (tests/test_mediamtx_live.bats and the other live files; 1.16.0, 1.17.0, 1.20.0
+# and 1.21.0 were also run once). NOTE: the path status
 # fields parsed below ("ready", "bytesReceived", "tracks") are DEPRECATED as of
 # v1.16/v1.17 in favour of "available"/"online"/"inboundBytes"/"tracks2" -- they
 # are still returned today, but a JSON-field migration (with real-hardware
 # validation) is advisable before a future MediaMTX major release removes them.
 #
 # Version History:
+# v2.0.0 - Remediation of the 2026-11 audit (docs/REMEDIATION-2026-11.md has the
+#          decisions and the register; CHANGELOG.md the user-visible list).
+#          Behaviour that changes for an existing node:
+#   - one owner of MediaMTX: a start is refused with exit 8 while mediamtx.service
+#     or another process owns it; the unit is rendered from config/mediamtx-audio.service
+#   - a start tells the truth: exit 9 when LYREBIRD_START_POLICY says so, exit 0 and
+#     "waiting for devices" with no microphone (LYREBIRD_ALLOW_EMPTY_START=false: exit 6);
+#     /run/lyrebird/status.json and `status --json` carry the outcome
+#   - MediaMTX's API and metrics listen on 127.0.0.1 (MEDIAMTX_API_BIND,
+#     MEDIAMTX_METRICS_BIND); RTSP_AUTH_MODE=local-only-publish is available
+#   - the configuration file carries a "Managed by LyreBirdAudio" first line;
+#     a file without it is yours and is never rewritten; timestamped backups,
+#     durable atomic writes; ports are MEDIAMTX_RTSP_PORT, MEDIAMTX_API_PORT,
+#     MEDIAMTX_METRICS_PORT (a bad value is exit 4)
+#   - locks are flock-only and never unlinked; processes are found and stopped by
+#     identity (executable, argument, start time), never by name
+#   - device configuration is parsed as data, never sourced
+#   - removed: AUDIO_DISK_PERSIST and the watchdog/heartbeat claims (the heartbeat is
+#     the time of the last monitor run)
+#
 # v1.5.1 - Generated mediamtx.yml disables the MoQ server that MediaMTX
 #          >= 1.19.0 starts by default (key written only for >= 1.19.0, which
 #          older versions reject)
@@ -206,7 +227,7 @@ unset _LYREBIRD_COMMON _LYREBIRD_COMMON_EXPECTED_HASH
 unset -f _verify_common_library
 
 # Constants
-readonly VERSION="1.5.1"
+readonly VERSION="2.0.0"
 
 # Script identification
 SCRIPT_NAME="$(basename "${BASH_SOURCE[0]}")"
