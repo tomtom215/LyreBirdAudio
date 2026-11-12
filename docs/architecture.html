@@ -269,7 +269,7 @@ or when its device is gone.</code></pre>
       <dt>Rationale</dt>
       <dd>Native ALSA support, codec flexibility, configurable for quality/performance trade-offs</dd>
       <dt>Trade-offs</dt>
-      <dd>Must be installed; process lifecycle management complexity; some options need a newer FFmpeg (the amix <code>normalize</code> option needs 4.4), which the manager detects</dd>
+      <dd>Must be installed; process lifecycle management complexity; some options are missing from older FFmpeg releases (the amix <code>normalize</code> option), which the manager detects by asking FFmpeg</dd>
     </dl>
 
     <h3>ADR-004: Shared Library Pattern</h3>

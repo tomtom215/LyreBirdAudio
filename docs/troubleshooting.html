@@ -129,7 +129,7 @@ sudo tail -50 /var/log/mediamtx.out
 # Check that MediaMTX answers (the API listens on this machine only)
 curl -s http://127.0.0.1:9997/v3/paths/list | head -20
 
-# Check the MediaMTX configuration (MediaMTX 1.21.1 or later)
+# Check the MediaMTX configuration (needs a MediaMTX that has the flag: 1.21.1 or later)
 /usr/local/bin/mediamtx --validate-conf=/etc/mediamtx/mediamtx.yml
 
 # Still stuck: stop what the manager started, then start again

@@ -259,7 +259,7 @@ manager_vars() { env -i "PATH=$PATH" "HOME=$TEST_SCRATCH" bash -c 'source "$1"; 
 }
 
 @test "the anchors the cross-references rely on exist: status document, monitor, backoff, start outcome, configuration ownership [DOC-02]" {
-    local bad=() want a page frag
+    local bad=() want page frag
     for want in monitoring#status-file monitoring#monitor monitoring#check-categories monitoring#prometheus monitoring#alerts \
         architecture#backoff architecture#ownership architecture#locking architecture#config-ownership \
         components#start-outcome components#storage components#updater components#alerts \
@@ -486,7 +486,7 @@ manager_vars() { env -i "PATH=$PATH" "HOME=$TEST_SCRATCH" bash -c 'source "$1"; 
 }
 
 @test "the stream manager commands and options in the pages are the ones its --help lists, and every command is documented [DOC-02]" {
-    local help cmds opts code tok bad=() c
+    local help cmds code tok bad=() c
     help="$(help_of lyrebird-stream-manager.sh)"
     cmds="$(sed -nE 's/^    (start|stop|force-stop|restart|reload|status|config|validate|monitor|install|help) .*/\1/p' <<<"$help" | sort -u | tr '\n' ' ')"
     [[ "$cmds" == "config force-stop help install monitor reload restart start status stop validate " ]] || { echo "unexpected command list: $cmds"; return 1; }
@@ -630,7 +630,7 @@ manager_vars() { env -i "PATH=$PATH" "HOME=$TEST_SCRATCH" bash -c 'source "$1"; 
 }
 
 @test "the exit-code table of every script lists the codes the script defines [DOC-02]" {
-    local bad=() real doc h2 spec
+    local bad=() real doc h2
     declare -A real_of=()
     local sm_help
     sm_help="$(help_of lyrebird-stream-manager.sh)"
@@ -792,7 +792,7 @@ manager_vars() { env -i "PATH=$PATH" "HOME=$TEST_SCRATCH" bash -c 'source "$1"; 
 }
 
 @test "the quality tier table is what calculate_encoder_bitrate and determine_optimal_settings compute [DOC-02]" {
-    local want got case_ rate ch tier expect cell
+    local got case_ rate ch tier expect
     # tier|rate|channels|bitrate the function must return, and the text the page must show for it
     for case_ in 'low|44100|1|96' 'low|44100|2|128' 'low|22050|1|64' 'low|22050|2|96' 'normal|48000|1|128' 'normal|48000|2|192' \
         'normal|96000|1|192' 'normal|96000|2|256' 'high|192000|1|192' 'high|192000|2|320' 'high|96000|1|160' 'high|96000|2|256' \

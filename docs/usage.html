@@ -197,9 +197,10 @@ rtsp://your-server-ip:8554/mic-right
     <h3>amix — Audio Mixing</h3>
     <p>
       Mixes all inputs into one stream with the channel count of one input (two stereo microphones give a stereo stream).
-      With FFmpeg 4.4 or newer the manager sets <code>normalize=0</code>, so the inputs are summed at full weight: two equal
-      inputs come out about 6 dB louder than FFmpeg's default amix, and loud inputs can clip. FFmpeg 4.2 and 4.3 have no
-      such option, so there the mix is normalized; the manager detects which applies.
+      When FFmpeg's amix has the <code>normalize</code> option (added in FFmpeg 4.4, from its changelog; not checked here) the manager sets <code>normalize=0</code>, so the inputs are summed at full weight:
+      two equal inputs come out about 6 dB louder than FFmpeg's default amix (measured with FFmpeg 6.1.1), and loud inputs can clip.
+      Without the option the manager leaves it out and amix normalizes. It asks FFmpeg which applies; the older-FFmpeg case
+      was tested only with a stand-in whose help text lacks the option, not with FFmpeg 4.2 or 4.3 themselves.
     </p>
     <pre><code>sudo ./lyrebird-stream-manager.sh -m multiplex -f amix start
 # Output: rtsp://host:8554/all_mics</code></pre>
@@ -231,7 +232,7 @@ rtsp://your-server-ip:8554/mic-right
         <tbody>
           <tr><td>Output channels</td><td>Same as one input</td><td>Sum of all inputs</td></tr>
           <tr><td>Channel separation</td><td>Lost (mixed together)</td><td>Kept: one channel per input channel</td></tr>
-          <tr><td>Loudness</td><td>Sum of the inputs (FFmpeg 4.4+), or normalized (4.2, 4.3)</td><td>Unchanged per channel</td></tr>
+          <tr><td>Loudness</td><td>Sum of the inputs (when amix has <code>normalize</code>), otherwise normalized</td><td>Unchanged per channel</td></tr>
           <tr><td>Limit</td><td>None beyond the codec's</td><td>The codec must encode the total channel count</td></tr>
         </tbody>
       </table>

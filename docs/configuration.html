@@ -112,7 +112,7 @@ DEVICE_MIC_RIGHT_PCM=1</code></pre>
 # Check the settings against what each card reports
 sudo ./lyrebird-mic-check.sh -V
 
-# Check the MediaMTX configuration (MediaMTX 1.21.1 or later; older releases have no such flag)
+# Check the MediaMTX configuration (the flag is in MediaMTX 1.21.1 and later; 1.19.0 and earlier do not have it)
 /usr/local/bin/mediamtx --validate-conf=/etc/mediamtx/mediamtx.yml</code></pre>
     <p>
       MediaMTX has no <code>--check</code> flag. Where the installed MediaMTX has <code>--validate-conf</code>, both the
