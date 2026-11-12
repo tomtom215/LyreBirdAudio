@@ -3645,6 +3645,27 @@ monitor_card_available() {
     return 1
 }
 
+# The same check for the multiplex stream: it can be started when at least one of its
+# devices can be opened (the start leaves out the cards that cannot). Run before the
+# restart budget is charged, as monitor_card_available is for the individual streams: the
+# multiplex branches of monitor_streams charged CRON_RESTART_MAX_PER_HOUR before any ALSA
+# check, so a detected card that could not be opened used up the budget without a restart
+# attempt (X-04, multiplex).
+# Usage: monitor_multiplex_cards_available STREAM_PATH DEVICE...  (DEVICE is "name:card")
+monitor_multiplex_cards_available() {
+    local stream_path="$1" device_info card_num cards=""
+    shift
+    for device_info in "$@"; do
+        card_num="${device_info#*:}"
+        if check_alsa_device_available "$card_num"; then
+            return 0
+        fi
+        cards+="${cards:+, }${card_num}"
+    done
+    log WARN "Multiplex stream $stream_path: ALSA device not available (card ${cards}), skipping restart"
+    return 1
+}
+
 # --- Deep health probe (H9) --------------------------------------------------
 # Ask the MediaMTX control API whether a path is actually publishing.
 # Returns: 0 = ready, 1 = not ready (MediaMTX has the path and it is not
@@ -3865,7 +3886,9 @@ monitor_streams() {
 
         # Check if PID file exists
         if [[ ! -f "$pid_file" ]]; then
-            if should_restart_stream "$stream_path"; then
+            if ! monitor_multiplex_cards_available "$stream_path" "${devices[@]}"; then
+                ((streams_failed++)) || true
+            elif should_restart_stream "$stream_path"; then
                 log WARN "Multiplex stream $stream_path has no PID file - restarting"
                 if start_multiplex_stream "${devices[@]}"; then
                     ((streams_restarted++)) || true
@@ -3884,7 +3907,9 @@ monitor_streams() {
             pid="$(read_pid_safe "$pid_file")"
 
             if [[ -z "$pid" ]]; then
-                if should_restart_stream "$stream_path"; then
+                if ! monitor_multiplex_cards_available "$stream_path" "${devices[@]}"; then
+                    ((streams_failed++)) || true
+                elif should_restart_stream "$stream_path"; then
                     log WARN "Multiplex stream $stream_path PID is invalid - restarting"
                     if start_multiplex_stream "${devices[@]}"; then
                         ((streams_restarted++)) || true
@@ -3898,7 +3923,9 @@ monitor_streams() {
                     log WARN "Multiplex stream $stream_path PID is invalid (cron mode: not restarting)"
                 fi
             elif pid_is_foreign_wrapper "$pid" "$stream_path"; then
-                if should_restart_stream "$stream_path"; then
+                if ! monitor_multiplex_cards_available "$stream_path" "${devices[@]}"; then
+                    ((streams_failed++)) || true
+                elif should_restart_stream "$stream_path"; then
                     log WARN "Multiplex stream $stream_path PID $pid is stale - restarting"
                     rm -f "$pid_file"
                     if start_multiplex_stream "${devices[@]}"; then
@@ -3915,7 +3942,9 @@ monitor_streams() {
             elif deep_stream_unhealthy "$stream_path"; then
                 # Wrapper alive but the path has been continuously not-ready:
                 # a hung FFmpeg or endless backoff. Restart within the budget.
-                if should_restart_stream "$stream_path"; then
+                if ! monitor_multiplex_cards_available "$stream_path" "${devices[@]}"; then
+                    ((streams_failed++)) || true
+                elif should_restart_stream "$stream_path"; then
                     log WARN "Multiplex stream $stream_path wrapper is alive but path is not ready - restarting"
                     terminate_process_group "$pid" 5 || true
                     rm -f "$pid_file"
@@ -3934,7 +3963,9 @@ monitor_streams() {
                 # A device appeared (a vanished one ends the wrapper itself): the
                 # wrapper captures the devices it was started with, so the stream
                 # is started again to include the new one
-                if should_restart_stream "$stream_path"; then
+                if ! monitor_multiplex_cards_available "$stream_path" "${devices[@]}"; then
+                    ((streams_failed++)) || true
+                elif should_restart_stream "$stream_path"; then
                     log WARN "Multiplex stream $stream_path: the set of devices changed - restarting"
                     terminate_process_group "$pid" 5 || true
                     rm -f "$pid_file"
