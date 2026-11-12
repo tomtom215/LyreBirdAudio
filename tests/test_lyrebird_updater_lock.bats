@@ -45,10 +45,13 @@ _hold_lock_with_flock() {
 # What the lock is
 # ============================================================================
 
+# These tests take and hold the lock with `--status`: the cheapest command that still takes
+# it. `--version`, `--help` and `--history` take no lock (they answer first).
+
 @test "the lock is an flock on a file that is never removed; it records the holder's pid and start time" {
     updater_checkout v1.1.0
     chmod +x "$REPO/lyrebird-updater.sh"
-    UPDATER_HOLD_DIRECT=yes updater_hold_lock 2 --version
+    UPDATER_HOLD_DIRECT=yes updater_hold_lock 2 --status
     [ -f "$LOCK" ]
     # really held: another open file description cannot take it
     run flock -n "$LOCK" true
@@ -70,7 +73,7 @@ _hold_lock_with_flock() {
     read -r rec_pid _ <"$LOCK"
     [ "$rec_pid" = "$HOLDER_PID" ]
     # and the next updater reuses the very same file
-    updater_run --version
+    updater_run --status
     [ "$status" -eq 0 ]
     [ "$(stat -c %i "$LOCK")" = "$inode" ]
 }
@@ -101,11 +104,11 @@ _hold_lock_with_flock() {
 
 @test "a second updater waits for the holder and goes ahead the moment it exits" {
     updater_checkout v1.1.0
-    updater_hold_lock 3 --version
-    LYREBIRD_UPDATER_LOCK_WAIT=20 updater_run --version
+    updater_hold_lock 3 --status
+    LYREBIRD_UPDATER_LOCK_WAIT=20 updater_run --status
     [ "$status" -eq 0 ]
     [[ "$output" == *"Waiting for other instance to finish"* ]]
-    [[ "$output" == *"LyreBirdAudio Version Manager"* ]]
+    [[ "$output" == *"Repository Status"* ]]
     wait "$HOLDER_PID"
 }
 
@@ -258,7 +261,7 @@ _same_instant() {
     mkdir -p "$STATE"
     # free lock, record of a dead process: taken, record replaced
     printf '%-64s\n' "2147483646 12345" >"$LOCK"
-    updater_run --version
+    updater_run --status
     [ "$status" -eq 0 ]
     local rec_pid
     read -r rec_pid _ <"$LOCK"
@@ -266,12 +269,12 @@ _same_instant() {
     # held, record of a dead process
     _hold_lock_with_flock
     printf '%-64s\n' "2147483646 12345" >"$LOCK"
-    LYREBIRD_UPDATER_LOCK_WAIT=1 updater_run --version
+    LYREBIRD_UPDATER_LOCK_WAIT=1 updater_run --status
     [ "$status" -eq 7 ]
     [[ "$output" == *"the last recorded owner, process 2147483646, start time 12345, is not running"* ]]
     # held, record of a live process with another start time (a recycled pid)
     printf '%-64s\n' "$$ 1" >"$LOCK"
-    LYREBIRD_UPDATER_LOCK_WAIT=1 updater_run --version
+    LYREBIRD_UPDATER_LOCK_WAIT=1 updater_run --status
     [ "$status" -eq 7 ]
     [[ "$output" == *"process $$, start time 1, is not running"* ]]
     [[ "$output" != *"Lock held by process $$"* ]]
@@ -284,7 +287,7 @@ _same_instant() {
         printf '%-64s\n' "2147483646 12345"
         printf 'data after the record\nand more\n'
     } >"$LOCK"
-    updater_run --version
+    updater_run --status
     [ "$status" -eq 0 ]
     local first
     first="$(head -n 1 "$LOCK")"

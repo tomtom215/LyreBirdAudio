@@ -1152,6 +1152,7 @@ COMMANDS:
     status              Show alerting system status
     config              Show current configuration
     setup               Interactive configuration setup
+    version             Show the version (also --version, -V)
     help                Show this help message
 
 SEND OPTIONS:
@@ -1484,6 +1485,9 @@ main() {
             ;;
         help | --help | -h)
             show_help
+            ;;
+        version | --version | -V)
+            echo "${SCRIPT_NAME} version ${SCRIPT_VERSION}"
             ;;
         *)
             echo "Unknown command: $command"

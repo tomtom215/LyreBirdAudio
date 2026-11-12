@@ -1888,6 +1888,50 @@
       "status": "wontfix",
       "tests": [],
       "note": "decision for the maintainer: carrying paths would change many tests that set them for hermetic renders; documented under known limits; set paths with a systemd drop-in and a cron environment line"
+    },
+    {
+      "id": "X-61",
+      "title": "lyrebird-stream-manager.sh and lyrebird-alerts.sh had no --version (the other scripts do)",
+      "severity": "P3",
+      "phase": 7,
+      "status": "fixed",
+      "tests": [
+        "the stream manager and alerts print their version and exit 0 for --version and -V [X-61]",
+        "the help of the stream manager and alerts lists the version option [X-61]"
+      ]
+    },
+    {
+      "id": "X-62",
+      "title": "the updater's --help and --version asked for the root confirmation, took its lock (waiting up to 30 s for a running updater) and checked the repository first; as root without a terminal they ended in 'Cancelled by user', exit 9",
+      "severity": "P3",
+      "phase": 7,
+      "status": "fixed",
+      "tests": [
+        "updater --help and --version answer at once for a sudo user without a terminal: no root prompt, no lock, exit 0 [X-62]"
+      ],
+      "note": "--version and --help answer first, like --history (U-23 of the updater notes)"
+    },
+    {
+      "id": "X-63",
+      "title": "lyrebird-mic-check.sh used negative array subscripts, which need Bash 4.3, while the project says Bash 4.x",
+      "severity": "P3",
+      "phase": 7,
+      "status": "fixed",
+      "tests": [
+        "no script uses a negative array subscript, which needs Bash 4.3 [X-63]",
+        "no script uses namerefs, wait -n, mapfile -d, \\${var@X} transforms or EPOCHSECONDS, which need Bash 4.3 to 5.0 [X-63]"
+      ],
+      "note": "replaced; a static guard keeps every script free of subscripts, namerefs, wait -n, mapfile -d, @-transforms and EPOCHSECONDS; Bash 4.2 itself is still not run here"
+    },
+    {
+      "id": "X-64",
+      "title": "the soak observer's header claimed Linux or macOS and bash 3.2 although it was only run on Linux with Bash 5.2",
+      "severity": "P3",
+      "phase": 7,
+      "status": "fixed",
+      "tests": [
+        "the soak observer's own header does not claim a platform or Bash it was never run on [X-64]"
+      ]
     }
   ]
 }

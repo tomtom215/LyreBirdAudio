@@ -4361,6 +4361,22 @@ main() {
         exit "$E_SUCCESS"
     fi
 
+    # --version and --help answer at once: no root confirmation (as root without a
+    # terminal that prompt ended in "Cancelled by user", exit 9, before the help),
+    # no prerequisites, no lock (which a running updater made them wait up to 30 s for)
+    # and no network. The help names the default branch from what the clone already knows.
+    case "${1:-}" in
+        --version | -v)
+            echo "LyreBirdAudio Version Manager v${VERSION}"
+            exit "$E_SUCCESS"
+            ;;
+        --help | -h)
+            DEFAULT_BRANCH="$(get_default_branch offline 2>/dev/null)" || DEFAULT_BRANCH=""
+            show_help
+            exit "$E_SUCCESS"
+            ;;
+    esac
+
     # A self-update re-exec resumes here with --post-update-* . At that point the
     # service is already stopped and only the completion/restore half remains.
     # Mark the run as resumed so check_prerequisites skips the interactive
@@ -4400,7 +4416,7 @@ main() {
     # must work with the network down.
     local branch_probe=""
     case "${1:-}" in
-        --version | -v | --help | -h | --status | -s | --migrate | --rollback | --post-update-complete | --post-update-restore)
+        --status | -s | --migrate | --rollback | --post-update-complete | --post-update-restore)
             branch_probe="offline"
             ;;
     esac
@@ -4490,16 +4506,6 @@ main() {
                 fi
                 echo
                 read -r -p "Press Enter to continue..." || true
-                ;;
-
-            --version | -v)
-                echo "LyreBirdAudio Version Manager v${VERSION}"
-                exit "$E_SUCCESS"
-                ;;
-
-            --help | -h)
-                show_help
-                exit "$E_SUCCESS"
                 ;;
 
             --status | -s)

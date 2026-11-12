@@ -9117,6 +9117,7 @@ Options:
                          saved first)
     -d, --debug          Enable debug output
     -h, --help           Show this help message
+    -V, --version        Show the version
 
 Environment Variables:
     MULTIPLEX_FILTER_TYPE    Multiplex audio filter type [default: amix]
@@ -9325,6 +9326,10 @@ parse_arguments() {
                 ;;
             -h | --help)
                 show_help
+                exit 0
+                ;;
+            -V | --version)
+                echo "${SCRIPT_NAME} version ${VERSION}"
                 exit 0
                 ;;
             -*)

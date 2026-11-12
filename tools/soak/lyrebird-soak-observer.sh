@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # lyrebird-soak-observer.sh - watch a LyreBirdAudio node's streams from outside
 #
-# Run on a second machine (Linux or macOS; bash 3.2 or later, ffmpeg). It
+# Run on a second machine (run on Linux with Bash 5.2 only; written to avoid
+# Bash 4 features, but never run on macOS or Bash 3.2 here; needs ffmpeg). It
 # keeps one RTSP reader per stream and logs, once a second, that audio
 # arrived. Gaps are measured from the listener's side, so they include what
 # the node itself cannot record: power cuts, kernel hangs, network loss.

@@ -996,8 +996,8 @@ detect_device_capabilities() {
     # These are Opus/AAC encoder bitrates, not PCM bitrates
     if [[ ${#all_rates[@]} -gt 0 ]] && [[ ${#all_channels[@]} -gt 0 ]]; then
         # Get highest sample rate and channel count
-        local max_rate="${all_rates[-1]}"
-        local max_channels="${all_channels[-1]}"
+        local max_rate="${all_rates[${#all_rates[@]} - 1]}"
+        local max_channels="${all_channels[${#all_channels[@]} - 1]}"
 
         # Calculate encoder bitrates for each quality tier
         for tier in low normal high; do
@@ -1204,8 +1204,8 @@ determine_optimal_settings() {
     fi
 
     # Get maximum capabilities (safe - arrays validated above)
-    local max_rate="${rate_array[-1]}"
-    local max_channels="${channel_array[-1]}"
+    local max_rate="${rate_array[${#rate_array[@]} - 1]}"
+    local max_channels="${channel_array[${#channel_array[@]} - 1]}"
 
     # Determine optimal sample rate based on tier
     local optimal_rate
