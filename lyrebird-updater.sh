@@ -14,6 +14,8 @@
 #     truncated (decision D2); a dead holder releases it by dying, so there is
 #     no stale-lock removal. The lock descriptor is closed in every git and
 #     systemctl the updater starts and before a self-update re-exec
+#   - A self-update runs the post-update migrations of the version it installs
+#     (they used to run only on updates that did not restart the updater)
 #   - A switch or reset that fails in the menu no longer ends the run: it is
 #     reported and the menu stays open (Q leaves with that status). End of input
 #     at a prompt leaves with exit status 12 and a message instead of a silent 1
@@ -2740,6 +2742,10 @@ recover_handoff() {
         log_warn "HEAD is no longer at the version that update switched to; leaving it where it is"
     fi
 
+    # The migrations are part of the update; the interrupted run may not have got
+    # to them (they are idempotent: one that already ran is skipped)
+    run_post_update_migrations
+
     if [[ -n "$stash_hash" ]] && [[ -n "$(find_stash_ref "$stash_hash")" ]]; then
         log_step "Restoring your saved changes..."
         restore_saved_changes "$stash_hash" || restore_status=$?
@@ -4317,6 +4323,10 @@ main() {
                 local restore_status=0 handoff_note=""
                 [[ "${3:-}" == "--no-menu" ]] && post_update_no_menu=true
                 handoff_load_journal || true
+                # The migrations of the version that was just installed run here, in
+                # its own updater, on the tree as that version left it (before the
+                # operator's changes come back)
+                run_post_update_migrations
                 restore_saved_changes "$2" || restore_status=$?
                 if [[ $restore_status -eq 0 ]]; then
                     log_success "Changes restored successfully"
@@ -4349,6 +4359,7 @@ main() {
 
                 [[ "${2:-}" == "--no-menu" ]] && post_update_no_menu=true
                 handoff_load_journal || true
+                run_post_update_migrations
                 # Check for pending service update
                 if check_pending_service_update; then
                     if ! complete_pending_service_update; then

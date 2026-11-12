@@ -158,6 +158,17 @@ updater_blackhole_stop() {
     fi
 }
 
+# updater_install_killat NAME...: put the killat shim on the node's PATH under
+# each NAME (mkdir, cp ...); with KILLAT_ARG set, a call of that command whose
+# arguments contain it kills the updater instead of running (see the shim).
+updater_install_killat() {
+    local name
+    export UPDATER_REAL_PATH="$PATH"
+    for name in "$@"; do
+        cp "$UPDATER_HELPER_DIR/helpers/updater/bin/killat" "$SHIMS/$name"
+    done
+}
+
 # updater_inject ON WHEN ACT [SKIP]: arm the git fault shim for the next run(s).
 updater_inject() {
     export FAULT_ON="$1" FAULT_WHEN="$2" FAULT_ACT="$3" FAULT_SKIP="${4:-0}"
