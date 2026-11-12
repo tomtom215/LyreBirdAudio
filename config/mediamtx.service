@@ -1,13 +1,25 @@
 # MediaMTX RTSP Server systemd Service
 # High-performance RTSP/RTMP/HLS/WebRTC media server
 #
-# Installation:
+# ONE template. `sudo ./install_mediamtx.sh install` renders it into
+# /etc/systemd/system/mediamtx.service; copying it there by hand
 #   sudo cp config/mediamtx.service /etc/systemd/system/
 #   sudo systemctl daemon-reload
 #   sudo systemctl enable mediamtx
 #   sudo systemctl start mediamtx
-#
-# Note: Adjust paths if MediaMTX is installed elsewhere
+# works when MediaMTX is at /usr/local/bin/mediamtx with its configuration in
+# /etc/mediamtx/mediamtx.yml (it then runs as root). The values below are those
+# defaults. The installer replaces them where they differ and changes nothing else:
+#   - ExecStart=       the MediaMTX binary and its configuration file
+#   - `# User=mediamtx` and `# Group=mediamtx` become User= and Group= lines: the
+#                      service account the installer created
+#   - WorkingDirectory=  the state directory
+#   - ReadWritePaths=  /var/log, the state directory and the configuration directory
+#   - StandardOutput=, StandardError=  the installer sends the log to the journal
+#                      (journalctl -u mediamtx), which rotates itself; the file below
+#                      suits the by-hand install together with
+#                      config/lyrebird-logrotate.conf
+# Change anything else with `systemctl edit mediamtx` (a drop-in), not here.
 
 [Unit]
 Description=MediaMTX RTSP Media Server
@@ -35,15 +47,20 @@ ExecStart=/usr/local/bin/mediamtx /etc/mediamtx/mediamtx.yml
 
 # Working directory
 WorkingDirectory=/var/lib/mediamtx
+# systemd creates /var/lib/mediamtx (owned by the service account) before the
+# process starts, so a node whose state directory was removed still starts
+StateDirectory=mediamtx
 
-# User/Group (uncomment to run as non-root)
+# User/Group: run as a non-root account (the installer creates "mediamtx" and
+# activates these two lines; by hand, create the account and uncomment them)
 # User=mediamtx
 # Group=mediamtx
 
-# Restart policy for 24/7 operation
+# Restart policy for 24/7 operation: whatever ends MediaMTX, it is started again
+# (with the start limit above). No RestartPreventExitStatus=: a SIGTERM sent by
+# something else than systemd must not leave an unattended node down.
 Restart=always
 RestartSec=5
-RestartPreventExitStatus=SIGTERM SIGINT
 
 # NOTE: no WatchdogSec here on purpose. MediaMTX does not implement the systemd
 # sd_notify watchdog protocol, so a WatchdogSec would never receive a keep-alive

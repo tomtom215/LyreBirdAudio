@@ -81,7 +81,7 @@ COMMAND=""
 
 # Derived paths
 INSTALL_DIR="${INSTALL_PREFIX}/bin"
-readonly SERVICE_DIR="/etc/systemd/system"
+readonly SERVICE_DIR="${MEDIAMTX_SERVICE_DIR:-/etc/systemd/system}"
 readonly SERVICE_NAME="mediamtx.service"
 readonly CONFIG_NAME="mediamtx.yml"
 # Unit that runs the stream manager (and through it MediaMTX plus its FFmpeg
@@ -146,9 +146,6 @@ RELEASE_VERSION=""
 # Platform information
 PLATFORM_OS=""
 PLATFORM_ARCH=""
-
-# Minimum version for --upgrade support (MediaMTX added this in v1.15.0)
-readonly MIN_UPGRADE_VERSION="1.15.0"
 
 # ============================================================================
 # Utility Functions
@@ -1186,6 +1183,127 @@ download_mediamtx() {
     log_debug "Binary extracted and verified"
 }
 
+# The version a MediaMTX binary reports ("vX.Y.Z"), or nothing and status 1 when
+# it is not an executable, does not run, or prints no version.
+#   mediamtx_binary_version BINARY
+mediamtx_binary_version() {
+    local bin="$1" out="" ver=""
+    [[ -x "${bin}" ]] || return 1
+    if command -v timeout &>/dev/null; then
+        out=$(timeout 10 "${bin}" --version 2>/dev/null) || return 1
+    else
+        out=$("${bin}" --version 2>/dev/null) || return 1
+    fi
+    ver=$(grep -oE 'v?[0-9]+\.[0-9]+\.[0-9]+' <<<"${out}" | head -n 1) || true
+    [[ -n "${ver}" ]] || return 1
+    printf '%s\n' "${ver}"
+}
+
+# --- MediaMTX configuration --------------------------------------------------
+#
+# The configuration comes from lyrebird_render_mediamtx_config (lyrebird-common.sh),
+# the generator the stream manager uses too: API and metrics on the loopback
+# address, every protocol this project does not use switched off, MoQ switched
+# off only for MediaMTX versions that have it, the first line the marker that
+# says LyreBirdAudio generated the file. A file without that first line is the
+# operator's (decision D10): it is never overwritten unless --force says so.
+
+# Stop with a clear message unless the shared library is beside this script: it
+# holds the configuration generator, the port check and the atomic file writer.
+require_common_library() {
+    if ! declare -F lyrebird_render_mediamtx_config >/dev/null 2>&1 \
+        || ! declare -F lyrebird_is_valid_port >/dev/null 2>&1 \
+        || ! declare -F lyrebird_atomic_write >/dev/null 2>&1; then
+        fatal "lyrebird-common.sh is required next to ${SCRIPT_NAME}: it holds the MediaMTX configuration generator and the atomic file writer (run the installer from a complete checkout of LyreBirdAudio; --no-config --no-service needs no library)" 4
+    fi
+}
+
+# The ports reach the configuration file, so each must be a decimal integer from
+# 1 to 65535 (leading zeros are fine and are not octal); an empty variable means
+# the default. A bad value stops the run before anything is written.
+validate_port_settings() {
+    local -a names=(MEDIAMTX_RTSP_PORT MEDIAMTX_API_PORT MEDIAMTX_METRICS_PORT)
+    local -a values=("${DEFAULT_RTSP_PORT}" "${DEFAULT_API_PORT}" "${DEFAULT_METRICS_PORT}")
+    local i
+    for i in "${!names[@]}"; do
+        if ! lyrebird_is_valid_port "${values[${i}]}"; then
+            fatal "${names[${i}]} must be an integer from 1 to 65535 (got: $(printf '%q' "${values[${i}]}"))" 10
+        fi
+    done
+}
+
+# Render the configuration for MediaMTX $2 (empty = unknown version: no key a
+# version could reject is written) into file $1. Prints nothing on stdout.
+render_mediamtx_config() {
+    local out_file="$1" version="${2:-}" err=""
+    local -a args=(--rtsp-port "${DEFAULT_RTSP_PORT}" --api-port "${DEFAULT_API_PORT}"
+        --metrics-port "${DEFAULT_METRICS_PORT}")
+    if [[ -n "${version}" ]]; then
+        args+=(--mediamtx-version "${version}")
+    fi
+    if ! err=$(lyrebird_render_mediamtx_config "${args[@]}" 2>&1 >"${out_file}"); then
+        log_error "Cannot render the MediaMTX configuration: ${err}"
+        return 1
+    fi
+}
+
+# Everything `install` needs to write the configuration is checked before it
+# changes anything: the generator is present, the ports are valid and differ.
+check_config_inputs() {
+    [[ "${SKIP_CONFIG}" != "true" ]] || return 0
+    require_common_library
+    validate_port_settings
+    render_mediamtx_config /dev/null "" || fatal "Invalid MediaMTX port settings" 10
+}
+
+# Is the first line of file $1 the marker that says LyreBirdAudio generated it?
+# Trailing blanks and the CR of a CRLF line ending do not count.
+config_is_managed() {
+    local first=""
+    IFS= read -r first <"$1" || [[ -n "${first}" ]] || return 1
+    first="${first%"${first##*[![:space:]]}"}"
+    [[ "${first}" == "${LYREBIRD_MEDIAMTX_CONFIG_MARKER}" ]]
+}
+
+# Ask the MediaMTX binary $1 whether it accepts configuration file $2, where it
+# can (--validate-conf exists from 1.21; an older binary has no such check and
+# the answer is yes). Logs MediaMTX's own message when it does not.
+mediamtx_accepts_config() {
+    local bin="$1" file="$2" help="" out="" rc=0
+    [[ -x "${bin}" ]] || return 0
+    if command -v timeout &>/dev/null; then
+        help=$(timeout 10 "${bin}" --help 2>&1) || true
+    else
+        help=$("${bin}" --help 2>&1) || true
+    fi
+    [[ "${help}" == *--validate-conf* ]] || return 0
+    if command -v timeout &>/dev/null; then
+        out=$(timeout 20 "${bin}" "--validate-conf=${file}" 2>&1) || rc=$?
+    else
+        out=$("${bin}" "--validate-conf=${file}" 2>&1) || rc=$?
+    fi
+    if [[ ${rc} -ne 0 ]]; then
+        log_error "MediaMTX rejects the generated configuration: ${out}"
+        return 1
+    fi
+    return 0
+}
+
+# Keep a copy of the configuration file about to be replaced, next to it, with
+# its mode, owner and time. Sets CONFIG_BACKUP (execute_rollback puts it back).
+backup_config_file() {
+    local config_file="$1" stamp backup n=0
+    stamp="$(date +%Y%m%d-%H%M%S)"
+    backup="${config_file}.backup.${stamp}"
+    while [[ -e "${backup}" ]]; do
+        ((++n))
+        backup="${config_file}.backup.${stamp}.${n}"
+    done
+    cp -p -- "${config_file}" "${backup}" || return 1
+    CONFIG_BACKUP="${backup}"
+    log_info "Existing config backed up to: ${CONFIG_BACKUP}"
+}
+
 create_config() {
     local config_file="${CONFIG_DIR}/${CONFIG_NAME}"
 
@@ -1199,66 +1317,177 @@ create_config() {
         return 0
     fi
 
-    [[ -d "${CONFIG_DIR}" ]] || mkdir -p "${CONFIG_DIR}"
+    require_common_library
+    validate_port_settings
 
-    # Backup existing config
-    if [[ -f "${config_file}" ]]; then
-        CONFIG_BACKUP="${config_file}.backup.$(date +%Y%m%d-%H%M%S)"
-        cp "${config_file}" "${CONFIG_BACKUP}"
-        log_info "Existing config backed up to: ${CONFIG_BACKUP}"
+    # The keys MediaMTX rejects depend on its version: render for the binary
+    # that was just installed
+    local version=""
+    version=$(mediamtx_binary_version "${INSTALL_DIR}/mediamtx") || version="${RELEASE_VERSION}"
+    if [[ -z "${version}" ]]; then
+        log_warn "The MediaMTX version is unknown: the generated configuration leaves out the keys only newer versions have (a MediaMTX 1.19 or later then starts a MoQ listener)"
     fi
 
-    cat >"${config_file}" <<EOF
-###############################################
-# MediaMTX Configuration
-# Generated by ${SCRIPT_NAME} v${SCRIPT_VERSION}
-# Date: $(date -Iseconds)
-###############################################
+    local rendered=""
+    rendered=$(mktemp) || fatal "Cannot create a temporary file for the configuration" 1
+    CLEANUP_FILES+=("${rendered}")
+    render_mediamtx_config "${rendered}" "${version}" || fatal "Not writing ${config_file}" 10
+    # (exit 9, not 7: the orchestrator's setup wizard reads 7 as "already installed" and carries on)
+    mediamtx_accepts_config "${INSTALL_DIR}/mediamtx" "${rendered}" || fatal "Not writing ${config_file}" 9
 
-# Global settings
-logLevel: info
-logDestinations: [stdout]
-logFile: ${STATE_DIR}/mediamtx.log
+    [[ -d "${CONFIG_DIR}" ]] || mkdir -p "${CONFIG_DIR}"
 
-# API Configuration
-api: yes
-apiAddress: :${DEFAULT_API_PORT}
+    # Who owns the file that is there? An empty one is what a power cut during a
+    # non-durable write leaves behind: nobody keeps an empty configuration.
+    local state=new
+    if [[ -s "${config_file}" ]]; then
+        if config_is_managed "${config_file}"; then
+            state=managed
+        else
+            state=operator
+        fi
+    elif [[ -e "${config_file}" ]]; then
+        state=managed
+    fi
 
-# Metrics
-metrics: yes
-metricsAddress: :${DEFAULT_METRICS_PORT}
+    case "${state}" in
+        managed)
+            if cmp -s "${rendered}" "${config_file}"; then
+                log_info "Configuration is up to date: ${config_file} left untouched"
+                return 0
+            fi
+            ;;
+        operator)
+            local origin=""
+            if [[ "$(sed -n 2p "${config_file}" 2>/dev/null)" == "# MediaMTX Configuration" ]]; then
+                origin=" It looks like the file an earlier release of this installer wrote: its API and metrics listen on every interface, it leaves SRT and MoQ on and it accepts no publisher."
+            fi
+            if [[ "${FORCE_MODE}" != "true" ]]; then
+                log_warn "${config_file} exists and does not start with the line '${LYREBIRD_MEDIAMTX_CONFIG_MARKER}': it is treated as yours, NOT overwritten, and used as it is.${origin} To replace it with the generated configuration, run the installer with --force (the previous file is saved first)."
+                return 0
+            fi
+            log_warn "${config_file} does not start with the line '${LYREBIRD_MEDIAMTX_CONFIG_MARKER}', so it was not generated by LyreBirdAudio: replacing it because --force was given.${origin}"
+            ;;
+        *) ;;
+    esac
 
-# RTSP Server Configuration
-rtsp: yes
-rtspAddress: :${DEFAULT_RTSP_PORT}
-rtspEncryption: "no"
-rtspTransports: [tcp, udp]
+    if [[ -s "${config_file}" ]]; then
+        backup_config_file "${config_file}" || fatal "Cannot save a backup of ${config_file}: leaving it as it is" 1
+    fi
 
-# RTMP Server (disabled by default)
-rtmp: no
-rtmpAddress: :1935
+    # Atomic and durable: a reader or a power cut sees the old file or the new one, never half
+    if ! lyrebird_atomic_write "${config_file}" 0644 <"${rendered}"; then
+        fatal "Failed to write ${config_file}" 1
+    fi
+    rm -f "${rendered}"
 
-# HLS Server (disabled by default)
-hls: no
-hlsAddress: :8888
+    log_info "Configuration created: ${config_file} (API and metrics listen on 127.0.0.1 only)"
+    log_info "To keep hand edits in it, delete its first line ('${LYREBIRD_MEDIAMTX_CONFIG_MARKER}'): a file without that line is yours and is never overwritten"
+}
 
-# WebRTC (disabled by default)
-webrtc: no
-webrtcAddress: :8889
+# --- systemd unit --------------------------------------------------------------
+#
+# One template, config/mediamtx.service (decision D12). It is a complete unit
+# with the default paths; render_service_unit replaces the few values that
+# depend on this installation (the lines the template's header lists) and
+# copies everything else, comments included, unchanged.
 
-# Paths configuration
-pathDefaults:
-  source: publisher
-  sourceOnDemand: no
+# Where the unit's template is: MEDIAMTX_UNIT_TEMPLATE, else config/ next to this script
+service_template_path() {
+    printf '%s' "${MEDIAMTX_UNIT_TEMPLATE:-${SCRIPT_DIR}/config/mediamtx.service}"
+}
 
-paths: {}
-  # Define your paths here
-EOF
+# Will install write a systemd unit? Not with --no-service, and not without systemd.
+service_creation_enabled() {
+    [[ "${SKIP_SERVICE}" != "true" ]] && command -v systemctl &>/dev/null
+}
 
-    chmod 644 "${config_file}"
-    chown root:root "${config_file}" 2>/dev/null || true
+# Render the unit to stdout: the template with ExecStart, User, Group,
+# WorkingDirectory, ReadWritePaths, StandardOutput and StandardError replaced
+# by this installation's values. Fails, printing no complete unit, for a value a
+# unit file cannot carry without quoting (a path with a space or another
+# character outside A-Z a-z 0-9 _ . / + -, an account name with a space or a
+# newline) and for a template that lacks a line to replace.
+render_service_unit() {
+    local template
+    template="$(service_template_path)"
+    if [[ ! -r "${template}" ]]; then
+        log_error "The unit template ${template} is missing: run the installer from a complete checkout of LyreBirdAudio (config/mediamtx.service), or set MEDIAMTX_UNIT_TEMPLATE"
+        return 1
+    fi
 
-    log_info "Configuration created: ${config_file}"
+    local path
+    for path in "${INSTALL_DIR}" "${CONFIG_DIR}" "${STATE_DIR}"; do
+        if [[ ! "${path}" =~ ^/[A-Za-z0-9_./+-]*$ ]]; then
+            log_error "Cannot write the unit: '${path}' is not an absolute path of letters, digits and _ . / + - only"
+            return 1
+        fi
+    done
+    local account
+    for account in "${SERVICE_USER}" "${SERVICE_GROUP}"; do
+        if [[ ! "${account}" =~ ^[A-Za-z_][A-Za-z0-9_.-]*$ ]]; then
+            log_error "Cannot write the unit: the account name '${account}' is not made of letters, digits and _ . - only"
+            return 1
+        fi
+    done
+
+    local -a lines=()
+    mapfile -t lines <"${template}"
+    local -A seen=()
+    local line out key
+    for line in ${lines[@]+"${lines[@]}"}; do
+        out="${line}"
+        key=""
+        case "${line}" in
+            ExecStart=*)
+                key=ExecStart
+                out="ExecStart=${INSTALL_DIR}/mediamtx ${CONFIG_DIR}/${CONFIG_NAME}"
+                ;;
+            '# User=mediamtx')
+                key=User
+                out="User=${SERVICE_USER}"
+                ;;
+            '# Group=mediamtx')
+                key=Group
+                out="Group=${SERVICE_GROUP}"
+                ;;
+            WorkingDirectory=*)
+                key=WorkingDirectory
+                out="WorkingDirectory=${STATE_DIR}"
+                ;;
+            ReadWritePaths=*)
+                key=ReadWritePaths
+                out="ReadWritePaths=/var/log ${STATE_DIR} ${CONFIG_DIR}"
+                ;;
+            StandardOutput=*)
+                key=StandardOutput
+                out="StandardOutput=journal"
+                ;;
+            StandardError=*)
+                key=StandardError
+                out="StandardError=journal"
+                ;;
+            *) ;;
+        esac
+        if [[ -n "${key}" ]]; then
+            seen["${key}"]=1
+        fi
+        printf '%s\n' "${out}"
+    done
+    for key in ExecStart User Group WorkingDirectory ReadWritePaths StandardOutput StandardError; do
+        if [[ -z "${seen[${key}]:-}" ]]; then
+            log_error "The unit template ${template} has no ${key} line to replace: the template and install_mediamtx.sh have drifted apart"
+            return 1
+        fi
+    done
+}
+
+# What `install` needs to write the unit is checked before it changes anything:
+# the library with the atomic writer, the template, and values the unit can carry.
+check_service_inputs() {
+    service_creation_enabled || return 0
+    require_common_library
+    render_service_unit >/dev/null || fatal "Cannot write the systemd unit" 10
 }
 
 create_service() {
@@ -1285,60 +1514,25 @@ create_service() {
         return 0
     fi
 
+    require_common_library
+
     local service_file="${SERVICE_DIR}/${SERVICE_NAME}"
+
+    # Render before anything is touched: a unit that cannot be written changes nothing
+    local unit=""
+    unit="$(render_service_unit && printf x)" || fatal "Cannot write the systemd unit" 10
+    unit="${unit%x}"
 
     # Backup existing service
     if [[ -f "${service_file}" ]]; then
         SERVICE_BACKUP="${service_file}.backup.$(date +%Y%m%d-%H%M%S)"
-        cp "${service_file}" "${SERVICE_BACKUP}"
+        cp -p -- "${service_file}" "${SERVICE_BACKUP}"
     fi
 
-    cat >"${service_file}" <<EOF
-[Unit]
-Description=MediaMTX Media Server
-Documentation=https://github.com/${DEFAULT_GITHUB_REPO}
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-User=${SERVICE_USER}
-Group=${SERVICE_GROUP}
-ExecStart=${INSTALL_DIR}/mediamtx ${CONFIG_DIR}/${CONFIG_NAME}
-ExecReload=/bin/kill -USR1 \$MAINPID
-
-# Restart configuration
-Restart=always
-RestartSec=10
-StartLimitInterval=60
-StartLimitBurst=3
-
-# Environment
-Environment="HOME=${STATE_DIR}"
-WorkingDirectory=${STATE_DIR}
-
-# Logging
-StandardOutput=journal
-StandardError=journal
-SyslogIdentifier=mediamtx
-
-# Security hardening
-NoNewPrivileges=true
-PrivateTmp=true
-ProtectSystem=strict
-ProtectHome=true
-ReadWritePaths=/var/log ${STATE_DIR}
-StateDirectory=mediamtx
-RuntimeDirectory=mediamtx
-
-# Resource limits
-LimitNOFILE=65536
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-    chmod 644 "${service_file}"
+    # Atomic and durable, like the configuration
+    if ! printf '%s' "${unit}" | lyrebird_atomic_write "${service_file}" 0644; then
+        fatal "Failed to write ${service_file}" 1
+    fi
     systemctl daemon-reload
 
     log_info "Service created: ${SERVICE_NAME}"
@@ -1390,6 +1584,11 @@ install_mediamtx() {
         fatal "MediaMTX is already installed. Use --force to override or 'update' command" 7
     fi
 
+    # Settings that cannot be carried into the configuration stop the run before
+    # anything is downloaded or written
+    check_config_inputs
+    check_service_inputs
+
     # Early writability check
     if [[ "${DRY_RUN_MODE}" != "true" ]]; then
         if [[ ! -d "${INSTALL_PREFIX}" ]]; then
@@ -1440,6 +1639,26 @@ install_mediamtx() {
     show_post_install_guidance
 }
 
+# MediaMTX 1.19 and later start a MoQ server (8892 tcp+udp, 8893 udp, every
+# interface) unless the configuration says "moq: no", a key older versions
+# reject: the file generated for such a version cannot carry it. After an update
+# across 1.19 the generated file is therefore missing a line it now needs, and
+# this says so. (The stream manager renders its file again at every start, with the
+# version of the binary, so it is not concerned.)
+#   warn_if_moq_listens VERSION
+warn_if_moq_listens() {
+    local version="$1" config_file="${CONFIG_DIR}/${CONFIG_NAME}" parts="" major=0 minor=0
+    declare -F lyrebird_mediamtx_version_parts >/dev/null 2>&1 || return 0
+    [[ -f "${config_file}" ]] || return 0
+    config_is_managed "${config_file}" || return 0
+    parts=$(lyrebird_mediamtx_version_parts "${version}") || return 0
+    read -r major minor _ <<<"${parts}"
+    if ((major > 1 || (major == 1 && minor >= 19))) && ! grep -q '^moq:' "${config_file}"; then
+        log_warn "MediaMTX ${version} starts a MoQ server (8892 tcp and udp, 8893 udp) on every interface unless its configuration says 'moq: no', and ${config_file}, generated for an older MediaMTX, does not. Add the line 'moq: no' (after 'srt: no'); the file stays a generated one."
+    fi
+    return 0
+}
+
 update_mediamtx() {
     log_info "Updating MediaMTX..."
 
@@ -1483,59 +1702,37 @@ update_mediamtx() {
     cp "${INSTALL_DIR}/mediamtx" "${BINARY_BACKUP}"
     log_info "Current binary backed up to: ${BINARY_BACKUP}"
 
-    # Try MediaMTX's built-in `--upgrade` ONLY when the operator did not pin a
-    # specific version: `--upgrade` always jumps to MediaMTX's own idea of latest
-    # and ignores RELEASE_VERSION, so a pinned `update -V vX.Y.Z` would silently
-    # install a different (untested) release. A pinned target must go through the
-    # manual, checksum-verified, atomic path below.
-    local upgrade_success=false
-    if [[ -z "${TARGET_VERSION}" ]] && version_compare "${current_version}" "${MIN_UPGRADE_VERSION}"; then
-        log_info "Attempting built-in upgrade (--upgrade)..."
+    # The update goes through the same verified download as install: the release
+    # tarball, checked against the checksums.sha256 published with it (a mismatch is
+    # fatal even with --force), extracted, then installed atomically. MediaMTX's own
+    # `--upgrade` is not used: it downloads "the latest" tag over HTTPS and replaces
+    # the executable in place with no checksum or signature check (upstream
+    # internal/upgrade, selfupdate.Apply with empty Options), whatever --force or
+    # a pinned target says.
+    log_info "Downloading and verifying MediaMTX ${RELEASE_VERSION}..."
+    download_mediamtx "${RELEASE_VERSION}" "${PLATFORM_OS}" "${PLATFORM_ARCH}"
 
-        if "${INSTALL_DIR}/mediamtx" --upgrade 2>&1 | tee -a "${LOG_FILE}"; then
-            # Verify the upgrade reached the intended release (normalize leading v)
-            local new_version
-            if new_version=$("${INSTALL_DIR}/mediamtx" --version 2>&1 | grep -oE 'v?[0-9]+\.[0-9]+\.[0-9]+' | head -1); then
-                if [[ "${new_version#v}" == "${RELEASE_VERSION#v}" ]]; then
-                    upgrade_success=true
-                    log_info "Built-in upgrade completed successfully (${current_version} -> ${new_version})"
-                elif [[ "${new_version}" != "${current_version}" ]]; then
-                    log_warn "Built-in upgrade produced ${new_version} but expected ${RELEASE_VERSION}; falling back to manual update"
-                else
-                    log_warn "Built-in upgrade reported success but version unchanged; falling back to manual update"
-                fi
-            else
-                log_warn "Could not verify new version after upgrade; falling back to manual update"
-            fi
-        else
-            log_warn "Built-in upgrade failed, falling back to manual update"
-        fi
-    else
-        log_debug "Using manual update (pinned target, or version ${current_version} predates --upgrade support ${MIN_UPGRADE_VERSION}+)"
+    # Atomic binary replacement with cleanup on failure
+    local temp_binary="${INSTALL_DIR}/mediamtx.new.$$"
+    if ! install -m 755 "${TEMP_DIR}/mediamtx" "${temp_binary}"; then
+        fatal "Failed to prepare binary for update" 7
+    fi
+    if ! mv -f "${temp_binary}" "${INSTALL_DIR}/mediamtx"; then
+        rm -f "${temp_binary}"
+        fatal "Failed to atomically update binary" 7
     fi
 
-    # Manual update if upgrade failed or not supported
-    if [[ "${upgrade_success}" != "true" ]]; then
-        log_info "Performing manual update..."
-        download_mediamtx "${RELEASE_VERSION}" "${PLATFORM_OS}" "${PLATFORM_ARCH}"
-
-        # Atomic binary replacement with cleanup on failure
-        local temp_binary="${INSTALL_DIR}/mediamtx.new.$$"
-        if ! install -m 755 "${TEMP_DIR}/mediamtx" "${temp_binary}"; then
-            fatal "Failed to prepare binary for update" 7
-        fi
-        if ! mv -f "${temp_binary}" "${INSTALL_DIR}/mediamtx"; then
-            rm -f "${temp_binary}"
-            fatal "Failed to atomically update binary" 7
-        fi
-    fi
-
-    # Verify new version
-    if "${INSTALL_DIR}/mediamtx" --version &>/dev/null; then
-        local new_version
-        new_version=$("${INSTALL_DIR}/mediamtx" --version 2>&1 | grep -oE 'v?[0-9]+\.[0-9]+\.[0-9]+' | head -1) || new_version="unknown"
-        log_info "Updated to version: ${new_version}"
-    fi
+    # The new binary must run. Without this a binary that cannot even print its
+    # version would be left in place whenever nothing starts MediaMTX afterwards
+    # (a MediaMTX that nobody supervises); fatal here rolls back to the previous one.
+    local new_version=""
+    new_version=$(mediamtx_binary_version "${INSTALL_DIR}/mediamtx") \
+        || fatal "The new MediaMTX binary does not run (--version failed); rolling back to the previous binary" 7
+    log_info "Updated to version: ${new_version}"
+    case "${MANAGEMENT_MODE}" in
+        stream-manager | stream-manager-service) ;;
+        *) warn_if_moq_listens "${new_version}" ;;
+    esac
 
     # FIX 1.5: Clean up old backup files
     log_info "Cleaning up old backup files..."
@@ -1557,10 +1754,20 @@ update_mediamtx() {
     # binary fails to start, fatal-exit: the EXIT-trap rollback then restores the
     # previous binary AND restarts it, so the recorder stays on last-known-good
     # rather than reporting "updated successfully" while the server is down.
+    # A MediaMTX that nobody supervises (started by hand) is the exception: the
+    # installer stopped it and has no way to start it, so it cannot verify a start
+    # that is not its to make. Waiting for one only ended every such update in a
+    # rollback; the operator is told instead.
     if [[ "${WAS_RUNNING}" == "true" ]]; then
-        start_mediamtx "${MANAGEMENT_MODE}"
-        if ! verify_service_started "${MANAGEMENT_MODE}"; then
-            fatal "MediaMTX did not come back up after the update; rolling back to the previous binary" 7
+        if [[ "${MANAGEMENT_MODE}" == "manual" ]]; then
+            log_warn "MediaMTX is NOT running: it was running outside systemd and the stream manager, so the installer stopped it and cannot start it again."
+            log_warn "The new binary (${new_version}) is installed. Start MediaMTX again the way you started it before, for example:"
+            log_warn "  ${INSTALL_DIR}/mediamtx ${CONFIG_DIR}/${CONFIG_NAME}"
+        else
+            start_mediamtx "${MANAGEMENT_MODE}"
+            if ! verify_service_started "${MANAGEMENT_MODE}"; then
+                fatal "MediaMTX did not come back up after the update; rolling back to the previous binary" 7
+            fi
         fi
     fi
 
@@ -1773,7 +1980,7 @@ start_mediamtx() {
             ;;
 
         manual | *)
-            log_info "Please manually restart MediaMTX"
+            log_info "Please manually restart MediaMTX: ${INSTALL_DIR}/mediamtx ${CONFIG_DIR}/${CONFIG_NAME}"
             ;;
     esac
 }
@@ -2089,14 +2296,14 @@ show_help() {
     cat <<EOF
 ${BOLD}MediaMTX Installation Manager v${SCRIPT_VERSION}${NC}
 
-Production-ready installer for MediaMTX with built-in upgrade support.
+Production-ready installer for MediaMTX: checksum-verified downloads, backup and rollback.
 
 ${BOLD}USAGE:${NC}
     ${SCRIPT_NAME} [OPTIONS] COMMAND
 
 ${BOLD}COMMANDS:${NC}
     install     Install MediaMTX
-    update      Update to latest version (uses built-in --upgrade when available)
+    update      Update to the latest (or the -V) version: verified download, atomic replace, rollback
     uninstall   Remove MediaMTX
     status      Show installation status
     verify      Verify installation integrity
@@ -2107,7 +2314,9 @@ ${BOLD}OPTIONS:${NC}
     -v, --verbose              Enable verbose output
     -q, --quiet                Suppress non-error output
     -n, --dry-run              Show what would be done
-    -f, --force                Force operation (skip confirmations/checksums)
+    -f, --force                Force operation (skip confirmations; skip checksum verification
+                               only when no checksum is available; replace a configuration
+                               file that is not LyreBirdAudio's, saving a backup first)
     -V, --target-version VER   Install specific version
     -p, --prefix DIR           Installation prefix (default: ${DEFAULT_INSTALL_PREFIX})
     --version                  Show script version
@@ -2118,7 +2327,7 @@ ${BOLD}EXAMPLES:${NC}
     # Install latest version
     sudo ${SCRIPT_NAME} install
 
-    # Update using built-in upgrade (MediaMTX v${MIN_UPGRADE_VERSION}+)
+    # Update to the latest version (checksum-verified)
     sudo ${SCRIPT_NAME} update
 
     # Install specific version
@@ -2140,6 +2349,8 @@ ${BOLD}ENVIRONMENT VARIABLES:${NC}
     MEDIAMTX_PREFIX       Installation prefix
     MEDIAMTX_CONFIG_DIR   Configuration directory
     MEDIAMTX_STATE_DIR    State directory
+    MEDIAMTX_SERVICE_DIR  Directory the systemd unit is written to (default /etc/systemd/system)
+    MEDIAMTX_UNIT_TEMPLATE  Unit template (default: config/mediamtx.service next to this script)
     MEDIAMTX_USER         Service user name
     MEDIAMTX_GROUP        Service group name
     MEDIAMTX_RTSP_PORT    RTSP port written to the config and checked by status (default 8554)
@@ -2149,9 +2360,16 @@ ${BOLD}ENVIRONMENT VARIABLES:${NC}
     MEDIAMTX_PID_FILE     PID file of the stream manager's MediaMTX (default /run/mediamtx-audio.pid)
 
 ${BOLD}UPDATE NOTES:${NC}
-    The update command uses MediaMTX's built-in --upgrade functionality
-    when available (v${MIN_UPGRADE_VERSION}+). This simplifies updates and ensures
-    platform compatibility. Falls back to manual update for older versions.
+    The update command downloads the release tarball and verifies it against the
+    checksums.sha256 published with the release (a mismatch is always fatal; --force
+    only skips the check when no checksum is available), stops MediaMTX through its
+    owner (systemd, the stream manager), installs the new binary atomically and
+    starts MediaMTX again. If the new binary does not run, or the service does not
+    come back up, the previous binary is restored. MediaMTX's own --upgrade is not
+    used: it replaces the executable without any checksum check.
+    A MediaMTX that nobody supervises (started by hand) is stopped and NOT started
+    again, since the installer cannot start a process it does not own: it prints the
+    command to start it and exits 0.
 
 ${BOLD}GITHUB:${NC}
     https://github.com/${DEFAULT_GITHUB_REPO}
