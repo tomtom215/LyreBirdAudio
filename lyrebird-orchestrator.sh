@@ -919,8 +919,9 @@ execute_script() {
 # Say how an installer action ended. execute_script prints nothing for the
 # installer (the wizard treats its exit status 7 as data), so a failure would
 # otherwise reach the user only as "Last Error" in the next menu redraw.
-# Exit status 7 is overloaded in the installer: "already installed", but also
-# several failed install steps; its own message, printed just before, says which.
+# Exit status 7 of the installer is "already installed" (install), "not installed"
+# (update, uninstall) or "could not stop MediaMTX"; the binary steps that failed
+# (extract, put in place) are 11 (X-57). Its own message, printed just before, says which.
 report_installer_result() {
     local action="$1"
 
@@ -928,7 +929,9 @@ report_installer_result() {
         return 0
     fi
     if [[ "$LAST_EXIT_CODE" == "7" ]]; then
-        warning "The installer exited with code 7: MediaMTX is already installed (use Update or Reinstall), or an install step failed; the installer's message above says which"
+        warning "The installer exited with code 7: MediaMTX is already installed (use Update or Reinstall), is not installed, or could not be stopped; the installer's message above says which"
+    elif [[ "$LAST_EXIT_CODE" == "11" ]]; then
+        error "MediaMTX ${action} failed (installer exit code: 11 - the MediaMTX binary could not be extracted or installed); see the installer's message above"
     else
         error "MediaMTX ${action} failed (installer exit code: ${LAST_EXIT_CODE}); see the installer's message above"
     fi

@@ -10,7 +10,11 @@
 # License: Apache 2.0
 #
 # Changelog:
-#   v2.1.0: Remediation of the 2026-11 audit (docs/REMEDIATION-2026-11.md). One MediaMTX
+#   v2.1.0: Exit status 11 is the binary steps (extract, binary missing in the archive, copy or
+#           move into place): 7 stays "already installed", "not installed" and "could not stop
+#           MediaMTX", which the orchestrator's wizard reads as "already installed: carry on"
+#           (X-57). The help lists every exit code.
+#           Remediation of the 2026-11 audit (docs/REMEDIATION-2026-11.md). One MediaMTX
 #           configuration generator, shared with the stream manager (lyrebird-common.sh): API
 #           and metrics listen on 127.0.0.1, SRT and MoQ are off, a "Managed by LyreBirdAudio"
 #           first line marks the file as ours (a file without it is yours and is kept unless
@@ -1198,11 +1202,11 @@ download_mediamtx() {
     # Extract
     log_info "Extracting archive..."
     if ! tar -xzf "${archive}" -C "${TEMP_DIR}"; then
-        fatal "Failed to extract archive" 7
+        fatal "Failed to extract archive" 11
     fi
 
     if [[ ! -f "${TEMP_DIR}/mediamtx" ]]; then
-        fatal "Binary not found in archive" 7
+        fatal "Binary not found in archive" 11
     fi
 
     # Verify binary
@@ -1654,11 +1658,11 @@ install_mediamtx() {
     log_info "Installing binary..."
     local temp_binary="${INSTALL_DIR}/mediamtx.new.$$"
     if ! install -m 755 "${TEMP_DIR}/mediamtx" "${temp_binary}"; then
-        fatal "Failed to prepare binary for installation" 7
+        fatal "Failed to prepare binary for installation" 11
     fi
     if ! mv -f "${temp_binary}" "${INSTALL_DIR}/mediamtx"; then
         rm -f "${temp_binary}"
-        fatal "Failed to atomically install binary" 7
+        fatal "Failed to atomically install binary" 11
     fi
 
     create_user
@@ -1778,11 +1782,11 @@ update_mediamtx() {
     # Atomic binary replacement with cleanup on failure
     local temp_binary="${INSTALL_DIR}/mediamtx.new.$$"
     if ! install -m 755 "${TEMP_DIR}/mediamtx" "${temp_binary}"; then
-        fatal "Failed to prepare binary for update" 7
+        fatal "Failed to prepare binary for update" 11
     fi
     if ! mv -f "${temp_binary}" "${INSTALL_DIR}/mediamtx"; then
         rm -f "${temp_binary}"
-        fatal "Failed to atomically update binary" 7
+        fatal "Failed to atomically update binary" 11
     fi
 
     # The new binary must run. Without this a binary that cannot even print its
@@ -2401,6 +2405,24 @@ ${BOLD}EXAMPLES:${NC}
 
     # Show script version
     ${SCRIPT_NAME} --version
+
+${BOLD}EXIT CODES:${NC}
+     0  Success
+     1  General error: the lock could not be taken, an unknown option or command, a file that could not be written
+     2  Not run as root
+     3  Unsupported operating system or architecture
+     4  A required tool is missing (bash 4+, curl or wget, mktemp, ...), or lyrebird-common.sh is not next to this script
+     5  The release could not be looked up or downloaded
+     6  The checksum could not be fetched or does not match
+     7  MediaMTX is already installed (install), is not installed (update, uninstall) or could not be stopped;
+        also an update that was rolled back because the new binary does not run or MediaMTX did not come back
+     8  The installation prefix cannot be created or written
+     9  The configuration file given with -c is missing or unreadable, or MediaMTX rejects the one generated
+    10  An invalid setting: prefix, version, port, or a value the systemd unit cannot carry
+    11  The MediaMTX binary could not be put in place: the archive does not extract or holds no binary,
+        or the copy or move into the installation directory failed (install, update)
+    The Quick Setup wizard of lyrebird-orchestrator.sh reads 7 from install as "already installed" and carries on;
+    every other non-zero status stops it.
 
 ${BOLD}FILES:${NC}
     Binary:  ${INSTALL_DIR}/mediamtx
