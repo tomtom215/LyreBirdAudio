@@ -1713,7 +1713,7 @@ sudo ./usb-audio-mapper.sh
 sudo ./usb-audio-mapper.sh -n --card 1 -f mic-left
 
 # Non-interactive by vendor/product id, choosing the port
-sudo ./usb-audio-mapper.sh -n -v XXXX -p YYYY -u 1-2 -f mic-right
+sudo ./usb-audio-mapper.sh -n -v 2e88 -p 4610 -u 1-2 -f mic-right
 
 # Remove a mapping
 sudo ./usb-audio-mapper.sh --remove mic-left
