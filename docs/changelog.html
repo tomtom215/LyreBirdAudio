@@ -19,203 +19,530 @@
     <div class="page-header">
       <span class="page-label">Reference</span>
       <h1 class="page-title">Changelog</h1>
-      <p class="page-subtitle">All notable changes, releases, and breaking changes. Follows <a href="https://keepachangelog.com/en/1.0.0/" target="_blank" rel="noopener">Keep a Changelog</a> and <a href="https://semver.org/" target="_blank" rel="noopener">Semantic Versioning</a>.</p>
+      <p class="page-subtitle">A copy of <code>CHANGELOG.md</code>: all notable changes, releases and breaking changes. Follows <a href="https://keepachangelog.com/en/1.0.0/" target="_blank" rel="noopener">Keep a Changelog</a> and <a href="https://semver.org/" target="_blank" rel="noopener">Semantic Versioning</a>.</p>
     </div>
 
-    <!-- Unreleased -->
     <h2 id="unreleased">Unreleased</h2>
-
-    <div class="callout warning">
-      <span class="callout-icon">⚠️</span>
-      <div class="callout-body">
-        <strong>Breaking Change: Script Renamed</strong>
-        <p><code>mediamtx-stream-manager.sh</code> has been renamed to <code>lyrebird-stream-manager.sh</code>. Log file path changed from <code>/var/log/mediamtx-stream-manager.log</code> to <code>/var/log/lyrebird-stream-manager.log</code>.</p>
-        <p><strong>Automatic migration:</strong> Run <code>./lyrebird-updater.sh</code> — migrations update systemd service files, cron jobs, <code>/usr/local/bin</code> installations, and create backward-compatible log symlinks.</p>
-        <p><strong>Manual migration:</strong> <code>sudo ./lyrebird-updater.sh --migrate</code></p>
-      </div>
+    <p>Everything since v1.3.0, the latest release (2026-07-19). The release that will carry it has no number yet. The version of every script in this tree is in the table at the end of this file; the "Component versions bumped" lines in the blocks below record the step each block made.</p>
+    <h3 id="audit-remediation-2026-11">Audit remediation (2026-11)</h3>
+    <p>An independent review of revision <code>5befe80</code> found defects in the stream manager, the installer, the updater and the documentation, and checking them found more. The IDs in brackets (<code>LB-</code> for the review's findings, <code>X-</code> for those found while checking, <code>DOC-</code> for documentation) are the ones in <code>docs/REMEDIATION-2026-11.md</code>, which also holds the design decisions D1 to D15. <code>docs/remediation-status.json</code> names the tests that cover each item.</p>
+    <h4 id="security">Security</h4>
+    <ul>
+    <li><strong>The MediaMTX API and metrics endpoint listen on <code>127.0.0.1</code> by default.</strong> In the configuration the stream manager and <code>install_mediamtx.sh</code> generated, they listened on every interface (ports 9997 and 9998). <code>MEDIAMTX_API_BIND</code> and <code>MEDIAMTX_METRICS_BIND</code> change the address; an empty value means every interface. MediaMTX's own default rules already refused API and metrics calls from other machines, so a working setup is not affected. [LB-06, LB-22]</li>
+    <li><strong>Only RTSP is open to the network.</strong> SRT, RTMP, HLS and WebRTC are off in every generated configuration, MoQ is off on MediaMTX 1.19.0 and later, and no setting turns any of them on. The installer's old configuration left SRT listening, and MoQ on 1.19.0 and later. With the generated configuration MediaMTX opens RTSP (every interface), the API and metrics (loopback) and the two UDP ports RTSP uses (8000 and 8001 by default), and nothing else; checked on MediaMTX 1.15.0, 1.18.0, 1.19.0, 1.21.1, 1.21.2 and 1.21.3. [LB-06]</li>
+    <li><strong>RTSP is still open by default</strong>: anyone who can reach port 8554 can publish to and read every stream, as before. The new <code>RTSP_AUTH_MODE=local-only-publish</code> closes it without editing the file: this machine needs no password, and every other client must be a user listed in <code>RTSP_USERS_FILE</code> and can only read. Publishers must then connect through a loopback name (<code>MEDIAMTX_HOST</code> of <code>localhost</code>, <code>127.x</code> or <code>::1</code>; the manager warns otherwise). <code>lyrebird-stream-manager.sh help</code> shows the file format; <code>docs/SECURITY-GUIDE.md</code> covers authentication. [LB-06]</li>
+    <li><strong>A <code>mediamtx.yml</code> you edited is no longer overwritten.</strong> The manager regenerated the file on every start, so a password, bind address or file mode you set was lost. Only a file whose first line is <code># Managed by LyreBirdAudio</code> is rewritten (after a backup); any other file is yours, is used as it is and is never written. [LB-22]</li>
+    <li><strong>The device configuration is read as data and never run.</strong> <code>/etc/mediamtx/audio-devices.conf</code> was loaded with <code>source</code>, so a line such as <code>exit 0</code> ended the manager and a <code>$(...)</code> ran as root. [LB-08, X-09]</li>
+    <li><strong>Generated files cannot be injected.</strong> Every value in a generated stream wrapper is quoted (a <code>"</code>, <code>$(...)</code>, backtick or trailing backslash in a setting used to run or break the wrapper), and a stream name can no longer add a YAML key (<code>runOnInit</code> ran as a command), a systemd directive or a cron line. [LB-09, X-10, X-11, LB-04]</li>
+    <li><strong><code>install_mediamtx.sh update</code> always checks the checksum.</strong> It used to run MediaMTX's own <code>--upgrade</code>, which downloads the newest tag and replaces the binary without any checksum check. [X-41]</li>
+    <li><strong>The metrics HTTP server listens on <code>127.0.0.1</code> by default.</strong> It listened on every interface while its log said "localhost". It still has no authentication or TLS. [X-17]</li>
+    <li><strong><code>docs/SECURITY-GUIDE.md</code> Option 2 set the admin password to a literal string.</strong> MediaMTX does not expand <code>${MEDIAMTX_ADMIN_PASSWORD}</code> in its YAML, so the password was that text (checked on MediaMTX 1.21.1: 200 for the literal string, 401 for the real value). If you followed that guide, change the password. [DOC-01]</li>
+    </ul>
+    <h4 id="changed-behaviour">Changed behaviour</h4>
+    <p><strong>Start, stop and ownership</strong></p>
+    <ul>
+    <li><strong><code>start</code> reports what happened.</strong> Exit status 0 means the start policy is met, and 9 (new) that it is not. <code>LYREBIRD_START_POLICY=degraded</code> (the default) requires one stream to be publishing, <code>strict</code> requires the stream of every detected device; "publishing" is what MediaMTX's API reports, not that FFmpeg is running. Before, <code>start</code> printed <code>[FAIL]</code> lines and still exited 0. A failed start stops what that run started and leaves a stack that was already running alone. Under systemd, a node whose microphones all fail now has a failed start, which <code>Restart=always</code> retries. [LB-03]</li>
+    <li><strong><code>start</code> is safe to repeat.</strong> With the manager's own MediaMTX running it changes nothing that works (same process IDs, no outage, configuration not rewritten) and starts only a stream whose wrapper is missing. Before, every start cleaned up and restarted everything. [LB-01]</li>
+    <li><strong>One MediaMTX owner.</strong> <code>mediamtx-audio.service</code> now conflicts with <code>mediamtx.service</code> (<code>Conflicts=</code>), and <code>start</code>, <code>restart</code> and <code>reload</code> refuse with exit 8 (new) and change nothing while <code>mediamtx.service</code> is active or a MediaMTX the manager did not start is running on its configuration. The old sample unit made the manager depend on <code>mediamtx.service</code> while the manager started its own MediaMTX on the same file and port. [LB-02]</li>
+    <li><strong>No USB microphone is not a failed start.</strong> <code>start</code> starts MediaMTX, reports <code>waiting_for_devices</code> and exits 0; it used to exit 6 without starting anything. <code>LYREBIRD_ALLOW_EMPTY_START=false</code> restores exit 6. The wait for USB devices to settle no longer counts an empty list as settled. The monitor starts the stream of each device that appears, restarts a multiplex stream when a device is added, and restarts a MediaMTX that is gone while the node is meant to run (<code>start</code> was run and <code>stop</code> was not, which the manager records in <code>/run/lyrebird/desired-running</code>), within <code>CRON_RESTART_MAX_PER_HOUR</code>. [LB-07, X-03]</li>
+    <li><strong>Lifecycle commands never overlap, and no lock goes stale.</strong> Locks are <code>flock</code>s on files that are never deleted or truncated; the kernel releases one when its holder dies, so <code>LOCK_STALE_THRESHOLD</code> is gone. <code>stop</code> and <code>force-stop</code> now refuse with exit 5 (nothing changed) when another lifecycle command still holds the lock after <code>STOP_LOCK_TIMEOUT</code> seconds (default 5); the monitor skips its cycle, exit 0, while one runs. The "Failed to acquire lock" message names the holder: do not delete lock files by hand. MediaMTX, the wrappers and FFmpeg no longer inherit the lock. [LB-05, X-02]</li>
+    <li><strong>Processes are found by identity, never by name.</strong> The manager signals only processes recorded in its own PID files (checked against the process start time, which is kept in a <code>&lt;pid file&gt;.id</code> record beside each) that are what it started. <code>stop</code> no longer kills other FFmpeg processes that read a stream, and <code>force-stop</code> kills only what this manager started. <code>force-stop --kill-all</code> prints what it would kill and exits 1; <code>force-stop --kill-all --yes</code> kills it: the only broad kill. The first signal is SIGTERM, then SIGKILL after the timeout. <code>stop</code> exits 1 when something could not be stopped. The installer stops MediaMTX through its owner (systemd or the manager) and, as a last resort, by executable path and configuration file; its <code>status</code> no longer reports another installation's MediaMTX as "Running (manual)". [LB-10]</li>
+    </ul>
+    <p><strong>Health checks and monitoring</strong></p>
+    <ul>
+    <li><strong>Silence is measured on the published stream.</strong> The monitor reads each published stream over RTSP for 3 seconds (<code>AUDIO_LEVEL_SAMPLE_DURATION</code>) at most every 240 seconds (<code>AUDIO_LEVEL_CHECK_INTERVAL</code>) and logs <code>DEAD MIC</code> once per silence episode, after 60 seconds (<code>AUDIO_SILENCE_WARN_DURATION</code>) at or below -60 dB (<code>AUDIO_SILENCE_THRESHOLD_DB</code>). <code>AUDIO_LEVEL_CHECK_ENABLED=true</code> was already the default, but nothing ever ran it. It does not open the sound card. It adds at most one short RTSP read session per stream and monitor run (visible in MediaMTX's log and API). There is no metric or alert for it: the log line is the signal. [LB-14, X-05]</li>
+    <li><strong>The heartbeat says only what it is.</strong> <code>/run/mediamtx-audio.heartbeat</code> holds the time of the last monitor run. <code>lyrebird_heartbeat_healthy</code> is 1 when the monitor ran within <code>LYREBIRD_HEARTBEAT_MAX_AGE</code> seconds (default 900); it was tied to 60 seconds although the monitor runs every 5 minutes. It proves that the monitor ran, not that any stream is up. [LB-15, X-13]</li>
+    <li><strong>MediaMTX readiness is checked, not assumed.</strong> Readiness, the API version and the per-stream probe check the HTTP status and the shape of the answer; any answer used to count. A 401 or 403 (an authenticated API) or an API that does not answer is "unknown" and never counts as a failed stream: before, such a stream was restarted after three monitor runs in a row. [LB-13]</li>
+    </ul>
+    <p><strong>Configuration</strong></p>
+    <ul>
+    <li><strong><code>mediamtx.yml</code> has an owner.</strong> A file with the <code># Managed by LyreBirdAudio</code> first line is rewritten only when its content changes, after a backup <code>mediamtx.yml.&lt;UTC time&gt;.&lt;nn&gt;.bak</code> (the newest <code>MEDIAMTX_CONFIG_BACKUPS</code>, default 5, are kept), written so that a power cut leaves the old or the new file. The manager and the installer render it with one generator. A file without the line is yours: <code>--regenerate-config start</code> (or <code>restart</code>) takes it over after a backup; to keep hand edits in a managed file, delete the first line. Where MediaMTX has <code>--validate-conf</code> (1.21.1 and later), the new file is checked by the binary before it replaces the old one. The file is written after the port check, not before. [LB-22, LB-23]</li>
+    <li><strong>The file an earlier manager wrote is adopted.</strong> A <code>mediamtx.yml</code> whose first line is <code># MediaMTX Configuration - Audio Streams</code> is replaced by the current rendering at the first <code>start</code> or <code>reload</code> (after a backup), with a log line saying so. An edit you made to it by hand is in the backup only. The file the earlier installer wrote (first line a row of <code>#</code>) is not adopted: it is yours, and every start warns about it. [X-38]</li>
+    <li><strong>The device configuration is checked, not trusted.</strong> The file is read line by line against a list of keys: <code>DEVICE_&lt;NAME&gt;_&lt;SETTING&gt;=value</code>, <code>&lt;SETTING&gt;</code> one of <code>SAMPLE_RATE</code>, <code>CHANNELS</code>, <code>CODEC</code>, <code>BITRATE</code>, <code>THREAD_QUEUE</code> and <code>PCM</code>, with the values each accepts. A line that cannot be used is skipped, logged with its file, line and key, and its setting keeps the default; it no longer stops <code>start</code> (which exited 4 for a syntax error). The new <code>lyrebird-stream-manager.sh validate</code> checks the file (exit 4 when a line cannot be used). Keys in mixed case, which <code>lyrebird-mic-check.sh</code> used to write and which were ignored, are now read and so apply. Settings are no longer taken from <code>DEVICE_*</code> environment variables. <code>DEFAULT_*=</code> lines in the file are an error (set them in the environment). <code>BITRATE</code> must be <code>NNNk</code> (<code>128000</code> is an error); <code>CODEC</code> must be <code>opus</code>, <code>aac</code> or <code>mp3</code> (<code>pcm_s16le</code> was accepted and left local recording empty). [LB-08, X-09, X-28]</li>
+    <li><strong>Stream names are canonical.</strong> One rule serves the MediaMTX path, the publisher URL, PID file, status and systemd line: lower case, <code>[a-z0-9_-]</code>, first character a letter or digit, at most 64 characters; other characters become <code>_</code> (<code>Studio Mix</code> is <code>studio_mix</code>, <code>My-Mix_2</code> is <code>my-mix_2</code>). The <code>-n</code> name goes through the same rule, and the result is logged when it differs. A name that is reserved (<code>control</code>, <code>stats</code>, <code>api</code>, <code>metrics</code>, <code>health</code>, <code>all</code>, <code>all_others</code>), too long or without a letter or digit ends the command with exit 4. A name with a space made MediaMTX refuse to start. [LB-04]</li>
+    <li><strong>The three ports are honoured everywhere.</strong> <code>MEDIAMTX_RTSP_PORT</code>, <code>MEDIAMTX_API_PORT</code> and <code>MEDIAMTX_METRICS_PORT</code> reach the generated file, readiness and stream probes, the port check, the wrappers' publish URL and every URL the manager prints; the manager hard-coded 8554 and 9997 before. A value that is not an integer from 1 to 65535 ends every command with exit 4. The unit and the cron file do not carry them: set them in both (see Upgrading). The port check no longer counts a client socket that merely uses the number. [X-19]</li>
+    <li><strong>The capture device is not assumed to be PCM 0.</strong> The manager lists a card's capture PCMs; <code>DEVICE_&lt;NAME&gt;_PCM</code> picks one if there are several. [LB-24]</li>
+    <li><strong>Multiplex mode asks FFmpeg before it starts.</strong> The amix <code>normalize</code> option needs FFmpeg 4.4; on 4.2 and 4.3 (Ubuntu 20.04, Debian 11) the stream used to fail with "Option not found" and now starts without it, which gives amix's default scaling. From 4.4 the mix stays the plain sum (<code>normalize=0</code>), 6 dB louder than amix's default for two equal inputs. A channel count the codec cannot encode (for example two stereo microphones with <code>amerge</code> and <code>opus</code>, 4 channels, on FFmpeg 6.1.1) is refused before the wrapper is written, with the alternatives in the message; an individual stream's <code>CHANNELS</code> is checked the same way. [X-20, X-49]</li>
+    <li><strong>Recording is RAM-only unless you point it elsewhere.</strong> With <code>AUDIO_LOCAL_RECORDING=true</code> the segments go to <code>AUDIO_RECORDING_PATH</code> (default <code>/dev/shm/lyrebird-buffer</code>, lost at reboot or power loss): the last <code>AUDIO_RECORDING_SEGMENTS</code> x <code>AUDIO_RECORDING_SEGMENT_TIME</code> seconds (one hour by default) per stream, overwritten in place. For recordings that survive, set <code>AUDIO_RECORDING_PATH</code> to persistent storage. After a wrapper restart the segments are not in slot order: sort them by modification time. [LB-16]</li>
+    <li><strong>Two log variables.</strong> <code>STREAM_MANAGER_LOG_FILE</code> is the manager's own log (default <code>/var/log/lyrebird-stream-manager.log</code>); <code>MEDIAMTX_LOG_FILE</code> is only where MediaMTX's output goes (default <code>/var/log/mediamtx.out</code>). They used to be one variable. [X-15]</li>
+    <li><strong>FFmpeg logs are kept.</strong> A new wrapper moves the previous <code>&lt;stream&gt;.log</code> to <code>&lt;stream&gt;.log.prev.1</code> and shifts older ones up; <code>FFMPEG_LOG_KEEP</code> (default 3, at most 20) bounds them. <code>start</code>, <code>stop</code> and <code>force-stop</code> no longer delete logs. [X-25]</li>
+    <li><strong><code>reload</code> is a real command.</strong> <code>lyrebird-stream-manager.sh reload</code> re-renders the MediaMTX configuration and lets the running MediaMTX apply it; the manager stops nothing. Changes to the log level, timeouts, metrics, RTSP settings or a path's settings make MediaMTX disconnect that stream's publishers, which reconnect (a gap); the command says which keys do. Per-device audio settings are applied by <code>restart</code>, not <code>reload</code>. Exit 7 means MediaMTX is not running. A terminal hang-up (SIGHUP) of a manually started manager now runs <code>reload</code>; it used to stop every stream. [LB-11, X-46]</li>
+    </ul>
+    <p><strong>systemd units</strong></p>
+    <ul>
+    <li><strong>One unit template, rendered at <code>install</code>.</strong> <code>config/mediamtx-audio.service</code> is the template; <code>lyrebird-stream-manager.sh install</code> renders it and the monitor cron file before it writes anything, and refuses (exit 4, nothing written) a value a unit cannot carry. <code>install</code> must be run from a checkout (it needs <code>config/</code> next to the script). Compared with the unit <code>install</code> used to write: <code>Restart=always</code> (was <code>on-failure</code>), the start limit is 10 in 20 minutes in <code>[Unit]</code> (<code>StartLimitInterval=</code> sat in <code>[Service]</code>), <code>ExecReload</code> runs the real <code>reload</code> (was <code>restart</code>), <code>ProtectSystem=strict</code> with every path the manager writes made writable (was <code>full</code>), start and stop timeouts computed from the manager's own timings (560 s and 130 s for 8 streams; were 300 and 120), <code>Conflicts=mediamtx.service</code>, no <code>Group=audio</code> and no faked <code>INVOCATION_ID</code>. The unit has no <code>WatchdogSec=</code>: the manager sends no keep-alives. A node keeps its old unit until <code>install</code> runs again (the updater does that). [LB-11, LB-12, X-12]</li>
+    <li><strong>The standalone MediaMTX unit</strong> (<code>config/mediamtx.service</code>) conflicts with the manager's unit and has the start limit in <code>[Unit]</code>, and <code>install_mediamtx.sh</code> renders the unit from that file. Compared with the unit the installer wrote: 5 starts in 300 s (was 3 in 60 s), <code>RestartSec=5</code> (was 10), no <code>ExecReload</code>, <code>MemoryMax=512M</code>. <code>systemctl reload mediamtx</code> now says the unit cannot reload: MediaMTX re-reads a changed configuration file by itself (checked on 1.15.0 and 1.21.1), and SIGHUP ends it. A node keeps its unit until <code>install_mediamtx.sh --force install</code>. [LB-02, X-12, LB-12]</li>
+    <li><strong>The cron monitor runs in the unit's stream mode.</strong> <code>install</code> writes <code>STREAM_MODE</code>, <code>MULTIPLEX_FILTER_TYPE</code> and <code>MULTIPLEX_STREAM_NAME</code> into <code>/etc/cron.d/mediamtx-monitor</code>; before, the monitor of a multiplex node ran in individual mode and started per-device streams next to the multiplexed one. Run <code>install</code> again to change the mode. [X-32]</li>
+    </ul>
+    <p><strong>Installer</strong> (<code>install_mediamtx.sh</code> 2.1.0)</p>
+    <ul>
+    <li><strong>The configuration is the shared generator's</strong>: first line <code># Managed by LyreBirdAudio</code>, API and metrics on <code>127.0.0.1</code>, everything but RTSP off, and a catch-all path so publishers are accepted (the old file's <code>paths: {}</code> made MediaMTX answer every publisher with "path is not configured"). It is generated for the version of the binary that will run it. An existing marked file is replaced only if its content changes, after <code>mediamtx.yml.backup.&lt;time&gt;</code>; a file without the marker is left alone unless <code>--force</code>, which saves a backup first. Exit 9: MediaMTX rejected the generated file (1.21.1 and later); nothing is written. [LB-06, LB-22]</li>
+    <li><strong>Ports are validated before anything is downloaded or written</strong>: a <code>MEDIAMTX_*_PORT</code> that is not an integer from 1 to 65535, or two equal ones, ends <code>install</code> with exit 10 and names the variable. [X-43]</li>
+    <li><strong><code>install</code> needs <code>lyrebird-common.sh</code> next to the installer</strong> (exit 4 otherwise); <code>--no-config --no-service</code> does not. [LB-22]</li>
+    <li><strong><code>update</code> downloads and verifies first, then stops MediaMTX</strong>, so a failed download or a checksum mismatch (always fatal, even with <code>--force</code>) leaves MediaMTX running. It installs atomically, checks that the new binary runs, and rolls back to the previous one when it does not run or the service does not come back. A MediaMTX started by hand is stopped, not started again; the command to start it is printed and the exit status is 0 (it used to end rolled back with exit 7). Across MediaMTX 1.19 an update adds <code>moq: no</code> to a generated configuration; before, MoQ listened on every interface. <code>update</code> still never rewrites the configuration or the unit otherwise. [X-39, X-40, X-41, X-42]</li>
+    </ul>
+    <p><strong>Updater</strong> (<code>lyrebird-updater.sh</code> 1.8.0)</p>
+    <ul>
+    <li><strong><code>--history</code> and <code>--rollback [VERSION]</code> exist</strong> (the README described them before they existed). <code>--history</code> lists updates, rollbacks and resets from a local log (<code>&lt;git-dir&gt;/lyrebird-updater/history.log</code>), and any update that did not finish. <code>--rollback</code> returns to the version the last update came from, or to a release tag or commit already in the clone; neither needs the network. [X-21]</li>
+    <li><strong>An update is a journalled transaction.</strong> An update killed halfway (a power cut, SIGKILL) is undone by the next run: back to the recorded commit, stash and service restored. Declining "Save your changes temporarily?" or a failing stash no longer discards your uncommitted edits; a conflicting stash restore leaves a clean tree, keeps your changes in the stash and exits 10. File modes survive (every tracked <code>*.sh</code> stays executable), and no command waits on an unreachable remote: a fetch is bounded (30 seconds, 3 attempts). [X-21]</li>
+    <li><strong>The lock is a kernel <code>flock</code></strong> on <code>&lt;git-dir&gt;/lyrebird-updater/updater.lock</code>, never deleted; it is no longer an untracked directory in the working tree. <code>flock</code> (util-linux) is now a prerequisite (exit 2 without it). Migrations now also run after a self-update. [X-31]</li>
+    <li><strong>Exit codes</strong>: 6 (the version is not in the clone), 10 (switched, but your saved changes conflict and are in the stash), 11 (the automatic rollback could not restore everything), 12 (input ended at a menu prompt). A switch that fails in the menu is reported and the menu stays open; <code>Q</code> leaves with the status of the last switch. [X-21, X-31]</li>
+    </ul>
+    <p><strong>Orchestrator</strong> (<code>lyrebird-orchestrator.sh</code> 2.2.0)</p>
+    <ul>
+    <li><strong>It says what a start really did.</strong> Audio Streaming Control (menu 4: Start All Streams, Restart All Streams) and the Quick Setup Wizard read <code>/run/lyrebird/status.json</code> (or <code>status --json</code>) and print each stream's state and reason, then the next step; the wizard's final message is decided by the start it just ran (it used to report success after a failed start, and warnings after a good one). Exit codes of the stream manager and the updater are explained in words. The wizard no longer advises a reboot. Version Management (menu 6) has 3) Show Update History and 4) Roll Back to a Previous Version. Listing stream URLs no longer ends the orchestrator on a system without the <code>ip</code> command. [LB-21, X-21]</li>
+    </ul>
+    <p><strong>Metrics</strong> (<code>lyrebird-metrics.sh</code> 1.4.0)</p>
+    <ul>
+    <li><strong><code>serve</code> and its options exist as documented</strong>: <code>serve [--port PORT] [--bind ADDR]</code> (and <code>--serve [PORT]</code>). It answers <code>GET /</code> and <code>GET /metrics</code> with correct HTTP framing, one connection at a time, a document generated after the request arrived, and no longer loops while the port is taken (exit 2 after 5 attempts). <code>--file</code> replaces the file atomically and keeps the previous one when anything fails. [LB-18, X-17]</li>
+    <li><strong>Exit status is no longer always 0</strong>: 2 when nothing could be delivered, 3 when a collector failed. New <code>lyrebird_scrape_success</code> and <code>lyrebird_collector_success{collector}</code> say which; a source that cannot be read makes its metrics absent, not 0 (alert on <code>lyrebird_scrape_success == 0</code>). [LB-18]</li>
+    <li><strong>MediaMTX is this installation's MediaMTX</strong>: the configured binary on the configured configuration (<code>MEDIAMTX_BINARY</code>, <code>MEDIAMTX_CONFIG_FILE</code>), as for the manager; a process whose command line merely contains "mediamtx" no longer counts. Liveness is read from <code>/proc</code>, not <code>kill -0</code>. Run the exporter as root: as another user MediaMTX details are left out and the scrape counts as degraded (exit 3). One scrape spends at most <code>LYREBIRD_API_TIMEOUT</code> seconds (default 5) on the MediaMTX API; a refused API costs 20 ms, not 1 second. [X-30]</li>
+    </ul>
+    <p><strong>Storage</strong> (<code>lyrebird-storage.sh</code> 1.3.0)</p>
+    <ul>
+    <li><strong>The documented cron lines work.</strong> <code>cleanup --quiet</code> and <code>monitor --once</code> are implemented (<code>monitor</code> checks once and exits; there is no <code>--interval</code> and never was). <code>/etc/lyrebird/storage.conf</code> is read, as data, when it exists, and not at all when anyone can write it or another user owns it (reported, exit 4); an <code>/etc/lyrebird/storage.conf</code> written from the old documentation takes effect with this version. Exit status 3 also covers a directory that could not be listed, and 4 means lines of the configuration file were ignored. [DOC-05, X-29]</li>
+    <li><strong>Retention and emergency cleanup see every recording.</strong> <code>.aac</code> was missing from the list, so <code>CODEC=aac</code> recordings were never cleaned (the list is now <code>opus ogg aac adts m4a mp3 flac wav</code>). Empty segments left by a killed FFmpeg are removed once idle for <code>LYREBIRD_ACTIVE_SEGMENT_SECONDS</code> (default 900); a file written more recently is never evicted. Emergency cleanup removes at most 100 of each kind per run, oldest first, and no longer deletes the buffer's stream directories (FFmpeg lost its recording leg until restarted). Symlinked configured directories are followed. [X-14, X-29]</li>
+    </ul>
+    <p><strong>Alerts</strong> (<code>lyrebird-alerts.sh</code> 1.1.0)</p>
+    <ul>
+    <li><strong>Delivery is tracked per destination.</strong> An identical alert is not sent again to a destination that confirmed it within <code>LYREBIRD_ALERT_RATE_LIMIT</code> seconds (default 300); a destination that failed is retried by the next identical alert. Five parallel identical alerts deliver once per destination. New exit status 5: some destinations have the alert and at least one failed (0 now means every destination that needed it has it). A script that sources the library and calls <code>send_alert</code> under <code>set -e</code> must handle 3, 4 and 5. [LB-17]</li>
+    </ul>
+    <p><strong>Test suite and CI</strong> (for contributors)</p>
+    <ul>
+    <li><strong>The suite no longer writes the machine's real <code>/var/log</code>, <code>/etc</code> or <code>/run</code></strong>, and <code>LYREBIRD_LEAK_CHECK_HOST=1 tests/check_tmp_leaks.sh</code> fails a run that does (CI sets it). Tests that tested copies of functions defined in the test file were converted to run the real script, or removed where a real test already covered the behaviour. [X-35, X-18]</li>
+    <li><strong>CI runs on every pull request and push to main</strong>, with no path filter. The <code>CI Summary</code> job fails unless every job succeeded, <code>shfmt</code> and <code>bashate</code> block, every Action is pinned to a commit and every downloaded tool is checked against a hash. The live matrix covers MediaMTX 1.15.0, 1.18.0, 1.19.0, 1.21.1, 1.21.2 and 1.21.3, plus an advisory canary on the newest upstream release. A tag runs the whole pipeline before a release is published, with a source tarball and <code>SHA256SUMS</code>; publishing can be repeated. [LB-19, LB-20, X-22, X-16]</li>
+    </ul>
+    <p><strong>Stream manager exit codes</strong> (<code>lyrebird-stream-manager.sh help</code> has the same list; 8 and 9 are new, 5, 6 and 7 changed)</p>
+    <div class="table-wrapper">
+    <table>
+    <thead><tr><th>Code</th><th>Meaning</th></tr></thead>
+    <tbody>
+    <tr><td>0</td><td>Success. <code>start</code>: the start policy is met, or there is no device and an empty start is allowed. <code>monitor</code>: healthy, waiting for devices, or skipped because a lifecycle command is running</td></tr>
+    <tr><td>1</td><td>General error, including <code>force-stop --kill-all</code> without <code>--yes</code> and a command that could not stop what it had to</td></tr>
+    <tr><td>2</td><td>Critical resource state (the cron job restarts the service)</td></tr>
+    <tr><td>3</td><td>Missing dependency (<code>curl</code> is now one)</td></tr>
+    <tr><td>4</td><td>Configuration error: an invalid <code>LYREBIRD_*</code> setting, port, stream name or device configuration, or no MediaMTX configuration</td></tr>
+    <tr><td>5</td><td>Another lifecycle command holds the lock; nothing was changed (<code>stop</code> and <code>force-stop</code> now return it too)</td></tr>
+    <tr><td>6</td><td>No USB audio device, with <code>LYREBIRD_ALLOW_EMPTY_START=false</code> only</td></tr>
+    <tr><td>7</td><td>MediaMTX not running (<code>monitor</code>; <code>reload</code>)</td></tr>
+    <tr><td>8</td><td>Another MediaMTX owns the node; <code>start</code>, <code>restart</code> and <code>reload</code> refused (new)</td></tr>
+    <tr><td>9</td><td><code>start</code> did not meet <code>LYREBIRD_START_POLICY</code>; what it started was stopped (new)</td></tr>
+    <tr><td>10</td><td>Streams degraded (<code>monitor</code>, logged only)</td></tr>
+    <tr><td>128+N</td><td>Ended by signal N: 130 SIGINT, 143 SIGTERM</td></tr>
+    </tbody>
+    </table>
     </div>
-
-    <h3>Added</h3>
+    <h4 id="fixed">Fixed</h4>
     <ul>
-      <li>Automatic migration system in <code>lyrebird-updater.sh</code> v1.6.0
-        <ul>
-          <li>Post-update migrations for breaking changes</li>
-          <li>Idempotent migration tracking in <code>/var/lib/lyrebird/migrations/</code></li>
-          <li>CLI flag <code>--migrate</code> for manual migration runs</li>
-        </ul>
-      </li>
-      <li>Migration detection in <code>lyrebird-orchestrator.sh</code>
-        <ul>
-          <li>Startup warning when old script names detected</li>
-          <li>Clear remediation steps</li>
-        </ul>
-      </li>
-      <li>Webhook alerting system (<code>lyrebird-alerts.sh</code>) for remote monitoring
-        <ul>
-          <li>Supports Discord, Slack, ntfy.sh, Pushover, and generic HTTP webhooks</li>
-          <li>Rate limiting and alert deduplication</li>
-          <li>Pure bash implementation with no new dependencies</li>
-        </ul>
-      </li>
-      <li><code>CHANGELOG.md</code> to track version history</li>
-      <li><code>CONTRIBUTING.md</code> with contribution guidelines</li>
+    <li><strong>A monitor restart reverted per-device settings to the defaults.</strong> The device configuration was loaded only when the MediaMTX configuration was generated. [X-01]</li>
+    <li><strong>A generated wrapper ended at its first back-off</strong> (<code>MAX_RESTART_DELAY: unbound variable</code>) unless those variables were in the manager's environment, so the "FFmpeg restarts with back-off" fix of 1.3.0 did not hold for a default install. [X-10]</li>
+    <li><strong>A card that is detected but cannot be opened used up the restart budget</strong>, so after six such attempts an hour a real restart was refused. The budget is charged only for restarts that are attempted, and in multiplex mode too. [X-04, X-48]</li>
+    <li><strong>A failed command left <code>/run/mediamtx-audio.cleanup</code></strong>, which makes every wrapper stop at its next loop; a failed <code>start</code> on a healthy node ended its streams. Only an interrupted run that could not take down what it had launched leaves it now, and a start refused by the lock or by ownership never does. A refused <code>restart</code> no longer leaves its marker either. [LB-03, LB-05]</li>
+    <li><strong>A card with no capture PCM (a USB speaker or DAC) counted as a failed stream.</strong> It is skipped, listed as <code>[SKIP]</code> and <code>"skipped":true</code> in the status file, left out of the start policy and of the monitor. A device without <code>/dev/snd/controlC&lt;N&gt;</code> is reported instead of skipped silently. [X-34, X-27]</li>
+    <li><strong><code>arecord -l | grep -q</code> under <code>pipefail</code> could report a present card as missing</strong> (SIGPIPE), so its stream was not started or restarted. [LB-24]</li>
+    <li><strong>A stream that failed its own validation left its wrapper behind.</strong> It is now stopped by identity, and its PID file, start-time record and wrapper script are removed. [X-47]</li>
+    <li><strong><code>status</code> without root printed running wrappers as "Not running"</strong>; it now says "Unknown (run as root)" for a process it cannot read. [X-36]</li>
+    <li><strong><code>exec ... 2&gt;/dev/null</code> silenced stderr for the rest of the process</strong>, so errors vanished after the first lock release. [X-06]</li>
+    <li><strong><code>AUDIO_RECORDING_PATH</code> with <code>|</code>, <code>\</code>, <code>'</code> or <code>%</code> changed what the tee muxer wrote</strong> (another directory, or an error). It is escaped; <code>[</code>, <code>]</code>, <code>:</code> and spaces were harmless. [X-33]</li>
+    <li><strong>A live PID file was deleted when its process had another program name</strong> (for example MediaMTX started from a differently named binary); identity is now the process start time. [X-26]</li>
+    <li><strong>The device config template, <code>lyrebird-mic-check.sh</code>'s generator and its restore are written durably</strong> (temp file, fsync, rename, fsync of the directory). mic-check writes quoted values, and the header of the file it generates, silently missing before, is back. [LB-23, LB-08]</li>
+    <li><strong>The metrics server could abort on SIGTERM</strong> (a bash 5.2 <code>read -t</code> timer left armed; seen in 6 of 480 shutdowns under load). [X-44]</li>
+    <li><strong><code>usb-audio-mapper.sh</code> could read a directory above its sysfs root as a USB port.</strong> Real sysfs was not affected; the mapper is 4.0.1. [X-45]</li>
+    <li><strong><code>tools/soak/README.md</code> claimed more than had been checked.</strong> It said that LyreBirdAudio's own silence detection covered a muted microphone (nothing ran it) and listed macOS for the observer (it has not been run there). It now has a Silence section that says what the monitor's check reads and what it cannot catch, and says what was and was not run for the observer. [DOC-03]</li>
+    <li><strong>The version table at the end of this file was out of date.</strong> It listed versions the scripts no longer had and called them current. It now gives each script's version in v1.3.0 and in this tree. [DOC-04]</li>
     </ul>
-
-    <h3>Changed</h3>
+    <h4 id="removed">Removed</h4>
     <ul>
-      <li>Improved inline documentation in <code>usb-audio-mapper.sh</code></li>
-      <li>Enhanced error messages with remediation steps</li>
-      <li><code>lyrebird-stream-manager.sh</code> v1.4.4 — Restructured API validation to preserve curl exit status; replaced <code>curl|grep</code> pattern with explicit exit code checking</li>
+    <li><strong><code>HEARTBEAT_INTERVAL</code>, <code>HARDWARE_WATCHDOG_TIMEOUT</code>, <code>ENABLE_HARDWARE_WATCHDOG</code>, <code>HARDWARE_WATCHDOG_DEVICE</code>, <code>LYREBIRD_WATCHDOG_ENABLED</code> and <code>LYREBIRD_WATCHDOG_INTERVAL</code></strong>, with the <code>/dev/watchdog</code> code and the SIGUSR2 handler: none of them did anything (the device was never opened). A set one is ignored with one warning per run. For a hardware watchdog use systemd's <code>RuntimeWatchdogSec=</code> or a watchdog daemon; this project neither implements nor tests one. [LB-15]</li>
+    <li><strong><code>AUDIO_DISK_PERSIST</code> and <code>AUDIO_DISK_PATH</code></strong>: they only created a directory and moved nothing. A set one is ignored with one warning per run. See "Recording is RAM-only" above. [LB-16]</li>
+    <li><strong><code>LOCK_STALE_THRESHOLD</code></strong>, the lock-age and process-name staleness checks, and the instruction to delete a stale lock file. [LB-05]</li>
+    <li><strong>The pattern kills</strong>: <code>pkill</code> and <code>pgrep -f</code> of FFmpeg and MediaMTX by name or command line in the manager, the installer and the metrics server, and the use of MediaMTX's <code>--upgrade</code>. [LB-10, X-17, X-41]</li>
+    <li><strong>A signal as a reload</strong>: <code>ExecReload=</code> in the units sent HUP (which ends MediaMTX) or USR1 (which it ignores). [X-12]</li>
+    <li><strong>From the manager's unit</strong>: <code>Wants=</code> and <code>PartOf=mediamtx.service</code>, the <code>LYREBIRD_WATCHDOG_*</code> lines and the memory limits of the sample, and the generated unit's <code>Group=audio</code>. [LB-02, LB-11]</li>
+    <li><strong>The wizard's "reboot may be needed" advice.</strong> [LB-21]</li>
+    <li><strong><code>/run/mediamtx-silence-&lt;stream&gt;</code> files</strong>, which nothing read: delete any that exist. [LB-14]</li>
     </ul>
-
+    <h4 id="added">Added</h4>
+    <ul>
+    <li><strong>Stream manager commands</strong>: <code>reload</code>, <code>validate</code>, <code>status --json</code>, <code>force-stop --kill-all [--yes]</code> and the option <code>--regenerate-config</code>. [LB-11, LB-08, LB-03, LB-10, LB-22]</li>
+    <li><strong>A status file</strong>, <code>/run/lyrebird/status.json</code> (<code>LYREBIRD_STATUS_FILE</code>), and <code>status --json</code>. Per stream: <code>configured</code>, <code>process_alive</code>, <code>path_ready</code>, <code>bytes_flowing</code> (each true, false or null for "not known") and <code>last_error</code>; overall <code>ok</code>, <code>degraded</code>, <code>failed</code>, <code>waiting_for_devices</code> or <code>stopped</code>. <code>start</code>, <code>stop</code>, <code>force-stop</code>, <code>monitor</code> and <code>status</code> write it atomically, so a reader never sees a partial file. <code>bytes_flowing</code> samples MediaMTX's inbound byte counter twice, <code>LYREBIRD_FLOW_SAMPLE_SECONDS</code> (3) apart, which adds that long to <code>status</code> and to each monitor run when a stream is ready. [LB-03, LB-07]</li>
+    <li><strong>Settings</strong>: <code>LYREBIRD_START_POLICY</code>, <code>LYREBIRD_ALLOW_EMPTY_START</code>, <code>LYREBIRD_STATE_DIR</code>, <code>MONITOR_LOCK_TIMEOUT</code> (5), <code>STOP_LOCK_TIMEOUT</code> (5), <code>MEDIAMTX_API_BIND</code>, <code>MEDIAMTX_METRICS_BIND</code>, <code>RTSP_AUTH_MODE</code>, <code>RTSP_USERS_FILE</code>, <code>MEDIAMTX_CONFIG_BACKUPS</code>, <code>FFMPEG_LOG_KEEP</code>, <code>STREAM_MANAGER_LOG_FILE</code>, <code>AUDIO_LEVEL_*</code>, <code>AUDIO_SILENCE_*</code>, <code>SILENCE_STATE_DIR</code>, <code>DEVICE_&lt;NAME&gt;_PCM</code>, and for <code>install</code> <code>LYREBIRD_UNIT_MAX_STREAMS</code> (8: the number of streams the unit's timeouts are sized for) and <code>LYREBIRD_UNIT_TEMPLATE</code>. The defaults are in the settings at the top of <code>lyrebird-stream-manager.sh</code>; <code>lyrebird-stream-manager.sh help</code> lists most of them.</li>
+    <li><strong>Updater</strong>: <code>--history</code>, <code>--rollback [VERSION]</code>, exit codes 6, 10, 11 and 12, and the settings <code>LYREBIRD_FETCH_TIMEOUT</code>, <code>LYREBIRD_FETCH_RETRIES</code>, <code>LYREBIRD_FETCH_RETRY_DELAY</code>, <code>LYREBIRD_REMOTE_PROBE_TIMEOUT</code>, <code>LYREBIRD_UPDATER_LOCK_WAIT</code> and <code>LYREBIRD_UPDATER_STATE_DIR</code>. [X-21]</li>
+    <li><strong>Installer</strong>: exit codes 4, 9 and 10, and the settings <code>MEDIAMTX_SERVICE_DIR</code>, <code>MEDIAMTX_UNIT_TEMPLATE</code>, <code>MEDIAMTX_STOP_TIMEOUT</code> and <code>MEDIAMTX_PID_FILE</code>. [LB-22, X-43]</li>
+    <li><strong>Metrics</strong>: <code>serve</code>, <code>--port</code>, <code>--bind</code>, <code>lyrebird_scrape_success</code>, <code>lyrebird_collector_success</code>, <code>LYREBIRD_HEARTBEAT_MAX_AGE</code> and <code>LYREBIRD_API_TIMEOUT</code>. [LB-18, X-13, X-30]</li>
+    <li><strong>Storage</strong>: <code>--quiet</code>, <code>--once</code>, <code>/etc/lyrebird/storage.conf</code> (<code>LYREBIRD_STORAGE_CONFIG</code> names another file; empty means none), <code>LYREBIRD_ACTIVE_SEGMENT_SECONDS</code>, <code>Empty segments</code> in <code>status</code>. [DOC-05, X-14]</li>
+    </ul>
+    <h4 id="upgrading-an-existing-node">Upgrading an existing node</h4>
+    <p>Which command refreshes which file:</p>
+    <ul>
+    <li><strong>The scripts of the checkout</strong>: <code>sudo ./lyrebird-updater.sh</code>.</li>
+    <li><strong><code>/etc/systemd/system/mediamtx-audio.service</code>, <code>/etc/cron.d/mediamtx-monitor</code> and <code>/etc/logrotate.d/mediamtx</code></strong>: <code>sudo ./lyrebird-stream-manager.sh install</code>. The updater runs it when the manager script changed and the service is installed.</li>
+    <li><strong><code>/etc/mediamtx/mediamtx.yml</code> of a manager node</strong>: the first <code>start</code>, if an earlier manager wrote it; otherwise <code>sudo ./lyrebird-stream-manager.sh --regenerate-config restart</code>.</li>
+    <li><strong><code>/etc/mediamtx/mediamtx.yml</code> and <code>/etc/systemd/system/mediamtx.service</code> of a standalone MediaMTX</strong>: <code>sudo ./install_mediamtx.sh --force install</code>, which reinstalls the latest binary too (<code>-V vX.Y.Z</code> pins one).</li>
+    <li><strong>The MediaMTX binary</strong>: <code>sudo ./install_mediamtx.sh update</code>, which touches nothing else.</li>
+    <li><strong><code>/etc/mediamtx/audio-devices.conf</code></strong>: never rewritten; <code>sudo ./lyrebird-stream-manager.sh validate</code> checks it.</li>
+    </ul>
+    <p>In this order:</p>
+    <ol>
+    <li>Look at what runs: <code>systemctl is-active mediamtx mediamtx-audio</code>. If both are active, choose one: the manager's unit conflicts with <code>mediamtx.service</code>, and the manager refuses to start (exit 8) while <code>mediamtx.service</code> is active. A node that streams microphones uses <code>mediamtx-audio.service</code>; the standalone unit is for a MediaMTX-only node.</li>
+    <li>Update the checkout with <code>sudo ./lyrebird-updater.sh</code> (option 1, or 3 for a tag) to the release that contains this section; v1.3.0 does not. When <code>mediamtx-audio.service</code> is installed and the manager script changed, the updater stops the service, runs <code>install</code> (keeping the <code>Environment=</code> lines you added to the unit), reloads systemd and starts the service. Without the updater, run <code>sudo ./lyrebird-stream-manager.sh install</code> with the <code>-m</code>, <code>-f</code> and <code>-n</code> options you used before (it rewrites the unit, so keep local settings in <code>systemctl edit mediamtx-audio</code>), then <code>sudo systemctl daemon-reload</code> and <code>sudo systemctl restart mediamtx-audio</code>.</li>
+    <li>Keep <code>lyrebird-common.sh</code> in the same directory as <code>lyrebird-stream-manager.sh</code> and <code>install_mediamtx.sh</code>, and run <code>install</code> from a checkout: the manager cannot write a MediaMTX configuration without the library, <code>install_mediamtx.sh install</code> needs it, and the unit is rendered from <code>config/mediamtx-audio.service</code>. A copy of one script alone in <code>/usr/local/bin</code> has none of that.</li>
+    <li>Check the device configuration with <code>sudo ./lyrebird-stream-manager.sh validate</code>. Lines that were silently ignored before are now listed with their line numbers, and mixed-case keys now take effect.</li>
+    <li>Replace <code>mediamtx.yml</code> where you want the new defaults (list above). The file the earlier manager wrote is replaced by the first <code>start</code>, after a backup. The file the earlier installer wrote is yours: until you replace it its API and metrics stay on every interface, SRT (and MoQ) stay on, and <code>paths: {}</code> still refuses every publisher.</li>
+    <li>Move settings. A node that set <code>MEDIAMTX_LOG_FILE</code> and relied on the manager log being in the same file must also set <code>STREAM_MANAGER_LOG_FILE</code>. <code>install</code> writes no port settings: a non-default <code>MEDIAMTX_RTSP_PORT</code>, <code>MEDIAMTX_API_PORT</code> or <code>MEDIAMTX_METRICS_PORT</code> must be in the unit's environment (<code>systemctl edit mediamtx-audio</code>) and, as <code>NAME=value</code> lines before the job line, in <code>/etc/cron.d/mediamtx-monitor</code>, which every <code>install</code> rewrites, so add them again afterwards. Delete the removed settings (see Removed) from the unit; until then every run logs one warning.</li>
+    <li>If the service was not restarted in step 2, restart it: <code>sudo systemctl restart mediamtx-audio</code>. On a node started by hand with the old code, the first <code>stop</code> or <code>force-stop</code> can wait <code>STOP_LOCK_TIMEOUT</code> seconds and refuse (exit 5), because MediaMTX and FFmpeg inherited the old lock; it lists the processes that hold it, and you stop them once.</li>
+    <li>Check: <code>sudo ./lyrebird-stream-manager.sh status</code> ends with an overall state of <code>ok</code>, <code>degraded</code> or <code>waiting_for_devices</code> (<code>status --json</code> has the same), and <code>systemctl status mediamtx-audio</code> is active.</li>
+    </ol>
+    <p>What changes without your doing anything:</p>
+    <ul>
+    <li>A Prometheus on another machine that scrapes <code>lyrebird-metrics.sh serve</code> needs <code>serve --bind ADDR</code> (or <code>0.0.0.0</code>) and a firewall. A cron job that redirects <code>lyrebird-metrics.sh</code> into a file should use <code>--file PATH</code>, which replaces the file atomically.</li>
+    <li>Alert state files of the previous version (<code>&lt;alert&gt;.last</code>) are no longer read, so the first identical alert after the upgrade can be delivered once more.</li>
+    <li>An <code>/etc/lyrebird/storage.conf</code> written from the old documentation, which was never read, now takes effect.</li>
+    <li>Each monitor run opens a short RTSP read session per published stream. A MediaMTX that requires authentication to read refuses it (401): the failed probe is logged every run and never counted as silence. <code>AUDIO_LEVEL_CHECK_ENABLED=false</code> turns the check off.</li>
+    </ul>
+    <h4 id="known-limits">Known limits</h4>
+    <ul>
+    <li><strong>Not run on hardware or under a real systemd manager.</strong> Tested here: Linux, Bash 5.2, MediaMTX 1.15.0, 1.18.0, 1.19.0, 1.21.1, 1.21.2 and 1.21.3 (live tests), <code>systemd-analyze verify</code> and a mount-namespace emulation of the unit's sandbox. Not tested: real USB hardware (hot-plug, how a card lays out its capture PCMs, <code>plughw</code> behaviour, a second open of a busy card), a hub that appears after the start limit is used up (LB-07, LB-11, LB-12, X-12), the <code>Conflicts=</code> and boot ordering with a real manager, <code>systemctl reload</code>, a real power cut during a write (only the order of the operations is tested; LB-23), USB clock drift between independent microphones (X-20), FFmpeg 4.2 and 4.3 at run time (the missing <code>normalize</code> option is tested with a stand-in help text), hardware watchdog drivers (LB-15), RTSP clients on another host (the tests connect to the machine's own non-loopback address), IPv6, ARM boards and binaries, macOS and BSD, Bash older than 5.2, and a real <code>sudo</code> for the orchestrator. [LB-07, LB-11, LB-12, X-12, LB-23, LB-24, X-20, LB-15]</li>
+    <li><strong>GitHub itself.</strong> The workflows were checked with actionlint and each step script was run locally; no run on GitHub is part of this check. Requiring the <code>CI Summary</code> check in branch protection, signing tags and attesting releases are repository settings this change does not make: a release carries a source tarball and <code>SHA256SUMS</code>, which prove integrity, not authorship. [LB-19, LB-20, X-22, X-16]</li>
+    <li><strong>Older MediaMTX cannot validate a file.</strong> <code>--validate-conf</code> exists from 1.21.1; before that an unknown key or an invalid path name is found only when MediaMTX refuses to start (the reason is in <code>/var/log/mediamtx.out</code>). [LB-22]</li>
+    <li><strong><code>install</code> writes no port settings</strong> into the unit or the cron file, and rewrites the cron file every time, so a node with non-default ports must repeat step 6 above after each <code>install</code>. [X-19]</li>
+    <li><strong>RTSP has no authentication unless you configure it</strong>, and the metrics server none at all (one connection at a time; for several scrapers use <code>--file</code> and node_exporter's textfile collector). [LB-06]</li>
+    <li><strong>The silence check is a log line, with a threshold not validated on real microphones.</strong> -60 dB was checked against digital silence (-91 dB) and an FFmpeg test tone only; a dead capsule that idles above it is not detected. The probe reads anonymously, so it cannot see a stream behind read authentication. [LB-14]</li>
+    <li><strong>Nothing monitors a node set up only by the Quick Setup Wizard.</strong> The monitor, and with it late-device recovery and the silence check, is the cron job <code>lyrebird-stream-manager.sh install</code> writes, and the wizard does not run it. [LB-07, LB-21]</li>
+    <li><strong>Known smaller defects, not fixed</strong>: the orchestrator's header counts every <code>ffmpeg</code> process on the host and finds MediaMTX by name, and "View Stream URLs" prints port 8554 whatever <code>MEDIAMTX_RTSP_PORT</code> says; the installer uses exit 7 for "already installed" and for some failed install steps, which the wizard reads as "already installed"; a second updater started in the instant of a self-update's <code>exec</code> could take its lock; non-root <code>status</code> prints a garbled <code>Resources:</code> line for MediaMTX; the failure counter of the network check is the fixed file <code>/run/mediamtx-network-failures</code>; a card whose <code>usbid</code> shows up before its PCM entries is skipped until the next monitor run.</li>
+    <li><strong>Older entries below claim more than was tested.</strong> "Cross-platform" and platform-list entries (orchestrator 2.0.1, diagnostics 1.0.2, installer 2.0.1) were never backed by a run on macOS, BSD or ARM: the suite runs on Linux, Bash 5.2, and <code>tests/fetch_mediamtx.sh</code> fetches linux amd64 releases only.</li>
+    </ul>
+    <h3 id="soak-testing-and-current-mediamtx-2026-10">Soak testing and current MediaMTX (2026-10)</h3>
+    <p>Component versions bumped: <code>lyrebird-stream-manager.sh</code> 1.5.0 → 1.5.1.</p>
+    <h4 id="soak-testing-and-current-mediamtx-2026-10-added">Added</h4>
+    <ul>
+    <li><code>tools/soak/</code>: a soak-test harness for field-like long runs. <code>lyrebird-soak.sh</code> runs on the node (systemd service), checks device names against the usb-audio-mapper rules, stream liveness and stalls, services and resource trends, injects faults on a seeded schedule (process kills, udev restarts, USB unplug, network loss, full disk, clock steps, reboots and hard resets; each undo armed as a systemd timer before the fault), and reports PASS/FAIL. <code>lyrebird-soak-observer.sh</code> watches the streams from a second machine (bash 3.2 or later), can cut the node's power through commands you supply, and reports gaps and time to audio. See <code>tools/soak/README.md</code>.</li>
+    <li>Live tests against real MediaMTX releases (<code>tests/fetch_mediamtx.sh</code> downloads checksum-pinned 1.15.0, 1.18.0, 1.19.0, 1.21.1, 1.21.2 and 1.21.3), run by a CI job per version.</li>
+    </ul>
+    <h4 id="soak-testing-and-current-mediamtx-2026-10-fixed">Fixed</h4>
+    <ul>
+    <li><strong>MediaMTX 1.19.0 and later opened three extra ports.</strong> Those versions start a MoQ (Media over QUIC) server unless told not to, so the generated <code>mediamtx.yml</code> left <code>:8892/tcp</code>, <code>:8892/udp</code> and <code>:8893/udp</code> listening on every interface (allowed origins <code>*</code>), and MediaMTX wrote a generated key/certificate pair into its working directory. The installer installs the latest release by default, so new installs were affected. The config now says <code>moq: no</code> when the installed MediaMTX is 1.19.0 or later; 1.15–1.18 refuse to start with that key, so it is left out for them and when the version cannot be read. Verified with the real binaries of every release from 1.15.0 to 1.21.1.</li>
+    </ul>
+    <h3 id="usb-audio-mapper-4-0-0-2026-10">USB Audio Mapper 4.0.0 (2026-10)</h3>
+    <p><code>usb-audio-mapper.sh</code> is now the same file as the standalone <a href="https://github.com/tomtom215/usb-audio-mapper" target="_blank" rel="noopener">usb-audio-mapper</a> 4.0.0 (its version number replaces this repository's 1.2.1). Tested end to end with real Linux kernels and real systemd-udevd in QEMU; see <code>docs/ENGINEERING-REVIEW-2026-07.md</code> §9.</p>
+    <p>Component versions bumped: <code>usb-audio-mapper.sh</code> 1.2.1 → 4.0.0, <code>lyrebird-orchestrator.sh</code> 2.1.2 → 2.1.3, <code>lyrebird-updater.sh</code> 1.6.0 → 1.6.1, <code>lyrebird-mic-check.sh</code> 1.0.0 → 1.0.1, <code>lyrebird-alerts.sh</code> 1.0.0 → 1.0.1.</p>
+    <h4 id="usb-audio-mapper-4-0-0-2026-10-fixed">Fixed</h4>
+    <ul>
+    <li><strong>USB persistent naming still never worked (critical).</strong> The 2026-07 fix (C1) made the rule an active line, but whenever udev knew the device's <code>ID_PATH</code> the rule matched <code>ENV{ID_PATH}</code> taken from the USB *device* node, which never equals the sound card's <code>ID_PATH</code> (the card's carries the interface suffix, e.g. <code>-usb-0:1:1.0</code>). In non-interactive mode the value also came from the first <code>lsusb</code> line with the vendor/product id, so identical devices all got the first device's rule and <code>-u</code> was ignored. Reproduced with three identical devices: 0 of 3 renamed. Rules now match the sound card's own <code>ID_PATH</code> (imported in the rule), gated to the card device; 3 of 3 renamed, immediately, after replug, after udevd restarts and system-wide triggers, and at boot.</li>
+    <li><strong>Wrong microphone named after USB bus renumbering (critical).</strong> A port rule such as <code>KERNELS=="1-1"</code> contains the USB bus number, which changes between boots when host-controller drivers register in a different order; in a test with two controllers one microphone got the other's name. <code>ID_PATH</code> omits the bus number and kept both names in every load order.</li>
+    <li><strong>Names the kernel truncates or refuses</strong>: ALSA card ids hold 15 characters (longer names were silently cut), and ids starting with <code>card</code> (the wizard's own fallback suggestion) or reserved words like <code>pcm</code> are refused.</li>
+    <li><strong>Rule side effects</strong>: the rule also matched <code>controlC*</code>/<code>pcm*</code> nodes, so udev logged failed <code>ATTR{id}</code> writes on every event and several nodes competed for the symlink; re-applying an unchanged id fails with <code>EEXIST</code>. Rules are now gated (<code>KERNEL=="card*"</code> / <code>"controlC*"</code>, <code>ACTION=="add|change"</code>) with an <code>ATTR{id}!=</code> guard.</li>
+    <li>An invalid <code>-u</code> value no longer silently falls back to a vendor/product rule that names every identical device the same; several identical devices with no port given are refused (exit 5).</li>
+    <li>Concurrent mapper runs no longer lose updates (<code>flock</code>).</li>
+    <li><code>-u usb-&lt;controller&gt;-&lt;port&gt;</code> (the form in <code>/proc/asound/cards</code>) was refused when the controller name contains <code>-</code>, as on dwc3 ARM boards (<code>usb-xhci-hcd.0.auto-1.2</code>).</li>
+    <li><strong>Test suite could delete recordings and logs.</strong> <code>tests/test_lyrebird_storage.bats</code> exported <code>RECORDING_DIR</code>/<code>LOG_DIR</code>/<code>TEMP_DIR</code>, which <code>lyrebird-storage.sh</code> overwrites with its readonly defaults when sourced, so the teardown's <code>rm -rf</code> hit <code>/var/lib/mediamtx-ffmpeg/recordings</code>, <code>/var/log/lyrebird</code> and <code>/tmp</code>. Run as root on a node, the test suite deleted all recordings and logs. The setup now uses the <code>LYREBIRD_*_DIR</code> variables; regression test in <code>tests/test_storage_suite_safety.bats</code>.</li>
+    <li><strong>321 tests could not fail.</strong> Six test files sourced a script in <code>setup()</code> that replaced bats' <code>EXIT</code> trap and then switched errexit off, so a failing assertion was ignored. A helper now restores bats' traps and options after sourcing, and <code>tests/test_suite_can_fail.bats</code> checks every test file. This surfaced 28 failures; 25 were wrong tests, corrected to the scripts' actual behaviour (<code>docs/ENGINEERING-REVIEW-2026-07.md</code> §9, U9–U13).</li>
+    <li>The test suite left 27 temp files and directories behind per run. Test files that create temp files now give each test a private <code>TMPDIR</code> (<code>tests/scratch_tmpdir.bash</code>), and CI runs <code>tests/check_tmp_leaks.sh</code>, which fails on any leftover.</li>
+    <li><code>lyrebird-mic-check.sh -g</code> wrote <code>DEFAULT_SAMPLE_RATE</code>, <code>DEFAULT_CHANNELS</code> and <code>DEFAULT_BITRATE</code> into <code>audio-devices.conf</code>, where the stream manager ignores them (they are readonly by then) and logs <code>readonly variable</code> on every load. They are now written as comments; set them in the stream manager's environment instead. README corrected.</li>
+    <li><code>lyrebird-alerts.sh</code>: level colours and prefixes were lost when the script was sourced from a function.</li>
+    <li><code>lyrebird-updater.sh --help</code> now lists the command-line options.</li>
+    <li><code>lyrebird-stream-manager.sh</code> header said version 1.4.4 (it is 1.5.0), which <code>lyrebird-diagnostics.sh</code> reported.</li>
+    </ul>
+    <h4 id="usb-audio-mapper-4-0-0-2026-10-added">Added</h4>
+    <ul>
+    <li><code>--card N</code>, <code>--list</code>, <code>--remove NAME</code>, <code>--dry-run</code>, <code>--no-apply</code>, <code>--any-port</code>; immediate application with kernel verification (exit 6 when the name did not take, naming the card that holds it); automatic migration of rules written by earlier versions; documented exit codes.</li>
+    </ul>
+    <h4 id="changed">Changed</h4>
+    <ul>
+    <li>Orchestrator: no reboot prompt after mapping (not needed any more); messages name the real outputs (<code>/proc/asound/cards</code>, <code>/dev/sound/by-id/</code>); "show mappings" uses <code>usb-audio-mapper.sh --list</code>.</li>
+    <li>Docs: removed references to <code>/dev/snd/by-usb-port/Device_N</code> and <code>--rescan</code>, neither of which existed, and to reboots after mapping.</li>
+    <li><code>tests/test_usb_audio_mapper.bats</code> replaced: the old file had 19 tests, 14 of which tested copies of functions defined inside the test file rather than the script. The new suite (56 tests) runs the real script against a fake sysfs. The QEMU end-to-end suite lives in the standalone repository.</li>
+    </ul>
+    <h3 id="reliability-audit-2026-07-third-pass">Reliability Audit (2026-07, third pass)</h3>
+    <p>A third adversarial, hardware-free reliability pass focused on the long-horizon and cold-start failure modes an unattended field node hits over weeks/months. Every fix ships with a regression test that fails before and passes after; the suite grew from 528 to 579 tests, all green, ShellCheck-clean. See <code>docs/ENGINEERING-REVIEW-2026-07.md</code> §8 for the reproduced findings.</p>
+    <p>Component versions bumped: <code>lyrebird-stream-manager.sh</code> 1.4.3 → 1.5.0, <code>lyrebird-metrics.sh</code> 1.1.0 → 1.2.0, <code>lyrebird-storage.sh</code> 1.0.0 → 1.1.0.</p>
+    <h4 id="deferred-trio-closed-with-simulation-proof">Deferred trio — closed with simulation proof</h4>
+    <ul>
+    <li><strong>Deep health check (H9)</strong>: <code>monitor_streams</code> now probes the MediaMTX control API for each path's readiness, not just the wrapper's bash PID. A stream whose path stays not-ready for <code>DEEP_HEALTH_MAX_STRIKES</code> (default 3) consecutive monitor runs — a hung FFmpeg or endless backoff — is restarted within the existing cron budget. An unreachable API neither strikes nor forgives a stream; a ready probe resets the streak; <code>DEEP_HEALTH_CHECK_ENABLED=false</code> restores the old shallow behavior.</li>
+    <li><strong>Deprecated MediaMTX JSON fields</strong>: readiness parsing now accepts both the deprecated (<code>ready</code>) and current (<code>available</code>) path-status shapes, preferring the new field, across all five grep sites (stream-manager ×4, metrics ×1). A future MediaMTX that drops <code>ready</code> no longer makes every stream look dead.</li>
+    <li><strong>Non-monotonic timing</strong>: wrapper run-time/backoff, the cron restart budget, and silence tracking now read <code>/proc/uptime</code> (monotonic) instead of wall-clock <code>date +%s</code>. An NTP step on an RTC-less Pi no longer counts a healthy multi-hour run as a failure, evaporates the anti-storm budget, or fires a false DEAD MIC. <strong>Correction (2026-11):</strong> nothing called the silence check at the time (<code>AUDIO_LEVEL_CHECK_ENABLED</code> did nothing); the monitor has run it since the 2026-11 audit [LB-14].</li>
+    </ul>
+    <h4 id="reliability-audit-2026-07-third-pass-fixed">Fixed</h4>
+    <ul>
+    <li><strong>errexit/pipefail silent aborts</strong>: swept 15 more <code>var=$(… | grep …)</code> sites across seven scripts where a zero-match grep aborted the whole run under <code>set -euo pipefail</code> (NTP probe on an unsynced daemon, audio-level check with no volumedetect output, metrics scrape when MediaMTX exits mid-scrape, checksum verification, service-env merge, and more). Idle-server counting in the stream manager (<code>0 ready paths</code>/<code>0 sessions</code>) was aborting too.</li>
+    <li><strong>Corrupt device config aborted <code>start</code></strong>: a config truncated by power loss, SD-card bit-rot, or a bad operator edit hit a syntax error that aborted the whole run under errexit — no streams came up on the next unattended boot. The config is now syntax-checked before sourcing and ignored if corrupt; a valid config is sourced with errexit neutralised and still fully honored. <strong>Correction (2026-11):</strong> the file is no longer sourced at all; it is read as data, line by line [LB-08].</li>
+    <li><strong>Non-numeric env knobs aborted the cron monitor</strong>: 37 numeric knobs in the stream manager (e.g. <code>CRON_RESTART_MAX_PER_HOUR=unlimited</code>) reached bash arithmetic and killed every cron pass with an "unbound variable" error. All are now coerced to sane defaults at load; valid overrides are preserved.</li>
+    <li><strong>Broken-clock mass deletion</strong>: age-based recording retention is skipped while the system clock is pre-2025 (not yet NTP-synced), and any recording whose mtime predates that epoch is kept — preventing minutes-old data from being deleted as "56 years old" the moment the clock steps. Emergency size-based cleanup is deliberately exempt.</li>
+    </ul>
+    <h4 id="reliability-audit-2026-07-third-pass-added">Added</h4>
+    <ul>
+    <li><strong>Inode-exhaustion detection</strong> in storage monitoring: a recorder writing many small files exhausts inodes long before blocks; <code>cmd_monitor</code> now applies the warning/critical/emergency thresholds to <code>df -Pi</code> too. Filesystems without inode accounting are treated as no pressure.</li>
+    <li><strong>In-band metrics staleness marker</strong>: every scrape emits <code>lyrebird_scrape_timestamp_seconds</code> so a <code>.prom</code> left behind by a dead exporter ("dead recorder looks alive") is detectable via a Prometheus age alert.</li>
+    </ul>
+    <h2 id="v1-3-0-2026-07-19"><span class="version-badge">1.3.0</span> - 2026-07-19</h2>
+    <p>First release to bundle the full Engineering Excellence Review (C1–C9, H1–H10) and the follow-up Reliability Hardening pass. A large correctness/reliability release for unattended 24/7 operation — no intentional breaking API change; the one script rename is handled by automatic migration. Suite: 528 tests, green; ShellCheck-clean. Highlights are grouped below.</p>
+    <h3 id="breaking-changes">⚠️ Breaking Changes</h3>
+    <ul>
+    <li><strong>Script Renamed</strong>: <code>mediamtx-stream-manager.sh</code> → <code>lyrebird-stream-manager.sh</code>
+    <ul>
+    <li>Log file path changed: <code>/var/log/mediamtx-stream-manager.log</code> → <code>/var/log/lyrebird-stream-manager.log</code></li>
+    <li><strong>Automatic migration</strong>: Running <code>lyrebird-updater.sh</code> will automatically update:
+    <ul>
+    <li>Systemd service files</li>
+    <li>Cron jobs</li>
+    <li><code>/usr/local/bin</code> installations</li>
+    <li>Log file symlinks for backward compatibility</li>
+    </ul></li>
+    <li><strong>Manual migration</strong>: Run <code>sudo ./lyrebird-updater.sh --migrate</code></li>
+    </ul></li>
+    </ul>
+    <h3 id="v1-3-0-2026-07-19-added">Added</h3>
+    <ul>
+    <li>Automatic migration system in <code>lyrebird-updater.sh</code> v1.6.0
+    <ul>
+    <li>Post-update migrations for breaking changes</li>
+    <li>Idempotent migration tracking in <code>/var/lib/lyrebird/migrations/</code></li>
+    <li>CLI flag <code>--migrate</code> for manual migration runs</li>
+    </ul></li>
+    <li>Migration detection in <code>lyrebird-orchestrator.sh</code>
+    <ul>
+    <li>Startup warning when old script names detected</li>
+    <li>Clear remediation steps for users</li>
+    </ul></li>
+    <li>Webhook alerting system (<code>lyrebird-alerts.sh</code>) for remote monitoring
+    <ul>
+    <li>Supports Discord, Slack, ntfy.sh, Pushover, and generic HTTP webhooks</li>
+    <li>Rate limiting and alert deduplication</li>
+    <li>Pure bash implementation with no new dependencies</li>
+    </ul></li>
+    <li><code>CHANGELOG.md</code> to track version history</li>
+    <li><code>CONTRIBUTING.md</code> with contribution guidelines</li>
+    </ul>
+    <h3 id="v1-3-0-2026-07-19-changed">Changed</h3>
+    <ul>
+    <li>Improved inline documentation in <code>usb-audio-mapper.sh</code></li>
+    <li>Enhanced error messages with remediation steps</li>
+    <li><code>lyrebird-stream-manager.sh</code> updated to v1.4.4
+    <ul>
+    <li>Restructured API validation to preserve curl exit status for better error detection</li>
+    <li>Replaced <code>curl|grep</code> pattern with explicit exit code checking</li>
+    </ul></li>
+    <li>CI now runs the <code>bats</code> test suite as a required check (previously never run)</li>
+    <li>Documented MediaMTX support through v1.19.x (endpoints/assets unchanged from v1.15.x)</li>
+    </ul>
+    <h3 id="fixed-engineering-excellence-review-2026-07">Fixed (Engineering Excellence Review, 2026-07)</h3>
+    <p>Full line-by-line audit; see <code>docs/ENGINEERING-REVIEW-2026-07.md</code>. Each fix ships with a regression test. Highlights (all verified against the code):</p>
+    <ul>
+    <li><strong>USB persistent naming never worked</strong> — <code>usb-audio-mapper.sh</code> emitted every udev rule as a comment (a literal <code>\n</code> collapsed the comment and rule onto one <code>#</code>-prefixed line). Also fixed an injection-prone card-name sanitizer.</li>
+    <li><strong>FFmpeg streams did not auto-restart</strong> — the supervisor wrapper died on the first FFmpeg failure (bare <code>wait</code> under <code>set -euo pipefail</code>) and again when the transient launcher PID exited. Restored the wrapper's backoff-restart loop. <strong>Correction (2026-11):</strong> the generated wrapper still ended at its first back-off (<code>MAX_RESTART_DELAY: unbound variable</code>) unless those variables were in the manager's environment; fixed in the 2026-11 audit [X-10].</li>
+    <li><strong>Per-device audio config was ignored</strong> — <code>lyrebird-mic-check.sh</code> wrote <code>DEVICE_&lt;name&gt;_*</code> keys in the wrong case for the stream manager's uppercase lookup; a "high quality" mic silently ran at defaults (and <code>--validate</code> passed).</li>
+    <li><strong>ntfy/Pushover alerts were silently dropped</strong> and falsely reported as sent.</li>
+    <li><strong>Prometheus scrape was rejected</strong> — duplicate <code># HELP</code>/<code># TYPE</code> lines.</li>
+    <li><strong>Self-update always failed</strong> — the updater deadlocked on its own lock after <code>exec</code>.</li>
+    <li><strong>Orchestrator interactive delegations couldn't read input</strong> (backgrounded child stdin was <code>/dev/null</code>) — the Quick Setup Wizard could not map devices.</li>
+    <li><strong>Storage cleanup halted on a 0-byte file</strong> (disk fill risk); emergency cleanup no longer deletes unrelated <code>/var/log/*.gz</code> or ignores <code>--dry-run</code>.</li>
+    <li><strong>Diagnostics aborted on a healthy host</strong> — <code>grep -c … || echo 0</code> produced a <code>0\n0</code> arithmetic error under <code>set -e</code>.</li>
+    <li><strong>Webhook/JSON output is now valid</strong> for control characters and backslashes.</li>
+    <li><strong>Test suite repaired</strong> — 159 tests silently never ran; source guards + <code>set -e</code> handling restored so all tests execute (and CI enforces them).</li>
+    </ul>
+    <h3 id="fixed-reliability-hardening-pass-2026-07">Fixed (Reliability Hardening pass, 2026-07)</h3>
+    <p>Deeper follow-up audit (6 parallel reviewers, every finding reproduced) closing the pending HIGH items and a large MEDIUM/LOW sweep. Every fix ships with a regression test; the suite is green (528 tests) and ShellCheck-clean.</p>
+    <ul>
+    <li><strong>Storage / data-loss:</strong> <code>df</code> output was misparsed on wrapped long device names (LVM/<code>/dev/mapper</code>), so a FULL disk read as "OK" and cleanup never ran; empty-dir cleanup could delete the recording directory itself; oversized-log truncation swapped the inode out from under the writer (invisible unbounded growth); a non-integer retention env value aborted the script at load (crons silently stopped). Now POSIX <code>df -P</code> with guards, <code>-mindepth 1</code>, in-place truncation, and validated numeric inputs.</li>
+    <li><strong>Metrics:</strong> the Prometheus scrape silently aborted in the normal "streams up, no listeners" state (unguarded <code>curl</code>/<code>grep|wc</code> under <code>set -euo pipefail</code>), so <code>--file</code> mode served a STALE <code>.prom</code> with <code>up=1</code> — a dead recorder looked alive for months. Guarded all collectors; label values are now escaped.</li>
+    <li><strong>Stream supervision:</strong> the wrapper gave up after a LIFETIME (not windowed) restart count, so streams died off one by one over weeks; a dead stream was never resurrected under cron (now bounded per-stream resurrection); disk/memory pressure triggered a 5-minute service-restart storm that freed nothing (now degraded/alert-only). Generated logrotate now uses <code>copytruncate</code>.</li>
+    <li><strong>Installer/updater:</strong> a failed <code>update</code> left MediaMTX stopped indefinitely (rollback never restarted it); <code>update -V &lt;ver&gt;</code> ignored the pin and jumped to latest; a branch switch never fast-forwarded (no-op "success"); a self-update re-exec could strand the service on a prompt.</li>
+    <li><strong>Alerts:</strong> every CRITICAL Pushover alert was rejected (missing retry/expire); ntfy titles containing a colon were truncated. <strong>Diagnostics:</strong> a healthy-host run could abort mid-way; several checks read false "healthy" (inotify, disk, world-writable config perms, "recent crash", BusyBox reachability).</li>
+    <li><strong>USB mapper:</strong> closed a udev-rule injection via <code>-u</code>; made VID:PID-only naming visible; atomic rules-file write. <strong>mic-check:</strong> <code>--format=json</code> always emitted an empty list; config could pick an unsupported channel count.</li>
+    <li><strong>Sample configs:</strong> removed systemd <code>WatchdogSec</code> restart-loop traps (MediaMTX can't feed it; the manager's ping is rejected under default <code>NotifyAccess</code>), fixed the audio unit's <code>Type</code> (forking) and <code>StartLimit</code> placement, and made logrotate use <code>copytruncate</code>. Added config-file validation tests.</li>
+    <li><strong>Tests/CI:</strong> added a hardware-free end-to-end integration suite (stub MediaMTX API, mock webhook, disk-full, device-config round-trip); bumped ShellCheck 0.10→0.11 (verified clean), shfmt 3.8→3.13.1, actions/checkout v4→v5.</li>
+    </ul>
+    <p>See <code>docs/ENGINEERING-REVIEW-2026-07.md</code> for the full finding-by-finding detail.</p>
+    <h2 id="v1-4-2-2025-12-19"><span class="version-badge">1.4.2</span> - 2025-12-19</h2>
+    <h3 id="v1-4-2-2025-12-19-added">Added</h3>
+    <ul>
+    <li>Prometheus metrics export (<code>lyrebird-metrics.sh</code>)</li>
+    <li>Storage management with configurable retention (<code>lyrebird-storage.sh</code>)</li>
+    <li>Comprehensive test suite (~90 tests, ~50% coverage)
+    <ul>
+    <li><code>test_usb_audio_mapper.bats</code> - 15 tests</li>
+    <li><code>test_lyrebird_diagnostics.bats</code> - 16 tests</li>
+    <li><code>test_lyrebird_orchestrator.bats</code> - 14 tests</li>
+    <li>Enhanced <code>test_stream_manager.bats</code> - 32 tests</li>
+    </ul></li>
+    <li>systemd service files with watchdog support
+    <ul>
+    <li><code>config/mediamtx.service</code></li>
+    <li><code>config/mediamtx-audio.service</code></li>
+    <li><strong>Correction (2026-11):</strong> <code>WatchdogSec=</code> was removed from the shipped units in 1.3.0, and the stream manager's own watchdog code, which never opened a device, in the 2026-11 audit [LB-15].</li>
+    </ul></li>
+    <li>Log rotation configuration (<code>config/lyrebird-logrotate.conf</code>)</li>
+    <li>Security documentation (<code>docs/SECURITY-GUIDE.md</code>) with optional TLS/auth guides</li>
+    <li><code>.gitignore</code> file to prevent accidental sensitive data commits</li>
+    </ul>
+    <h3 id="v1-4-2-2025-12-19-changed">Changed</h3>
+    <ul>
+    <li>Updated stream manager version to 1.4.2</li>
+    <li>README updated with new scripts and configuration files</li>
+    <li>Comprehensive audit report documenting 64 issues</li>
+    </ul>
+    <h2 id="v1-4-1-2025-12"><span class="version-badge">1.4.1</span> - 2025-12</h2>
+    <h3 id="v1-4-1-2025-12-added">Added</h3>
+    <ul>
+    <li>Friendly name support for device configuration in stream manager</li>
+    <li>Dual-lookup config system (friendly names and full device IDs)</li>
+    </ul>
+    <h3 id="v1-4-1-2025-12-fixed">Fixed</h3>
+    <ul>
+    <li>Device configuration lookup now tries friendly name first, then full ID</li>
+    </ul>
+    <h2 id="v1-4-0-2025-12"><span class="version-badge">1.4.0</span> - 2025-12</h2>
+    <h3 id="v1-4-0-2025-12-added">Added</h3>
+    <ul>
+    <li>Production stability and monitoring enhancements</li>
+    <li>Heartbeat/watchdog integration with systemd
+    <ul>
+    <li><strong>Correction (2026-11):</strong> there was no working watchdog. The hardware watchdog code never opened the device; what remains is a heartbeat file holding the time of the monitor's last run [LB-15].</li>
+    </ul></li>
+    <li>Network connectivity monitoring</li>
+    <li>Resource threshold monitoring (CPU, memory, file descriptors)</li>
+    </ul>
+    <h3 id="v1-4-0-2025-12-changed">Changed</h3>
+    <ul>
+    <li>Improved stream recovery with exponential backoff</li>
+    <li>Better cron-based health monitoring</li>
+    </ul>
+    <h2 id="v1-3-4-2025-12"><span class="version-badge">1.3.4</span> - 2025-12</h2>
+    <h3 id="v1-3-4-2025-12-fixed">Fixed</h3>
+    <ul>
+    <li>Resolved persistent stream failure issues</li>
+    <li>Improved FFmpeg process lifecycle management</li>
+    </ul>
+    <h2 id="v2-1-2-2025-12-orchestrator"><span class="version-badge">2.1.2</span> - 2025-12 (Orchestrator)</h2>
+    <h3 id="v2-1-2-2025-12-orchestrator-fixed">Fixed</h3>
+    <ul>
+    <li>Fixed broken integrations found in verification testing</li>
+    <li>Improved menu navigation and user feedback</li>
+    </ul>
+    <h2 id="v2-1-1-2025-12-orchestrator"><span class="version-badge">2.1.1</span> - 2025-12 (Orchestrator)</h2>
+    <h3 id="v2-1-1-2025-12-orchestrator-fixed">Fixed</h3>
+    <ul>
+    <li>Various bugs in menu handling</li>
+    <li>Improved UI/UX responsiveness</li>
+    </ul>
+    <h2 id="v2-1-0-2025-12-orchestrator"><span class="version-badge">2.1.0</span> - 2025-12 (Orchestrator)</h2>
+    <h3 id="v2-1-0-2025-12-orchestrator-added">Added</h3>
+    <ul>
+    <li>Microphone capability detection integration</li>
+    <li>Security hardening for external script calls</li>
+    <li>SHA256 integrity checking for sourced scripts</li>
+    </ul>
+    <h3 id="v2-1-0-2025-12-orchestrator-changed">Changed</h3>
+    <ul>
+    <li>Improved hardware capability display</li>
+    <li>Better error handling throughout</li>
+    </ul>
+    <h2 id="v2-0-1-2025-12-orchestrator"><span class="version-badge">2.0.1</span> - 2025-12 (Orchestrator)</h2>
+    <h3 id="v2-0-1-2025-12-orchestrator-added">Added</h3>
+    <ul>
+    <li>Cross-platform support improvements</li>
+    <li>Security fixes for input handling</li>
+    </ul>
+    <h2 id="v1-5-1-2025-12-updater"><span class="version-badge">1.5.1</span> - 2025-12 (Updater)</h2>
+    <h3 id="v1-5-1-2025-12-updater-added">Added</h3>
+    <ul>
+    <li>Pre-execution syntax validation for self-updates</li>
+    <li>Self-update safety checks</li>
+    </ul>
+    <h3 id="v1-5-1-2025-12-updater-fixed">Fixed</h3>
+    <ul>
+    <li>Improved rollback reliability</li>
+    </ul>
+    <h2 id="v1-5-0-2025-12-updater"><span class="version-badge">1.5.0</span> - 2025-12 (Updater)</h2>
+    <h3 id="v1-5-0-2025-12-updater-added">Added</h3>
+    <ul>
+    <li>Automatic systemd service lifecycle management</li>
+    <li>Stop services before update, reinstall after</li>
+    <li>Cron job update handling</li>
+    </ul>
+    <h2 id="v1-2-1-2025-12-usb-audio-mapper"><span class="version-badge">1.2.1</span> - 2025-12 (USB Audio Mapper)</h2>
+    <h3 id="v1-2-1-2025-12-usb-audio-mapper-fixed">Fixed</h3>
+    <ul>
+    <li>USB port detection bug causing incorrect device-to-port mapping</li>
+    <li>Improved physical port path resolution</li>
+    </ul>
+    <h2 id="v1-0-2-2025-12-diagnostics"><span class="version-badge">1.0.2</span> - 2025-12 (Diagnostics)</h2>
+    <h3 id="v1-0-2-2025-12-diagnostics-added">Added</h3>
+    <ul>
+    <li>Cross-platform compatibility improvements</li>
+    </ul>
+    <h3 id="v1-0-2-2025-12-diagnostics-fixed">Fixed</h3>
+    <ul>
+    <li>Reliability fixes for various system configurations</li>
+    </ul>
+    <h2 id="v2-0-1-2025-12-mediamtx-installer"><span class="version-badge">2.0.1</span> - 2025-12 (MediaMTX Installer)</h2>
+    <h3 id="v2-0-1-2025-12-mediamtx-installer-added">Added</h3>
+    <ul>
+    <li>Platform-aware installation (Linux/Darwin/FreeBSD)</li>
+    <li>Automatic architecture detection (x86_64, ARM64, ARMv7, ARMv6)
+    <ul>
+    <li><strong>Correction (2026-11):</strong> the installer has Darwin, FreeBSD and ARM branches, but no test in this repository runs on those platforms or downloads those builds; <code>tests/fetch_mediamtx.sh</code> fetches linux amd64 releases only.</li>
+    </ul></li>
+    <li>SHA256 checksum verification</li>
+    <li>Atomic updates with automatic rollback</li>
+    <li>Dry-run mode for testing</li>
+    </ul>
+    <h3 id="v2-0-1-2025-12-mediamtx-installer-changed">Changed</h3>
+    <ul>
+    <li>Built-in upgrade support for MediaMTX 1.15.0+
+    <ul>
+    <li><strong>Correction (2026-11):</strong> removed in installer 2.1.0. MediaMTX's own <code>--upgrade</code> applies no checksum, and MediaMTX 1.15.0 does not have the flag (<code>--help</code> lists it from 1.18.0; 1.16 and 1.17 were not checked) [X-41].</li>
+    </ul></li>
+    </ul>
+    <h2 id="v1-0-0-2025-12-mic-check"><span class="version-badge">1.0.0</span> - 2025-12 (Mic Check)</h2>
+    <h3 id="v1-0-0-2025-12-mic-check-added">Added</h3>
+    <ul>
+    <li>Hardware capability detection via <code>/proc/asound</code></li>
+    <li>Non-invasive detection (won't interrupt active streams)</li>
+    <li>Automatic sample rate, channel, and format detection</li>
+    <li>Quality tier recommendations (low/normal/high)</li>
+    <li>Configuration generation and validation</li>
+    <li>JSON output support</li>
+    </ul>
+    <h2 id="v1-0-0-2025-12-common-library"><span class="version-badge">1.0.0</span> - 2025-12 (Common Library)</h2>
+    <h3 id="v1-0-0-2025-12-common-library-added">Added</h3>
+    <ul>
+    <li>Shared utility library (<code>lyrebird-common.sh</code>)</li>
+    <li>Standardized color handling</li>
+    <li>Common logging functions (debug, info, warn, error)</li>
+    <li>Command existence checking with caching</li>
+    <li>Portable hash computation</li>
+    <li>Standard exit codes</li>
+    </ul>
     <hr>
-
-    <!-- v1.4.2 -->
-    <h2 id="v142"><span class="version-badge">v1.4.2</span> — 2025-12-19</h2>
-
-    <h3>Added</h3>
+    <h2 id="version-numbering">Version Numbering</h2>
+    <p>The <strong>suite</strong> is released as a whole under a single <code>vX.Y.Z</code> git tag. The tags are v1.1.0 (2025-10-11), v1.2.0 (2025-10-22) and v1.3.0 (2026-07-19), the latest release. The release that will carry the [Unreleased] changes has no number yet. The headings above that carry a version number and no component name (1.4.2, 1.4.1, 1.4.0 and 1.3.4) are versions of the stream manager, not tags of the suite.</p>
+    <p>Each script also carries its own version. This table gives it as it is in v1.3.0 and as it is in this tree, which is not released:</p>
+    <div class="table-wrapper">
+    <table>
+    <thead><tr><th>Component</th><th>In v1.3.0</th><th>In this tree</th></tr></thead>
+    <tbody>
+    <tr><td>lyrebird-orchestrator.sh</td><td>2.1.2</td><td>2.2.0</td></tr>
+    <tr><td>lyrebird-stream-manager.sh</td><td>1.4.3</td><td>2.0.0</td></tr>
+    <tr><td>lyrebird-updater.sh</td><td>1.6.0</td><td>1.8.0</td></tr>
+    <tr><td>usb-audio-mapper.sh</td><td>1.2.1</td><td>4.0.1</td></tr>
+    <tr><td>lyrebird-diagnostics.sh</td><td>1.0.2</td><td>1.0.2</td></tr>
+    <tr><td>install_mediamtx.sh</td><td>2.0.1</td><td>2.1.0</td></tr>
+    <tr><td>lyrebird-mic-check.sh</td><td>1.0.0</td><td>1.0.2</td></tr>
+    <tr><td>lyrebird-common.sh</td><td>1.0.0</td><td>1.1.0</td></tr>
+    <tr><td>lyrebird-metrics.sh</td><td>1.1.0</td><td>1.4.0</td></tr>
+    <tr><td>lyrebird-storage.sh</td><td>1.0.0</td><td>1.3.0</td></tr>
+    <tr><td>lyrebird-alerts.sh</td><td>1.0.0</td><td>1.1.0</td></tr>
+    <tr><td>tools/soak/lyrebird-soak.sh</td><td>not in v1.3.0</td><td>1.0.0</td></tr>
+    </tbody>
+    </table>
+    </div>
+    <h2 id="links">Links</h2>
     <ul>
-      <li>Prometheus metrics export (<code>lyrebird-metrics.sh</code>)</li>
-      <li>Storage management with configurable retention (<code>lyrebird-storage.sh</code>)</li>
-      <li>Comprehensive test suite (~90 tests, ~50% coverage)
-        <ul>
-          <li><code>test_usb_audio_mapper.bats</code> — 15 tests</li>
-          <li><code>test_lyrebird_diagnostics.bats</code> — 16 tests</li>
-          <li><code>test_lyrebird_orchestrator.bats</code> — 14 tests</li>
-          <li><code>test_stream_manager.bats</code> — 32 tests</li>
-        </ul>
-      </li>
-      <li>systemd service files with watchdog support
-        <ul>
-          <li><code>config/mediamtx.service</code></li>
-          <li><code>config/mediamtx-audio.service</code></li>
-        </ul>
-      </li>
-      <li>Log rotation configuration (<code>config/lyrebird-logrotate.conf</code>)</li>
-      <li>Security documentation (<code>docs/SECURITY-GUIDE.md</code>) with optional TLS/auth guides</li>
-      <li><code>.gitignore</code> file to prevent accidental sensitive data commits</li>
+    <li><a href="https://github.com/tomtom215/LyreBirdAudio" target="_blank" rel="noopener">GitHub Repository</a></li>
+    <li><a href="https://github.com/tomtom215/LyreBirdAudio/issues" target="_blank" rel="noopener">Issue Tracker</a></li>
+    <li><a href="https://github.com/tomtom215/LyreBirdAudio/discussions" target="_blank" rel="noopener">Discussions</a></li>
     </ul>
-
-    <h3>Changed</h3>
-    <ul>
-      <li>Updated stream manager to v1.4.2</li>
-      <li>README updated with new scripts and configuration files</li>
-    </ul>
-
-    <hr>
-
-    <!-- v1.4.1 -->
-    <h2 id="v141"><span class="version-badge">v1.4.1</span> — 2025-12</h2>
-
-    <h3>Added</h3>
-    <ul>
-      <li>Friendly name support for device configuration in stream manager</li>
-      <li>Dual-lookup config system (friendly names and full device IDs)</li>
-    </ul>
-
-    <h3>Fixed</h3>
-    <ul>
-      <li>Device configuration lookup now tries friendly name first, then full ID</li>
-    </ul>
-
-    <hr>
-
-    <!-- v1.4.0 -->
-    <h2 id="v140"><span class="version-badge">v1.4.0</span> — 2025-12</h2>
-
-    <h3>Added</h3>
-    <ul>
-      <li>Production stability and monitoring enhancements</li>
-      <li>Heartbeat/watchdog integration with systemd</li>
-      <li>Network connectivity monitoring</li>
-      <li>Resource threshold monitoring (CPU, memory, file descriptors)</li>
-    </ul>
-
-    <h3>Changed</h3>
-    <ul>
-      <li>Improved stream recovery with exponential backoff</li>
-      <li>Better cron-based health monitoring</li>
-    </ul>
-
-    <hr>
-
-    <!-- Orchestrator versions -->
-    <h2 id="orchestrator-versions">Orchestrator History</h2>
-
-    <h3><span class="version-badge">v2.1.3</span></h3>
-    <ul>
-      <li>After USB mapping: no reboot prompt (names apply immediately with usb-audio-mapper 4.0.0); correct paths in messages; "show mappings" uses <code>usb-audio-mapper.sh --list</code></li>
-    </ul>
-
-    <h3><span class="version-badge">v2.1.2</span></h3>
-    <ul>
-      <li>Fixed broken integrations found in verification testing</li>
-      <li>Improved menu navigation and user feedback</li>
-    </ul>
-
-    <h3><span class="version-badge">v2.1.0</span></h3>
-    <ul>
-      <li>Added microphone capability detection integration</li>
-      <li>Security hardening for external script calls</li>
-      <li>SHA256 integrity checking for sourced scripts</li>
-      <li>Improved hardware capability display</li>
-    </ul>
-
-    <hr>
-
-    <!-- USB Mapper -->
-    <h2 id="usb-mapper-versions">USB Audio Mapper History</h2>
-
-    <h3><span class="version-badge">v4.0.0</span></h3>
-    <ul>
-      <li><strong>Fixed (critical):</strong> generated rules never renamed a device. They matched <code>ENV{ID_PATH}</code> taken from the USB device node, which never equals the sound card's own <code>ID_PATH</code>; rules now match the card's own <code>ID_PATH</code> (imported in the rule). Verified with a real kernel and udev.</li>
-      <li><strong>Fixed (critical):</strong> port rules keyed on the USB bus number (<code>KERNELS=="1-1"</code>) named the wrong microphone when bus numbers changed between boots; <code>ID_PATH</code> has no bus number.</li>
-      <li><strong>Fixed:</strong> names longer than 15 characters (truncated by the kernel), names starting with <code>card</code> and ALSA reserved words are rejected; udev-rule injection through descriptions and ports is blocked and every generated line is checked.</li>
-      <li><strong>Added:</strong> <code>--card</code>, <code>--list</code>, <code>--remove</code>, <code>--dry-run</code>, <code>--no-apply</code>, <code>--any-port</code>; immediate application and verification (no reboot); migration of older rules; locking and atomic writes.</li>
-      <li>Version numbers now match the standalone <a href="https://github.com/tomtom215/usb-audio-mapper">usb-audio-mapper</a> project, which shares this script.</li>
-    </ul>
-
-    <h3><span class="version-badge">v1.2.1</span></h3>
-    <ul>
-      <li><strong>Fixed:</strong> USB port detection bug causing incorrect device-to-port mapping</li>
-      <li><strong>Fixed:</strong> Improved physical port path resolution</li>
-    </ul>
-
-    <hr>
-
-    <!-- Updater -->
-    <h2 id="updater-versions">Version Manager History</h2>
-
-    <h3><span class="version-badge">v1.5.1</span></h3>
-    <ul>
-      <li>Pre-execution syntax validation for self-updates</li>
-      <li>Self-update safety checks</li>
-      <li><strong>Fixed:</strong> Improved rollback reliability</li>
-    </ul>
-
-    <h3><span class="version-badge">v1.5.0</span></h3>
-    <ul>
-      <li>Automatic systemd service lifecycle management</li>
-      <li>Stop services before update, reinstall after</li>
-      <li>Cron job update handling</li>
-    </ul>
-
-    <hr>
-
-    <!-- Installer -->
-    <h2 id="installer-versions">MediaMTX Installer History</h2>
-
-    <h3><span class="version-badge">v2.0.1</span></h3>
-    <ul>
-      <li>Cross-platform support improvements</li>
-      <li>Security fixes for input handling</li>
-    </ul>
-
-    <hr>
-    <p>
-      For the complete changelog with all detailed entries, see
-      <a href="https://github.com/tomtom215/LyreBirdAudio/blob/main/CHANGELOG.md" target="_blank" rel="noopener">CHANGELOG.md on GitHub</a>.
-    </p>
 
   </main>
   <nav id="page-nav" class="page-nav"></nav>
