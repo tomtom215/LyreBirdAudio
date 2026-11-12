@@ -1304,7 +1304,7 @@ display_error() {
 
 get_primary_ip() {
     # Try to get primary IP address
-    local primary_ip
+    local primary_ip=""
 
     # Try ip command first
     if command_exists ip; then
