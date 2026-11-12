@@ -1570,7 +1570,7 @@
     {
       "id": "X-45",
       "title": "usb-audio-mapper card_usb_port took a directory above the sysfs root for the card's USB port",
-      "severity": "P4",
+      "severity": "P3",
       "phase": 6,
       "status": "fixed",
       "tests": [
