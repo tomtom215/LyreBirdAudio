@@ -6042,6 +6042,33 @@ WRAPPER_LOGIC
     return 0
 }
 
+# Escape directory DIR for the filename part of a tee muxer slave whose muxer is
+# `segment` (X-33): the directory of the recording slave of the tee argument. Measured with
+# FFmpeg 6.1.1, four characters of the path change where the segments go:
+#   |   ends the slave: what follows is a second, different output
+#   \ and '   are escapes and quotes of the tee argument and are consumed (a path
+#       with one records into a different directory or fails)
+#   %   starts a pattern of the segment filename ("%03d"): "Invalid segment
+#       filename template"
+# Each is escaped (a backslash before | \ and ', the % doubled). [ ] : and blanks need
+# nothing: the slave's options end at the first "]" before the filename starts. A
+# relative path gets "./": FFmpeg reads "word:" at the start of a name as a protocol
+# ("rtmp:x/y" would open an RTMP connection).
+# Usage: tee_segment_dir DIR
+tee_segment_dir() {
+    local dir="$1" out="" ch i
+    [[ "$dir" == /* || "$dir" == ./* ]] || dir="./${dir}"
+    for ((i = 0; i < ${#dir}; i++)); do
+        ch="${dir:i:1}"
+        case "$ch" in
+            '\' | "'" | '|') out+="\\${ch}" ;;
+            '%') out+='%%' ;;
+            *) out+="$ch" ;;
+        esac
+    done
+    printf '%s' "$out"
+}
+
 # Start FFmpeg stream
 start_ffmpeg_stream() {
     local device_name="$1"
@@ -6140,6 +6167,7 @@ WRAPPER_START
         AUDIO_RTBUFSIZE "${AUDIO_RTBUFSIZE}" \
         AUDIO_LOCAL_RECORDING "${AUDIO_LOCAL_RECORDING}" \
         AUDIO_RECORDING_PATH "${AUDIO_RECORDING_PATH}" \
+        RECORDING_TEE_DIR "$(tee_segment_dir "${AUDIO_RECORDING_PATH}/${stream_path}")" \
         AUDIO_RECORDING_SEGMENT_TIME "${AUDIO_RECORDING_SEGMENT_TIME}" \
         AUDIO_RECORDING_SEGMENTS "${AUDIO_RECORDING_SEGMENTS}" \
         FFMPEG_PID "" || {
@@ -6261,12 +6289,13 @@ run_ffmpeg() {
         # Create recording directory (defaults to /dev/shm which is tmpfs/RAM)
         mkdir -p "${AUDIO_RECORDING_PATH}/${STREAM_PATH}" 2>/dev/null || true
 
-        # Use tee muxer for simultaneous streaming and recording
+        # Use tee muxer for simultaneous streaming and recording. RECORDING_TEE_DIR is the
+        # same directory, escaped for the tee muxer's argument (X-33).
         ffmpeg_cmd+=("${codec_opts[@]}")
         ffmpeg_cmd+=(
             -f tee
             -map 0:a
-            "[f=rtsp:rtsp_transport=tcp]rtsp://${MEDIAMTX_HOST}:${MEDIAMTX_RTSP_PORT}/${STREAM_PATH}|[f=segment:segment_time=${AUDIO_RECORDING_SEGMENT_TIME}:segment_wrap=${AUDIO_RECORDING_SEGMENTS}:strftime=0]${AUDIO_RECORDING_PATH}/${STREAM_PATH}/audio_%03d.${CODEC}"
+            "[f=rtsp:rtsp_transport=tcp]rtsp://${MEDIAMTX_HOST}:${MEDIAMTX_RTSP_PORT}/${STREAM_PATH}|[f=segment:segment_time=${AUDIO_RECORDING_SEGMENT_TIME}:segment_wrap=${AUDIO_RECORDING_SEGMENTS}:strftime=0]${RECORDING_TEE_DIR}/audio_%03d.${CODEC}"
         )
         log_message "Local recording enabled: ${AUDIO_RECORDING_PATH}/${STREAM_PATH} (${AUDIO_RECORDING_SEGMENTS} x ${AUDIO_RECORDING_SEGMENT_TIME}s segments)"
     else
