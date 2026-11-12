@@ -692,6 +692,34 @@ install_lifecycle_traps() {
     trap 'on_terminate_signal QUIT 3' QUIT
 }
 
+# Succeeds when THIS process holds the lifecycle lock, that is, is in the middle of a
+# start, stop, restart, reload, force-stop or monitor cycle
+lifecycle_lock_held_here() {
+    [[ ${MAIN_LOCK_FD} -gt 2 ]] && [[ "/proc/self/fd/${MAIN_LOCK_FD}" -ef "${LOCK_FILE}" ]]
+}
+
+# SIGHUP of a run that is not under systemd (installed below): reload the MediaMTX
+# configuration, as the `reload` command does, without stopping or restarting anything.
+# The handler used to run a full restart_mediamtx under the comment "reload", so a
+# terminal hang-up (a dropped SSH session during an interactive `start`) stopped every
+# stream. While this process is itself running a lifecycle command the signal is logged
+# and ignored: a nested start of the streams could launch a second wrapper for a stream
+# whose first one is not recorded yet, and the command in progress applies the current
+# configuration anyway.
+on_sighup() {
+    local rc=0
+    if lifecycle_lock_held_here; then
+        log INFO "Received SIGHUP while a lifecycle command is running in this process; not reloading (that command applies the current configuration)"
+        return 0
+    fi
+    log INFO "Received SIGHUP, reloading the MediaMTX configuration (nothing is restarted)"
+    reload_mediamtx || rc=$?
+    if ((rc != 0)); then
+        log WARN "Reload after SIGHUP failed (exit ${rc}); nothing was stopped"
+    fi
+    return 0
+}
+
 # Set trap for cleanup only in main script
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]] && [[ $$ -eq $BASHPID ]]; then
     # Comprehensive signal handling for production reliability
@@ -704,8 +732,8 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]] && [[ $$ -eq $BASHPID ]]; then
     # Only set custom handlers when NOT running under systemd
     if ! lyrebird_under_systemd; then
         # Not running under systemd - safe to use custom handlers
-        # SIGHUP: Reload configuration without full restart
-        trap 'log INFO "Received SIGHUP, reloading configuration"; restart_mediamtx' HUP
+        # SIGHUP: reload the configuration without a restart (on_sighup)
+        trap on_sighup HUP
         # SIGUSR1: Dump status for debugging
         trap 'log INFO "Received SIGUSR1, dumping status"; show_status >/dev/null 2>&1 || log INFO "Status dump completed"' USR1
     fi
@@ -736,7 +764,7 @@ exit_critical_section() {
     CRITICAL_SECTION_ACTIVE=false
     # Restore signal handlers (only when not running under systemd)
     if ! lyrebird_under_systemd; then
-        trap 'log INFO "Received SIGHUP, reloading configuration"; restart_mediamtx' HUP
+        trap on_sighup HUP
         trap 'log INFO "Received SIGUSR1, dumping status"; show_status >/dev/null 2>&1 || log INFO "Status dump completed"' USR1
     fi
 }
