@@ -14,23 +14,32 @@
 #   ./lyrebird-storage.sh cleanup       # Run cleanup based on retention policy
 #   ./lyrebird-storage.sh emergency     # Emergency cleanup (critical disk usage)
 #   ./lyrebird-storage.sh monitor       # Monitor and cleanup if needed
+#   (--quiet for cleanup and monitor: warnings, errors and one summary line;
+#   --once for monitor: one check, which is all monitor ever does)
+#
+# Configuration: environment variables, or /etc/lyrebird/storage.conf (see
+# --help and the "Configuration" section below).
 #
 # Cron Integration:
 #   # Daily cleanup at 3 AM
-#   0 3 * * * /usr/local/bin/lyrebird-storage.sh cleanup
+#   0 3 * * * /usr/local/bin/lyrebird-storage.sh cleanup --quiet
 #
-#   # Hourly monitoring
-#   0 * * * * /usr/local/bin/lyrebird-storage.sh monitor
+#   # Every 15 minutes: silent while the disk is fine
+#   */15 * * * * /usr/local/bin/lyrebird-storage.sh monitor --once
 #
-# Exit status: 0 success, 1 usage error, 3 finished but at least one deletion
-# failed (permission, immutable file, read-only filesystem; see the ERROR lines).
+# Exit status: 0 success, 1 usage error, 3 finished but something could not be
+# done: a deletion failed (permission, immutable file, read-only filesystem) or a
+# directory could not be listed (see the ERROR lines), 4 finished but lines of the
+# configuration file were not accepted.
 #
-# Version: 1.2.0 - Every recording codec covered, empty/active segment handling,
-#                  failed deletions surfaced, deterministic emergency eviction
+# Version: 1.3.0 - Symlinked and relative directories, listing failures counted,
+#                  --quiet/--once, /etc/lyrebird/storage.conf (read as data);
+#                  1.2.0: every recording codec covered, empty/active segment
+#                  handling, failed deletions surfaced, deterministic eviction
 
 set -euo pipefail
 
-readonly VERSION="1.2.0"
+readonly VERSION="1.3.0"
 SCRIPT_NAME="$(basename "${BASH_SOURCE[0]}")"
 readonly SCRIPT_NAME
 
@@ -38,13 +47,263 @@ readonly SCRIPT_NAME
 # Configuration
 # ============================================================================
 
-# Paths
-readonly RECORDING_DIR="${LYREBIRD_RECORDING_DIR:-/var/lib/mediamtx-ffmpeg/recordings}"
-readonly LOG_DIR="${LYREBIRD_LOG_DIR:-/var/log/lyrebird}"
-readonly MEDIAMTX_LOG="${MEDIAMTX_LOG:-/var/log/mediamtx.out}"
-readonly MEDIAMTX_LOG_DIR="${MEDIAMTX_LOG%/*}" # Directory containing MediaMTX log
-readonly TEMP_DIR="${LYREBIRD_TEMP_DIR:-/tmp}"
-readonly BUFFER_DIR="${LYREBIRD_BUFFER_DIR:-/dev/shm/lyrebird-buffer}"
+# Configuration file. /etc/lyrebird/storage.conf (README, docs/components.html),
+# or the file LYREBIRD_STORAGE_CONFIG names; set to the empty string it means "no
+# file". The file is DATA: it is read line by line and never sourced, so nothing
+# in it runs and no variable of this script (PATH, IFS, DRY_RUN, ...) can be
+# set from it. Each line is KEY=VALUE, a blank line or a # comment; the value is
+# bare, 'single-quoted' or "double-quoted" and is taken literally (no expansion);
+# a # comment may follow it. KEY must be one of the settings below: the names the
+# environment variables have, and RECORDING_DIR and LOG_DIR, which the
+# documentation uses, as aliases of LYREBIRD_RECORDING_DIR and LYREBIRD_LOG_DIR
+# (the aliases are read from this file only: a variable called LOG_DIR in the
+# environment of some other program is not an instruction to delete there). The
+# environment wins over the file; a line that cannot be accepted is reported with
+# its file and line number, ignored, and makes the run's exit status 4.
+# A file that is writable by everyone or owned by another user than root (or the
+# user running this) is not read: it decides what gets deleted.
+readonly STORAGE_CONFIG_PATH="${LYREBIRD_STORAGE_CONFIG-/etc/lyrebird/storage.conf}"
+readonly STORAGE_CONFIG_MAX_BYTES=65536
+readonly STORAGE_CONFIG_MAX_LINE=4096
+readonly STORAGE_CONFIG_MAX_PROBLEMS=100
+readonly STORAGE_CONFIG_KEYS="LYREBIRD_RECORDING_DIR (alias RECORDING_DIR), LYREBIRD_LOG_DIR (alias LOG_DIR), LYREBIRD_TEMP_DIR, LYREBIRD_BUFFER_DIR, MEDIAMTX_LOG, RECORDING_RETENTION_DAYS, LOG_RETENTION_DAYS, TEMP_RETENTION_HOURS, DISK_WARNING_PERCENT, DISK_CRITICAL_PERCENT, DISK_EMERGENCY_PERCENT, MIN_FREE_SPACE_MB, MAX_LOG_SIZE, LYREBIRD_CLOCK_SANE_EPOCH, LYREBIRD_ACTIVE_SEGMENT_SECONDS"
+readonly EXIT_CONFIG=4
+
+# Problems found in the configuration file, and the file when it was read
+CONFIG_PROBLEMS=0
+CONFIG_FILE_USED=""
+
+# The settings: key -> kind of value
+declare -gA _CONF_KIND=(
+    [LYREBIRD_RECORDING_DIR]=path [RECORDING_DIR]=path
+    [LYREBIRD_LOG_DIR]=path [LOG_DIR]=path
+    [LYREBIRD_TEMP_DIR]=path [LYREBIRD_BUFFER_DIR]=path [MEDIAMTX_LOG]=path
+    [RECORDING_RETENTION_DAYS]=uint [LOG_RETENTION_DAYS]=uint [TEMP_RETENTION_HOURS]=uint
+    [DISK_WARNING_PERCENT]=uint [DISK_CRITICAL_PERCENT]=uint [DISK_EMERGENCY_PERCENT]=uint
+    [MIN_FREE_SPACE_MB]=uint [MAX_LOG_SIZE]=uint
+    [LYREBIRD_CLOCK_SANE_EPOCH]=uint [LYREBIRD_ACTIVE_SEGMENT_SECONDS]=uint
+)
+declare -gA _CONF_ALIAS_OF=([RECORDING_DIR]=LYREBIRD_RECORDING_DIR [LOG_DIR]=LYREBIRD_LOG_DIR)
+# What the file set, by setting; the alias spellings are kept apart so that the
+# LYREBIRD_ spelling wins whatever the order of the lines
+declare -gA _CONF_VALUE=()
+declare -gA _CONF_ALIAS_VALUE=()
+declare -gA _CONF_LINE=()
+
+# These run before the logging functions below exist
+_conf_log() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [$1] ${*:2}" >&2
+}
+
+# _conf_problem FILE LINE KEY TEXT [EXPECTED]: an error, counted
+_conf_problem() {
+    local where="$1" key="$3" text="$4" expected="${5-}"
+    if (($2 > 0)); then
+        where="${1}:${2}"
+    fi
+    CONFIG_PROBLEMS=$((CONFIG_PROBLEMS + 1))
+    _conf_log ERROR "${where}: ${key:+${key}: }${text}${expected:+ (expected: ${expected})}"
+}
+
+# Read FILE into _CONF_VALUE / _CONF_ALIAS_VALUE. $2 is "yes" when the file was
+# asked for by name (LYREBIRD_STORAGE_CONFIG): then a missing file is a problem.
+_load_config_file() {
+    local file="$1" explicit="$2"
+    # character classes mean ASCII, whatever the locale
+    local LC_ALL=C
+    local line lineno=0 rest key kind canon value body tail st owner mode size
+    local re_expansion='[$`\\]'
+
+    if [[ ! -e "$file" ]]; then
+        if [[ "$explicit" == "yes" ]]; then
+            _conf_problem "$file" 0 "" "does not exist" "the file LYREBIRD_STORAGE_CONFIG names"
+        fi
+        return 0
+    fi
+    if [[ ! -f "$file" ]]; then
+        _conf_problem "$file" 0 "" "is not a regular file" "a regular file with KEY=value lines"
+        return 0
+    fi
+    if [[ ! -r "$file" ]]; then
+        _conf_problem "$file" 0 "" "cannot be read" "a readable file"
+        return 0
+    fi
+    st="$(stat -c '%u %a %s' -- "$file" 2>/dev/null)" || st=""
+    read -r owner mode size <<<"$st"
+    if [[ ! "$owner" =~ ^[0-9]+$ || ! "$mode" =~ ^[0-7]+$ || ! "$size" =~ ^[0-9]+$ ]]; then
+        _conf_problem "$file" 0 "" "its owner and mode cannot be determined, so it is not read"
+        return 0
+    fi
+    if ((8#$mode & 8#002)); then
+        _conf_problem "$file" 0 "" "is writable by everyone (mode ${mode}), so it is not read: it decides what is deleted" "a file only root can write"
+        return 0
+    fi
+    if ((owner != 0 && owner != EUID)); then
+        _conf_problem "$file" 0 "" "belongs to user ${owner}, so it is not read: it decides what is deleted" "a file owned by root"
+        return 0
+    fi
+    if ((size > STORAGE_CONFIG_MAX_BYTES)); then
+        _conf_problem "$file" 0 "" "is ${size} bytes long, more than the ${STORAGE_CONFIG_MAX_BYTES} byte limit" "a short list of KEY=value lines"
+        return 0
+    fi
+
+    CONFIG_FILE_USED="$file"
+    local label="$file" # what the messages in the loop name (the loop reads $file)
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        lineno=$((lineno + 1))
+        if ((CONFIG_PROBLEMS >= STORAGE_CONFIG_MAX_PROBLEMS)); then
+            _conf_log ERROR "${label}:${lineno}: stopped reading after ${STORAGE_CONFIG_MAX_PROBLEMS} problems; this line and the rest of the file were not read"
+            break
+        fi
+        # the length is checked before anything else touches the line
+        if ((${#line} > STORAGE_CONFIG_MAX_LINE)); then
+            if [[ "$line" != "#"* ]]; then
+                _conf_problem "$label" "$lineno" "" "line is ${#line} characters long, more than the ${STORAGE_CONFIG_MAX_LINE} character limit"
+            fi
+            continue
+        fi
+        if ((lineno == 1)); then
+            line="${line#$'\xef\xbb\xbf'}"
+        fi
+        line="${line%$'\r'}"
+        line="${line//$'\t'/ }"
+        line="${line#"${line%%[![:space:]]*}"}"
+        if [[ -z "$line" || "$line" == "#"* ]]; then
+            continue
+        fi
+        if [[ ! "$line" =~ ^([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]]; then
+            _conf_problem "$label" "$lineno" "" "not a KEY=value line (shell commands are not run): '${line:0:40}'" "KEY=value"
+            continue
+        fi
+        key="${BASH_REMATCH[1]}"
+        rest="${BASH_REMATCH[2]}"
+        kind="${_CONF_KIND[$key]-}"
+        if [[ -z "$kind" ]]; then
+            _conf_problem "$label" "$lineno" "$key" "unknown setting" "one of ${STORAGE_CONFIG_KEYS}"
+            continue
+        fi
+
+        # the value: bare, 'single-quoted' or "double-quoted", then at most a comment
+        case "$rest" in
+            "'"*)
+                body="${rest:1}"
+                if [[ "$body" != *"'"* ]]; then
+                    _conf_problem "$label" "$lineno" "$key" "unterminated single quote" "a value in matching quotes"
+                    continue
+                fi
+                value="${body%%"'"*}"
+                tail="${body#*"'"}"
+                ;;
+            '"'*)
+                body="${rest:1}"
+                if [[ "$body" != *'"'* ]]; then
+                    _conf_problem "$label" "$lineno" "$key" "unterminated double quote" "a value in matching quotes"
+                    continue
+                fi
+                value="${body%%'"'*}"
+                tail="${body#*'"'}"
+                if [[ "$value" =~ $re_expansion ]]; then
+                    _conf_problem "$label" "$lineno" "$key" "\$, backticks and backslashes are not interpreted in a value" "a plain value, or one in single quotes"
+                    continue
+                fi
+                ;;
+            *)
+                value="${rest%%[[:space:]]*}"
+                tail="${rest#"$value"}"
+                if [[ ! "$value" =~ ^[A-Za-z0-9._+:/@%,=-]*$ ]]; then
+                    _conf_problem "$label" "$lineno" "$key" "shell syntax is not accepted in a value: '${value:0:40}'" "a plain value, or one in quotes"
+                    continue
+                fi
+                ;;
+        esac
+        tail="${tail#"${tail%%[![:space:]]*}"}"
+        if [[ -n "$tail" && "$tail" != "#"* ]]; then
+            _conf_problem "$label" "$lineno" "$key" "unexpected text after the value: '${tail:0:40}'" "one value, optionally followed by a # comment"
+            continue
+        fi
+
+        case "$kind" in
+            uint)
+                if [[ ! "$value" =~ ^[0-9]{1,12}$ ]]; then
+                    _conf_problem "$label" "$lineno" "$key" "not a whole number: '${value:0:40}'" "digits only, for example 30"
+                    continue
+                fi
+                ;;
+            path)
+                if [[ "$value" != /* ]]; then
+                    _conf_problem "$label" "$lineno" "$key" "not an absolute path: '${value:0:40}'" "a path that starts with /"
+                    continue
+                fi
+                ;;
+        esac
+
+        canon="${_CONF_ALIAS_OF[$key]-}"
+        if [[ -n "$canon" ]]; then
+            _CONF_ALIAS_VALUE[$canon]="$value"
+        else
+            canon="$key"
+            if [[ -n "${_CONF_VALUE[$canon]+x}" ]]; then
+                _conf_log WARN "${label}:${lineno}: ${key}: overrides the value on line ${_CONF_LINE[$canon]}"
+            fi
+            _CONF_VALUE[$canon]="$value"
+            _CONF_LINE[$canon]="$lineno"
+        fi
+    done <"$file"
+    return 0
+}
+
+# Make what the file set the value of each setting that the environment does not
+# set, so that the defaults below ("${NAME:-default}") see it.
+_apply_config_file() {
+    local key value
+    for key in "${!_CONF_KIND[@]}"; do
+        [[ -z "${_CONF_ALIAS_OF[$key]-}" ]] || continue
+        value="${_CONF_VALUE[$key]-}"
+        [[ -n "$value" ]] || value="${_CONF_ALIAS_VALUE[$key]-}"
+        [[ -n "$value" ]] || continue
+        [[ -z "${!key:-}" ]] || continue
+        printf -v "$key" '%s' "$value"
+    done
+}
+
+if [[ -n "$STORAGE_CONFIG_PATH" ]]; then
+    if [[ -n "${LYREBIRD_STORAGE_CONFIG+x}" ]]; then
+        _load_config_file "$STORAGE_CONFIG_PATH" yes
+    else
+        _load_config_file "$STORAGE_CONFIG_PATH" no
+    fi
+    _apply_config_file
+fi
+
+# Paths. Each is made absolute here, once: a relative value is taken relative to
+# the directory the script was started in. `find` reads an argument that starts
+# with "-" as part of its expression, not as a directory, so a relative
+# LYREBIRD_RECORDING_DIR=-rec made every listing fail (hidden by 2>/dev/null) and
+# cleanup report "Cleaned 0 recording file(s)" with old files left; an absolute
+# path starts with "/".
+_absolute_path() {
+    case "$1" in
+        /*) printf '%s' "$1" ;;
+        *) printf '%s/%s' "$PWD" "$1" ;;
+    esac
+}
+
+_rec_dir="$(_absolute_path "${LYREBIRD_RECORDING_DIR:-/var/lib/mediamtx-ffmpeg/recordings}")"
+_log_dir="$(_absolute_path "${LYREBIRD_LOG_DIR:-/var/log/lyrebird}")"
+_mtx_log="$(_absolute_path "${MEDIAMTX_LOG:-/var/log/mediamtx.out}")"
+_tmp_dir="$(_absolute_path "${LYREBIRD_TEMP_DIR:-/tmp}")"
+_buf_dir="$(_absolute_path "${LYREBIRD_BUFFER_DIR:-/dev/shm/lyrebird-buffer}")"
+# The directory of the MediaMTX log (for a file directly under /, that is /)
+_mtx_log_dir="${_mtx_log%/*}"
+[[ -n "$_mtx_log_dir" ]] || _mtx_log_dir="/"
+
+readonly RECORDING_DIR="$_rec_dir"
+readonly LOG_DIR="$_log_dir"
+readonly MEDIAMTX_LOG="$_mtx_log"
+readonly MEDIAMTX_LOG_DIR="$_mtx_log_dir"
+readonly TEMP_DIR="$_tmp_dir"
+readonly BUFFER_DIR="$_buf_dir"
+unset _rec_dir _log_dir _mtx_log _mtx_log_dir _tmp_dir _buf_dir
 
 # Coerce a value to a non-negative base-10 integer, falling back to a default
 # when the input is not all digits. A non-numeric env value (e.g. an operator
@@ -166,6 +425,11 @@ readonly EXIT_DELETE_FAILED=3
 # Deletions that failed in this run; every delete goes through safe_delete.
 DELETE_FAILURES=0
 
+# Files removed (or, in a dry run, that would be) in this run and their size in
+# bytes, for the summary line; safe_delete keeps them.
+RUN_FILES=0
+RUN_BYTES=0
+
 # Most files one emergency run evicts, so a single run stays short; the next
 # monitor run continues.
 readonly EMERGENCY_MAX_DELETE=100
@@ -205,9 +469,19 @@ fi
 # Helper Functions
 # ============================================================================
 
+# The log is stderr: this script writes nothing to stdout except `status`. With
+# --quiet (QUIET=true) the informational lines are dropped and warnings, errors
+# and the one summary line of the run (log_summary) remain; a cron job then
+# mails, or an `>> file 2>&1` redirection keeps, one line per run plus whatever
+# needs attention.
+QUIET=false
+
 log() {
     local level="${1:-INFO}"
     shift
+    if [[ "$QUIET" == "true" && "$level" == "INFO" ]]; then
+        return 0
+    fi
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] [${level}] $*" >&2
 }
 
@@ -215,6 +489,11 @@ log_info() { log INFO "$@"; }
 log_warn() { log WARN "$@"; }
 log_error() { log ERROR "$@"; }
 log_debug() { [[ "${DEBUG:-false}" == "true" ]] && log DEBUG "$@" || true; }
+# The one line --quiet still prints at INFO level
+log_summary() {
+    local QUIET=false
+    log INFO "$@"
+}
 
 # ============================================================================
 # Signal Handling
@@ -287,7 +566,10 @@ get_free_space_mb() {
 get_dir_size() {
     local path="$1"
     if [[ -d "$path" ]]; then
-        du -sbD "$path" 2>/dev/null | cut -f1
+        # du exits 1 for a subdirectory it cannot read but still prints the total
+        # of the rest; under pipefail and errexit that status used to end `status`
+        # right after its "Recordings:" heading, printing nothing more.
+        { du -sbD "$path" 2>/dev/null || true; } | cut -f1
     else
         echo "0"
     fi
@@ -297,7 +579,7 @@ get_dir_size() {
 count_files() {
     local path="$1"
     local pattern="${2:-*}"
-    find "$path" -maxdepth 1 -name "$pattern" -type f 2>/dev/null | wc -l
+    find -H "$path" -maxdepth 1 -name "$pattern" -type f 2>/dev/null | wc -l
 }
 
 # Safe delete with dry run support. Returns 0 when the file is gone (or, in a dry
@@ -310,15 +592,22 @@ count_files() {
 safe_delete() {
     local path="$1"
     local desc="${2:-file}"
-    local err
+    local err size
+
+    # what the run's summary reports (stat does not follow a symlink)
+    size=$(stat -c%s -- "$path" 2>/dev/null || echo 0)
 
     if [[ "$DRY_RUN" == "true" ]]; then
         log_info "[DRY RUN] Would delete ${desc}: $path"
+        RUN_FILES=$((RUN_FILES + 1))
+        RUN_BYTES=$((RUN_BYTES + size))
         return 0
     fi
 
     log_debug "Deleting ${desc}: $path"
     if err=$(rm -f -- "$path" 2>&1); then
+        RUN_FILES=$((RUN_FILES + 1))
+        RUN_BYTES=$((RUN_BYTES + size))
         return 0
     fi
     # Already gone (another run, or the recorder reusing the slot): done.
@@ -341,11 +630,66 @@ _sweep_reset() {
     SWEEP_FREED=0
 }
 
+# Directory listings that failed in this run. A listing that could not be made
+# is not "nothing to clean": `find ... 2>/dev/null` used to turn an unreadable
+# directory (or any other find failure) into an empty result and a clean run.
+SCAN_FAILURES=0
+
+# A listing is NUL-separated records. When find fails, _find0 ends its listing
+# with one record that starts with this tag (real records are absolute paths, or
+# "<mtime> <path>" from _list_oldest_first, so none can look like it) and carries
+# find's exit status and the directory; _next_record reads it as the end of the
+# listing and counts it. find's own message ("find: '/x': Permission denied") is
+# left on stderr.
+readonly FIND_FAILED_TAG='!find-failed:'
+
+# find -H DIR [ARGS...], with the listing protocol above. -ignore_readdir_race:
+# a file that goes away between find reading its directory entry and looking at
+# it (the recorder rotating a segment) is not an error; it would only make a run
+# of a live system fail now and then.
+_find0() {
+    local dir="$1" rc=0
+    shift
+    find -H "$dir" -ignore_readdir_race "$@" || rc=$?
+    if ((rc != 0)); then
+        printf '%s%d:%s\0' "$FIND_FAILED_TAG" "$rc" "$dir"
+    fi
+    return 0
+}
+
+# Read the next record of a listing from stdin into the variable named $1.
+# Returns 1 at the end of the listing; a failure record ends it too, after it has
+# been counted in SCAN_FAILURES and logged.
+_next_record() {
+    local failure rc dir
+    IFS= read -r -d '' "$1" || return 1
+    if [[ "${!1}" == "$FIND_FAILED_TAG"* ]]; then
+        failure="${!1#"$FIND_FAILED_TAG"}"
+        rc="${failure%%:*}"
+        dir="${failure#*:}"
+        ((++SCAN_FAILURES))
+        log_error "Cannot list ${dir} completely: find exited with status ${rc} (its message is above); the files it could not reach were not examined"
+        return 1
+    fi
+    return 0
+}
+
+# Count the records of a listing read from stdin into COUNT_RECORDS.
+COUNT_RECORDS=0
+_count_records() {
+    # shellcheck disable=SC2034  # _next_record fills `record`; only the count matters
+    local record
+    COUNT_RECORDS=0
+    while _next_record record; do
+        ((++COUNT_RECORDS))
+    done
+}
+
 # Delete every NUL-separated path read from stdin through safe_delete, adding to
 # the SWEEP_* totals. A failure is counted and the sweep carries on.
 _sweep() {
     local desc="$1" file size
-    while IFS= read -r -d '' file; do
+    while _next_record file; do
         size=$(stat -c%s -- "$file" 2>/dev/null || echo 0)
         if safe_delete "$file" "$desc"; then
             ((++SWEEP_DELETED))
@@ -365,13 +709,18 @@ _failed_suffix() {
 }
 
 # End-of-command verdict: the run's exit status is EXIT_DELETE_FAILED when any
-# deletion failed, 0 otherwise.
+# deletion failed or any directory could not be listed, 0 otherwise.
 _report_delete_failures() {
+    local rc=0
     if ((DELETE_FAILURES > 0)); then
         log_error "Run finished with ${DELETE_FAILURES} failed deletion(s); the files named in the errors above are still on disk"
-        return "$EXIT_DELETE_FAILED"
+        rc="$EXIT_DELETE_FAILED"
     fi
-    return 0
+    if ((SCAN_FAILURES > 0)); then
+        log_error "Run finished with ${SCAN_FAILURES} directory listing(s) that failed; what could not be listed was not cleaned (see the errors above)"
+        rc="$EXIT_DELETE_FAILED"
+    fi
+    return "$rc"
 }
 
 # True when mtime $1 (epoch seconds) lies within ACTIVE_SEGMENT_SECONDS of now $2
@@ -398,9 +747,14 @@ _recently_modified() {
 # into a separate "path", which was then deleted relative to the current
 # directory.
 _list_oldest_first() {
-    local root="$1"
+    local root="$1" rc=0
     shift
-    find -H "$root" -type f "$@" -printf '%T@ %p\0' 2>/dev/null | LC_ALL=C sort -z -k1,1n -k2
+    find -H "$root" -ignore_readdir_race -type f "$@" -printf '%T@ %p\0' | LC_ALL=C sort -z -k1,1n -k2 || rc=$?
+    # the failure record comes after the sorted list (see _find0)
+    if ((rc != 0)); then
+        printf '%s%d:%s\0' "$FIND_FAILED_TAG" "$rc" "$root"
+    fi
+    return 0
 }
 
 # Delete the oldest files under $1, at most $2 attempts (0 = no limit), logging
@@ -417,7 +771,7 @@ _evict_oldest_first() {
     EVICT_FREED=0
     EVICT_PROTECTED=0
     now=$(date +%s)
-    while IFS= read -r -d '' rec; do
+    while _next_record rec; do
         mtime="${rec%% *}"
         file="${rec#* }"
         if _recently_modified "${mtime%%.*}" "$now"; then
@@ -473,7 +827,7 @@ cleanup_recordings() {
     # younger empty file is a segment being opened (FFmpeg keeps the segment in
     # progress at 0 bytes until its first flush). Same clock rule as below: a
     # pre-CLOCK_SANE_EPOCH mtime has no known age, so it is kept.
-    while IFS= read -r -d '' file; do
+    while _next_record file; do
         mtime=$(stat -c%Y -- "$file" 2>/dev/null || echo 0)
         if [[ "$mtime" -lt "$CLOCK_SANE_EPOCH" ]] || _recently_modified "$mtime" "$now_epoch"; then
             continue
@@ -483,10 +837,10 @@ cleanup_recordings() {
         else
             ((++failed))
         fi
-    done < <(find -H "$RECORDING_DIR" -type f "${RECORDING_NAME_TEST[@]}" -empty -print0 2>/dev/null)
+    done < <(_find0 "$RECORDING_DIR" -type f "${RECORDING_NAME_TEST[@]}" -empty -print0)
 
     # Find and delete old recording files
-    while IFS= read -r -d '' file; do
+    while _next_record file; do
         # A pre-CLOCK_SANE_EPOCH mtime means the file was written while the
         # clock was broken; its real age is unknown and it may be minutes old.
         mtime=$(stat -c%Y "$file" 2>/dev/null || echo 0)
@@ -501,7 +855,7 @@ cleanup_recordings() {
         else
             ((++failed))
         fi
-    done < <(find -H "$RECORDING_DIR" -type f "${RECORDING_NAME_TEST[@]}" -mtime "+${RECORDING_RETENTION_DAYS}" -print0 2>/dev/null)
+    done < <(_find0 "$RECORDING_DIR" -type f "${RECORDING_NAME_TEST[@]}" -mtime "+${RECORDING_RETENTION_DAYS}" -print0)
 
     if [[ $kept_broken_clock -gt 0 ]]; then
         log_warn "Kept $kept_broken_clock recording(s) with pre-${CLOCK_SANE_EPOCH} mtimes (written before NTP sync; real age unknown)"
@@ -512,7 +866,19 @@ cleanup_recordings() {
     # itself, and if the recorder does not recreate it on the next write, every
     # subsequent recording silently fails — permanent data loss on an
     # unattended box.
-    find -H "$RECORDING_DIR" -mindepth 1 -type d -empty -delete 2>/dev/null || true
+    if [[ "$DRY_RUN" == "true" ]]; then
+        # a dry run removes nothing, directories included
+        while _next_record file; do
+            log_info "[DRY RUN] Would remove empty directory: $file"
+        done < <(_find0 "$RECORDING_DIR" -mindepth 1 -type d -empty -print0)
+    else
+        local sweep_rc=0
+        find -H "$RECORDING_DIR" -ignore_readdir_race -mindepth 1 -type d -empty -delete || sweep_rc=$?
+        if ((sweep_rc != 0)); then
+            ((++SCAN_FAILURES))
+            log_error "Cannot sweep the empty directories of ${RECORDING_DIR} completely: find exited with status ${sweep_rc} (its message is above)"
+        fi
+    fi
 
     if [[ $empty_removed -gt 0 ]]; then
         log_info "Removed $empty_removed empty recording segment(s) idle for over ${ACTIVE_SEGMENT_SECONDS}s"
@@ -528,12 +894,12 @@ cleanup_logs() {
 
     # Clean LyreBird logs
     if [[ -d "$LOG_DIR" ]]; then
-        _sweep "log" < <(find "$LOG_DIR" -type f -name "*.log*" -mtime "+${LOG_RETENTION_DAYS}" -print0 2>/dev/null)
+        _sweep "log" < <(_find0 "$LOG_DIR" -type f -name "*.log*" -mtime "+${LOG_RETENTION_DAYS}" -print0)
     fi
 
     # Clean rotated MediaMTX logs
     if [[ -d "$MEDIAMTX_LOG_DIR" ]]; then
-        _sweep "mediamtx log" < <(find "$MEDIAMTX_LOG_DIR" -type f -name "mediamtx*.out.*" -mtime "+${LOG_RETENTION_DAYS}" -print0 2>/dev/null)
+        _sweep "mediamtx log" < <(_find0 "$MEDIAMTX_LOG_DIR" -type f -name "mediamtx*.out.*" -mtime "+${LOG_RETENTION_DAYS}" -print0)
     fi
 
     log_info "Cleaned $SWEEP_DELETED log file(s), freed $(format_bytes "$SWEEP_FREED")$(_failed_suffix "$SWEEP_FAILED")"
@@ -546,11 +912,13 @@ cleanup_temp() {
     _sweep_reset
 
     # Clean LyreBird temp files in /tmp
-    _sweep "temp" < <(find "$TEMP_DIR" -maxdepth 1 -type f -name "lyrebird-*" -mmin "+$((TEMP_RETENTION_HOURS * 60))" -print0 2>/dev/null)
+    if [[ -d "$TEMP_DIR" ]]; then
+        _sweep "temp" < <(_find0 "$TEMP_DIR" -maxdepth 1 -type f -name "lyrebird-*" -mmin "+$((TEMP_RETENTION_HOURS * 60))" -print0)
+    fi
 
     # Clean memory buffer directory if present
     if [[ -d "$BUFFER_DIR" ]]; then
-        _sweep "buffer" < <(find -H "$BUFFER_DIR" -type f -mmin "+$((TEMP_RETENTION_HOURS * 60))" -print0 2>/dev/null)
+        _sweep "buffer" < <(_find0 "$BUFFER_DIR" -type f -mmin "+$((TEMP_RETENTION_HOURS * 60))" -print0)
     fi
 
     log_info "Cleaned $SWEEP_DELETED temp file(s), freed $(format_bytes "$SWEEP_FREED")$(_failed_suffix "$SWEEP_FAILED")"
@@ -563,8 +931,18 @@ truncate_large_logs() {
     # Clean up any stale .tmp files from interrupted previous runs.
     # MEDIAMTX_LOG_DIR is typically /var/log, so scope tightly to our own files
     # (maxdepth 1 + mediamtx-prefixed) rather than every *.tmp on the system.
-    find "$MEDIAMTX_LOG_DIR" -maxdepth 1 -name "mediamtx*.tmp" -mmin +5 -delete 2>/dev/null || true
-    [[ -d "$LOG_DIR" ]] && find "$LOG_DIR" -maxdepth 1 -name "*.tmp" -mmin +5 -delete 2>/dev/null || true
+    # They go through safe_delete like every other deletion: a dry run leaves them,
+    # a refusal is logged and counted (it used to be `-delete 2>/dev/null || true`).
+    _sweep_reset
+    if [[ -d "$MEDIAMTX_LOG_DIR" ]]; then
+        _sweep "stale temp" < <(_find0 "$MEDIAMTX_LOG_DIR" -maxdepth 1 \( -type f -o -type l \) -name "mediamtx*.tmp" -mmin +5 -print0)
+    fi
+    if [[ -d "$LOG_DIR" ]]; then
+        _sweep "stale temp" < <(_find0 "$LOG_DIR" -maxdepth 1 \( -type f -o -type l \) -name "*.tmp" -mmin +5 -print0)
+    fi
+    if ((SWEEP_DELETED + SWEEP_FAILED > 0)); then
+        log_info "Removed $SWEEP_DELETED stale temp file(s)$(_failed_suffix "$SWEEP_FAILED")"
+    fi
 
     # Check MediaMTX log
     if [[ -f "$MEDIAMTX_LOG" ]]; then
@@ -636,19 +1014,23 @@ emergency_cleanup() {
     # Delete rotated logs and temp files.
     # These must honour DRY_RUN (a "preview" must not delete anything), and the
     # *.gz sweep must be tightly scoped: MEDIAMTX_LOG_DIR is typically /var/log,
-    # so a bare `find "$MEDIAMTX_LOG_DIR" -name '*.gz' -delete` would wipe every
+    # so a bare `find -H "$MEDIAMTX_LOG_DIR" -name '*.gz' -delete` would wipe every
     # rotated SYSTEM log (syslog, auth.log, journal exports) during an incident.
     if [[ "$DRY_RUN" == "true" ]]; then
         log_info "[DRY RUN] Would delete rotated LyreBird/MediaMTX logs and LyreBird temp files"
     else
         _sweep_reset
         if [[ -d "$LOG_DIR" ]]; then
-            _sweep "rotated log" < <(find "$LOG_DIR" -maxdepth 1 -type f -name "*.gz" -print0 2>/dev/null)
+            _sweep "rotated log" < <(_find0 "$LOG_DIR" -maxdepth 1 -type f -name "*.gz" -print0)
         fi
-        _sweep "rotated mediamtx log" < <(find "$MEDIAMTX_LOG_DIR" -maxdepth 1 -type f -name "mediamtx*.out*.gz" -print0 2>/dev/null)
+        if [[ -d "$MEDIAMTX_LOG_DIR" ]]; then
+            _sweep "rotated mediamtx log" < <(_find0 "$MEDIAMTX_LOG_DIR" -maxdepth 1 -type f -name "mediamtx*.out*.gz" -print0)
+        fi
 
         # Clear LyreBird temp files
-        _sweep "temp" < <(find "$TEMP_DIR" -maxdepth 1 -name "lyrebird-*" -type f -print0 2>/dev/null)
+        if [[ -d "$TEMP_DIR" ]]; then
+            _sweep "temp" < <(_find0 "$TEMP_DIR" -maxdepth 1 -name "lyrebird-*" -type f -print0)
+        fi
         log_info "Emergency: Deleted $SWEEP_DELETED rotated log/temp file(s)$(_failed_suffix "$SWEEP_FAILED")"
     fi
 
@@ -706,15 +1088,20 @@ cmd_status() {
     if [[ -d "$RECORDING_DIR" ]]; then
         local rec_size
         rec_size=$(get_dir_size "$RECORDING_DIR")
-        local rec_count empty_count
-        # `|| true`: find exits 1 on an unreadable subdirectory, which under
-        # pipefail would abort `status` before it printed anything.
-        rec_count=$({ find -H "$RECORDING_DIR" -type f "${RECORDING_NAME_TEST[@]}" ! -empty 2>/dev/null || true; } | wc -l)
-        empty_count=$({ find -H "$RECORDING_DIR" -type f "${RECORDING_NAME_TEST[@]}" -empty 2>/dev/null || true; } | wc -l)
+        local rec_count empty_count scan_failures_before="$SCAN_FAILURES"
+        # An unreadable subdirectory is reported (find's message and a failure
+        # record), not left out of the count unseen, and does not stop `status`.
+        _count_records < <(_find0 "$RECORDING_DIR" -type f "${RECORDING_NAME_TEST[@]}" ! -empty -print0)
+        rec_count="$COUNT_RECORDS"
+        _count_records < <(_find0 "$RECORDING_DIR" -type f "${RECORDING_NAME_TEST[@]}" -empty -print0)
+        empty_count="$COUNT_RECORDS"
         printf "  Path: %s\n" "$RECORDING_DIR"
         printf "  Size: %s\n" "$(format_bytes "$rec_size")"
         printf "  Files: %d\n" "$rec_count"
         printf "  Empty segments: %d\n" "$empty_count"
+        if ((SCAN_FAILURES > scan_failures_before)); then
+            printf "  (incomplete: part of %s could not be read, see the errors above)\n" "$RECORDING_DIR"
+        fi
         printf "  Retention: %d days\n" "$RECORDING_RETENTION_DAYS"
     else
         echo "  No recording directory"
@@ -737,6 +1124,7 @@ cmd_status() {
 
     # Configuration
     echo "Configuration:"
+    printf "  Config file: %s\n" "${CONFIG_FILE_USED:-none}"
     printf "  Retention (recordings): %d days\n" "$RECORDING_RETENTION_DAYS"
     printf "  Retention (logs): %d days\n" "$LOG_RETENTION_DAYS"
     printf "  Warning threshold: %d%%\n" "$DISK_WARNING_PERCENT"
@@ -744,22 +1132,48 @@ cmd_status() {
     printf "  Emergency threshold: %d%%\n" "$DISK_EMERGENCY_PERCENT"
 }
 
-# Run standard cleanup
-cmd_cleanup() {
-    log_info "Starting storage cleanup"
+# What this run did, for the one summary line: "removed N file(s), X freed" (in a
+# dry run "would remove ..."), and what failed
+_run_totals() {
+    local verb="removed"
+    [[ "$DRY_RUN" != "true" ]] || verb="would remove"
+    printf '%s %d file(s), %s freed' "$verb" "$RUN_FILES" "$(format_bytes "$RUN_BYTES")"
+    if ((DELETE_FAILURES > 0)); then
+        printf '; %d deletion(s) FAILED' "$DELETE_FAILURES"
+    fi
+    if ((SCAN_FAILURES > 0)); then
+        printf '; %d listing(s) FAILED' "$SCAN_FAILURES"
+    fi
+}
 
+# The steps of a standard cleanup. The status is EXIT_DELETE_FAILED when a
+# deletion failed or a directory could not be listed.
+_cleanup_steps() {
+    log_info "Starting storage cleanup"
     cleanup_recordings
     cleanup_logs
     cleanup_temp
     truncate_large_logs
-
-    _report_delete_failures || return "$EXIT_DELETE_FAILED"
-    log_info "Cleanup completed"
+    _report_delete_failures
 }
 
-# Monitor and cleanup if needed
+# Run standard cleanup
+cmd_cleanup() {
+    local rc=0
+    _cleanup_steps || rc=$?
+    if ((rc != 0)); then
+        log_summary "Cleanup incomplete: $(_run_totals)"
+        return "$EXIT_DELETE_FAILED"
+    fi
+    log_summary "Cleanup completed: $(_run_totals)"
+}
+
+# Monitor and cleanup if needed. One check per invocation (run it from cron or a
+# timer); it prints nothing while the disk is fine. When it acts or finds the
+# disk above a threshold, the last line says what the disk looked like and what
+# was done (the one line --quiet keeps).
 cmd_monitor() {
-    local usage free_mb rc=0
+    local usage free_mb rc=0 level="ok" iusage=0
     usage=$(get_disk_usage "/")
     free_mb=$(get_free_space_mb "/")
 
@@ -769,7 +1183,8 @@ cmd_monitor() {
     # the safe, retention-based cleanup (which deletes solely by age).
     if [[ ! "$usage" =~ ^[0-9]+$ ]] || [[ ! "$free_mb" =~ ^[0-9]+$ ]]; then
         log_error "Could not determine disk usage for / (df unparseable: usage='${usage}', free='${free_mb}'MB); running standard cleanup only"
-        cmd_cleanup || rc=$?
+        _cleanup_steps || rc=$?
+        log_summary "Monitor: disk usage of / unknown (df unparseable); standard cleanup only: $(_run_totals)"
         return "$rc"
     fi
 
@@ -777,7 +1192,6 @@ cmd_monitor() {
     # inodes long before blocks, and every write then fails ENOSPC while the
     # block percentage still looks healthy. Unknown ("-", unsupported fs) is
     # treated as no pressure, never as an emergency.
-    local iusage
     iusage=$(get_inode_usage "/")
     [[ "$iusage" =~ ^[0-9]+$ ]] || iusage=0
 
@@ -785,19 +1199,25 @@ cmd_monitor() {
 
     if [[ $usage -ge $DISK_EMERGENCY_PERCENT ]] || [[ $iusage -ge $DISK_EMERGENCY_PERCENT ]] \
         || [[ $free_mb -lt $MIN_FREE_SPACE_MB ]]; then
+        level="emergency"
         log_error "EMERGENCY: Disk ${usage}% full, inodes ${iusage}% used, ${free_mb}MB free"
         emergency_cleanup
-        cmd_cleanup || rc=$?
+        _cleanup_steps || rc=$?
     elif [[ $usage -ge $DISK_CRITICAL_PERCENT ]] || [[ $iusage -ge $DISK_CRITICAL_PERCENT ]]; then
+        level="critical"
         log_warn "CRITICAL: Disk ${usage}% full, inodes ${iusage}% used"
-        cmd_cleanup || rc=$?
+        _cleanup_steps || rc=$?
     elif [[ $usage -ge $DISK_WARNING_PERCENT ]] || [[ $iusage -ge $DISK_WARNING_PERCENT ]]; then
+        level="warning"
         log_warn "WARNING: Disk ${usage}% full, inodes ${iusage}% used"
         cleanup_temp
         truncate_large_logs
         _report_delete_failures || rc=$?
     else
         log_debug "Disk usage OK: ${usage}%"
+    fi
+    if [[ "$level" != "ok" ]]; then
+        log_summary "Monitor: disk ${usage}% used, inodes ${iusage}%, ${free_mb}MB free (${level}): $(_run_totals)"
     fi
     return "$rc"
 }
@@ -830,6 +1250,12 @@ Options:
   -v, --version  Show version
   -n, --dry-run  Show what would be deleted without deleting
   -d, --debug    Enable debug output
+  -q, --quiet    (cleanup, monitor) Print only warnings, errors and one summary
+                 line per run, to stderr like every other message; nothing to
+                 stdout
+  --once         (monitor) One check, then exit. This is what monitor always does:
+                 it never loops, run it from cron or a timer (there is no
+                 --interval)
 
 Environment Variables:
   RECORDING_RETENTION_DAYS   Days to keep recordings (default: 30)
@@ -848,10 +1274,25 @@ Environment Variables:
 
 Recordings are files ending in: ${RECORDING_EXTENSIONS[*]}
 
+Configuration file:
+  ${STORAGE_CONFIG_PATH:-(none)} is read when it exists; LYREBIRD_STORAGE_CONFIG=FILE names another one
+  and LYREBIRD_STORAGE_CONFIG= (empty) none. It is data, never run: KEY=value lines,
+  # comments, values bare or in '...' / "..." and taken literally. Keys are the
+  names of the environment variables above (and LYREBIRD_TEMP_DIR,
+  LYREBIRD_BUFFER_DIR, MEDIAMTX_LOG, TEMP_RETENTION_HOURS, MAX_LOG_SIZE,
+  LYREBIRD_CLOCK_SANE_EPOCH); RECORDING_DIR and LOG_DIR are accepted as other names
+  of LYREBIRD_RECORDING_DIR and LYREBIRD_LOG_DIR in the file (not in the
+  environment). A variable in the environment wins over the file. Directories in
+  the file must be absolute. A file that anyone can write, or that belongs to a
+  user other than root, is not read.
+
 Exit status:
   0  success
   1  usage error
-  3  finished, but at least one deletion failed (see the ERROR lines)
+  3  finished, but at least one deletion failed (see the ERROR lines), or a
+     directory could not be listed (find's message and an ERROR line say which)
+  4  finished, but lines of the configuration file were not accepted and ignored
+     (each is reported with its line number)
 
 Examples:
   ${SCRIPT_NAME} status
@@ -860,16 +1301,16 @@ Examples:
   ${SCRIPT_NAME} monitor
 
 Cron Integration:
-  # Daily cleanup at 3 AM
-  0 3 * * * ${SCRIPT_NAME} cleanup
+  # Daily cleanup at 3 AM, one summary line per run
+  0 3 * * * ${SCRIPT_NAME} cleanup --quiet
 
-  # Hourly monitoring
-  0 * * * * ${SCRIPT_NAME} monitor
+  # Every 15 minutes: silent while the disk is fine
+  */15 * * * * ${SCRIPT_NAME} monitor --once
 EOF
 }
 
 main() {
-    local command=""
+    local command="" quiet=false once=false
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -889,6 +1330,14 @@ main() {
                 DEBUG="true"
                 shift
                 ;;
+            -q | --quiet)
+                quiet=true
+                shift
+                ;;
+            --once)
+                once=true
+                shift
+                ;;
             status | cleanup | monitor | emergency)
                 command="$1"
                 shift
@@ -905,21 +1354,38 @@ main() {
         show_help
         exit 1
     fi
+    if [[ "$quiet" == "true" && "$command" != "cleanup" && "$command" != "monitor" ]]; then
+        log_error "--quiet applies to cleanup and monitor only (not ${command})"
+        exit 1
+    fi
+    if [[ "$once" == "true" && "$command" != "monitor" ]]; then
+        log_error "--once applies to monitor only (not ${command})"
+        exit 1
+    fi
+    QUIET="$quiet"
 
+    local rc=0
     case "$command" in
         status)
-            cmd_status
+            cmd_status || rc=$?
             ;;
         cleanup)
-            cmd_cleanup
+            cmd_cleanup || rc=$?
             ;;
         monitor)
-            cmd_monitor
+            cmd_monitor || rc=$?
             ;;
         emergency)
-            cmd_emergency
+            cmd_emergency || rc=$?
             ;;
     esac
+    # A configuration file whose lines were ignored is not a clean run (a failed
+    # deletion or listing, status 3, is the more specific news and keeps its code)
+    if ((rc == 0 && CONFIG_PROBLEMS > 0)); then
+        log_error "Finished, but ${CONFIG_PROBLEMS} line(s) of ${STORAGE_CONFIG_PATH} were not accepted and ignored (listed above)"
+        rc="$EXIT_CONFIG"
+    fi
+    return "$rc"
 }
 
 # Only execute when run directly, not when sourced (e.g. by the test suite)

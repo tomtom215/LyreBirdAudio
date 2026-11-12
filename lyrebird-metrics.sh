@@ -24,12 +24,14 @@
 # Integration with node_exporter:
 #   ./lyrebird-metrics.sh --file /var/lib/node_exporter/textfile_collector/lyrebird.prom
 #
-# Version: 1.3.0 - Valid-by-construction exposition, collector/scrape status,
-#                  atomic --file publishing, hardened --serve, heartbeat max age
+# Version: 1.4.0 - MediaMTX and stream liveness by process identity (no name
+#                  patterns, no kill -0), time-bounded MediaMTX API requests;
+#                  1.3.0: valid-by-construction exposition, collector/scrape
+#                  status, atomic --file publishing, hardened --serve
 
 set -euo pipefail
 
-readonly VERSION="1.3.0"
+readonly VERSION="1.4.0"
 SCRIPT_NAME="$(basename "${BASH_SOURCE[0]}")"
 readonly SCRIPT_NAME
 
@@ -39,10 +41,18 @@ readonly MEDIAMTX_API_PORT="${MEDIAMTX_API_PORT:-9997}"
 # shellcheck disable=SC2034  # Exported for use by install_mediamtx.sh and external scripts
 readonly MEDIAMTX_RTSP_PORT="${MEDIAMTX_PORT:-8554}"
 readonly HEARTBEAT_FILE="${HEARTBEAT_FILE:-/run/mediamtx-audio.heartbeat}"
-readonly PID_FILE="${PID_FILE:-/run/mediamtx-audio.pid}"
+# The PID file of the stream manager's MediaMTX: PID_FILE, else the variable the
+# manager itself reads (MEDIAMTX_PID_FILE)
+readonly PID_FILE="${PID_FILE:-${MEDIAMTX_PID_FILE:-/run/mediamtx-audio.pid}}"
 readonly FFMPEG_PID_DIR="${FFMPEG_PID_DIR:-/var/lib/mediamtx-ffmpeg}"
 readonly CONFIG_DIR="${MEDIAMTX_CONFIG_DIR:-/etc/mediamtx}"
 readonly DEVICE_CONFIG="${CONFIG_DIR}/audio-devices.conf"
+# The MediaMTX this installation runs, named by the variables the stream manager
+# reads: a process is this MediaMTX when its executable is MEDIAMTX_BIN and its
+# first argument is MEDIAMTX_CONFIG_FILE (that is how the manager and the
+# mediamtx.service unit start it)
+readonly MEDIAMTX_BIN="${MEDIAMTX_BINARY:-/usr/local/bin/mediamtx}"
+readonly MEDIAMTX_CONFIG_FILE="${MEDIAMTX_CONFIG_FILE:-${CONFIG_DIR}/mediamtx.yml}"
 
 # Metric prefix
 readonly METRIC_PREFIX="lyrebird"
@@ -94,6 +104,209 @@ resolve_heartbeat_max_age() {
 }
 HEARTBEAT_MAX_AGE="$(resolve_heartbeat_max_age)"
 readonly HEARTBEAT_MAX_AGE
+
+# The longest, in seconds, that one scrape may spend on the MediaMTX API in all,
+# every request and retry together. A MediaMTX that is hung or being restarted
+# must not stall the scrape: a Prometheus scrape gives up after its
+# scrape_timeout (10 s by default), a `--serve` response waits for the scrape and
+# a cron `--file` run would pile up behind it. Override with LYREBIRD_API_TIMEOUT
+# (a positive integer number of seconds). The limit is kept to whole seconds, so
+# a scrape can take up to one second more than this.
+resolve_api_timeout() {
+    local raw="${LYREBIRD_API_TIMEOUT-}"
+    local default=5
+
+    if [[ -z "$raw" ]]; then
+        printf '%s' "$default"
+    elif [[ "$raw" =~ ^[0-9]+$ ]] && ((10#$raw > 0)); then
+        printf '%s' "$((10#$raw))"
+    else
+        log "WARN: ignoring LYREBIRD_API_TIMEOUT='${raw}' (need a positive integer number of seconds); using ${default}"
+        printf '%s' "$default"
+    fi
+}
+API_TIMEOUT="$(resolve_api_timeout)"
+readonly API_TIMEOUT
+
+# ============================================================================
+# Process state
+# ============================================================================
+#
+# A process is looked at through /proc/<pid>/stat, which every user may read, and
+# never by sending it a signal: `kill -0` fails with EPERM for another user's
+# process, so a stream wrapper owned by root read as down whenever the exporter
+# ran as an unprivileged user (a cron job as node_exporter, a unit with User=).
+# A /proc entry that exists but cannot be read (/proc mounted with hidepid=1) is
+# "cannot tell", which is not "down": the caller leaves the metric out and fails
+# its collector rather than publish a made-up 0.
+
+_PS_STATE="" # set by read_proc_stat
+_PS_START=""
+_REC_START="" # set by pid_file_recorded_start
+
+# Set _PS_STATE and _PS_START from /proc/PID/stat. Returns 0 when read, 1 when
+# there is no such process, 2 when there is one whose stat cannot be read. The
+# command name is the only field that can contain spaces and is enclosed in
+# parentheses, so everything up to the last ") " is skipped.
+read_proc_stat() {
+    # the shutdown trap can interrupt `IFS= read` with that IFS still in effect
+    local IFS=$' \t\n'
+    local stat rest
+    local -a fields
+    _PS_STATE=""
+    _PS_START=""
+    if ! { read -r stat <"/proc/$1/stat"; } 2>/dev/null; then
+        [[ -d "/proc/$1" ]] && return 2
+        return 1
+    fi
+    rest="${stat##*) }"
+    read -r -a fields <<<"$rest"
+    _PS_STATE="${fields[0]:-}"
+    _PS_START="${fields[19]:-}"
+    return 0
+}
+
+# Is PID running, and (when START is given) the process that started at START
+# (field 22 of /proc/PID/stat)? A PID that has been reused has another start
+# time; a zombie has exited and counts as gone.
+#   0  running
+#   1  not running (no such process, a zombie, or another process under that PID)
+#   2  cannot tell: its /proc entry exists but cannot be read
+proc_check() {
+    local pid="$1" start="${2-}" rc=0
+    [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 1
+    read_proc_stat "$pid" || rc=$?
+    ((rc == 0)) || return "$rc"
+    [[ "$_PS_STATE" != "Z" && "$_PS_STATE" != "X" ]] || return 1
+    [[ -z "$start" || "$_PS_START" == "$start" ]]
+}
+
+# Set _REC_START to the start time the stream manager recorded next to PID file
+# $1 for process $2 ("<pid> <starttime>" in "<pid file>.id"); empty when there is
+# no record (older versions wrote none) or it is about another PID.
+pid_file_recorded_start() {
+    local rec_pid="" rec_start=""
+    _REC_START=""
+    { IFS=' ' read -r rec_pid rec_start _ <"${1}.id"; } 2>/dev/null || true
+    if [[ "$rec_pid" == "$2" && "$rec_start" =~ ^[0-9]+$ ]]; then
+        _REC_START="$rec_start"
+    fi
+}
+
+# Is PID $2 of PID file $1 still the process the manager recorded? proc_check's
+# statuses, with the recorded start time telling a reused PID from the original.
+pid_file_process_state() {
+    pid_file_recorded_start "$1" "$2"
+    proc_check "$2" "$_REC_START"
+}
+
+# Which process is MediaMTX is decided by identity, as the stream manager does it
+# (is_managed_mediamtx_pid), never by a name or command-line pattern: a pattern
+# such as `pgrep -f mediamtx` also matches an editor on mediamtx.yml, a
+# mediamtx-exporter, `tail -f /var/log/mediamtx.log` and another installation's
+# MediaMTX, whose memory and uptime were then published as ours.
+
+_ARGV1=""  # set by proc_argv
+MTX_PID="" # set by mediamtx_locate
+_MTX_WANT_EXE=""
+
+# Set _ARGV1 to the first argument of process $1 (the one after the program name;
+# cmdline is NUL-separated and, unlike /proc/PID/exe, readable by every user).
+# Returns 0 when read, 1 when there is no such process, 2 when there is one whose
+# cmdline cannot be read.
+proc_argv() {
+    _ARGV1=""
+    if ! {
+        IFS= read -r -d '' _ || true
+        IFS= read -r -d '' _ARGV1 || true
+    } 2>/dev/null <"/proc/$1/cmdline"; then
+        [[ -d "/proc/$1" ]] && return 2
+        return 1
+    fi
+    return 0
+}
+
+# Is PID $1 this installation's MediaMTX: running, the executable is MEDIAMTX_BIN
+# (an upgrade may have replaced the file since: the kernel then reports
+# "<path> (deleted)", still the same program) and argv[1] is MEDIAMTX_CONFIG_FILE?
+# $2 is the start time the manager recorded for the PID, if any.
+#   0  yes
+#   1  no (not running, another program, another configuration)
+#   2  cannot tell: the executable of another user's process cannot be read and
+#      there is no recorded start time to go by instead
+mediamtx_verify_pid() {
+    local pid="$1" recorded="${2-}" rc=0 exe="" deleted_suffix=" (deleted)"
+    proc_check "$pid" "$recorded" || rc=$?
+    ((rc == 0)) || return "$rc"
+    # argv[1] first: it is read without forking and rules out almost everything
+    proc_argv "$pid" || rc=$?
+    ((rc == 0)) || return "$rc"
+    [[ "$_ARGV1" == "$MEDIAMTX_CONFIG_FILE" ]] || return 1
+    if exe="$(readlink "/proc/${pid}/exe" 2>/dev/null)" && [[ -n "$exe" ]]; then
+        [[ "${exe%"${deleted_suffix}"}" == "$_MTX_WANT_EXE" ]]
+        return
+    fi
+    [[ -d "/proc/${pid}" ]] || return 1
+    # The process started at the recorded time and runs the configuration, which
+    # is the one the manager recorded after it had started MediaMTX itself
+    [[ -n "$recorded" ]] && return 0
+    return 2
+}
+
+# Look through every process for this installation's MediaMTX. Sets MTX_PID.
+# 0 = found, 1 = no such process, 2 = not found but not ruled out either: a
+# process that runs the configuration has an executable that cannot be read.
+mediamtx_scan() {
+    local dir pid rc unknown=0
+    MTX_PID=""
+    for dir in /proc/[0-9]*; do
+        pid="${dir#/proc/}"
+        rc=0
+        proc_argv "$pid" || rc=$?
+        if ((rc == 2)); then
+            unknown=1
+            continue
+        elif ((rc != 0)); then
+            continue
+        fi
+        [[ "$_ARGV1" == "$MEDIAMTX_CONFIG_FILE" ]] || continue
+        rc=0
+        mediamtx_verify_pid "$pid" || rc=$?
+        if ((rc == 0)); then
+            MTX_PID="$pid"
+            return 0
+        elif ((rc == 2)); then
+            unknown=1
+        fi
+    done
+    ((unknown == 0)) || return 2
+    return 1
+}
+
+# Find MediaMTX: the process the stream manager recorded in PID_FILE (with its
+# start-time record) if that is verified, else the scan above, which is also what
+# finds a stand-alone MediaMTX (mediamtx.service) and one the manager's PID file
+# no longer names. Sets MTX_PID; 0 = running, 1 = not running, 2 = cannot tell.
+mediamtx_locate() {
+    local raw="" pid="" rc=0
+    MTX_PID=""
+    _MTX_WANT_EXE="$(readlink -f -- "$MEDIAMTX_BIN" 2>/dev/null)" || _MTX_WANT_EXE=""
+    [[ -n "$_MTX_WANT_EXE" ]] || _MTX_WANT_EXE="$MEDIAMTX_BIN"
+    if [[ -f "$PID_FILE" ]] && raw="$(cat "$PID_FILE" 2>/dev/null)"; then
+        pid="${raw%%[[:space:]]*}"
+        if [[ "$pid" =~ ^[1-9][0-9]*$ ]]; then
+            pid_file_recorded_start "$PID_FILE" "$pid"
+            mediamtx_verify_pid "$pid" "$_REC_START" || rc=$?
+            if ((rc == 0)); then
+                MTX_PID="$pid"
+                return 0
+            fi
+        fi
+    fi
+    rc=0
+    mediamtx_scan || rc=$?
+    return "$rc"
+}
 
 # ============================================================================
 # Metric Collection Functions
@@ -165,22 +378,22 @@ emit_help_type() {
     echo "# TYPE ${METRIC_PREFIX}_${name} ${type}"
 }
 
-# Collect MediaMTX service metrics
+# Collect MediaMTX service metrics. The process is this installation's MediaMTX
+# by identity (mediamtx_locate); when that cannot be settled (another user's
+# processes cannot be looked at) mediamtx_up is left out and the collector fails,
+# instead of publishing a false lyrebird_mediamtx_up 0.
 collect_mediamtx_metrics() {
     local mediamtx_running=0
     local mediamtx_pid=0
+    local failed=0 located=0
 
-    # Without pgrep "not running" cannot be told from "cannot tell"; report the
-    # collector as failed instead of publishing a false lyrebird_mediamtx_up 0.
-    if ! has_command pgrep; then
-        log "ERROR: pgrep not found; cannot tell whether MediaMTX is running (install procps)"
+    mediamtx_locate || located=$?
+    if ((located == 2)); then
+        log "ERROR: cannot tell whether MediaMTX (${MEDIAMTX_BIN} ${MEDIAMTX_CONFIG_FILE}) is running: the executable of a process that runs that configuration cannot be read (run as root)"
         return 1
-    fi
-
-    # Check if MediaMTX is running
-    if pgrep -f "mediamtx" >/dev/null 2>&1; then
+    elif ((located == 0)); then
         mediamtx_running=1
-        mediamtx_pid=$(pgrep -f "mediamtx" | head -1) || true
+        mediamtx_pid="$MTX_PID"
     fi
 
     emit_metric "mediamtx_up" "$mediamtx_running" "MediaMTX server running (1=up, 0=down)"
@@ -203,11 +416,17 @@ collect_mediamtx_metrics() {
             emit_metric "mediamtx_cpu_percent" "${cpu_usage%.*}" "MediaMTX CPU usage percentage"
         fi
 
-        # File descriptors
+        # File descriptors. /proc/PID/fd can be listed by the process's own user
+        # and by root only: where it cannot, the count is unknown (the glob stays
+        # unexpanded), not 0.
         if [[ -d "/proc/${mediamtx_pid}/fd" ]]; then
-            local fd_count
-            fd_count=$(find "/proc/${mediamtx_pid}/fd" -maxdepth 1 -type l 2>/dev/null | wc -l || true)
-            emit_metric "mediamtx_open_fds" "$fd_count" "MediaMTX open file descriptors"
+            local -a fds=("/proc/${mediamtx_pid}"/fd/*)
+            if [[ -L "${fds[0]}" ]]; then
+                emit_metric "mediamtx_open_fds" "${#fds[@]}" "MediaMTX open file descriptors"
+            else
+                log "ERROR: cannot list /proc/${mediamtx_pid}/fd; the number of open file descriptors of MediaMTX is unknown (run as root)"
+                failed=1
+            fi
         fi
 
         # Process uptime
@@ -226,7 +445,7 @@ collect_mediamtx_metrics() {
             fi
         fi
     fi
-    return 0
+    return "$failed"
 }
 
 # Collect stream manager metrics
@@ -242,10 +461,15 @@ collect_stream_manager_metrics() {
 
     # Check if stream manager is running
     if [[ -f "$PID_FILE" ]]; then
-        local pid
+        local pid state=0
         if pid=$(cat "$PID_FILE" 2>/dev/null); then
-            if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+            pid_file_process_state "$PID_FILE" "$pid" || state=$?
+            if ((state == 0)); then
                 stream_mgr_running=1
+            elif ((state == 2)); then
+                log "ERROR: cannot tell whether PID ${pid} of ${PID_FILE} is running: /proc/${pid} cannot be read (run as root)"
+                failed=1
+                stream_mgr_running=""
             fi
         elif [[ -e "$PID_FILE" ]]; then
             log "ERROR: cannot read ${PID_FILE}"
@@ -269,7 +493,14 @@ collect_stream_manager_metrics() {
                 active_streams=""
                 break
             fi
-            if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+            local state=0
+            pid_file_process_state "$pid_file" "$pid" || state=$?
+            if ((state == 2)); then
+                log "ERROR: cannot tell whether PID ${pid} of ${pid_file} is running: /proc/${pid} cannot be read (run as root)"
+                failed=1
+                active_streams=""
+                break
+            elif ((state == 0)); then
                 ((++active_streams))
             fi
         done
@@ -424,23 +655,54 @@ collect_system_metrics() {
     return "$failed"
 }
 
-# Helper function for API calls with retry for transient network failures
-# Usage: api_call_with_retry <url> [timeout] [retries]
-api_call_with_retry() {
-    local url="$1"
-    local timeout="${2:-5}"
-    local retries="${3:-2}"
-    local attempt=0
-    local result=""
+# The scrape's time for the MediaMTX API runs out at this value of SECONDS (set by
+# collect_api_metrics); API_BODY is what api_get received; API_INCOMPLETE is 1
+# once a request of the scrape went unanswered.
+API_DEADLINE=0
+API_BODY=""
+API_INCOMPLETE=0
 
-    while ((attempt < retries)); do
-        ((attempt++)) || true
-        result=$(curl -s --connect-timeout "$timeout" "$url" 2>/dev/null) && break
-        # Brief pause before retry
-        ((attempt < retries)) && sleep 1
+# GET URL from the MediaMTX API within what is left of the scrape's budget
+# (API_TIMEOUT seconds for all requests together): every request is bounded by
+# curl's --max-time, so a MediaMTX that accepts the connection and never answers
+# cannot hold the scrape. Puts the body in API_BODY. Returns 0 for an answer,
+# else curl's exit status (28 also when no time is left).
+# A refused or unresolvable connection is final at once (nothing listens, and a
+# second attempt a moment later would only cost the scrape a pause: with the
+# API down every scrape used to wait a second); any other failure (a reset, an
+# empty reply, a timeout) is tried once more after a short pause if time is left.
+api_get() {
+    local url="$1" attempt remaining rc=0
+    API_BODY=""
+    for attempt in 1 2; do
+        remaining=$((API_DEADLINE - SECONDS))
+        if ((remaining < 1)); then
+            return 28
+        fi
+        rc=0
+        API_BODY="$(curl -s --connect-timeout "$((remaining < 2 ? remaining : 2))" --max-time "$remaining" "$url" 2>/dev/null)" || rc=$?
+        if ((rc == 0)); then
+            return 0
+        fi
+        API_BODY=""
+        case "$rc" in
+            6 | 7) return "$rc" ;;
+        esac
+        if ((attempt == 1)); then
+            sleep 0.2 2>/dev/null || true
+        fi
     done
+    return "$rc"
+}
 
-    echo "$result"
+# api_get for the optional lists after /v3/info: a request that went unanswered
+# leaves its metrics out (API_BODY is empty) and marks the scrape incomplete.
+api_list() {
+    if ! api_get "$1"; then
+        API_BODY=""
+        API_INCOMPLETE=1
+    fi
+    return 0
 }
 
 # Collect MediaMTX API metrics (if available)
@@ -454,11 +716,20 @@ collect_api_metrics() {
 
     local api_url="http://${MEDIAMTX_API_HOST}:${MEDIAMTX_API_PORT}"
 
-    # Check API availability and get instance info (with retry for transient failures)
+    # Everything this collector asks the API shares one time budget
+    API_DEADLINE=$((SECONDS + API_TIMEOUT))
+    API_INCOMPLETE=0
+
+    # Check API availability and get instance info
     local api_up=0
-    local info_json
-    info_json=$(api_call_with_retry "${api_url}/v3/info" 2 2)
-    if [[ -n "$info_json" ]] && echo "$info_json" | grep -q '"version"'; then
+    local info_json=""
+    if api_get "${api_url}/v3/info"; then
+        info_json="$API_BODY"
+    fi
+    # A pattern match, not `echo | grep -q`: grep -q leaves at the first match, and
+    # under pipefail the echo that is still writing a large body then dies of
+    # SIGPIPE, the pipeline's status is 141 and a live API read as down.
+    if [[ "$info_json" == *'"version"'* ]]; then
         api_up=1
     fi
 
@@ -480,7 +751,8 @@ collect_api_metrics() {
 
         # Get path count from API
         local paths_json
-        paths_json=$(curl -s --connect-timeout 5 "${api_url}/v3/paths/list" 2>/dev/null || true)
+        api_list "${api_url}/v3/paths/list"
+        paths_json="$API_BODY"
 
         if [[ -n "$paths_json" ]]; then
             # Count paths (simple grep approach for portability)
@@ -501,7 +773,8 @@ collect_api_metrics() {
 
         # Collect RTSP session metrics
         local rtsp_sessions_json
-        rtsp_sessions_json=$(curl -s --connect-timeout 5 "${api_url}/v3/rtspsessions/list" 2>/dev/null || true)
+        api_list "${api_url}/v3/rtspsessions/list"
+        rtsp_sessions_json="$API_BODY"
         if [[ -n "$rtsp_sessions_json" ]]; then
             local rtsp_session_count
             rtsp_session_count=$(echo "$rtsp_sessions_json" | grep -o '"id"' | wc -l || true)
@@ -510,7 +783,8 @@ collect_api_metrics() {
 
         # Collect RTSP connection metrics
         local rtsp_conns_json
-        rtsp_conns_json=$(curl -s --connect-timeout 5 "${api_url}/v3/rtspconns/list" 2>/dev/null || true)
+        api_list "${api_url}/v3/rtspconns/list"
+        rtsp_conns_json="$API_BODY"
         if [[ -n "$rtsp_conns_json" ]]; then
             local rtsp_conn_count
             rtsp_conn_count=$(echo "$rtsp_conns_json" | grep -o '"id"' | wc -l || true)
@@ -519,7 +793,8 @@ collect_api_metrics() {
 
         # Collect RTSPS (secure) session metrics
         local rtsps_sessions_json
-        rtsps_sessions_json=$(curl -s --connect-timeout 5 "${api_url}/v3/rtspssessions/list" 2>/dev/null || true)
+        api_list "${api_url}/v3/rtspssessions/list"
+        rtsps_sessions_json="$API_BODY"
         if [[ -n "$rtsps_sessions_json" ]]; then
             local rtsps_session_count
             rtsps_session_count=$(echo "$rtsps_sessions_json" | grep -o '"id"' | wc -l || true)
@@ -528,7 +803,8 @@ collect_api_metrics() {
 
         # Collect RTMP connection metrics
         local rtmp_conns_json
-        rtmp_conns_json=$(curl -s --connect-timeout 5 "${api_url}/v3/rtmpconns/list" 2>/dev/null || true)
+        api_list "${api_url}/v3/rtmpconns/list"
+        rtmp_conns_json="$API_BODY"
         if [[ -n "$rtmp_conns_json" ]]; then
             local rtmp_conn_count
             rtmp_conn_count=$(echo "$rtmp_conns_json" | grep -o '"id"' | wc -l || true)
@@ -537,7 +813,8 @@ collect_api_metrics() {
 
         # Collect RTMPS (secure) connection metrics
         local rtmps_conns_json
-        rtmps_conns_json=$(curl -s --connect-timeout 5 "${api_url}/v3/rtmpsconns/list" 2>/dev/null || true)
+        api_list "${api_url}/v3/rtmpsconns/list"
+        rtmps_conns_json="$API_BODY"
         if [[ -n "$rtmps_conns_json" ]]; then
             local rtmps_conn_count
             rtmps_conn_count=$(echo "$rtmps_conns_json" | grep -o '"id"' | wc -l || true)
@@ -546,7 +823,8 @@ collect_api_metrics() {
 
         # Collect WebRTC session metrics
         local webrtc_sessions_json
-        webrtc_sessions_json=$(curl -s --connect-timeout 5 "${api_url}/v3/webrtcsessions/list" 2>/dev/null || true)
+        api_list "${api_url}/v3/webrtcsessions/list"
+        webrtc_sessions_json="$API_BODY"
         if [[ -n "$webrtc_sessions_json" ]]; then
             local webrtc_session_count
             webrtc_session_count=$(echo "$webrtc_sessions_json" | grep -o '"id"' | wc -l || true)
@@ -555,7 +833,8 @@ collect_api_metrics() {
 
         # Collect SRT connection metrics
         local srt_conns_json
-        srt_conns_json=$(curl -s --connect-timeout 5 "${api_url}/v3/srtconns/list" 2>/dev/null || true)
+        api_list "${api_url}/v3/srtconns/list"
+        srt_conns_json="$API_BODY"
         if [[ -n "$srt_conns_json" ]]; then
             local srt_conn_count
             srt_conn_count=$(echo "$srt_conns_json" | grep -o '"id"' | wc -l || true)
@@ -564,7 +843,8 @@ collect_api_metrics() {
 
         # Collect HLS muxer metrics
         local hls_muxers_json
-        hls_muxers_json=$(curl -s --connect-timeout 5 "${api_url}/v3/hlsmuxers/list" 2>/dev/null || true)
+        api_list "${api_url}/v3/hlsmuxers/list"
+        hls_muxers_json="$API_BODY"
         if [[ -n "$hls_muxers_json" ]]; then
             local hls_muxer_count
             hls_muxer_count=$(echo "$hls_muxers_json" | grep -o '"path"' | wc -l || true)
@@ -573,22 +853,30 @@ collect_api_metrics() {
 
         # Collect recording metrics
         local recordings_json
-        recordings_json=$(curl -s --connect-timeout 5 "${api_url}/v3/recordings/list" 2>/dev/null || true)
+        api_list "${api_url}/v3/recordings/list"
+        recordings_json="$API_BODY"
         if [[ -n "$recordings_json" ]]; then
             local recording_count
             recording_count=$(echo "$recordings_json" | grep -o '"name"' | wc -l || true)
             emit_metric "api_recordings_total" "$recording_count" "Total recording paths"
         fi
 
-        # Calculate total connections across all protocols
-        local total_connections=0
-        [[ "${rtsp_session_count:-0}" =~ ^[0-9]+$ ]] && total_connections=$((total_connections + rtsp_session_count))
-        [[ "${rtsps_session_count:-0}" =~ ^[0-9]+$ ]] && total_connections=$((total_connections + rtsps_session_count))
-        [[ "${rtmp_conn_count:-0}" =~ ^[0-9]+$ ]] && total_connections=$((total_connections + rtmp_conn_count))
-        [[ "${rtmps_conn_count:-0}" =~ ^[0-9]+$ ]] && total_connections=$((total_connections + rtmps_conn_count))
-        [[ "${webrtc_session_count:-0}" =~ ^[0-9]+$ ]] && total_connections=$((total_connections + webrtc_session_count))
-        [[ "${srt_conn_count:-0}" =~ ^[0-9]+$ ]] && total_connections=$((total_connections + srt_conn_count))
-        emit_metric "api_total_connections" "$total_connections" "Total active connections across all protocols"
+        # Calculate total connections across all protocols. A total over lists
+        # that were not all received would be a made-up number, so it is left out.
+        if ((API_INCOMPLETE == 0)); then
+            local total_connections=0
+            [[ "${rtsp_session_count:-0}" =~ ^[0-9]+$ ]] && total_connections=$((total_connections + ${rtsp_session_count:-0}))
+            [[ "${rtsps_session_count:-0}" =~ ^[0-9]+$ ]] && total_connections=$((total_connections + ${rtsps_session_count:-0}))
+            [[ "${rtmp_conn_count:-0}" =~ ^[0-9]+$ ]] && total_connections=$((total_connections + ${rtmp_conn_count:-0}))
+            [[ "${rtmps_conn_count:-0}" =~ ^[0-9]+$ ]] && total_connections=$((total_connections + ${rtmps_conn_count:-0}))
+            [[ "${webrtc_session_count:-0}" =~ ^[0-9]+$ ]] && total_connections=$((total_connections + ${webrtc_session_count:-0}))
+            [[ "${srt_conn_count:-0}" =~ ^[0-9]+$ ]] && total_connections=$((total_connections + ${srt_conn_count:-0}))
+            emit_metric "api_total_connections" "$total_connections" "Total active connections across all protocols"
+        fi
+    fi
+    if ((API_INCOMPLETE != 0)); then
+        log "ERROR: the MediaMTX API did not answer every request within ${API_TIMEOUT}s; the API metrics missing from this scrape are unknown, not 0"
+        return 1
     fi
     return 0
 }
@@ -605,7 +893,7 @@ collect_stream_metrics() {
     fi
 
     local -a stream_names=() stream_pids=() stream_alive=()
-    local pid_file stream_name pid i n labels
+    local pid_file stream_name pid i n labels state
     local failed=0
     for pid_file in "${FFMPEG_PID_DIR}"/*.pid; do
         [[ -f "$pid_file" ]] || continue
@@ -618,9 +906,18 @@ collect_stream_metrics() {
             failed=1
             continue
         fi
+        state=0
+        pid_file_process_state "$pid_file" "$pid" || state=$?
+        if ((state == 2)); then
+            # a stream whose process cannot be looked at is neither up nor down:
+            # its samples are left out
+            log "ERROR: cannot tell whether PID ${pid} of ${pid_file} is running: /proc/${pid} cannot be read (run as root)"
+            failed=1
+            continue
+        fi
         stream_names+=("$stream_name")
         stream_pids+=("$pid")
-        if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+        if ((state == 0)); then
             stream_alive+=(1)
         else
             stream_alive+=(0)
@@ -886,8 +1183,6 @@ _SRV_NC_BIN=""
 _SRV_NC_VARIANT=""
 _SRV_NC_HELP=""
 _SRV_NC_CMD=()
-_PS_STATE="" # set by read_proc_stat
-_PS_START=""
 _BYTES=0 # set by byte_length
 
 # A TCP port number, 1-65535.
@@ -1005,24 +1300,6 @@ build_nc_command() {
 # never written to. Takes seconds, fractions allowed.
 srv_sleep() {
     read -r -t "$1" -u "$_SRV_SLEEP" _ || true
-}
-
-# Set _PS_STATE and _PS_START from /proc/PID/stat; returns 1 if there is no such
-# process. The command name is the only field that can contain spaces and is
-# enclosed in parentheses, so everything up to the last ") " is skipped.
-read_proc_stat() {
-    # the shutdown trap can interrupt `IFS= read` with that IFS still in effect
-    local IFS=$' \t\n'
-    local stat rest
-    local -a fields
-    _PS_STATE=""
-    _PS_START=""
-    { read -r stat <"/proc/$1/stat"; } 2>/dev/null || return 1
-    rest="${stat##*) }"
-    read -r -a fields <<<"$rest"
-    _PS_STATE="${fields[0]:-}"
-    _PS_START="${fields[19]:-}"
-    return 0
 }
 
 # Is the nc we started in slot $1 still running? A pid alone could have been
@@ -1453,6 +1730,20 @@ Options:
 The HTTP server answers GET / and GET /metrics (200), any other path with 404 and
 any other method with 405, one connection at a time. It needs netcat (OpenBSD
 nc, ncat, traditional/GNU nc or BusyBox nc). SIGTERM or SIGINT stops it cleanly.
+
+Environment:
+  MEDIAMTX_BINARY, MEDIAMTX_CONFIG_FILE (else MEDIAMTX_CONFIG_DIR/mediamtx.yml)
+      MediaMTX is the process that runs that binary on that configuration, as for
+      the stream manager; a name or command line that merely contains
+      "mediamtx" is not MediaMTX
+  PID_FILE (else MEDIAMTX_PID_FILE)  the stream manager's PID file
+  LYREBIRD_API_TIMEOUT  seconds one scrape may spend on the MediaMTX API in all
+                        (default: 5)
+  LYREBIRD_HEARTBEAT_MAX_AGE  seconds a monitor heartbeat counts as recent
+                        (default: 900)
+Run as root for a complete scrape: another user's processes cannot be looked at
+closely enough (executable, descriptors); what cannot be read is left out of the
+document and its collector is reported failed.
 
 Exit status:
   0  every collector completed (the server: stopped by a signal)

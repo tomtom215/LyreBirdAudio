@@ -294,6 +294,37 @@ CURLEOF
     [[ "$output" =~ lyrebird_api_up[[:space:]]+1 ]]
 }
 
+# --- X-30 (d): a large /v3/info body must not read as "API down" ---------------
+
+@test "a large /v3/info body that names the version early still reads as an API that is up: no SIGPIPE of echo into grep -q under pipefail [X-30]" {
+    local bin="$TEST_SCRATCH/bigapi"
+    mkdir -p "$bin"
+    # about 2.6 MB over 40000 lines, "version" on the first
+    cat >"$bin/curl" <<'CURLEOF'
+#!/bin/bash
+for a in "$@"; do
+    case "$a" in
+        *"/v3/info")
+            printf '{"version":"1.19.2","upTime":100000000000,\n'
+            yes '"pad": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",' | head -n 40000
+            printf '"end":1}\n'
+            exit 0
+            ;;
+    esac
+done
+echo '{"itemCount":0,"items":[]}'
+CURLEOF
+    chmod +x "$bin/curl"
+    local i
+    for i in 1 2 3; do
+        run env PROJECT_ROOT="$PROJECT_ROOT" PATH="$bin:$PATH" \
+            bash -c 'source "$PROJECT_ROOT/lyrebird-metrics.sh"; collect_api_metrics'
+        [ "$status" -eq 0 ]
+        [[ "$output" == *$'\nlyrebird_api_up 1\n'* ]] || { echo "run $i: $(printf '%s\n' "$output" | grep api_up)"; return 1; }
+        [[ "$output" == *'lyrebird_api_info{version="1.19.2"} 1'* ]]
+    done
+}
+
 # --- MET-2: grep -c must not emit "0\n0" and break the scrape ------------------
 
 @test "configured_devices emits a single valid 0, never '0\\n0' [MET-2 regression]" {
@@ -449,7 +480,7 @@ _toolbox_without() {
     shift
     mkdir -p "$dir"
     for t in date grep awk cat find wc ps df getconf curl head tr cut basename dirname \
-        sleep pgrep mktemp mv rm chmod mkfifo id uname nc ncat netcat; do
+        sleep pgrep mktemp mv rm chmod mkfifo id uname readlink nc ncat netcat; do
         for omit in "$@"; do
             [[ "$t" == "$omit" ]] && continue 2
         done
@@ -531,17 +562,21 @@ _run_once() {
     [[ "$output" == *'lyrebird_scrape_success 0'* ]]
 }
 
-@test "without pgrep the mediamtx collector fails visibly and no false lyrebird_mediamtx_up 0 is published [LB-18]" {
+# Changed for X-30. The collector used to look for MediaMTX with `pgrep -f mediamtx`
+# and failed visibly without pgrep (the old test pinned that); it now tells MediaMTX
+# by identity from /proc and has no use for pgrep, so what is pinned is that a node
+# without pgrep is scraped completely. The visible failure when the collector cannot
+# tell is in tests/test_metrics_process_identity.bats.
+@test "the mediamtx collector needs no pgrep: without it the scrape is complete and no tool is reported missing [LB-18, X-30]" {
     _toolbox_without "$TEST_SCRATCH/nopgrep" pgrep
     _run_once PATH="$TEST_SCRATCH/nopgrep" FFMPEG_PID_DIR="$FFMPEG_PID_DIR" PID_FILE="$PID_FILE" HEARTBEAT_FILE="$HEARTBEAT_FILE"
-    [ "$RUN_RC" -eq 3 ]
+    [ "$RUN_RC" -eq 0 ]
     run prom_validate "$TEST_SCRATCH/out"
     [ "$status" -eq 0 ] || { echo "$output"; return 1; }
-    grep -qx 'lyrebird_collector_success{collector="mediamtx"} 0' "$TEST_SCRATCH/out"
-    grep -qx 'lyrebird_collector_success{collector="system"} 1' "$TEST_SCRATCH/out"
-    grep -qx 'lyrebird_scrape_success 0' "$TEST_SCRATCH/out"
-    ! grep -q '^lyrebird_mediamtx_up' "$TEST_SCRATCH/out" || false
-    grep -q 'pgrep' "$TEST_SCRATCH/err"
+    grep -qx 'lyrebird_collector_success{collector="mediamtx"} 1' "$TEST_SCRATCH/out"
+    grep -qx 'lyrebird_scrape_success 1' "$TEST_SCRATCH/out"
+    grep -q '^lyrebird_mediamtx_up [01]$' "$TEST_SCRATCH/out"
+    ! grep -q 'pgrep' "$TEST_SCRATCH/err" || false
 }
 
 @test "without curl the api collector fails visibly instead of publishing nothing silently [LB-18]" {
