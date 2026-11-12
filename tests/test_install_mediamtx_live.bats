@@ -155,3 +155,71 @@ default_listeners() {
         mtx_stop
     done
 }
+
+# Run the installer's `update` (forced, so that a release of the same version is
+# an update too) from a release fixture of BINARY, a real MediaMTX or a stand-in
+run_update() {
+    local bin="$1" version="$2"
+    installer_environment
+    export MEDIAMTX_PID_FILE="$TEST_SCRATCH/no-such.pid"
+    installer_release_fixture "$FIXTURE_DIR" "$version" "$bin"
+    PREAMBLE="$(installer_fixture_preamble)"$'\nSKIP_SERVICE=true\nFORCE_MODE=true'
+    export PREAMBLE
+    run bash -c 'source "$PROJECT_ROOT/install_mediamtx.sh"; eval "$PREAMBLE"; update_mediamtx'
+}
+
+@test "update in manual mode on a real MediaMTX stops it by identity, installs the verified binary, exits 0 and says how to start it; the new binary loads the old configuration [N-1]" {
+    require_live
+    local bin
+    for bin in $LYREBIRD_TEST_MEDIAMTX_BINS; do
+        each_binary_begin "$bin"
+        run_install "$bin"
+        [ "$status" -eq 0 ]
+        # started by hand, the way an operator without systemd would: the installed binary on the installed configuration
+        mtx_start "$MEDIAMTX_PREFIX/bin/mediamtx" "$MEDIAMTX_CONFIG_DIR/mediamtx.yml"
+        local running_pid="$MTX_PID"
+        run_update "$bin" "$(mtx_version "$bin")"
+        [ "$status" -eq 0 ] || {
+            echo "$output"
+            false
+        }
+        # the installer stopped that process (and only that one) ...
+        ! kill -0 "$running_pid" 2>/dev/null || {
+            echo "MediaMTX (PID $running_pid) is still running"
+            false
+        }
+        [[ "$output" == *"MediaMTX is NOT running"* ]]
+        [[ "$output" == *"  $MEDIAMTX_PREFIX/bin/mediamtx $MEDIAMTX_CONFIG_DIR/mediamtx.yml"* ]]
+        [[ "$output" != *"rollback"* ]]
+        # ... and the verified binary is installed: the release's file, running
+        cmp "$bin" "$MEDIAMTX_PREFIX/bin/mediamtx"
+        [ "$(mtx_version "$MEDIAMTX_PREFIX/bin/mediamtx")" = "$(mtx_version "$bin")" ]
+        # started again the way the notice says, it loads the configuration it had
+        mtx_start "$MEDIAMTX_PREFIX/bin/mediamtx" "$MEDIAMTX_CONFIG_DIR/mediamtx.yml"
+        [ "$(mtx_http_status "http://127.0.0.1:${P_API}/v3/paths/list")" = 200 ]
+        mtx_stop
+    done
+}
+
+@test "update in manual mode on a real MediaMTX restores the previous binary, exit 7, when the new one does not run [N-1]" {
+    require_live
+    local bin
+    for bin in $LYREBIRD_TEST_MEDIAMTX_BINS; do
+        each_binary_begin "$bin"
+        run_install "$bin"
+        [ "$status" -eq 0 ]
+        mtx_start "$MEDIAMTX_PREFIX/bin/mediamtx" "$MEDIAMTX_CONFIG_DIR/mediamtx.yml"
+        local running_pid="$MTX_PID"
+        mkdir -p "$TEST_SCRATCH/broken"
+        printf '#!/bin/bash\necho "cannot execute binary file" >&2\nexit 126\n' >"$TEST_SCRATCH/broken/mediamtx"
+        chmod +x "$TEST_SCRATCH/broken/mediamtx"
+        run_update "$TEST_SCRATCH/broken/mediamtx" "$(mtx_version "$bin")"
+        [ "$status" -eq 7 ]
+        [[ "$output" == *"does not run"* ]]
+        ! kill -0 "$running_pid" 2>/dev/null || false
+        # the real binary is back, byte for byte, and runs
+        cmp "$bin" "$MEDIAMTX_PREFIX/bin/mediamtx"
+        mtx_start "$MEDIAMTX_PREFIX/bin/mediamtx" "$MEDIAMTX_CONFIG_DIR/mediamtx.yml"
+        mtx_stop
+    done
+}

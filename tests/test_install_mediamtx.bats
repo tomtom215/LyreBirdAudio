@@ -6,6 +6,7 @@
 # Setup - source the installer script
 load bats_shell_state
 load process_decoys
+load installer_fixture
 
 setup() {
     # Get the directory of this test file
@@ -1681,4 +1682,284 @@ unit_value() {
     [ "$status" -eq 10 ]
     MEDIAMTX_UNIT_TEMPLATE="$DECOY_DIR/nonexistent.service" PREAMBLE='SKIP_SERVICE=true; check_service_inputs' run_strict true
     [ "$status" -eq 0 ]
+}
+
+# ============================================================================
+# update: the verified download path, and a MediaMTX nobody supervises
+# [N-1, supply chain: MediaMTX's own --upgrade]
+#
+# Without a pinned version `update` ran the installed MediaMTX's own
+# `--upgrade`. Upstream (internal/upgrade/upgrade.go, v1.21.3) downloads the
+# newest v1.x tag's tarball with http.Get and replaces the executable through
+# selfupdate.Apply with empty options: no checksum, no signature, whatever
+# --force says; only afterwards did the installer compare the version it
+# printed. `update` now always takes the path `install` takes: the tarball is
+# verified against the release's checksums.sha256 (a mismatch is fatal), then
+# installed atomically, with the previous binary restored on failure.
+# The release comes from a local stand-in (tests/installer_fixture.bash); the
+# download, checksum, extraction and replacement code is the installer's own.
+# ============================================================================
+
+# A release (default v9.9.9) whose binary is a fake MediaMTX that runs ("good"),
+# one whose --version fails ("broken"), or a good one with a wrong published
+# checksum ("bad-checksum"); sets FIXTURE_DIR and NEW_BINARY
+#   update_fixture [good|broken|bad-checksum] [VERSION]
+update_fixture() {
+    local kind="${1:-good}" version="${2:-v9.9.9}" mode=""
+    export FIXTURE_DIR="$DECOY_DIR/release"
+    NEW_BINARY="$DECOY_DIR/new/mediamtx"
+    mkdir -p "$DECOY_DIR/new"
+    if [[ "$kind" == broken ]]; then
+        printf '#!/bin/bash\necho "cannot execute binary file" >&2\nexit 126\n' >"$NEW_BINARY"
+        chmod +x "$NEW_BINARY"
+    else
+        fake_mediamtx "$NEW_BINARY" "$version"
+    fi
+    if [[ "$kind" == bad-checksum ]]; then
+        mode=bad-checksum
+    fi
+    installer_release_fixture "$FIXTURE_DIR" "$version" "$NEW_BINARY" "$mode"
+}
+
+# The installer's process code for an update from the fixture (see update_fixture)
+update_preamble() {
+    installer_fixture_preamble
+    printf '%s\n' "$@"
+}
+
+@test "update in manual mode ends successfully with the new binary in place, MediaMTX stopped, and says how to start it, instead of rolling back [N-1]" {
+    installer_env
+    fleet_up
+    update_fixture good
+    local config_before
+    config_before="$(sha256sum <"$CONFIG_DIR/mediamtx.yml")"
+    PREAMBLE="$(update_preamble)" run_strict update_mediamtx
+    [ "$status" -eq 0 ] || {
+        echo "$output"
+        false
+    }
+    # the new binary is the one in the release, and MediaMTX is stopped (the installer stopped it)
+    cmp "$NEW_BINARY" "$INSTALL_DIR/mediamtx"
+    decoy_dead M
+    assert_decoys_alive A B C D
+    assert_signals_only_to_managed
+    # the operator is told, with the command, and nothing was rolled back
+    [[ "$output" == *"MediaMTX is NOT running"* ]]
+    [[ "$output" == *"Start MediaMTX again"* ]]
+    [[ "$output" == *"  $INSTALL_DIR/mediamtx $CONFIG_DIR/mediamtx.yml"* ]]
+    [[ "$output" != *"did not come back up"* && "$output" != *"rollback"* && "$output" != *"Restoring binary"* ]]
+    # the previous binary was kept as a backup; the configuration was not touched
+    [ -n "$(compgen -G "$INSTALL_DIR/mediamtx.backup.*" || true)" ]
+    [ "$(sha256sum <"$CONFIG_DIR/mediamtx.yml")" = "$config_before" ]
+    [ "$(ls -A "$CONFIG_DIR" | tr '\n' ' ')" = "mediamtx.yml mediamtx.yml.bak " ]
+    # nothing was started by the installer: it does not own this process
+    ! grep -q '^systemctl start' "$SYSTEMCTL_LOG" || false
+}
+
+@test "update rolls back, restoring the previous binary, when the new binary does not run: with MediaMTX stopped by hand, and with nothing running [N-1]" {
+    installer_env
+    fleet_up
+    update_fixture broken
+    local before
+    before="$(sha256sum <"$INSTALL_DIR/mediamtx")"
+    PREAMBLE="$(update_preamble)" run_strict update_mediamtx
+    [ "$status" -eq 7 ]
+    [[ "$output" == *"does not run"* ]]
+    [ "$(sha256sum <"$INSTALL_DIR/mediamtx")" = "$before" ]
+    [[ "$output" == *"Restoring binary backup"* ]]
+    # nothing was running: a binary that cannot run is not left installed (the old code left it)
+    decoy_teardown
+    installer_env
+    update_fixture broken
+    printf '#!/bin/bash\necho v1.20.0\n' >"$INSTALL_DIR/mediamtx"
+    chmod +x "$INSTALL_DIR/mediamtx"
+    before="$(sha256sum <"$INSTALL_DIR/mediamtx")"
+    PREAMBLE="$(update_preamble)" run_strict update_mediamtx
+    [ "$status" -eq 7 ]
+    [[ "$output" == *"does not run"* ]]
+    [ "$(sha256sum <"$INSTALL_DIR/mediamtx")" = "$before" ]
+}
+
+@test "update with a wrong published checksum is fatal, exit 6, and leaves the previous binary installed; --force does not accept a mismatch [supply chain]" {
+    installer_env
+    printf '#!/bin/bash\necho v1.20.0\n' >"$INSTALL_DIR/mediamtx"
+    chmod +x "$INSTALL_DIR/mediamtx"
+    update_fixture bad-checksum
+    local before
+    before="$(sha256sum <"$INSTALL_DIR/mediamtx")"
+    PREAMBLE="$(update_preamble)" run_strict update_mediamtx
+    [ "$status" -eq 6 ]
+    [[ "$output" == *"Checksum mismatch"* ]]
+    [ "$(sha256sum <"$INSTALL_DIR/mediamtx")" = "$before" ]
+    PREAMBLE="$(update_preamble 'FORCE_MODE=true')" run_strict update_mediamtx
+    [ "$status" -eq 6 ]
+    [[ "$output" == *"Checksum mismatch"* ]]
+    [ "$(sha256sum <"$INSTALL_DIR/mediamtx")" = "$before" ]
+}
+
+@test "update never runs the installed MediaMTX's own --upgrade: the binary that ends up installed is the one from the verified tarball [supply chain]" {
+    installer_env
+    update_fixture good
+    # An old MediaMTX that has --upgrade. Its --upgrade does what upstream's does: it replaces
+    # the executable with whatever it fetched, with no checksum check (here a different file that
+    # also reports v9.9.9, so that a version comparison afterwards would be satisfied).
+    export CALLS_LOG="$DECOY_DIR/calls.log"
+    export TAMPERED="$DECOY_DIR/tampered"
+    printf '#!/bin/bash\n# not the release\necho v9.9.9\n' >"$TAMPERED"
+    chmod +x "$TAMPERED"
+    cat >"$INSTALL_DIR/mediamtx" <<'OLD'
+#!/bin/bash
+echo "$*" >>"$CALLS_LOG"
+case "${1:-}" in
+    --version) echo v1.20.0 ;;
+    --upgrade) cp "$TAMPERED" "$0" && echo "MediaMTX upgraded successfully" ;;
+esac
+exit 0
+OLD
+    chmod +x "$INSTALL_DIR/mediamtx"
+    PREAMBLE="$(update_preamble)" run_strict update_mediamtx
+    [ "$status" -eq 0 ] || {
+        echo "$output"
+        false
+    }
+    ! grep -qx -- '--upgrade' "$CALLS_LOG" || {
+        echo "the installed MediaMTX was asked to upgrade itself"
+        false
+    }
+    cmp "$NEW_BINARY" "$INSTALL_DIR/mediamtx"
+    # the same with a pinned version: the verified path, as before
+    : >"$CALLS_LOG"
+    cat >"$INSTALL_DIR/mediamtx" <<'OLD'
+#!/bin/bash
+echo "$*" >>"$CALLS_LOG"
+case "${1:-}" in
+    --version) echo v1.20.0 ;;
+    --upgrade) cp "$TAMPERED" "$0" ;;
+esac
+exit 0
+OLD
+    PREAMBLE="$(update_preamble 'TARGET_VERSION=v9.9.9')" run_strict update_mediamtx
+    [ "$status" -eq 0 ]
+    cmp "$NEW_BINARY" "$INSTALL_DIR/mediamtx"
+    ! grep -qx -- '--upgrade' "$CALLS_LOG" || false
+}
+
+@test "update in service modes still verifies that the service came back: success when it is active, rollback with the previous binary when it is not [N-1, unchanged verification]" {
+    installer_env
+    update_fixture good
+    local mode unit
+    for mode in systemd stream-manager-service; do
+        unit=mediamtx
+        [[ "$mode" == stream-manager-service ]] && unit=mediamtx-audio
+        # the running unit: update stops it, installs, starts it, verifies it is active
+        printf '#!/bin/bash\necho v1.20.0\n' >"$INSTALL_DIR/mediamtx"
+        chmod +x "$INSTALL_DIR/mediamtx"
+        rm -f "$SHIM_STATE"/active.* "$SHIM_STATE"/fail.*
+        decoy_unit_active "$unit"
+        : >"$SYSTEMCTL_LOG"
+        PREAMBLE="$(update_preamble 'sleep() { :; }')" run_strict update_mediamtx
+        [ "$status" -eq 0 ] || {
+            echo "$mode: $output"
+            false
+        }
+        cmp "$NEW_BINARY" "$INSTALL_DIR/mediamtx"
+        grep -qx "systemctl stop $unit" "$SYSTEMCTL_LOG"
+        grep -qx "systemctl start $unit" "$SYSTEMCTL_LOG"
+        [[ "$output" != *"NOT running"* ]]
+        # the unit does not come back: fatal, the previous binary is restored and a restart is tried again
+        printf '#!/bin/bash\necho v1.20.0\n' >"$INSTALL_DIR/mediamtx"
+        chmod +x "$INSTALL_DIR/mediamtx"
+        local before
+        before="$(sha256sum <"$INSTALL_DIR/mediamtx")"
+        rm -f "$SHIM_STATE"/active.* "$SHIM_STATE"/fail.*
+        decoy_unit_active "$unit"
+        decoy_fail start
+        : >"$SYSTEMCTL_LOG"
+        PREAMBLE="$(update_preamble 'sleep() { :; }')" run_strict update_mediamtx
+        [ "$status" -eq 7 ] || {
+            echo "$mode: status $status: $output"
+            false
+        }
+        [[ "$output" == *"did not come back up after the update"* ]]
+        [ "$(sha256sum <"$INSTALL_DIR/mediamtx")" = "$before" ]
+        [ "$(grep -cx "systemctl start $unit" "$SYSTEMCTL_LOG")" -eq 2 ]
+    done
+}
+
+@test "update in stream-manager mode still verifies by identity that MediaMTX came back, and rolls back when it did not [N-1, unchanged verification]" {
+    installer_env
+    fleet_up
+    stub_stream_manager
+    echo "$(decoy_pid M)" >"$MEDIAMTX_PID_FILE"
+    update_fixture good
+    # the stand-in manager's start does not start MediaMTX: the update must not report success
+    PREAMBLE="$(update_preamble 'find_stream_manager() { echo "$STUB_MANAGER"; }' 'sleep() { :; }')" run_strict update_mediamtx
+    [ "$status" -eq 7 ]
+    grep -qx "manager stop" "$MANAGER_LOG"
+    grep -qx "manager start" "$MANAGER_LOG"
+    [[ "$output" == *"did not come back up after the update"* ]]
+    assert_decoys_alive A B C D
+}
+
+@test "the help says update is a verified download with rollback and does not claim a built-in upgrade [supply chain]" {
+    run show_help
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"checksums.sha256"* ]]
+    [[ "$output" == *"NOT started"* ]]
+    [[ "$output" != *"uses built-in --upgrade"* && "$output" != *"built-in upgrade support"* ]]
+}
+
+@test "update says so when it crosses MediaMTX 1.19 with a generated configuration that cannot switch MoQ off, and stays quiet when there is nothing to say [LB-06 installer]" {
+    installer_env
+    local moq_warning="starts a MoQ server"
+    # a configuration the installer generated for MediaMTX 1.18, which rejects the moq key
+    fake_mediamtx "$INSTALL_DIR/mediamtx" v1.18.0
+    run_strict create_config
+    [ "$status" -eq 0 ]
+    ! grep -q '^moq:' "$CONFIG_DIR/mediamtx.yml" || false
+    cp "$CONFIG_DIR/mediamtx.yml" "$DECOY_DIR/generated.yml"
+    # updated to 1.21.3: MediaMTX would now start a MoQ listener on every interface
+    update_fixture good v1.21.3
+    PREAMBLE="$(update_preamble)" run_strict update_mediamtx
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"$moq_warning"* && "$output" == *"$CONFIG_DIR/mediamtx.yml"* && "$output" == *"moq: no"* ]]
+    # it only says so: the configuration is not rewritten by an update
+    cmp "$DECOY_DIR/generated.yml" "$CONFIG_DIR/mediamtx.yml"
+    [ "$(ls -A "$CONFIG_DIR")" = "mediamtx.yml" ]
+    # quiet: the file already switches MoQ off (generated for a version that has the key)
+    fake_mediamtx "$INSTALL_DIR/mediamtx" v1.21.3
+    rm -f "$CONFIG_DIR/mediamtx.yml"
+    run_strict create_config
+    grep -qxF 'moq: no' "$CONFIG_DIR/mediamtx.yml"
+    # (the installed binary is older than the release, or update would stop at "already at version")
+    fake_mediamtx "$INSTALL_DIR/mediamtx" v1.21.2
+    PREAMBLE="$(update_preamble)" run_strict update_mediamtx
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"Updated to version: v1.21.3"* && "$output" != *"$moq_warning"* ]]
+    # quiet: the new version has no MoQ
+    fake_mediamtx "$INSTALL_DIR/mediamtx" v1.18.0
+    cp "$DECOY_DIR/generated.yml" "$CONFIG_DIR/mediamtx.yml"
+    update_fixture good v1.18.2
+    PREAMBLE="$(update_preamble)" run_strict update_mediamtx
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"Updated to version: v1.18.2"* && "$output" != *"$moq_warning"* ]]
+    # quiet: the file is the operator's (no marker), or there is none
+    fake_mediamtx "$INSTALL_DIR/mediamtx" v1.18.0
+    update_fixture good v1.21.3
+    sed 1d "$DECOY_DIR/generated.yml" >"$CONFIG_DIR/mediamtx.yml"
+    PREAMBLE="$(update_preamble)" run_strict update_mediamtx
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"Updated to version: v1.21.3"* && "$output" != *"$moq_warning"* ]]
+    fake_mediamtx "$INSTALL_DIR/mediamtx" v1.18.0
+    rm -f "$CONFIG_DIR/mediamtx.yml"
+    PREAMBLE="$(update_preamble)" run_strict update_mediamtx
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"Updated to version: v1.21.3"* && "$output" != *"$moq_warning"* ]]
+    # quiet: the stream manager renders the file again at every start, with the binary's version
+    fake_mediamtx "$INSTALL_DIR/mediamtx" v1.18.0
+    cp "$DECOY_DIR/generated.yml" "$CONFIG_DIR/mediamtx.yml"
+    decoy_unit_active mediamtx-audio
+    PREAMBLE="$(update_preamble 'sleep() { :; }')" run_strict update_mediamtx
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"Updated to version: v1.21.3"* && "$output" != *"$moq_warning"* ]]
 }

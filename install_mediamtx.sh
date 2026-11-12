@@ -147,9 +147,6 @@ RELEASE_VERSION=""
 PLATFORM_OS=""
 PLATFORM_ARCH=""
 
-# Minimum version for --upgrade support (MediaMTX added this in v1.15.0)
-readonly MIN_UPGRADE_VERSION="1.15.0"
-
 # ============================================================================
 # Utility Functions
 # ============================================================================
@@ -1641,6 +1638,26 @@ install_mediamtx() {
     show_post_install_guidance
 }
 
+# MediaMTX 1.19 and later start a MoQ server (8892 tcp+udp, 8893 udp, every
+# interface) unless the configuration says "moq: no", a key older versions
+# reject: the file generated for such a version cannot carry it. After an update
+# across 1.19 the generated file is therefore missing a line it now needs, and
+# this says so. (The stream manager renders its file again at every start, with the
+# version of the binary, so it is not concerned.)
+#   warn_if_moq_listens VERSION
+warn_if_moq_listens() {
+    local version="$1" config_file="${CONFIG_DIR}/${CONFIG_NAME}" parts="" major=0 minor=0
+    declare -F lyrebird_mediamtx_version_parts >/dev/null 2>&1 || return 0
+    [[ -f "${config_file}" ]] || return 0
+    config_is_managed "${config_file}" || return 0
+    parts=$(lyrebird_mediamtx_version_parts "${version}") || return 0
+    read -r major minor _ <<<"${parts}"
+    if ((major > 1 || (major == 1 && minor >= 19))) && ! grep -q '^moq:' "${config_file}"; then
+        log_warn "MediaMTX ${version} starts a MoQ server (8892 tcp and udp, 8893 udp) on every interface unless its configuration says 'moq: no', and ${config_file}, generated for an older MediaMTX, does not. Add the line 'moq: no' (after 'srt: no'); the file stays a generated one."
+    fi
+    return 0
+}
+
 update_mediamtx() {
     log_info "Updating MediaMTX..."
 
@@ -1684,59 +1701,37 @@ update_mediamtx() {
     cp "${INSTALL_DIR}/mediamtx" "${BINARY_BACKUP}"
     log_info "Current binary backed up to: ${BINARY_BACKUP}"
 
-    # Try MediaMTX's built-in `--upgrade` ONLY when the operator did not pin a
-    # specific version: `--upgrade` always jumps to MediaMTX's own idea of latest
-    # and ignores RELEASE_VERSION, so a pinned `update -V vX.Y.Z` would silently
-    # install a different (untested) release. A pinned target must go through the
-    # manual, checksum-verified, atomic path below.
-    local upgrade_success=false
-    if [[ -z "${TARGET_VERSION}" ]] && version_compare "${current_version}" "${MIN_UPGRADE_VERSION}"; then
-        log_info "Attempting built-in upgrade (--upgrade)..."
+    # The update goes through the same verified download as install: the release
+    # tarball, checked against the checksums.sha256 published with it (a mismatch is
+    # fatal even with --force), extracted, then installed atomically. MediaMTX's own
+    # `--upgrade` is not used: it downloads "the latest" tag over HTTPS and replaces
+    # the executable in place with no checksum or signature check (upstream
+    # internal/upgrade, selfupdate.Apply with empty Options), whatever --force or
+    # a pinned target says.
+    log_info "Downloading and verifying MediaMTX ${RELEASE_VERSION}..."
+    download_mediamtx "${RELEASE_VERSION}" "${PLATFORM_OS}" "${PLATFORM_ARCH}"
 
-        if "${INSTALL_DIR}/mediamtx" --upgrade 2>&1 | tee -a "${LOG_FILE}"; then
-            # Verify the upgrade reached the intended release (normalize leading v)
-            local new_version
-            if new_version=$("${INSTALL_DIR}/mediamtx" --version 2>&1 | grep -oE 'v?[0-9]+\.[0-9]+\.[0-9]+' | head -1); then
-                if [[ "${new_version#v}" == "${RELEASE_VERSION#v}" ]]; then
-                    upgrade_success=true
-                    log_info "Built-in upgrade completed successfully (${current_version} -> ${new_version})"
-                elif [[ "${new_version}" != "${current_version}" ]]; then
-                    log_warn "Built-in upgrade produced ${new_version} but expected ${RELEASE_VERSION}; falling back to manual update"
-                else
-                    log_warn "Built-in upgrade reported success but version unchanged; falling back to manual update"
-                fi
-            else
-                log_warn "Could not verify new version after upgrade; falling back to manual update"
-            fi
-        else
-            log_warn "Built-in upgrade failed, falling back to manual update"
-        fi
-    else
-        log_debug "Using manual update (pinned target, or version ${current_version} predates --upgrade support ${MIN_UPGRADE_VERSION}+)"
+    # Atomic binary replacement with cleanup on failure
+    local temp_binary="${INSTALL_DIR}/mediamtx.new.$$"
+    if ! install -m 755 "${TEMP_DIR}/mediamtx" "${temp_binary}"; then
+        fatal "Failed to prepare binary for update" 7
+    fi
+    if ! mv -f "${temp_binary}" "${INSTALL_DIR}/mediamtx"; then
+        rm -f "${temp_binary}"
+        fatal "Failed to atomically update binary" 7
     fi
 
-    # Manual update if upgrade failed or not supported
-    if [[ "${upgrade_success}" != "true" ]]; then
-        log_info "Performing manual update..."
-        download_mediamtx "${RELEASE_VERSION}" "${PLATFORM_OS}" "${PLATFORM_ARCH}"
-
-        # Atomic binary replacement with cleanup on failure
-        local temp_binary="${INSTALL_DIR}/mediamtx.new.$$"
-        if ! install -m 755 "${TEMP_DIR}/mediamtx" "${temp_binary}"; then
-            fatal "Failed to prepare binary for update" 7
-        fi
-        if ! mv -f "${temp_binary}" "${INSTALL_DIR}/mediamtx"; then
-            rm -f "${temp_binary}"
-            fatal "Failed to atomically update binary" 7
-        fi
-    fi
-
-    # Verify new version
-    if "${INSTALL_DIR}/mediamtx" --version &>/dev/null; then
-        local new_version
-        new_version=$("${INSTALL_DIR}/mediamtx" --version 2>&1 | grep -oE 'v?[0-9]+\.[0-9]+\.[0-9]+' | head -1) || new_version="unknown"
-        log_info "Updated to version: ${new_version}"
-    fi
+    # The new binary must run. Without this a binary that cannot even print its
+    # version would be left in place whenever nothing starts MediaMTX afterwards
+    # (a MediaMTX that nobody supervises); fatal here rolls back to the previous one.
+    local new_version=""
+    new_version=$(mediamtx_binary_version "${INSTALL_DIR}/mediamtx") \
+        || fatal "The new MediaMTX binary does not run (--version failed); rolling back to the previous binary" 7
+    log_info "Updated to version: ${new_version}"
+    case "${MANAGEMENT_MODE}" in
+        stream-manager | stream-manager-service) ;;
+        *) warn_if_moq_listens "${new_version}" ;;
+    esac
 
     # FIX 1.5: Clean up old backup files
     log_info "Cleaning up old backup files..."
@@ -1758,10 +1753,20 @@ update_mediamtx() {
     # binary fails to start, fatal-exit: the EXIT-trap rollback then restores the
     # previous binary AND restarts it, so the recorder stays on last-known-good
     # rather than reporting "updated successfully" while the server is down.
+    # A MediaMTX that nobody supervises (started by hand) is the exception: the
+    # installer stopped it and has no way to start it, so it cannot verify a start
+    # that is not its to make. Waiting for one only ended every such update in a
+    # rollback; the operator is told instead.
     if [[ "${WAS_RUNNING}" == "true" ]]; then
-        start_mediamtx "${MANAGEMENT_MODE}"
-        if ! verify_service_started "${MANAGEMENT_MODE}"; then
-            fatal "MediaMTX did not come back up after the update; rolling back to the previous binary" 7
+        if [[ "${MANAGEMENT_MODE}" == "manual" ]]; then
+            log_warn "MediaMTX is NOT running: it was running outside systemd and the stream manager, so the installer stopped it and cannot start it again."
+            log_warn "The new binary (${new_version}) is installed. Start MediaMTX again the way you started it before, for example:"
+            log_warn "  ${INSTALL_DIR}/mediamtx ${CONFIG_DIR}/${CONFIG_NAME}"
+        else
+            start_mediamtx "${MANAGEMENT_MODE}"
+            if ! verify_service_started "${MANAGEMENT_MODE}"; then
+                fatal "MediaMTX did not come back up after the update; rolling back to the previous binary" 7
+            fi
         fi
     fi
 
@@ -1974,7 +1979,7 @@ start_mediamtx() {
             ;;
 
         manual | *)
-            log_info "Please manually restart MediaMTX"
+            log_info "Please manually restart MediaMTX: ${INSTALL_DIR}/mediamtx ${CONFIG_DIR}/${CONFIG_NAME}"
             ;;
     esac
 }
@@ -2290,14 +2295,14 @@ show_help() {
     cat <<EOF
 ${BOLD}MediaMTX Installation Manager v${SCRIPT_VERSION}${NC}
 
-Production-ready installer for MediaMTX with built-in upgrade support.
+Production-ready installer for MediaMTX: checksum-verified downloads, backup and rollback.
 
 ${BOLD}USAGE:${NC}
     ${SCRIPT_NAME} [OPTIONS] COMMAND
 
 ${BOLD}COMMANDS:${NC}
     install     Install MediaMTX
-    update      Update to latest version (uses built-in --upgrade when available)
+    update      Update to the latest (or the -V) version: verified download, atomic replace, rollback
     uninstall   Remove MediaMTX
     status      Show installation status
     verify      Verify installation integrity
@@ -2321,7 +2326,7 @@ ${BOLD}EXAMPLES:${NC}
     # Install latest version
     sudo ${SCRIPT_NAME} install
 
-    # Update using built-in upgrade (MediaMTX v${MIN_UPGRADE_VERSION}+)
+    # Update to the latest version (checksum-verified)
     sudo ${SCRIPT_NAME} update
 
     # Install specific version
@@ -2354,9 +2359,16 @@ ${BOLD}ENVIRONMENT VARIABLES:${NC}
     MEDIAMTX_PID_FILE     PID file of the stream manager's MediaMTX (default /run/mediamtx-audio.pid)
 
 ${BOLD}UPDATE NOTES:${NC}
-    The update command uses MediaMTX's built-in --upgrade functionality
-    when available (v${MIN_UPGRADE_VERSION}+). This simplifies updates and ensures
-    platform compatibility. Falls back to manual update for older versions.
+    The update command downloads the release tarball and verifies it against the
+    checksums.sha256 published with the release (a mismatch is always fatal; --force
+    only skips the check when no checksum is available), stops MediaMTX through its
+    owner (systemd, the stream manager), installs the new binary atomically and
+    starts MediaMTX again. If the new binary does not run, or the service does not
+    come back up, the previous binary is restored. MediaMTX's own --upgrade is not
+    used: it replaces the executable without any checksum check.
+    A MediaMTX that nobody supervises (started by hand) is stopped and NOT started
+    again, since the installer cannot start a process it does not own: it prints the
+    command to start it and exits 0.
 
 ${BOLD}GITHUB:${NC}
     https://github.com/${DEFAULT_GITHUB_REPO}
