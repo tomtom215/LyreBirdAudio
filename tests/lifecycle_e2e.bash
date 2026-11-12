@@ -104,6 +104,9 @@ export STREAM_MANAGER_LOG_FILE="$WORK/sm.log"
 export MEDIAMTX_RESTART_MARKER="$WORK/restart.marker" MEDIAMTX_CLEANUP_MARKER="$WORK/cleanup.marker"
 export STREAM_STARTUP_DELAY=0 STREAM_VALIDATION_DELAY=1 STREAM_VALIDATION_ATTEMPTS=5
 export USB_STABILIZATION_DELAY=1 RESTART_STABILIZATION_DELAY=1 MEDIAMTX_API_TIMEOUT=30
+# The status file and the desired-state marker go into the scratch directory (the
+# default /run/lyrebird is the host's: /run is not private to this namespace)
+export LYREBIRD_STATE_DIR="$WORK/state" LYREBIRD_FLOW_SAMPLE_SECONDS=1
 export PROJECT_ROOT WORK DEVICES="mic1:31 mic2:32"
 # MEDIAMTX_HOST stays "localhost", as on a node
 

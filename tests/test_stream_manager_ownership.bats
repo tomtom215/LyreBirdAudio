@@ -107,13 +107,19 @@ run_mgr_real() {
     run bash -c 'source "$PROJECT_ROOT/lyrebird-stream-manager.sh"; eval "$PREAMBLE"; "$@"' _ "$@"
 }
 
-# Hardware seams (devices come from $DEVICES, "name:card name:card ...")
+# Hardware seams (devices come from $DEVICES, "name:card name:card ..."). start
+# reports what is publishing (LB-03, D4); these tests are about process
+# ownership, not about streams, so the control nodes exist and the MediaMTX API
+# seam says every stream is published (tests/test_stream_outcome.bats and
+# test_stream_status.bats test the outcome against real wrappers).
 use_seams() {
     PREAMBLE='
 detect_audio_devices() { printf "%s\n" ${DEVICES:-}; }
 wait_for_usb_stabilization() { echo "stabilize $*" >>"$SEAM_LOG"; return 0; }
 check_audio_device() { return 0; }
 validate_stream() { return 0; }
+device_node_exists() { return 0; }
+mediamtx_path_info() { printf "{\"ready\":true,\"bytesReceived\":1}"; }
 '
     export DEVICES="${DEVICES:-mic1:31}"
 }

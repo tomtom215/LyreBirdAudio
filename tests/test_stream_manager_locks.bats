@@ -798,12 +798,17 @@ STUB_EOF
 
 # Hardware-only seams: no USB device and no stream publishing. Everything else
 # (the lock, the config generation, the launch itself) is the real function.
+# start now reports what is publishing (LB-03, D4): these tests are about the
+# lock descriptors, not about streams, so the MediaMTX API seam says the stream
+# is published.
 _SEAMS='
 detect_audio_devices() { echo "testmic:1"; }
 wait_for_usb_stabilization() { return 0; }
 start_all_ffmpeg_streams() { :; }
 validate_stream() { return 0; }
 check_audio_device() { return 0; }
+device_node_exists() { return 0; }
+mediamtx_path_info() { printf "{\"ready\":true,\"bytesReceived\":1}"; }
 '
 
 # The generated wrapper looks for the card's capture device node, which a machine

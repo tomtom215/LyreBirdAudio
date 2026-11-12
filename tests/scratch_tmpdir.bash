@@ -14,6 +14,10 @@ scratch_setup() {
     _SCRATCH_HAD_TMPDIR="${TMPDIR+set}"
     TEST_SCRATCH="$(mktemp -d)"
     export TMPDIR="$TEST_SCRATCH"
+    # The stream manager records its status and desired state under /run/lyrebird
+    # by default; a test that runs its start/stop/monitor paths must not touch
+    # the host's (a test that sets its own location overrides this)
+    export LYREBIRD_STATE_DIR="$TEST_SCRATCH/lyrebird-state"
 }
 
 scratch_teardown() {
