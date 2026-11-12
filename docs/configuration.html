@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Configuration - LyreBirdAudio Docs</title>
-  <meta name="description" content="Configure audio devices, codecs, sample rates, and MediaMTX integration.">
+  <meta name="description" content="Device settings, environment variables, MediaMTX configuration ownership and ports.">
   <link rel="stylesheet" href="css/style.css">
 </head>
 <body>
@@ -19,7 +19,7 @@
     <div class="page-header">
       <span class="page-label">User Guide</span>
       <h1 class="page-title">Configuration</h1>
-      <p class="page-subtitle">Customize audio quality, device settings, environment variables, and MediaMTX integration.</p>
+      <p class="page-subtitle">Per-device audio settings, environment variables, and how LyreBirdAudio and MediaMTX share the MediaMTX configuration file.</p>
     </div>
 
     <div class="toc">
@@ -29,84 +29,95 @@
         <li><a href="#config-files">Configuration Files</a></li>
         <li><a href="#env-vars">Environment Variables</a></li>
         <li><a href="#mediamtx">MediaMTX Integration</a></li>
+        <li><a href="#mediamtx-config">Who Owns mediamtx.yml</a></li>
         <li><a href="#quality-tiers">Quality Tiers</a></li>
       </ul>
     </div>
 
     <h2 id="audio-config">Audio Device Configuration</h2>
     <p>
-      Device-specific audio settings live in <code>/etc/mediamtx/audio-devices.conf</code>.
-      This file uses a simple <code>KEY=VALUE</code> format (bash environment variables) that
-      the stream manager reads at startup.
+      Per-device audio settings live in <code>/etc/mediamtx/audio-devices.conf</code>. The stream manager reads it as
+      data: one <code>DEVICE_&lt;NAME&gt;_&lt;SETTING&gt;=value</code> assignment per line, never executed. A line it cannot
+      use is skipped and reported (file, line, key, what was expected), and that setting keeps its default; a bad line never
+      stops a stream from starting.
     </p>
 
-    <h3>Auto-Generate Configuration (Recommended)</h3>
-    <p>The <code>lyrebird-mic-check.sh</code> script detects your hardware capabilities and writes an optimal configuration:</p>
-    <pre><code># Generate with normal quality (recommended default)
+    <h3>Auto-Generate Configuration</h3>
+    <p>The <code>lyrebird-mic-check.sh</code> script reads each card's capabilities from <code>/proc/asound</code> and writes the file. The stream manager does not run it for you.</p>
+    <pre><code># Generate with normal quality (the default tier)
 sudo ./lyrebird-mic-check.sh -g
 
-# Generate with high quality (more bandwidth)
+# High or low quality
 sudo ./lyrebird-mic-check.sh -g --quality=high
-
-# Generate with low quality (speech / bandwidth-constrained)
 sudo ./lyrebird-mic-check.sh -g --quality=low
 
-# Preview what would be generated without writing (dry-run)
-./lyrebird-mic-check.sh -g --dry-run</code></pre>
+# Without -g it only lists devices and capabilities
+./lyrebird-mic-check.sh</code></pre>
+    <p>An existing file is backed up first as <code>audio-devices.conf.backup.&lt;YYYYmmdd_HHMMSS&gt;</code>; <code>--list-backups</code> and <code>--restore</code> work with those copies.</p>
 
     <h3>Manual Configuration Format</h3>
-    <p>Settings use a <code>DEVICE_&lt;NAME&gt;_&lt;PARAMETER&gt;=value</code> pattern. Device names are sanitized
-    (special characters → underscores, uppercased).</p>
-    <pre><code># /etc/mediamtx/audio-devices.conf
+    <p>
+      <code>&lt;NAME&gt;</code> is the stream's friendly name (the ALSA card id given by the USB mapper, which is also the RTSP path)
+      or the full device name from <code>/dev/snd/by-id</code>, upper-cased, with every other character replaced by <code>_</code>.
+      A value is bare, <code>'single-quoted'</code> or <code>"double-quoted"</code>, and is taken literally: <code>$</code>, backticks and
+      backslashes are not interpreted. No spaces around <code>=</code>; a <code>#</code> comment may follow the value.
+    </p>
+    <pre id="example-audio-devices-conf"><code># /etc/mediamtx/audio-devices.conf
 
-# ── Device-specific settings (by friendly name) ──────────────────
-DEVICE_USB_MICROPHONE_SAMPLE_RATE=48000
-DEVICE_USB_MICROPHONE_CHANNELS=2
-DEVICE_USB_MICROPHONE_BITRATE=192k
-DEVICE_USB_MICROPHONE_CODEC=opus
+# By friendly name (the card id from usb-audio-mapper.sh; this is also the stream path)
+DEVICE_MIC_LEFT_SAMPLE_RATE=48000
+DEVICE_MIC_LEFT_CHANNELS=2
+DEVICE_MIC_LEFT_BITRATE=192k
+DEVICE_MIC_LEFT_CODEC=opus
 
-# ── Device-specific settings (by full device ID, guaranteed unique) ──
-DEVICE_USB_MANUFACTURER_MODEL_SERIAL_00000000_SAMPLE_RATE=48000
-DEVICE_USB_MANUFACTURER_MODEL_SERIAL_00000000_CHANNELS=2
-DEVICE_USB_MANUFACTURER_MODEL_SERIAL_00000000_BITRATE=128k
+# By full device name (usb-Blue_Microphones_Yeti-00 becomes USB_BLUE_MICROPHONES_YETI_00)
+DEVICE_USB_BLUE_MICROPHONES_YETI_00_SAMPLE_RATE=44100
+DEVICE_USB_BLUE_MICROPHONES_YETI_00_CHANNELS=1
+DEVICE_USB_BLUE_MICROPHONES_YETI_00_THREAD_QUEUE=16384
 
-# ── Fallback defaults ─────────────────────────────────────────────
-DEFAULT_SAMPLE_RATE=48000
-DEFAULT_CHANNELS=2
-DEFAULT_BITRATE=128k
-DEFAULT_CODEC=opus
-DEFAULT_THREAD_QUEUE=8192</code></pre>
+# A card whose capture device is not PCM 0
+DEVICE_MIC_RIGHT_PCM=1</code></pre>
 
     <div class="callout info">
       <span class="callout-icon">ℹ️</span>
       <div class="callout-body">
         <strong>Lookup Priority</strong>
-        <p>The stream manager tries settings in this order: (1) friendly name config, (2) full device ID config, (3) defaults. This lets you set one value for a device regardless of which USB port it's plugged into.</p>
+        <p>For each setting the stream manager uses (1) the friendly-name key, then (2) the full-device-name key, then (3) the built-in default. The built-in defaults come from the <code>DEFAULT_*</code> environment variables below. A <code>DEFAULT_*=</code> line in this file is reported as a problem and ignored.</p>
       </div>
     </div>
 
-    <h3>Available Parameters</h3>
+    <h3>Available Settings</h3>
     <div class="table-wrapper">
       <table>
-        <thead><tr><th>Parameter</th><th>Values</th><th>Default</th><th>Description</th></tr></thead>
+        <thead><tr><th>Setting</th><th>Accepted values</th><th>Default</th><th>Description</th></tr></thead>
         <tbody>
-          <tr><td><code>SAMPLE_RATE</code></td><td>16000, 44100, 48000, 96000</td><td>48000</td><td>Audio sample rate in Hz</td></tr>
-          <tr><td><code>CHANNELS</code></td><td>1 (mono), 2 (stereo)</td><td>2</td><td>Number of audio channels</td></tr>
-          <tr><td><code>BITRATE</code></td><td>64k, 96k, 128k, 192k, 256k</td><td>128k</td><td>Encoder bitrate</td></tr>
-          <tr><td><code>CODEC</code></td><td>opus, aac, mp3, pcm</td><td>opus</td><td>Audio codec</td></tr>
-          <tr><td><code>THREAD_QUEUE</code></td><td>Integer (power of 2)</td><td>8192</td><td>FFmpeg thread queue size (buffer)</td></tr>
-          <tr><td><code>ANALYZEDURATION</code></td><td>Integer (microseconds)</td><td>5000000</td><td>FFmpeg input analysis duration</td></tr>
-          <tr><td><code>PROBESIZE</code></td><td>Integer (bytes)</td><td>5000000</td><td>FFmpeg input probe size</td></tr>
+          <tr><td><code>SAMPLE_RATE</code></td><td>8000, 11025, 12000, 16000, 22050, 24000, 32000, 44100, 48000, 88200, 96000, 176400, 192000, 352800, 384000, 705600, 768000</td><td><code>48000</code></td><td>Sample rate in Hz. The sound card's own limits are not checked here</td></tr>
+          <tr><td><code>CHANNELS</code></td><td>1 to 32</td><td><code>2</code></td><td>Channel count. A count the codec cannot encode (for example 4 with <code>opus</code>) stops that stream with an error that names the setting</td></tr>
+          <tr><td><code>BITRATE</code></td><td><code>1k</code> to <code>9999k</code></td><td><code>128k</code></td><td>Encoder bitrate; the <code>k</code> is required</td></tr>
+          <tr><td><code>CODEC</code></td><td><code>opus</code>, <code>aac</code>, <code>mp3</code></td><td><code>opus</code></td><td>Audio codec. <code>pcm</code> is not accepted</td></tr>
+          <tr><td><code>THREAD_QUEUE</code></td><td>1 to 1048576</td><td><code>8192</code></td><td>FFmpeg thread queue size</td></tr>
+          <tr><td><code>PCM</code></td><td>0 to 255</td><td>the card's first capture PCM</td><td>Which capture PCM of the card to read, for cards whose capture device is not PCM 0</td></tr>
         </tbody>
       </table>
     </div>
+    <p>
+      FFmpeg's input analysis settings are not per-device: <code>DEFAULT_ANALYZEDURATION</code> and
+      <code>DEFAULT_PROBESIZE</code> (both <code>5000000</code>) are environment variables only.
+    </p>
 
     <h3>Validate Configuration</h3>
-    <pre><code># Check configuration against detected hardware capabilities
+    <pre><code># Check the file with the stream manager's own parser (no root needed; exit 0, or 4 for a bad line)
+./lyrebird-stream-manager.sh validate
+
+# Check the settings against what each card reports
 sudo ./lyrebird-mic-check.sh -V
 
-# Also validates MediaMTX config
-/usr/local/bin/mediamtx --check /etc/mediamtx/mediamtx.yml</code></pre>
+# Check the MediaMTX configuration (MediaMTX 1.21.1 or later; older releases have no such flag)
+/usr/local/bin/mediamtx --validate-conf=/etc/mediamtx/mediamtx.yml</code></pre>
+    <p>
+      MediaMTX has no <code>--check</code> flag. Where the installed MediaMTX has <code>--validate-conf</code>, both the
+      installer and the stream manager validate a configuration with it before they replace a file.
+    </p>
 
     <h2 id="config-files">Configuration Files</h2>
     <div class="table-wrapper">
@@ -116,32 +127,47 @@ sudo ./lyrebird-mic-check.sh -V
           <tr>
             <td><code>/etc/mediamtx/mediamtx.yml</code></td>
             <td>YAML</td>
-            <td>MediaMTX main configuration (ports, protocols, auth)</td>
+            <td>MediaMTX configuration; generated by LyreBirdAudio or yours (see <a href="#mediamtx-config">Who Owns mediamtx.yml</a>)</td>
           </tr>
           <tr>
             <td><code>/etc/mediamtx/audio-devices.conf</code></td>
-            <td>Bash env vars</td>
-            <td>Per-device audio codec and quality settings</td>
+            <td><code>KEY=value</code> lines</td>
+            <td>Per-device audio settings (read as data)</td>
+          </tr>
+          <tr>
+            <td><code>/etc/mediamtx/rtsp-users.conf</code></td>
+            <td><code>user:sha256:&lt;base64&gt;</code> lines</td>
+            <td>Read-only RTSP users, only with <code>RTSP_AUTH_MODE=local-only-publish</code></td>
           </tr>
           <tr>
             <td><code>/etc/udev/rules.d/99-usb-soundcards.rules</code></td>
             <td>udev</td>
-            <td>USB device persistence rules (persistent symlinks)</td>
-          </tr>
-          <tr>
-            <td><code>/etc/systemd/system/mediamtx.service</code></td>
-            <td>systemd unit</td>
-            <td>MediaMTX server service definition</td>
+            <td>Persistent USB sound-card names, written by the USB mapper</td>
           </tr>
           <tr>
             <td><code>/etc/systemd/system/mediamtx-audio.service</code></td>
             <td>systemd unit</td>
-            <td>Stream manager service with watchdog support</td>
+            <td>The stream manager's service (it owns MediaMTX and the FFmpeg streams). <code>Restart=always</code>; no watchdog. Written by <code>lyrebird-stream-manager.sh install</code></td>
+          </tr>
+          <tr>
+            <td><code>/etc/systemd/system/mediamtx.service</code></td>
+            <td>systemd unit</td>
+            <td>MediaMTX on its own, for installs without the stream manager. Written by <code>install_mediamtx.sh</code>. It conflicts with <code>mediamtx-audio.service</code>: only one of the two runs</td>
+          </tr>
+          <tr>
+            <td><code>/etc/cron.d/mediamtx-monitor</code></td>
+            <td>cron</td>
+            <td>Runs <code>monitor</code> every 5 minutes; written by <code>install</code></td>
           </tr>
           <tr>
             <td><code>/etc/lyrebird/alerts.conf</code></td>
-            <td>Bash env vars</td>
+            <td><code>KEY=value</code> lines</td>
             <td>Webhook alert configuration</td>
+          </tr>
+          <tr>
+            <td><code>/etc/lyrebird/storage.conf</code></td>
+            <td><code>KEY=value</code> lines</td>
+            <td>Storage retention settings (optional; see <a href="components.html#storage">Storage Management</a>)</td>
           </tr>
         </tbody>
       </table>
@@ -152,98 +178,203 @@ sudo ./lyrebird-mic-check.sh -V
       <table>
         <thead><tr><th>Path</th><th>Purpose</th></tr></thead>
         <tbody>
-          <tr><td><code>/run/mediamtx-audio.pid</code></td><td>Stream manager PID</td></tr>
-          <tr><td><code>/run/mediamtx-audio.lock</code></td><td>Concurrency lock file</td></tr>
-          <tr><td><code>/var/lib/mediamtx-ffmpeg/</code></td><td>Per-device FFmpeg PID files and wrapper scripts</td></tr>
-          <tr><td><code>/var/log/mediamtx.out</code></td><td>MediaMTX output log</td></tr>
-          <tr><td><code>/var/log/lyrebird-stream-manager.log</code></td><td>Stream manager log</td></tr>
-          <tr><td><code>/var/log/lyrebird/</code></td><td>Per-device FFmpeg logs</td></tr>
-          <tr><td><code>/var/log/lyrebird-orchestrator.log</code></td><td>Orchestrator log</td></tr>
-          <tr><td><code>/var/log/lyrebird-diagnostics.log</code></td><td>Diagnostics output</td></tr>
+          <tr><td><code>/run/mediamtx-audio.pid</code>, <code>.pid.id</code></td><td>PID of the MediaMTX this manager started, and its process start time (the record that proves the PID is still that process)</td></tr>
+          <tr><td><code>/run/mediamtx-audio.lock</code>, <code>/etc/mediamtx/.config.lock</code></td><td>Lock files. They are kernel <code>flock</code> locks and are never deleted: do not remove them. A failed lock message names the holder</td></tr>
+          <tr><td><code>/run/lyrebird/status.json</code></td><td>Per-stream outcome of the last command that changed or checked state (see <a href="monitoring.html#status-file">Monitoring</a>)</td></tr>
+          <tr><td><code>/run/lyrebird/desired-running</code></td><td>Present while the node is meant to be running (<code>start</code> writes it, <code>stop</code> removes it); lets the monitor bring a dead MediaMTX back</td></tr>
+          <tr><td><code>/run/lyrebird/cron-restarts/</code>, <code>deep-health/</code>, <code>silence/</code></td><td>Monitor state: restart budgets, not-ready strikes, silence episodes</td></tr>
+          <tr><td><code>/run/mediamtx-audio.heartbeat</code></td><td>Unix time of the last monitor run, nothing else</td></tr>
+          <tr><td><code>/var/lib/mediamtx-ffmpeg/</code></td><td>Per-stream wrapper scripts, PID files, and the FFmpeg logs (<code>&lt;stream&gt;.log</code>, <code>.log.prev.N</code>)</td></tr>
+          <tr><td><code>/var/log/mediamtx.out</code></td><td>MediaMTX output</td></tr>
+          <tr><td><code>/var/log/lyrebird-stream-manager.log</code></td><td>Stream manager log (also where the systemd unit appends its output)</td></tr>
+          <tr><td><code>/var/log/lyrebird-orchestrator.log</code>, <code>/var/log/lyrebird-diagnostics.log</code></td><td>Orchestrator and diagnostics logs</td></tr>
         </tbody>
       </table>
     </div>
 
     <h2 id="env-vars">Environment Variables</h2>
     <p>
-      All configuration can be overridden via environment variables. This is useful for custom
-      deployments, Docker-adjacent setups, or testing alternative values.
+      The stream manager reads these when it starts. Defaults are the values in the script. A variable you set in your shell
+      reaches a run you start by hand with <code>sudo env NAME=value ./lyrebird-stream-manager.sh ...</code>. It does not
+      reach the service or the monitor:
+    </p>
+    <ul>
+      <li><strong>Service:</strong> <code>sudo systemctl edit mediamtx-audio</code> and add <code>Environment="NAME=value"</code> lines. A drop-in survives <code>install</code>.</li>
+      <li><strong>Monitor:</strong> cron does not inherit the unit's environment. Add <code>NAME=value</code> lines above the job line of <code>/etc/cron.d/mediamtx-monitor</code>. <code>install</code> rewrites that file, so add them again afterwards.</li>
+    </ul>
+    <div class="callout warning">
+      <span class="callout-icon">⚠️</span>
+      <div class="callout-body">
+        <strong>Non-default ports must be set in both places</strong>
+        <p><code>install</code> passes the stream mode on (<code>STREAM_MODE</code>, <code>MULTIPLEX_FILTER_TYPE</code>, <code>MULTIPLEX_STREAM_NAME</code>) but not the port variables: the unit and the cron file it renders carry no port, even when you run <code>install</code> with one set. A monitor that restarts a stream without <code>MEDIAMTX_RTSP_PORT</code> in its environment publishes it to port 8554.</p>
+      </div>
+    </div>
+
+    <h3>Paths, Ports and MediaMTX</h3>
+    <div class="table-wrapper">
+      <table>
+        <thead><tr><th>Variable</th><th>Default</th><th>Meaning</th></tr></thead>
+        <tbody>
+          <tr><td><code>MEDIAMTX_BINARY</code></td><td><code>/usr/local/bin/mediamtx</code></td><td>MediaMTX executable</td></tr>
+          <tr><td><code>MEDIAMTX_CONFIG_DIR</code></td><td><code>/etc/mediamtx</code></td><td>Configuration directory</td></tr>
+          <tr><td><code>MEDIAMTX_CONFIG_FILE</code></td><td><code>/etc/mediamtx/mediamtx.yml</code></td><td>MediaMTX configuration file</td></tr>
+          <tr><td><code>MEDIAMTX_DEVICE_CONFIG</code></td><td><code>/etc/mediamtx/audio-devices.conf</code></td><td>Per-device settings file</td></tr>
+          <tr><td><code>STREAM_MANAGER_LOG_FILE</code></td><td><code>/var/log/lyrebird-stream-manager.log</code></td><td>The manager's own log</td></tr>
+          <tr><td><code>MEDIAMTX_LOG_FILE</code></td><td><code>/var/log/mediamtx.out</code></td><td>Where the MediaMTX process's output goes (it no longer also moves the manager's log)</td></tr>
+          <tr><td><code>MEDIAMTX_HOST</code></td><td><code>localhost</code></td><td>Host the manager and its FFmpeg publishers connect to</td></tr>
+          <tr><td><code>MEDIAMTX_RTSP_PORT</code></td><td><code>8554</code></td><td>RTSP port. Ports must be integers from 1 to 65535 and differ; anything else is an error (exit 4), never a silent default</td></tr>
+          <tr><td><code>MEDIAMTX_API_PORT</code></td><td><code>9997</code></td><td>MediaMTX control API port</td></tr>
+          <tr><td><code>MEDIAMTX_METRICS_PORT</code></td><td><code>9998</code></td><td>MediaMTX metrics port</td></tr>
+          <tr><td><code>MEDIAMTX_API_BIND</code></td><td><code>127.0.0.1</code></td><td>Address the API listens on; an IP address, or empty for every interface</td></tr>
+          <tr><td><code>MEDIAMTX_METRICS_BIND</code></td><td><code>127.0.0.1</code></td><td>The same for MediaMTX's metrics endpoint</td></tr>
+          <tr><td><code>RTSP_AUTH_MODE</code></td><td><code>open</code></td><td><code>open</code>, or <code>local-only-publish</code> (see <a href="#mediamtx-config">below</a>)</td></tr>
+          <tr><td><code>RTSP_USERS_FILE</code></td><td><code>/etc/mediamtx/rtsp-users.conf</code></td><td>Users for <code>local-only-publish</code></td></tr>
+          <tr><td><code>MEDIAMTX_CONFIG_BACKUPS</code></td><td><code>5</code></td><td>Timestamped backups of a managed <code>mediamtx.yml</code> to keep (at least 1)</td></tr>
+          <tr><td><code>MEDIAMTX_PID_FILE</code></td><td><code>/run/mediamtx-audio.pid</code></td><td>PID file of the manager's MediaMTX</td></tr>
+          <tr><td><code>MEDIAMTX_LOCK_FILE</code></td><td><code>/run/mediamtx-audio.lock</code></td><td>Lifecycle lock file</td></tr>
+          <tr><td><code>MEDIAMTX_FFMPEG_DIR</code></td><td><code>/var/lib/mediamtx-ffmpeg</code></td><td>Wrapper scripts, PID files and FFmpeg logs</td></tr>
+          <tr><td><code>FFMPEG_LOG_KEEP</code></td><td><code>3</code></td><td>Previous runs of each stream's FFmpeg log to keep (0 to 20)</td></tr>
+          <tr><td><code>LYREBIRD_STATE_DIR</code></td><td><code>/run/lyrebird</code></td><td>Status file and desired-running marker</td></tr>
+          <tr><td><code>LYREBIRD_STATUS_FILE</code></td><td><code>/run/lyrebird/status.json</code></td><td>Status document</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h3>Start, Timing and Stream Mode</h3>
+    <div class="table-wrapper">
+      <table>
+        <thead><tr><th>Variable</th><th>Default</th><th>Meaning</th></tr></thead>
+        <tbody>
+          <tr><td><code>LYREBIRD_START_POLICY</code></td><td><code>degraded</code></td><td><code>degraded</code>: <code>start</code> succeeds when at least one stream publishes. <code>strict</code>: only when the stream of every detected device does. Anything else: exit 4</td></tr>
+          <tr><td><code>LYREBIRD_ALLOW_EMPTY_START</code></td><td><code>true</code></td><td>With no USB audio device, start MediaMTX anyway and exit 0 (<code>waiting_for_devices</code>). <code>false</code>: exit 6, MediaMTX not started</td></tr>
+          <tr><td><code>LYREBIRD_FLOW_SAMPLE_SECONDS</code></td><td><code>3</code></td><td>Seconds between the two samples of a stream's inbound byte counter (<code>bytes_flowing</code>); 0 skips the second sample</td></tr>
+          <tr><td><code>STREAM_STARTUP_DELAY</code></td><td><code>10</code></td><td>Seconds a started stream is given before its first check (plus 3)</td></tr>
+          <tr><td><code>STREAM_VALIDATION_ATTEMPTS</code></td><td><code>3</code></td><td>Checks per stream after start; with <code>STREAM_VALIDATION_DELAY</code> (<code>5</code> seconds) this is how long a stream has to become ready</td></tr>
+          <tr><td><code>STREAM_VALIDATION_DELAY</code></td><td><code>5</code></td><td>Seconds between those checks</td></tr>
+          <tr><td><code>USB_STABILIZATION_DELAY</code></td><td><code>5</code></td><td>Seconds to wait for the USB device list to settle</td></tr>
+          <tr><td><code>RESTART_STABILIZATION_DELAY</code></td><td><code>15</code></td><td>The same wait after a restart</td></tr>
+          <tr><td><code>LOCK_ACQUISITION_TIMEOUT</code></td><td><code>30</code></td><td>Seconds <code>start</code> and <code>restart</code> wait for the lifecycle lock</td></tr>
+          <tr><td><code>STOP_LOCK_TIMEOUT</code></td><td><code>5</code></td><td>Seconds <code>stop</code> and <code>force-stop</code> wait for it, then refuse with exit 5</td></tr>
+          <tr><td><code>MONITOR_LOCK_TIMEOUT</code></td><td><code>5</code></td><td>Seconds the monitor waits for a running start/stop/restart before it skips its cycle (exit 0)</td></tr>
+          <tr><td><code>MEDIAMTX_API_TIMEOUT</code></td><td><code>60</code></td><td>Seconds to wait for MediaMTX's API after launching it</td></tr>
+          <tr><td><code>STREAM_MODE</code></td><td><code>individual</code></td><td><code>individual</code> or <code>multiplex</code> (the <code>-m</code> option)</td></tr>
+          <tr><td><code>MULTIPLEX_FILTER_TYPE</code></td><td><code>amix</code></td><td><code>amix</code> or <code>amerge</code> (the <code>-f</code> option)</td></tr>
+          <tr><td><code>MULTIPLEX_STREAM_NAME</code></td><td><code>all_mics</code></td><td>Multiplex stream name (the <code>-n</code> option)</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h3>Audio Defaults, Recording</h3>
+    <div class="table-wrapper">
+      <table>
+        <thead><tr><th>Variable</th><th>Default</th><th>Meaning</th></tr></thead>
+        <tbody>
+          <tr><td><code>DEFAULT_SAMPLE_RATE</code></td><td><code>48000</code></td><td>Used when a device has no <code>SAMPLE_RATE</code> setting. A <code>DEFAULT_*</code> value that is not valid (for example a rate outside the accepted list) is replaced by the built-in value (here 48000) with an error in the log</td></tr>
+          <tr><td><code>DEFAULT_CHANNELS</code></td><td><code>2</code></td><td>Default channel count</td></tr>
+          <tr><td><code>DEFAULT_CODEC</code></td><td><code>opus</code></td><td>Default codec</td></tr>
+          <tr><td><code>DEFAULT_BITRATE</code></td><td><code>128k</code></td><td>Default bitrate</td></tr>
+          <tr><td><code>DEFAULT_THREAD_QUEUE</code></td><td><code>8192</code></td><td>Default thread queue size</td></tr>
+          <tr><td><code>DEFAULT_ANALYZEDURATION</code></td><td><code>5000000</code></td><td>FFmpeg input analysis duration in microseconds (all devices)</td></tr>
+          <tr><td><code>DEFAULT_PROBESIZE</code></td><td><code>5000000</code></td><td>FFmpeg input probe size in bytes (all devices)</td></tr>
+          <tr><td><code>AUDIO_LOCAL_RECORDING</code></td><td><code>false</code></td><td>Also write a ring of segments next to the stream</td></tr>
+          <tr><td><code>AUDIO_RECORDING_PATH</code></td><td><code>/dev/shm/lyrebird-buffer</code></td><td>Where the segments go. The default is RAM: it is lost at reboot or power loss. Recording that must survive means a directory on persistent storage</td></tr>
+          <tr><td><code>AUDIO_RECORDING_SEGMENT_TIME</code></td><td><code>300</code></td><td>Seconds per segment</td></tr>
+          <tr><td><code>AUDIO_RECORDING_SEGMENTS</code></td><td><code>12</code></td><td>Segments kept per stream; FFmpeg overwrites them in place, so the directory never holds more, whatever the retention days of the storage script say (the last hour at the defaults). Slot numbers are not chronological after a restart: order by modification time</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h3>Recovery and Monitoring</h3>
+    <p>What these do is described on <a href="architecture.html#backoff">Architecture</a> and <a href="monitoring.html#monitor">Monitoring</a>.</p>
+    <div class="table-wrapper">
+      <table>
+        <thead><tr><th>Variable</th><th>Default</th><th>Meaning</th></tr></thead>
+        <tbody>
+          <tr><td><code>INITIAL_RESTART_DELAY</code></td><td><code>10</code></td><td>Seconds; a wrapper's wait before restarting FFmpeg starts from this value and doubles</td></tr>
+          <tr><td><code>MAX_RESTART_DELAY</code></td><td><code>300</code></td><td>Longest wait between FFmpeg restarts</td></tr>
+          <tr><td><code>WRAPPER_SUCCESS_DURATION</code></td><td><code>300</code></td><td>An FFmpeg run longer than this many seconds resets the wrapper's failure counters</td></tr>
+          <tr><td><code>MAX_CONSECUTIVE_FAILURES</code></td><td><code>5</code></td><td>Short runs in a row after which the wrapper gives up and exits</td></tr>
+          <tr><td><code>MAX_WRAPPER_RESTARTS</code></td><td><code>50</code></td><td>FFmpeg restarts without a long run after which the wrapper gives up and exits</td></tr>
+          <tr><td><code>CRON_RESTART_MAX_PER_HOUR</code></td><td><code>6</code></td><td>Restarts per stream (and of MediaMTX) the monitor may spend per hour</td></tr>
+          <tr><td><code>DEEP_HEALTH_CHECK_ENABLED</code></td><td><code>true</code></td><td>Ask MediaMTX's API whether each path is ready</td></tr>
+          <tr><td><code>DEEP_HEALTH_MAX_STRIKES</code></td><td><code>3</code></td><td>Consecutive monitor runs a path may stay not ready before its stream is restarted</td></tr>
+          <tr><td><code>AUDIO_LEVEL_CHECK_ENABLED</code></td><td><code>true</code></td><td>Read each published stream back and log silence</td></tr>
+          <tr><td><code>AUDIO_LEVEL_SAMPLE_DURATION</code></td><td><code>3</code></td><td>Seconds of each stream measured per probe</td></tr>
+          <tr><td><code>AUDIO_LEVEL_CHECK_INTERVAL</code></td><td><code>240</code></td><td>Least seconds between two probes of one stream</td></tr>
+          <tr><td><code>AUDIO_SILENCE_THRESHOLD_DB</code></td><td><code>-60</code></td><td>A probe whose maximum level is at or below this many dB counts as silence</td></tr>
+          <tr><td><code>AUDIO_SILENCE_WARN_DURATION</code></td><td><code>60</code></td><td>Seconds of silence before the <code>DEAD MIC</code> error is logged (once per silence episode)</td></tr>
+          <tr><td><code>MAX_FD_WARNING</code></td><td><code>500</code></td><td>MediaMTX open file descriptors: warning level</td></tr>
+          <tr><td><code>MAX_FD_CRITICAL</code></td><td><code>1000</code></td><td>Critical level: the monitor exits 2 and cron restarts the service</td></tr>
+          <tr><td><code>MAX_CPU_WARNING</code></td><td><code>20</code></td><td>MediaMTX CPU percent: warning level</td></tr>
+          <tr><td><code>MAX_CPU_CRITICAL</code></td><td><code>40</code></td><td>Critical level (exit 2)</td></tr>
+          <tr><td><code>DISK_SPACE_WARNING_PERCENT</code></td><td><code>80</code></td><td>Disk use that is logged as a warning (never a restart)</td></tr>
+          <tr><td><code>DISK_SPACE_CRITICAL_PERCENT</code></td><td><code>95</code></td><td>Disk use that is logged as critical (never a restart)</td></tr>
+          <tr><td><code>MEM_WARNING_PERCENT</code></td><td><code>80</code></td><td>System memory use that is logged as a warning</td></tr>
+          <tr><td><code>MEM_CRITICAL_PERCENT</code></td><td><code>95</code></td><td>System memory use that is logged as critical (never a restart)</td></tr>
+          <tr><td><code>NETWORK_CHECK_ENABLED</code></td><td><code>true</code></td><td>Ping the gateway (or <code>NETWORK_CHECK_TARGET</code>) during the monitor run</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h3>Removed Settings</h3>
+    <p>
+      These settings no longer do anything. If one is present in the environment the manager logs one warning per run
+      and ignores it: <code>HEARTBEAT_INTERVAL</code>, <code>HARDWARE_WATCHDOG_TIMEOUT</code>, <code>ENABLE_HARDWARE_WATCHDOG</code>,
+      <code>HARDWARE_WATCHDOG_DEVICE</code>, <code>LYREBIRD_WATCHDOG_ENABLED</code>, <code>LYREBIRD_WATCHDOG_INTERVAL</code>
+      (there is no software watchdog; for a hardware watchdog use systemd's <code>RuntimeWatchdogSec=</code> or a watchdog daemon),
+      <code>AUDIO_DISK_PERSIST</code> and <code>AUDIO_DISK_PATH</code> (point <code>AUDIO_RECORDING_PATH</code> at persistent storage instead),
+      and <code>LOCK_STALE_THRESHOLD</code> (locks are never stale).
     </p>
 
-    <h3>Stream Manager</h3>
-    <pre><code># MediaMTX paths
-MEDIAMTX_BINARY="/usr/local/bin/mediamtx"
-MEDIAMTX_CONFIG_DIR="/etc/mediamtx"
-MEDIAMTX_CONFIG_FILE="/etc/mediamtx/mediamtx.yml"
-MEDIAMTX_DEVICE_CONFIG="/etc/mediamtx/audio-devices.conf"
-MEDIAMTX_LOG_FILE="/var/log/mediamtx.out"
-MEDIAMTX_HOST="localhost"
-MEDIAMTX_API_PORT="9997"
-
-# Process management
-MEDIAMTX_PID_FILE="/run/mediamtx-audio.pid"
-MEDIAMTX_LOCK_FILE="/run/mediamtx-audio.lock"
-MEDIAMTX_FFMPEG_DIR="/var/lib/mediamtx-ffmpeg"
-
-# Timing
-STREAM_STARTUP_DELAY=10         # Seconds before starting streams
-USB_STABILIZATION_DELAY=5       # Seconds to wait after USB events
-RESTART_STABILIZATION_DELAY=15  # Seconds between restart attempts
-
-# Recovery
-MAX_WRAPPER_RESTARTS=50         # Max auto-restarts before giving up
-WRAPPER_SUCCESS_DURATION=300    # Seconds to count as "successful run"
-MAX_CONSECUTIVE_FAILURES=5      # Max failures before escalation
-INITIAL_RESTART_DELAY=10        # Starting exponential backoff (seconds)
-MAX_RESTART_DELAY=300           # Maximum backoff delay (5 minutes)
-
-# Resource thresholds
-MAX_FD_WARNING=500              # File descriptor warning level
-MAX_FD_CRITICAL=1000            # File descriptor critical level
-MAX_CPU_WARNING=20              # CPU % warning per stream
-MAX_CPU_CRITICAL=40             # CPU % critical per stream
-
-# Audio defaults (when not in config file)
-DEFAULT_SAMPLE_RATE=48000
-DEFAULT_CHANNELS=2
-DEFAULT_CODEC=opus
-DEFAULT_BITRATE=128k
-DEFAULT_THREAD_QUEUE=8192
-
-# Debugging
-DEBUG=1                         # Enable verbose output</code></pre>
+    <h3>Debugging</h3>
+    <p>
+      Use <code>sudo ./lyrebird-stream-manager.sh -d start</code> for debug output. <code>DEBUG=1</code> does nothing: the scripts compare
+      <code>DEBUG</code> with the word <code>true</code>, and <code>DEBUG=true</code> in the stream manager also turns on shell tracing
+      (<code>set -x</code>), which is very verbose.
+    </p>
 
     <h3>Usage Examples</h3>
-    <pre><code># Use custom log location
-FFMPEG_LOG_DIR=/mnt/storage/logs sudo ./lyrebird-stream-manager.sh start
+    <pre><code># Increase the startup delay for a slow USB hub
+sudo env STREAM_STARTUP_DELAY=20 ./lyrebird-stream-manager.sh start
 
-# Increase startup delay for slow USB hubs
-STREAM_STARTUP_DELAY=20 sudo ./lyrebird-stream-manager.sh start
+# Require every microphone to publish for start to succeed
+sudo env LYREBIRD_START_POLICY=strict ./lyrebird-stream-manager.sh start
 
-# Enable debug output
-export DEBUG=1
-sudo ./lyrebird-stream-manager.sh start
+# Use a different RTSP port for a run you start by hand
+sudo env MEDIAMTX_RTSP_PORT=9554 ./lyrebird-stream-manager.sh start
 
-# Install MediaMTX to a custom prefix
-MEDIAMTX_PREFIX=/opt/mediamtx sudo ./install_mediamtx.sh install</code></pre>
+# Install MediaMTX under a custom prefix
+sudo env MEDIAMTX_PREFIX=/opt/mediamtx ./install_mediamtx.sh install</code></pre>
 
     <h2 id="mediamtx">MediaMTX Integration</h2>
     <p>
-      MediaMTX serves RTSP, WebRTC, HLS, and RTMP. LyreBirdAudio configures and manages the MediaMTX
-      process. The main configuration is at <code>/etc/mediamtx/mediamtx.yml</code>.
+      The configuration LyreBirdAudio generates enables RTSP, plus MediaMTX's control API and metrics endpoint on the
+      loopback address, and switches RTMP, HLS, WebRTC, SRT and (on MediaMTX 1.19.0 and later) MoQ off. There is no option
+      that turns the other protocols on. The project's live tests assert, against real MediaMTX 1.15.0, 1.18.0, 1.19.0,
+      1.21.1, 1.21.2 and 1.21.3 (skipped unless <code>LYREBIRD_TEST_MEDIAMTX_BINS</code> names the binaries), that these are
+      the only sockets MediaMTX opens.
     </p>
 
     <h3>Default Port Assignments</h3>
     <div class="table-wrapper">
       <table>
-        <thead><tr><th>Protocol</th><th>Default Port</th><th>Purpose</th></tr></thead>
+        <thead><tr><th>Listener</th><th>Default port</th><th>Reachable from</th><th>Set by</th></tr></thead>
         <tbody>
-          <tr><td>RTSP</td><td>8554</td><td>Stream consumption (VLC, FFplay, etc.)</td></tr>
-          <tr><td>HTTP API</td><td>9997</td><td>REST API for stream management</td></tr>
-          <tr><td>WebRTC</td><td>8889</td><td>Browser-based streaming</td></tr>
-          <tr><td>RTP / RTCP</td><td>8000–8001</td><td>Media transport</td></tr>
+          <tr><td>RTSP</td><td>8554</td><td>every interface</td><td><code>MEDIAMTX_RTSP_PORT</code></td></tr>
+          <tr><td>RTP / RTCP over UDP</td><td>8000 / 8001</td><td>every interface</td><td>MediaMTX defaults; open because the configuration allows UDP transport</td></tr>
+          <tr><td>MediaMTX control API</td><td>9997</td><td>this machine only</td><td><code>MEDIAMTX_API_PORT</code>, <code>MEDIAMTX_API_BIND</code></td></tr>
+          <tr><td>MediaMTX metrics</td><td>9998</td><td>this machine only</td><td><code>MEDIAMTX_METRICS_PORT</code>, <code>MEDIAMTX_METRICS_BIND</code></td></tr>
+          <tr><td>LyreBirdAudio metrics exporter</td><td>9100</td><td>this machine only</td><td><code>lyrebird-metrics.sh serve --port --bind</code>; runs only when you start it</td></tr>
         </tbody>
       </table>
+    </div>
+
+    <div class="callout warning">
+      <span class="callout-icon">⚠️</span>
+      <div class="callout-body">
+        <strong>RTSP is open by default</strong>
+        <p>With the generated configuration, anyone who can reach port 8554 can read every stream and publish to any path, without a password. The API and metrics refuse callers other than this machine, but there is no authentication on RTSP unless you add it: set <code>RTSP_AUTH_MODE=local-only-publish</code> (below) or write your own MediaMTX authentication, and use a firewall. See <a href="security.html">Security</a>.</p>
+      </div>
     </div>
 
     <h3>Management Modes</h3>
@@ -253,58 +384,82 @@ MEDIAMTX_PREFIX=/opt/mediamtx sudo ./install_mediamtx.sh install</code></pre>
         <tbody>
           <tr>
             <td><strong>Stream Manager</strong> (default)</td>
-            <td>Audio streaming with automatic recovery</td>
-            <td><code>./lyrebird-stream-manager.sh start</code></td>
+            <td>Audio streaming: owns MediaMTX and the FFmpeg streams</td>
+            <td><code>sudo ./lyrebird-stream-manager.sh start</code>, or the <code>mediamtx-audio</code> service</td>
           </tr>
           <tr>
-            <td><strong>Systemd Direct</strong></td>
-            <td>General MediaMTX usage without audio scripts</td>
-            <td><code>systemctl start mediamtx</code></td>
+            <td><strong>Standalone service</strong></td>
+            <td>MediaMTX without the audio scripts</td>
+            <td><code>sudo systemctl start mediamtx</code>. The stream manager refuses to start (exit 8) while this is active</td>
           </tr>
           <tr>
             <td><strong>Manual</strong></td>
             <td>Development / debugging</td>
-            <td><code>/usr/local/bin/mediamtx /etc/mediamtx/mediamtx.yml</code></td>
+            <td><code>/usr/local/bin/mediamtx /etc/mediamtx/mediamtx.yml</code>. Stop it before using the stream manager</td>
           </tr>
         </tbody>
       </table>
     </div>
 
     <h3>MediaMTX API</h3>
-    <p>The REST API (port 9997) is available for programmatic stream management:</p>
-    <pre><code># List all active paths/streams
-curl http://localhost:9997/v3/paths/list
+    <p>The control API is available on this machine for reading state (the default MediaMTX policy refuses other callers):</p>
+    <pre><code># List the paths MediaMTX knows
+curl http://127.0.0.1:9997/v3/paths/list
 
-# Get info for a specific stream
-curl http://localhost:9997/v3/paths/get/Device_1
+# Get one stream; its "available" field says whether it is publishing
+curl http://127.0.0.1:9997/v3/paths/get/mic-left</code></pre>
+    <p>The manager's readiness checks look at the HTTP status and the shape of the answer: a 401 or 403 (an API that wants credentials) never counts against a healthy stream.</p>
 
-# Check MediaMTX health
-curl http://localhost:9997/v3/config/global/get</code></pre>
+    <h2 id="mediamtx-config">Who Owns mediamtx.yml</h2>
+    <p>
+      The first line of a file LyreBirdAudio generated is exactly <code># Managed by LyreBirdAudio</code>. That line decides who owns the file.
+    </p>
+    <div class="table-wrapper">
+      <table>
+        <thead><tr><th>State of <code>/etc/mediamtx/mediamtx.yml</code></th><th>What the stream manager does</th></tr></thead>
+        <tbody>
+          <tr><td>Missing or empty</td><td>Writes it (mode 0644, 0640 when it carries password hashes)</td></tr>
+          <tr><td>First line is the marker</td><td>Renders the configuration on every start and reload. An unchanged rendering leaves the file untouched; a changed one is validated, the old file is saved as <code>mediamtx.yml.&lt;UTC stamp&gt;.&lt;nn&gt;.bak</code>, and the new one is written atomically</td></tr>
+          <tr><td>First line is <code># MediaMTX Configuration - Audio Streams</code></td><td>The file an earlier release regenerated on every start. It is adopted: the first start replaces it with the current rendering after a backup, so an edit you made by hand is only in the backup</td></tr>
+          <tr><td>Any other file</td><td>Yours. It is validated and used as it is, never written; each start logs one warning. <code>--regenerate-config</code> with <code>start</code> or <code>restart</code> replaces it after saving a backup</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <ul>
+      <li>To keep hand edits in a generated file, delete the marker line. From then on neither the stream manager nor <code>install_mediamtx.sh</code> (without <code>--force</code>) rewrites it.</li>
+      <li><code>install_mediamtx.sh</code> uses the same generator and the same rule. Its backups are named <code>mediamtx.yml.backup.&lt;YYYYmmdd-HHMMSS&gt;</code> and are not pruned.</li>
+      <li>The old generator's file had its API and metrics on every interface. A node that still has a file an earlier <em>installer</em> wrote (not the stream manager) keeps it, because it has no marker; replace it with <code>sudo ./install_mediamtx.sh --force install</code>, which also reinstalls the latest binary unless you pass <code>-V</code>.</li>
+      <li><code>RTSP_AUTH_MODE=local-only-publish</code> renders a password-less user restricted to loopback with every permission, plus one read-only user per line of <code>RTSP_USERS_FILE</code> (<code>user:sha256:&lt;base64 of the raw SHA-256 digest&gt;</code>, made with <code>printf '%s' 'the password' | openssl dgst -sha256 -binary | base64</code>). Publishers must connect from loopback, so <code>MEDIAMTX_HOST</code> must stay <code>localhost</code> (or another loopback address). The mode is ignored, with a warning, for a file you own.</li>
+      <li><code>systemctl reload</code> on the stream manager's unit runs <code>reload</code>, which applies a changed configuration without restarting MediaMTX; some changes (log level, timeouts, RTSP settings, path settings) still make MediaMTX disconnect publishers, and their wrappers reconnect them. The standalone <code>mediamtx.service</code> has no <code>ExecReload</code>: <code>systemctl reload mediamtx</code> does nothing useful, because MediaMTX re-reads its file by itself.</li>
+    </ul>
 
     <h2 id="quality-tiers">Quality Tiers</h2>
-    <p>The capability checker provides three quality presets. Choose based on your use case:</p>
+    <p>The capability checker (<code>lyrebird-mic-check.sh -g --quality=TIER</code>) picks, per card, from what the card reports. Bitrates are the encoder bitrate it writes.</p>
 
     <div class="table-wrapper">
       <table>
-        <thead><tr><th>Tier</th><th>Sample Rate</th><th>Bitrate</th><th>Best For</th></tr></thead>
+        <thead><tr><th>Tier</th><th>Sample rate</th><th>Channels</th><th>Bitrate</th><th>Best For</th></tr></thead>
         <tbody>
           <tr>
             <td><span class="badge badge-blue">low</span></td>
-            <td>16,000 Hz</td>
-            <td>64 kbps</td>
+            <td>44,100 Hz if offered, else 48,000 Hz, else the card's lowest</td>
+            <td>mono if offered</td>
+            <td>96k mono, 128k stereo (64k and 96k below 44.1 kHz)</td>
             <td>Speech, monitoring, bandwidth-constrained</td>
           </tr>
           <tr>
             <td><span class="badge badge-green">normal</span></td>
-            <td>48,000 Hz</td>
-            <td>128 kbps</td>
-            <td>General purpose, balanced (default)</td>
+            <td>48,000 Hz if offered, else 44,100 Hz, else the highest up to 48 kHz</td>
+            <td>stereo if offered</td>
+            <td>128k mono, 192k stereo (192k and 256k from 96 kHz)</td>
+            <td>General purpose (default)</td>
           </tr>
           <tr>
             <td><span class="badge badge-orange">high</span></td>
-            <td>48,000 Hz+</td>
-            <td>256 kbps+</td>
-            <td>Music, high-quality recording</td>
+            <td>192,000 Hz if offered, else 96,000 Hz, else 48,000 Hz</td>
+            <td>stereo if offered</td>
+            <td>192k mono, 320k stereo at 192 kHz; 160k / 256k at 96 kHz; 128k / 192k at 48 kHz</td>
+            <td>Music, bird song, archival</td>
           </tr>
         </tbody>
       </table>
@@ -316,22 +471,16 @@ curl http://localhost:9997/v3/config/global/get</code></pre>
         <thead><tr><th>Codec</th><th>Quality/Bitrate</th><th>Compatibility</th><th>Latency</th></tr></thead>
         <tbody>
           <tr>
-            <td><strong>Opus</strong></td>
-            <td>Best (recommended)</td>
-            <td>Modern clients, VLC, FFplay</td>
+            <td><strong>Opus</strong> (default)</td>
+            <td>Best</td>
+            <td>Modern clients, VLC, FFplay. FFmpeg's libopus refuses some channel counts, for example the 4 channels of two merged stereo microphones</td>
             <td>Very low</td>
           </tr>
           <tr>
             <td><strong>AAC</strong></td>
             <td>Good</td>
-            <td>Widest (iOS, browsers)</td>
+            <td>Widest (iOS, browsers). FFmpeg's aac encoder took 1 to 8 channels and refused 9 when measured</td>
             <td>Moderate</td>
-          </tr>
-          <tr>
-            <td><strong>PCM</strong></td>
-            <td>Lossless</td>
-            <td>All FFmpeg-capable clients</td>
-            <td>Lowest</td>
           </tr>
           <tr>
             <td><strong>MP3</strong></td>
@@ -342,6 +491,7 @@ curl http://localhost:9997/v3/config/global/get</code></pre>
         </tbody>
       </table>
     </div>
+    <p>The channel limits above were measured with FFmpeg 6.1.1 and depend on the channel layout. The manager asks the FFmpeg you have, with the exact encoder arguments, before it starts a stream, so a count your FFmpeg refuses is reported instead of failing in a loop.</p>
 
     <h3>High-Quality Example</h3>
     <pre><code># High quality music streaming
