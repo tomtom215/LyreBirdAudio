@@ -297,7 +297,7 @@ get_dir_size() {
 count_files() {
     local path="$1"
     local pattern="${2:-*}"
-    find "$path" -maxdepth 1 -name "$pattern" -type f 2>/dev/null | wc -l
+    find -H "$path" -maxdepth 1 -name "$pattern" -type f 2>/dev/null | wc -l
 }
 
 # Safe delete with dry run support. Returns 0 when the file is gone (or, in a dry
@@ -528,12 +528,12 @@ cleanup_logs() {
 
     # Clean LyreBird logs
     if [[ -d "$LOG_DIR" ]]; then
-        _sweep "log" < <(find "$LOG_DIR" -type f -name "*.log*" -mtime "+${LOG_RETENTION_DAYS}" -print0 2>/dev/null)
+        _sweep "log" < <(find -H "$LOG_DIR" -type f -name "*.log*" -mtime "+${LOG_RETENTION_DAYS}" -print0 2>/dev/null)
     fi
 
     # Clean rotated MediaMTX logs
     if [[ -d "$MEDIAMTX_LOG_DIR" ]]; then
-        _sweep "mediamtx log" < <(find "$MEDIAMTX_LOG_DIR" -type f -name "mediamtx*.out.*" -mtime "+${LOG_RETENTION_DAYS}" -print0 2>/dev/null)
+        _sweep "mediamtx log" < <(find -H "$MEDIAMTX_LOG_DIR" -type f -name "mediamtx*.out.*" -mtime "+${LOG_RETENTION_DAYS}" -print0 2>/dev/null)
     fi
 
     log_info "Cleaned $SWEEP_DELETED log file(s), freed $(format_bytes "$SWEEP_FREED")$(_failed_suffix "$SWEEP_FAILED")"
@@ -546,7 +546,7 @@ cleanup_temp() {
     _sweep_reset
 
     # Clean LyreBird temp files in /tmp
-    _sweep "temp" < <(find "$TEMP_DIR" -maxdepth 1 -type f -name "lyrebird-*" -mmin "+$((TEMP_RETENTION_HOURS * 60))" -print0 2>/dev/null)
+    _sweep "temp" < <(find -H "$TEMP_DIR" -maxdepth 1 -type f -name "lyrebird-*" -mmin "+$((TEMP_RETENTION_HOURS * 60))" -print0 2>/dev/null)
 
     # Clean memory buffer directory if present
     if [[ -d "$BUFFER_DIR" ]]; then
@@ -563,8 +563,8 @@ truncate_large_logs() {
     # Clean up any stale .tmp files from interrupted previous runs.
     # MEDIAMTX_LOG_DIR is typically /var/log, so scope tightly to our own files
     # (maxdepth 1 + mediamtx-prefixed) rather than every *.tmp on the system.
-    find "$MEDIAMTX_LOG_DIR" -maxdepth 1 -name "mediamtx*.tmp" -mmin +5 -delete 2>/dev/null || true
-    [[ -d "$LOG_DIR" ]] && find "$LOG_DIR" -maxdepth 1 -name "*.tmp" -mmin +5 -delete 2>/dev/null || true
+    find -H "$MEDIAMTX_LOG_DIR" -maxdepth 1 -name "mediamtx*.tmp" -mmin +5 -delete 2>/dev/null || true
+    [[ -d "$LOG_DIR" ]] && find -H "$LOG_DIR" -maxdepth 1 -name "*.tmp" -mmin +5 -delete 2>/dev/null || true
 
     # Check MediaMTX log
     if [[ -f "$MEDIAMTX_LOG" ]]; then
@@ -636,19 +636,19 @@ emergency_cleanup() {
     # Delete rotated logs and temp files.
     # These must honour DRY_RUN (a "preview" must not delete anything), and the
     # *.gz sweep must be tightly scoped: MEDIAMTX_LOG_DIR is typically /var/log,
-    # so a bare `find "$MEDIAMTX_LOG_DIR" -name '*.gz' -delete` would wipe every
+    # so a bare `find -H "$MEDIAMTX_LOG_DIR" -name '*.gz' -delete` would wipe every
     # rotated SYSTEM log (syslog, auth.log, journal exports) during an incident.
     if [[ "$DRY_RUN" == "true" ]]; then
         log_info "[DRY RUN] Would delete rotated LyreBird/MediaMTX logs and LyreBird temp files"
     else
         _sweep_reset
         if [[ -d "$LOG_DIR" ]]; then
-            _sweep "rotated log" < <(find "$LOG_DIR" -maxdepth 1 -type f -name "*.gz" -print0 2>/dev/null)
+            _sweep "rotated log" < <(find -H "$LOG_DIR" -maxdepth 1 -type f -name "*.gz" -print0 2>/dev/null)
         fi
-        _sweep "rotated mediamtx log" < <(find "$MEDIAMTX_LOG_DIR" -maxdepth 1 -type f -name "mediamtx*.out*.gz" -print0 2>/dev/null)
+        _sweep "rotated mediamtx log" < <(find -H "$MEDIAMTX_LOG_DIR" -maxdepth 1 -type f -name "mediamtx*.out*.gz" -print0 2>/dev/null)
 
         # Clear LyreBird temp files
-        _sweep "temp" < <(find "$TEMP_DIR" -maxdepth 1 -name "lyrebird-*" -type f -print0 2>/dev/null)
+        _sweep "temp" < <(find -H "$TEMP_DIR" -maxdepth 1 -name "lyrebird-*" -type f -print0 2>/dev/null)
         log_info "Emergency: Deleted $SWEEP_DELETED rotated log/temp file(s)$(_failed_suffix "$SWEEP_FAILED")"
     fi
 
