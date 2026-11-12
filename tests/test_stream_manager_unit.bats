@@ -562,7 +562,10 @@ cron_monitor_calls() { # cron_monitor_calls CRONFILE: prints "individual:<name>"
     : >"$UN/calls"
     rm -rf "$UN/ff" "$UN/cronstate"
     mkdir -p "$UN/ff"
-    env -i "${assigns[@]}" HOME=/root ISCRIPT="$ISCRIPT" UN="$UN" MEDIAMTX_PID_FILE="$UN/mtx.pid" MEDIAMTX_FFMPEG_DIR="$UN/ff" \
+    # the two stood-in cards are microphones: each has a capture PCM (a card without one is a
+    # speaker, which the monitor skips, X-34)
+    mkdir -p "$UN/asound/card1/pcm0c" "$UN/asound/card2/pcm0c"
+    env -i "${assigns[@]}" HOME=/root ISCRIPT="$ISCRIPT" UN="$UN" ASOUND_PROC_ROOT="$UN/asound" MEDIAMTX_PID_FILE="$UN/mtx.pid" MEDIAMTX_FFMPEG_DIR="$UN/ff" \
         MEDIAMTX_CONFIG_DIR="$UN/cfg" MEDIAMTX_LOG_FILE="$UN/sm.log" STREAM_MANAGER_LOG_FILE="$UN/sm.log" MEDIAMTX_LOCK_FILE="$UN/run.lock" \
         CRON_RESTART_STATE_DIR="$UN/cronstate" DEEP_HEALTH_STATE_DIR="$UN/deep" MEDIAMTX_HOST=cron.invalid \
         bash -c '

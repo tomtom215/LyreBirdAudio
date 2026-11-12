@@ -205,8 +205,18 @@ device_add() {
     : >"$HW/dev-snd/pcmC${2}D0c"
 }
 device_remove() {
-    rm -f "$HW/$1" "$HW/dev-snd/controlC$1" "$HW/dev-snd/pcmC${1}D0c"
+    rm -f "$HW/$1" "$HW/dev-snd/controlC$1" "$HW/dev-snd/pcmC${1}D0c" "$HW/dev-snd/pcmC${1}D0p"
     rm -rf "$HW/asound/card$1"
+}
+
+# device_add_playback NAME CARD: plug in a USB speaker or DAC: a USB audio card with a
+# playback PCM and no capture PCM
+device_add_playback() {
+    printf '%s\n' "$1" >"$HW/$2"
+    : >"$HW/dev-snd/controlC$2"
+    mkdir -p "$HW/asound/card$2/pcm0p"
+    echo "0d8c:0014" >"$HW/asound/card$2/usbid"
+    : >"$HW/dev-snd/pcmC${2}D0p"
 }
 
 # card_unavailable CARD / card_available CARD: the card stays detected but ALSA

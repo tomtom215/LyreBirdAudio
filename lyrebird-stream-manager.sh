@@ -3793,14 +3793,28 @@ monitor_streams() {
     fi
 
     # Get current devices
-    local devices=()
-    readarray -t devices < <(detect_audio_devices)
+    local detected=() devices=() device_info
+    readarray -t detected < <(detect_audio_devices)
+
+    # A card without a capture PCM (a USB speaker) is not a stream (X-34): there is
+    # nothing of it to restart, so it costs no restart budget and is not a failure
+    split_capture_devices ${detected[@]+"${detected[@]}"}
+    for device_info in ${CAPTURE_DEVICES[@]+"${CAPTURE_DEVICES[@]}"}; do
+        devices+=("$device_info")
+    done
+    for device_info in ${SKIPPED_DEVICES[@]+"${SKIPPED_DEVICES[@]}"}; do
+        log DEBUG "Card ${device_info#*:} (${device_info%%:*}): ${NO_CAPTURE_REASON}; nothing to monitor"
+    done
 
     if [[ ${#devices[@]} -eq 0 ]]; then
         # A node without devices is waiting for them (D5): a stream is started
         # for each one that appears, by the checks below on a later cycle
         if allow_empty_start; then
-            log INFO "No USB audio devices detected; waiting for devices"
+            if ((${#detected[@]} == 0)); then
+                log INFO "No USB audio devices detected; waiting for devices"
+            else
+                log INFO "No USB audio device that can capture (${#detected[@]} playback-only card(s) skipped); waiting for devices"
+            fi
             return 0
         fi
         log WARN "No USB audio devices detected"
@@ -5179,6 +5193,41 @@ first_capture_pcm() {
     local -a pcms=()
     mapfile -t pcms < <(alsa_capture_pcms "$1")
     printf '%s' "${pcms[0]-}"
+}
+
+# Succeeds when CARD has at least one capture PCM. A USB speaker or DAC (a playback-only
+# card) has none: it is detected as a USB audio card but is not a microphone, so it gets
+# no stream and does not count for the start policy, the status or the monitor (X-34).
+# Usage: card_has_capture_pcm CARD
+NO_CAPTURE_REASON="no capture PCM (playback-only card)"
+card_has_capture_pcm() {
+    [[ -n "$(first_capture_pcm "$1")" ]]
+}
+
+# Split the devices ("name:card" each) into CAPTURE_DEVICES, the cards that can capture,
+# and SKIPPED_DEVICES, the ones that cannot (X-34). With "log" as the first argument one
+# INFO line per skipped card says so and why.
+# Usage: split_capture_devices [log] DEVICE...
+declare -ga CAPTURE_DEVICES=() SKIPPED_DEVICES=()
+split_capture_devices() {
+    local do_log=false device_info device_name card_num
+    if [[ "${1:-}" == "log" ]]; then
+        do_log=true
+        shift
+    fi
+    CAPTURE_DEVICES=()
+    SKIPPED_DEVICES=()
+    for device_info in "$@"; do
+        IFS=':' read -r device_name card_num <<<"$device_info"
+        if [[ -z "$device_name" || -z "$card_num" ]] || card_has_capture_pcm "$card_num"; then
+            CAPTURE_DEVICES+=("$device_info")
+        else
+            SKIPPED_DEVICES+=("$device_info")
+            if [[ "$do_log" == "true" ]]; then
+                log INFO "Not streaming ${device_name} (card ${card_num}): ${NO_CAPTURE_REASON}; it is not counted for the start policy"
+            fi
+        fi
+    done
 }
 
 # Choose the capture PCM of CARD for one stream and put it in STREAM_PCM: the
@@ -7006,6 +7055,9 @@ rollback_failed_start() {
 declare -ga OUTCOME_PATHS=()
 declare -gA OUTCOME_DEVICE=() OUTCOME_CARD=() OUTCOME_CONFIGURED=() OUTCOME_ALIVE=()
 declare -gA OUTCOME_READY=() OUTCOME_FLOWING=() OUTCOME_ERROR=()
+# A card that cannot capture (no capture PCM: a USB speaker) is listed, with the reason,
+# but is not a stream: the policy and the overall state do not count it (X-34)
+declare -gA OUTCOME_SKIPPED=()
 # Why a stream is not publishing, recorded by the code that found out (a failed
 # launch, a skipped device). It wins over what is derived from the state.
 declare -gA STREAM_LAST_ERROR=()
@@ -7069,6 +7121,7 @@ stream_outcome_reset() {
     OUTCOME_READY=()
     OUTCOME_FLOWING=()
     OUTCOME_ERROR=()
+    OUTCOME_SKIPPED=()
 }
 
 # stream_outcome_add PATH DEVICE CARD
@@ -7081,6 +7134,14 @@ stream_outcome_add() {
     OUTCOME_READY[$1]=false
     OUTCOME_FLOWING[$1]=false
     OUTCOME_ERROR[$1]=""
+    OUTCOME_SKIPPED[$1]=false
+}
+
+# stream_outcome_skip PATH DEVICE CARD: list a card that cannot capture, with the reason
+stream_outcome_skip() {
+    stream_outcome_add "$1" "$2" "$3"
+    OUTCOME_SKIPPED[$1]=true
+    OUTCOME_ERROR[$1]="${NO_CAPTURE_REASON}"
 }
 
 # The streams that DEVICES ("name:card" each) call for: one per device, or the
@@ -7090,28 +7151,36 @@ stream_outcome_expect() {
     local -a names=() cards=()
     stream_outcome_reset
     (($# > 0)) || return 0
+    # A card without a capture PCM is no stream (X-34): it is listed as skipped, after
+    # the streams, and the multiplex stream is made of the cards that can capture
+    split_capture_devices "$@"
     if [[ "$(effective_stream_mode)" == "multiplex" ]]; then
-        for device_info in "$@"; do
+        for device_info in ${CAPTURE_DEVICES[@]+"${CAPTURE_DEVICES[@]}"}; do
             IFS=':' read -r device_name card_num <<<"$device_info"
             [[ -n "$device_name" && -n "$card_num" ]] || continue
             names+=("$device_name")
             cards+=("$card_num")
         done
-        ((${#names[@]} > 0)) || return 0
-        stream_outcome_add "$(multiplex_stream_path)" "$(
-            IFS=,
-            printf '%s' "${names[*]}"
-        )" "$(
-            IFS=,
-            printf '%s' "${cards[*]}"
-        )"
+        if ((${#names[@]} > 0)); then
+            stream_outcome_add "$(multiplex_stream_path)" "$(
+                IFS=,
+                printf '%s' "${names[*]}"
+            )" "$(
+                IFS=,
+                printf '%s' "${cards[*]}"
+            )"
+        fi
     else
-        for device_info in "$@"; do
+        for device_info in ${CAPTURE_DEVICES[@]+"${CAPTURE_DEVICES[@]}"}; do
             IFS=':' read -r device_name card_num <<<"$device_info"
             [[ -n "$device_name" && -n "$card_num" ]] || continue
             stream_outcome_add "$(generate_stream_path "$device_name" "$card_num")" "$device_name" "$card_num"
         done
     fi
+    for device_info in ${SKIPPED_DEVICES[@]+"${SKIPPED_DEVICES[@]}"}; do
+        IFS=':' read -r device_name card_num <<<"$device_info"
+        stream_outcome_skip "$(generate_stream_path "$device_name" "$card_num")" "$device_name" "$card_num"
+    done
 }
 
 # Succeeds when the sound card's control node exists (a card that is listed but
@@ -7150,6 +7219,8 @@ stream_outcome_probe() {
     fi
 
     for path in ${OUTCOME_PATHS[@]+"${OUTCOME_PATHS[@]}"}; do
+        # A card that cannot capture has no stream to establish (X-34)
+        [[ "${OUTCOME_SKIPPED[$path]}" != "true" ]] || continue
         if [[ -f "${FFMPEG_PID_DIR}/${path}.sh" && -f "${FFMPEG_PID_DIR}/${path}.pid" ]]; then
             OUTCOME_CONFIGURED[$path]=true
         fi
@@ -7202,6 +7273,7 @@ stream_outcome_probe() {
     fi
 
     for path in ${OUTCOME_PATHS[@]+"${OUTCOME_PATHS[@]}"}; do
+        [[ "${OUTCOME_SKIPPED[$path]}" != "true" ]] || continue
         OUTCOME_ERROR[$path]=""
         if [[ "${OUTCOME_READY[$path]}" == "true" ]]; then
             if [[ "${OUTCOME_FLOWING[$path]}" == "false" ]]; then
@@ -7246,7 +7318,7 @@ stream_outcome_collect() {
 # to be running), waiting_for_devices (MediaMTX is up and no device is detected)
 # or stopped (down on purpose). $1 = whether MediaMTX is running.
 outcome_overall() {
-    local path ready=0 total=${#OUTCOME_PATHS[@]}
+    local path ready=0 total=0
     if [[ "$1" != "true" ]]; then
         if desired_present; then
             printf 'failed'
@@ -7255,15 +7327,18 @@ outcome_overall() {
         fi
         return 0
     fi
-    if ((total == 0)); then
-        printf 'waiting_for_devices'
-        return 0
-    fi
-    for path in "${OUTCOME_PATHS[@]}"; do
+    # Only streams count: a card that cannot capture is not one (X-34)
+    for path in ${OUTCOME_PATHS[@]+"${OUTCOME_PATHS[@]}"}; do
+        [[ "${OUTCOME_SKIPPED[$path]}" != "true" ]] || continue
+        ((total++)) || true
         if [[ "${OUTCOME_READY[$path]}" == "true" ]]; then
             ((ready++)) || true
         fi
     done
+    if ((total == 0)); then
+        printf 'waiting_for_devices'
+        return 0
+    fi
     if ((ready == total)); then
         printf 'ok'
     elif ((ready > 0)); then
@@ -7307,10 +7382,16 @@ status_document() {
     overall="$(outcome_overall "$running")"
     policy="$(start_policy)" || policy="invalid"
     for path in ${OUTCOME_PATHS[@]+"${OUTCOME_PATHS[@]}"}; do
-        items+=("$(printf '{"device":%s,"card":%s,"path":%s,"configured":%s,"process_alive":%s,"path_ready":%s,"bytes_flowing":%s,"last_error":%s}' \
+        # "skipped":true only on a card that cannot capture (X-34), which is listed
+        # but is not a stream and is not counted in "overall"
+        local skipped_key=""
+        if [[ "${OUTCOME_SKIPPED[$path]}" == "true" ]]; then
+            skipped_key=',"skipped":true'
+        fi
+        items+=("$(printf '{"device":%s,"card":%s,"path":%s,"configured":%s,"process_alive":%s,"path_ready":%s,"bytes_flowing":%s,"last_error":%s%s}' \
             "$(json_string "${OUTCOME_DEVICE[$path]}")" "$(json_string "${OUTCOME_CARD[$path]}")" "$(json_string "$path")" \
             "${OUTCOME_CONFIGURED[$path]}" "${OUTCOME_ALIVE[$path]}" "${OUTCOME_READY[$path]}" "${OUTCOME_FLOWING[$path]}" \
-            "$(json_string_or_null "${OUTCOME_ERROR[$path]}")")")
+            "$(json_string_or_null "${OUTCOME_ERROR[$path]}")" "$skipped_key")")
     done
     printf '{"schema_version":1,"timestamp":"%s","timestamp_epoch":%s,"command":%s,"overall":"%s","policy":"%s","stream_mode":"%s","mediamtx":{"running":%s,"pid":%s},"streams":[%s]}\n' \
         "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$(date +%s)" "$(json_string "$command")" "$overall" "$policy" \
@@ -7561,20 +7642,38 @@ start_streams_and_report() {
     local devices=("$@")
     local policy path total=0 ready=0 note=""
 
-    if [[ ${#devices[@]} -eq 0 ]]; then
-        # No device: MediaMTX is up and waits for them (D5); the monitor starts
-        # a stream for each one that appears
+    # A card without a capture PCM (a USB speaker) is not a stream (X-34): one INFO
+    # line each, and it is left out of everything below, the policy included
+    split_capture_devices log ${devices[@]+"${devices[@]}"}
+    local -a capture_devices=()
+    local device_info
+    for device_info in ${CAPTURE_DEVICES[@]+"${CAPTURE_DEVICES[@]}"}; do
+        capture_devices+=("$device_info")
+    done
+
+    if [[ ${#capture_devices[@]} -eq 0 ]]; then
+        # No device that can capture: MediaMTX is up and waits for one (D5); the
+        # monitor starts a stream for each one that appears
         if ! allow_empty_start; then
-            log ERROR "No USB audio devices detected"
+            if ((${#devices[@]} == 0)); then
+                log ERROR "No USB audio devices detected"
+            else
+                log ERROR "No USB audio device that can capture (${#devices[@]} playback-only card(s) skipped)"
+            fi
             rollback_failed_start || true
             return "${E_USB_NO_DEVICES}"
         fi
-        log INFO "No USB audio devices detected; MediaMTX is running and waiting for devices"
-        echo "No USB audio devices detected: MediaMTX is running and waiting for devices."
+        if ((${#devices[@]} == 0)); then
+            log INFO "No USB audio devices detected; MediaMTX is running and waiting for devices"
+            echo "No USB audio devices detected: MediaMTX is running and waiting for devices."
+        else
+            log INFO "No USB audio device that can capture (${#devices[@]} playback-only card(s) skipped); MediaMTX is running and waiting for devices"
+            echo "No USB audio device that can capture: MediaMTX is running and waiting for devices."
+        fi
         RUN_STARTED_STREAMS=()
         RUN_STARTED_MEDIAMTX=""
         RUN_DIRTY=false
-        stream_outcome_collect
+        stream_outcome_collect ${devices[@]+"${devices[@]}"}
         status_publish start
         return 0
     fi
@@ -7585,12 +7684,12 @@ start_streams_and_report() {
         local multiplex_path was_running=false
         multiplex_path="$(multiplex_stream_path)"
         log INFO "Multiplex mode - starting single multiplexed stream to ${multiplex_path}"
-        echo "Starting multiplexed stream (${#devices[@]} devices): ${multiplex_path}..."
+        echo "Starting multiplexed stream (${#capture_devices[@]} devices): ${multiplex_path}..."
         if stream_wrapper_alive "$multiplex_path"; then
             was_running=true
         fi
         # Start single multiplex stream with all devices
-        if start_multiplex_stream "${devices[@]}"; then
+        if start_multiplex_stream "${capture_devices[@]}"; then
             unset 'STREAM_LAST_ERROR[$multiplex_path]'
             if [[ "$was_running" != "true" ]]; then
                 run_track_stream "$multiplex_path"
@@ -7602,13 +7701,14 @@ start_streams_and_report() {
     else
         log INFO "Individual stream mode - starting separate streams"
         # Pass the stable device list to start function
-        start_all_ffmpeg_streams "${devices[@]}"
+        start_all_ffmpeg_streams "${capture_devices[@]}"
     fi
 
     # What counts is what is publishing: wait for each stream that was launched
     # to show up in MediaMTX, then establish the facts
     stream_outcome_expect "${devices[@]}"
     for path in ${OUTCOME_PATHS[@]+"${OUTCOME_PATHS[@]}"}; do
+        [[ "${OUTCOME_SKIPPED[$path]}" != "true" ]] || continue
         if [[ -z "${STREAM_LAST_ERROR[$path]:-}" ]]; then
             wait_path_ready "$path" || true
         fi
@@ -7619,10 +7719,14 @@ start_streams_and_report() {
     echo
     echo -e "${GREEN}=== Available RTSP Streams ===${NC}"
     for path in ${OUTCOME_PATHS[@]+"${OUTCOME_PATHS[@]}"}; do
+        if [[ "${OUTCOME_SKIPPED[$path]}" == "true" ]]; then
+            echo -e "${YELLOW}[SKIP]${NC} ${OUTCOME_DEVICE[$path]} (card ${OUTCOME_CARD[$path]}): ${OUTCOME_ERROR[$path]}"
+            continue
+        fi
         total=$((total + 1))
         note=""
         if [[ "$(effective_stream_mode)" == "multiplex" ]]; then
-            note=" (multiplexed from ${#devices[@]} devices)"
+            note=" (multiplexed from ${#capture_devices[@]} devices)"
         fi
         if [[ "${OUTCOME_READY[$path]}" == "true" ]]; then
             ready=$((ready + 1))
@@ -7633,7 +7737,8 @@ start_streams_and_report() {
     done
     echo
 
-    # The policy decides whether this is a start (D4)
+    # The policy decides whether this is a start (D4). Only streams are counted:
+    # a skipped card is neither a success nor a failure.
     local satisfied=true
     if [[ "$policy" == "strict" ]]; then
         ((ready == total)) || satisfied=false
@@ -7645,7 +7750,7 @@ start_streams_and_report() {
         if ((ready < total)); then
             log WARN "Started in degraded mode: ${ready} of ${total} streams are publishing (policy ${policy})"
             for path in ${OUTCOME_PATHS[@]+"${OUTCOME_PATHS[@]}"}; do
-                if [[ "${OUTCOME_READY[$path]}" != "true" ]]; then
+                if [[ "${OUTCOME_SKIPPED[$path]}" != "true" && "${OUTCOME_READY[$path]}" != "true" ]]; then
                     log WARN "  ${path}: ${OUTCOME_ERROR[$path]}"
                 fi
             done
@@ -7662,6 +7767,7 @@ start_streams_and_report() {
 
     log ERROR "Start failed: ${ready} of ${total} streams are publishing (policy ${policy})"
     for path in ${OUTCOME_PATHS[@]+"${OUTCOME_PATHS[@]}"}; do
+        [[ "${OUTCOME_SKIPPED[$path]}" != "true" ]] || continue
         if [[ "${OUTCOME_READY[$path]}" == "true" ]]; then
             STREAM_LAST_ERROR[$path]="was publishing; stopped again because the start failed under policy '${policy}'"
         else
@@ -8058,10 +8164,18 @@ status_print_summary() {
     echo
     if [[ "$running" == "true" ]]; then
         echo "Streams (as MediaMTX sees them):"
-        if ((${#OUTCOME_PATHS[@]} == 0)); then
+        local listed=0
+        for path in ${OUTCOME_PATHS[@]+"${OUTCOME_PATHS[@]}"}; do
+            [[ "${OUTCOME_SKIPPED[$path]}" == "true" ]] || listed=$((listed + 1))
+        done
+        if ((listed == 0)); then
             echo "  none: waiting for devices"
         fi
         for path in ${OUTCOME_PATHS[@]+"${OUTCOME_PATHS[@]}"}; do
+            if [[ "${OUTCOME_SKIPPED[$path]}" == "true" ]]; then
+                echo "  ${OUTCOME_DEVICE[$path]}: skipped (${OUTCOME_ERROR[$path]})"
+                continue
+            fi
             case "${OUTCOME_READY[$path]}" in
                 true) state="${GREEN}ready${NC}" ;;
                 null) state="${YELLOW}unknown${NC}" ;;
@@ -8134,10 +8248,11 @@ show_status() {
 
     if [[ "$is_multiplex_mode" == "true" ]]; then
         # Multiplex mode is active
-        echo "Multiplex stream (combining ${#devices[@]} devices):"
+        split_capture_devices ${devices[@]+"${devices[@]}"}
+        echo "Multiplex stream (combining ${#CAPTURE_DEVICES[@]} devices):"
         echo "  Stream: rtsp://${MEDIAMTX_HOST}:${MEDIAMTX_RTSP_PORT}/${MULTIPLEX_STREAM_NAME}"
-        if [[ ${#devices[@]} -gt 0 ]]; then
-            IFS=':' read -r device_name _ <<<"${devices[0]}"
+        if [[ ${#CAPTURE_DEVICES[@]} -gt 0 ]]; then
+            IFS=':' read -r device_name _ <<<"${CAPTURE_DEVICES[0]}"
             resolve_stream_settings "$device_name" "${MULTIPLEX_STREAM_NAME}"
             echo "  Settings: ${STREAM_SAMPLE_RATE} Hz, ${STREAM_CHANNELS} ch, ${STREAM_CODEC} ${STREAM_BITRATE}"
         fi
@@ -8157,7 +8272,11 @@ show_status() {
         else
             for device_info in "${devices[@]}"; do
                 IFS=':' read -r device_name card_num <<<"$device_info"
-                echo "  - $device_name (card $card_num)"
+                if card_has_capture_pcm "$card_num"; then
+                    echo "  - $device_name (card $card_num)"
+                else
+                    echo "  - $device_name (card $card_num): skipped, ${NO_CAPTURE_REASON}"
+                fi
             done
         fi
     else
@@ -8173,6 +8292,11 @@ show_status() {
                 stream_path="$(generate_stream_path "$device_name" "$card_num")"
 
                 echo "  - $device_name (card $card_num)"
+                if ! card_has_capture_pcm "$card_num"; then
+                    # A speaker or DAC: detected, but not a microphone and not a stream (X-34)
+                    echo -e "    Status: ${YELLOW}Skipped${NC} (${NO_CAPTURE_REASON})"
+                    continue
+                fi
                 echo "    Stream: rtsp://${MEDIAMTX_HOST}:${MEDIAMTX_RTSP_PORT}/$stream_path"
                 resolve_stream_settings "$device_name" "$stream_path"
                 echo "    Settings: ${STREAM_SAMPLE_RATE} Hz, ${STREAM_CHANNELS} ch, ${STREAM_CODEC} ${STREAM_BITRATE}"

@@ -31,6 +31,10 @@ setup() {
     export MEDIAMTX_HOST=localhost
     export MEDIAMTX_RTSP_PORT="$P_RTSP" MEDIAMTX_API_PORT="$P_API" MEDIAMTX_METRICS_PORT="$P_METRICS"
     export LOCK_ACQUISITION_TIMEOUT=2 STOP_LOCK_TIMEOUT=1
+    # The stood-in cards ("testmic" on card 1 and 2) are microphones: each has a capture
+    # PCM in a fake ALSA tree. A card without one is a speaker, which the manager skips (X-34).
+    mkdir -p "$D/asound/card1/pcm0c" "$D/asound/card2/pcm0c"
+    export ASOUND_PROC_ROOT="$D/asound"
 
     # Nothing of the host may be touched: process lookups and kills are PATH
     # shims that find nothing
